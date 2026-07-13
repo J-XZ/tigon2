@@ -862,7 +862,7 @@ class BPlusTree {
 		 */
 		BTreeLeaf *split(KeyType &sep)
 		{
-                        char *base = reinterpret_cast<char *>(star::cxl_memory.cxlalloc_malloc_wrapper(sizeof(BTreeLeaf), star::CXLMemory::INDEX_ALLOCATION));
+                        char *base = reinterpret_cast<char *>(star::cxl_memory.cxlalloc_malloc_wrapper(LeafPageSize, star::CXLMemory::INDEX_ALLOCATION));
 			BTreeLeaf *newLeaf = new (base) BTreeLeaf(); // Placement new
 
 			newLeaf->setCount(this->getCount() - (this->getCount() / 2));
@@ -905,7 +905,7 @@ class BPlusTree {
 			sep = keys_[this->getCount() - 1].deepCopy();
 		}
 	};
-	// static_assert(LeafPageSize > sizeof(BTreeLeaf), "LeafPageSize too small");
+	static_assert(LeafPageSize >= sizeof(BTreeLeaf), "LeafPageSize too small");
 
 	/**
 	 * BTreeInner - inner node
