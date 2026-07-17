@@ -1,0 +1,17 @@
+{
+  "shared_memory": {
+    "size_mb": 16,
+    "path": "/tmp/tigonkv-trace-backing",
+    "device_path": "/dev/ivpci0",
+    "hwcc": { "offset_mb": 0, "size_mb": 1 },
+    "swcc": { "offset_mb": 1, "size_mb": 15 }
+  },
+  "vm": { "count": 2 },
+  "tigon_kv": {
+    "partition_count": 8,
+    "fixed_key_size": 32,
+    "fixed_value_size": 128,
+    "hwcc_budget_mb": 1,
+    "enable_scan": true
+  }
+}

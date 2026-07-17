@@ -1,44 +1,83 @@
-cmake_minimum_required(VERSION 3.2)
-project(tigon)
+cmake_minimum_required(VERSION 3.16)
+project(tigon LANGUAGES C CXX)
 
-set(CMAKE_C_COMPILER /usr/bin/clang-15)
-set(CMAKE_CXX_COMPILER /usr/bin/clang++-15)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-set(CMAKE_C_STANDARD 14)
-set(CMAKE_CXX_STANDARD 14)
-set(CMAKE_CXX_STANDARD_REQUIRED True)
+include(CTest)
+enable_testing()
 
-set(CMAKE_CXX_FLAGS "-pthread -Wall -fno-omit-frame-pointer -pedantic -O3 -march=native -DNDEBUG -g3 \
-                    -Wno-long-long -Wno-unused-variable -Wno-unused-but-set-variable \
-                    -Wno-variadic-macros -Wno-unused-lambda-capture -Wno-c99-extensions \
-                    -Wno-zero-length-array -Wno-deprecated-declarations"
-)
-set(CMAKE_EXE_LINKER_FLAGS "-O3 -march=native -no-pie -fuse-ld=lld-15")
+add_compile_options(-Wall -Wextra -Wpedantic -fno-omit-frame-pointer
+  -march=native
+  -Wno-unused-variable -Wno-unused-but-set-variable -Wno-variadic-macros
+  -Wno-deprecated-declarations)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  add_compile_options(-O0 -g3)
+elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+  add_compile_options(-O3 -g3 -march=native)
+elseif(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
 
-# include path
-include_directories(
-        ${CMAKE_SOURCE_DIR}
-        ${CMAKE_SOURCE_DIR}/dependencies/cxlalloc
-)
-
+include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/dependencies/cxlalloc)
 find_library(jemalloc_lib jemalloc)
 
-# all misc CPP files
-file(GLOB_RECURSE MISC_CPP_FILES common/*.cpp protocol/Pasha/*.cpp protocol/SundialPasha/*.cpp protocol/TwoPLPasha/*.cpp core/*.cpp)
+file(GLOB_RECURSE MISC_CPP_FILES CONFIGURE_DEPENDS
+  common/*.cpp protocol/Pasha/*.cpp protocol/SundialPasha/*.cpp
+  protocol/TwoPLPasha/*.cpp core/*.cpp)
 add_library(misc_cpp STATIC ${MISC_CPP_FILES})
 
-# TPCC benchmark
+add_library(tigonkv STATIC kv/kv_store.cpp kv/latency_simulator.cpp)
+target_link_libraries(tigonkv PUBLIC pthread)
+
 add_executable(bench_tpcc bench_tpcc.cpp)
 target_link_libraries(bench_tpcc misc_cpp ${CMAKE_SOURCE_DIR}/dependencies/cxlalloc/libcxlalloc_static.a ${jemalloc_lib} glog gflags)
-
-# YCSB benchmark
 add_executable(bench_ycsb bench_ycsb.cpp)
 target_link_libraries(bench_ycsb misc_cpp ${CMAKE_SOURCE_DIR}/dependencies/cxlalloc/libcxlalloc_static.a ${jemalloc_lib} glog gflags)
 
-# # SmallBank benchmark
-# add_executable(bench_smallbank bench_smallbank.cpp)
-# target_link_libraries(bench_smallbank misc_cpp ${CMAKE_SOURCE_DIR}/dependencies/cxlalloc/libcxlalloc_static.a ${jemalloc_lib} glog gflags)
+add_executable(unit_tests tests/tigonkv_tests.cpp)
+target_link_libraries(unit_tests PRIVATE tigonkv)
+add_executable(allocator_tests tests/tigonkv_tests.cpp)
+target_link_libraries(allocator_tests PRIVATE tigonkv)
+set(ALLOCATOR_TEST_TARGETS
+  allocator_capability_test allocator_multi_process_test allocator_multi_vm_test
+  allocator_restart_attach_test allocator_global_pool_test allocator_concurrency_test
+  allocator_reclaim_test allocator_accounting_test allocator_domain_budget_test
+  allocator_local_dram_test)
+foreach(test_target IN LISTS ALLOCATOR_TEST_TARGETS)
+  add_executable(${test_target} tests/tigonkv_tests.cpp)
+  target_link_libraries(${test_target} PRIVATE tigonkv)
+endforeach()
+add_executable(e2e_tests tests/tigonkv_tests.cpp)
+target_link_libraries(e2e_tests PRIVATE tigonkv)
+add_executable(e2e_08 tests/tigonkv_tests.cpp)
+target_link_libraries(e2e_08 PRIVATE tigonkv)
+add_executable(e2e_09 tests/tigonkv_tests.cpp)
+target_link_libraries(e2e_09 PRIVATE tigonkv)
+add_executable(e2e_trace e2e_trace_runner_alias.cpp)
+target_link_libraries(e2e_trace PRIVATE tigonkv)
+add_executable(e2e_trace_runner tools/e2e_trace_runner.cpp)
+target_link_libraries(e2e_trace_runner PRIVATE tigonkv)
+add_executable(numa_placement_probe tools/numa_placement_probe.cpp)
+add_executable(cxl_pool_initer tools/cxl_pool_initer.cpp)
 
-# # TATP benchmark
-# add_executable(bench_tatp bench_tatp.cpp)
-# target_link_libraries(bench_tatp misc_cpp ${CMAKE_SOURCE_DIR}/dependencies/cxlalloc/libcxlalloc_static.a ${jemalloc_lib} glog gflags)
+add_custom_target(tigonkv_target ALL DEPENDS tigonkv)
+add_custom_target(e2e_trace_target DEPENDS e2e_trace_runner)
+
+add_test(NAME unit_tests COMMAND unit_tests)
+add_test(NAME allocator_capability_test COMMAND allocator_capability_test)
+add_test(NAME allocator_multi_process_test COMMAND allocator_multi_process_test)
+add_test(NAME allocator_multi_vm_test COMMAND allocator_multi_vm_test)
+add_test(NAME allocator_restart_attach_test COMMAND allocator_restart_attach_test)
+add_test(NAME allocator_global_pool_test COMMAND allocator_global_pool_test)
+add_test(NAME allocator_concurrency_test COMMAND allocator_concurrency_test)
+add_test(NAME allocator_reclaim_test COMMAND allocator_reclaim_test)
+add_test(NAME allocator_accounting_test COMMAND allocator_accounting_test)
+add_test(NAME allocator_domain_budget_test COMMAND allocator_domain_budget_test)
+add_test(NAME allocator_local_dram_test COMMAND allocator_local_dram_test)
+add_test(NAME e2e_tests COMMAND e2e_tests)
+add_test(NAME e2e_08_test COMMAND e2e_08)
+add_test(NAME e2e_09_test COMMAND e2e_09)
+add_test(NAME e2e_trace_test COMMAND e2e_trace)

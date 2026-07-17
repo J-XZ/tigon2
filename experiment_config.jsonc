@@ -1,0 +1,49 @@
+{
+  // NUMA-based CXL shared-memory emulation: the backing file is ordinary host DRAM.
+  "shared_memory": {
+    "size_mb": 4096,
+    "path": "/mnt/xz_shared_mem",
+    "device_path": "/dev/ivpci0",
+    "numa_node": 1,
+    "hwcc": { "offset_mb": 0, "size_mb": 1024 },
+    "swcc": { "offset_mb": 1024, "size_mb": 3072 }
+  },
+  "host_cpu": {
+    "reserved_cores": [0, 1],
+    "ivshmem_server_cores": [2, 3],
+    "vm_cores": [32, 33, 34, 35]
+  },
+  "vm": {
+    "count": 2,
+    "core_count_per_vm": 2,
+    "storage_path": "/mnt/xz_vm_storage",
+    "numa_node": 0
+  },
+  "network": { "base_ssh_port": 2200 },
+  "sync": { "timeout_sec": 60 },
+  "e2e": { "foreground_worker_count_per_vm": 1 },
+  "tigon_kv": {
+    "partition_count": 16,
+    "fixed_key_size": 32,
+    "fixed_value_size": 1000,
+    "hwcc_budget_mb": 1024,
+    "hwcc_reserved_mb": 64,
+    "owner_private_swcc_fraction": 0.75,
+    "shared_payload_swcc_fraction": 0.25,
+    "migration_policy": "Clock",
+    "reuse_shared_payload_after_moveout": false,
+    "checkpoint_on_clean_exit": true,
+    "enable_scan": true,
+    "strict_swcc_access": false,
+    "latency_inject": {
+      "enabled": false,
+      "cache_model": "none",
+      "swcc_read_ns": 0,
+      "swcc_write_ns": 0,
+      "swcc_flush_ns": 0,
+      "hwcc_read_ns": 0,
+      "hwcc_write_ns": 0,
+      "hwcc_atomic_ns": 0
+    }
+  }
+}

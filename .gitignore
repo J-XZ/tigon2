@@ -1,6 +1,8 @@
 .vscode
 settings.json
 build
+build-*/
+results/ycsb_traces/
 tmp*
 __pycache__
 

@@ -1,0 +1,6 @@
+# OP KEY_LEN LEN KEY
+PUT 5 3 alpha
+GET 5 0 alpha
+SCAN 1 10 a
+DELETE 5 0 alpha
+GET 5 0 alpha

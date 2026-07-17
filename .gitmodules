@@ -1,0 +1,4 @@
+[submodule "thirdparty_libs/YCSB-cpp"]
+	path = thirdparty_libs/YCSB-cpp
+	url = https://github.com/J-XZ/YCSB-cpp.git
+	branch = cxlkv_trace

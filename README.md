@@ -13,6 +13,32 @@ This repository contains the following:
 * Scripts for building and running Tigon/baselines
 * Scripts for reproducing the results reported in the paper
 
+## TigonKV shared-memory emulation path
+
+The independent KV path is built as `tigonkv` and exposes one namespace through
+`KVStore::Put`, `Get`, `Delete`, `Scan`, `CompareExchange`, and `Increment`. It keeps
+Tigon's partition/owner model internally and promotes a row to a shared payload only
+when a non-owner VM accesses it. The backing file is ordinary host DRAM mapped through
+ivshmem; HWCC/SWCC are logical protocol and accounting categories. Results must be
+described as NUMA-based CXL shared-memory emulation and software latency-injected
+results, never as real CXL hardware performance.
+
+The default experiment paths are `/mnt/xz_shared_mem/ivshmem_shared_mem`,
+`/dev/ivpci0`, and `/mnt/xz_vm_storage`. `scripts/vm/*` only inspects or reuses an
+existing topology and deliberately refuses to start/reboot VMs, configure networking,
+or change host tuning. See [experiment_config.jsonc](experiment_config.jsonc),
+[缓存一致性设计.md](缓存一致性设计.md), and [内存布局.md](内存布局.md).
+
+Build and local verification:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+```
+
+The repository's original `bench_ycsb` and `bench_tpcc` targets remain available.
+
 ## Claims
 By running the experiments, you should be able to reproduce the numbers shown in:
 * **Figure 4(a)**: TPC-C throughput of Sundial, Sundial-CXL, and Sundial+, varying percentages of multi-partition transactions
