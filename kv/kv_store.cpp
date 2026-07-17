@@ -98,7 +98,7 @@ void ValidateKnownKeys(const std::string &s) {
 
 struct Slot {
   uint8_t state;
-  uint8_t owner;
+  uint32_t owner;
   uint16_t key_len;
   uint32_t value_len;
   uint64_t version;
