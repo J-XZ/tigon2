@@ -187,6 +187,10 @@ void SyncRangeOrThrow(const void *address, size_t length, const char *what) {
   __sync_synchronize();
 }
 
+uint64_t CacheLineToken(const void *address) {
+  return reinterpret_cast<std::uintptr_t>(address) / 64;
+}
+
 class Lock {
  public:
   explicit Lock(pthread_mutex_t *mutex, LatencySimulator *latency = nullptr)
@@ -661,12 +665,12 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
   if (was_shared) {
     ++runtime_.shared_puts;
     ++runtime_.shared_swcc_flushes;
-    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kWrite, value.size());
-    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kWrite, value.size(), CacheLineToken(row));
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
     SyncRangeOrThrow(row, sizeof(Slot), "shared promotion write-back");
   } else {
     ++runtime_.private_puts;
-    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kWrite, value.size());
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kWrite, value.size(), CacheLineToken(row));
   }
   if (!existing) { impl_->PublishIndex(row); impl_->PublishSortedIndex(row); }
   return Status::Ok();
@@ -687,12 +691,12 @@ GetResult KVStore::Get(std::string_view key) {
         // Publication is the linearization point: the complete source value is
         // write-backed before another VM can rely on the shared state.
         ++runtime_.shared_swcc_flushes;
-        impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+        impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(&row));
         SyncRangeOrThrow(&row, sizeof(Slot), "shared promotion write-back");
       }
       bool shared = row.state == kShared;
-      if (shared) { ++runtime_.shared_gets; impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, row.value_len); }
-      else { ++runtime_.private_gets; impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, row.value_len); }
+      if (shared) { ++runtime_.shared_gets; impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, row.value_len, CacheLineToken(&row)); }
+      else { ++runtime_.private_gets; impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, row.value_len, CacheLineToken(&row)); }
       ++runtime_.commits;
       return {Status::Ok(), std::string(row.value, row.value_len)};
   }
@@ -723,7 +727,7 @@ Status KVStore::Delete(std::string_view key) {
         if (impl_->header->active_shared_rows) --impl_->header->active_shared_rows;
         ++runtime_.shared_deletes;
         ++runtime_.shared_swcc_flushes;
-        impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+        impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(&row));
         SyncRangeOrThrow(&row, sizeof(Slot), "shared delete write-back");
       }
       else ++runtime_.private_deletes;
@@ -786,11 +790,13 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
       ++impl_->header->active_shared_rows;
       ++runtime_.migration_in;
       ++runtime_.shared_swcc_flushes;
-      impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+      impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(&row));
       SyncRangeOrThrow(&row, sizeof(Slot), "shared scan promotion write-back");
     }
     if (row.state == kPrivate) ++runtime_.private_gets;
     else ++runtime_.shared_gets;
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, row.value_len,
+                          CacheLineToken(&row));
     all.push_back({std::string(row.key, row.key_len), std::string(row.value, row.value_len)});
   }
   ++runtime_.logical_ops; ++runtime_.commits;
@@ -817,7 +823,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
       return {Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded"), false};
     impl_->TransitionPayload(row, kShared); ++impl_->header->active_shared_rows; ++runtime_.migration_in;
     ++runtime_.shared_swcc_flushes;
-    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
     SyncRangeOrThrow(row, sizeof(Slot), "shared CAS promotion write-back");
   }
   if (row->state == kEmpty || row->state == kTombstone) {
@@ -831,7 +837,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
   if (row->state == kShared) {
     ++runtime_.shared_puts;
     ++runtime_.shared_swcc_flushes;
-    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
     SyncRangeOrThrow(row, sizeof(Slot), "shared CAS write-back");
   }
   else ++runtime_.private_puts;
@@ -853,7 +859,7 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
       return {Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded"), 0};
     impl_->TransitionPayload(row, kShared); ++impl_->header->active_shared_rows; ++runtime_.migration_in;
     ++runtime_.shared_swcc_flushes;
-    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
     SyncRangeOrThrow(row, sizeof(Slot), "shared increment promotion write-back");
   }
   if (row) { auto result = std::from_chars(row->value, row->value + row->value_len, old); if (result.ec != std::errc()) return {Status::Error(StatusCode::kInvalidArgument, "value is not an integer"), 0}; }
@@ -876,7 +882,7 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   if (row->state == kShared) {
     ++runtime_.shared_puts;
     ++runtime_.shared_swcc_flushes;
-    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
     SyncRangeOrThrow(row, sizeof(Slot), "shared increment write-back");
   }
   else ++runtime_.private_puts;

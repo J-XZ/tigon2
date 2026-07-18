@@ -27,7 +27,11 @@ class LatencySimulator {
                          const char *cache_model = "none",
                          double fixed_hit_rate = 0.0,
                          uint64_t cache_capacity_lines = 0);
-  void Record(PoolKind pool, AccessKind kind, uint64_t bytes);
+  // cache_line_id is optional so existing instrumentation remains source
+  // compatible.  A non-zero token identifies the first cache line touched by
+  // this access; subsequent lines use consecutive tokens.
+  void Record(PoolKind pool, AccessKind kind, uint64_t bytes,
+              uint64_t cache_line_id = 0);
   // Sleep for latency accumulated by the current operation. Call only after
   // releasing protocol locks.
   void DrainPending();

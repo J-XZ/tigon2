@@ -289,10 +289,47 @@ void TestLatencyAndStrictAccess() {
   assert(hit_stats.cache_hits == 1 && hit_stats.cache_misses == 0 && hit_stats.delayed_ns == 0);
   simulator.Reset();
   simulator.ConfigureDetailed(true, 1, 2, 3, 100, 200, 300, "per_thread_lru", 0.0, 1);
-  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64);
-  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64);
+  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64, 1);
+  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64, 2);
+  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64, 1);
   const auto lru_stats = simulator.Snapshot();
-  assert(lru_stats.cache_hits == 1 && lru_stats.cache_misses == 1 && lru_stats.delayed_ns == 100);
+  assert(lru_stats.cache_hits == 0 && lru_stats.cache_misses == 3 && lru_stats.delayed_ns == 300);
+  simulator.Reset();
+  simulator.ConfigureDetailed(true, 1, 2, 3, 100, 200, 300, "per_thread_lru", 0.0, 2);
+  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64, 1);
+  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64, 2);
+  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64, 1);
+  const auto lru_hit_stats = simulator.Snapshot();
+  assert(lru_hit_stats.cache_hits == 1 && lru_hit_stats.cache_misses == 2 &&
+         lru_hit_stats.delayed_ns == 200);
+
+  const std::string latency_path = "/tmp/tigonkv-latency-enabled-" + std::to_string(getpid());
+  std::remove(latency_path.c_str());
+  auto latency_config = TestConfig(latency_path, 0);
+  latency_config.latency_enabled = true;
+  latency_config.swcc_read_ns = 1;
+  latency_config.swcc_write_ns = 2;
+  latency_config.swcc_flush_ns = 3;
+  auto latency_store = KVStore::Create(latency_config, true);
+  assert(latency_store->Put("latency", "value").ok());
+  assert(latency_store->Get("latency").status.ok());
+  assert(latency_store->Checkpoint().ok());
+  const std::string enabled_dump = latency_store->DumpStats();
+  const size_t enabled_delay = enabled_dump.find("delayed_ns=");
+  assert(enabled_delay != std::string::npos && enabled_dump.substr(enabled_delay, 12) != "delayed_ns=0");
+  latency_store.reset();
+  std::remove(latency_path.c_str());
+
+  const std::string disabled_path = "/tmp/tigonkv-latency-disabled-" + std::to_string(getpid());
+  std::remove(disabled_path.c_str());
+  auto disabled_store = KVStore::Create(TestConfig(disabled_path, 0), true);
+  assert(disabled_store->Put("latency", "value").ok());
+  assert(disabled_store->Get("latency").status.ok());
+  const std::string disabled_dump = disabled_store->DumpStats();
+  const size_t disabled_delay = disabled_dump.find("delayed_ns=");
+  assert(disabled_delay != std::string::npos && disabled_dump.substr(disabled_delay, 12) == "delayed_ns=0");
+  disabled_store.reset();
+  std::remove(disabled_path.c_str());
 
   const std::string path = "/tmp/tigonkv-strict-" + std::to_string(getpid());
   std::remove(path.c_str());

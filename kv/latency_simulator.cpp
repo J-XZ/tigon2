@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -12,6 +13,7 @@ namespace tigonkv {
 
 namespace {
 thread_local std::unordered_map<const LatencySimulator *, uint64_t> pending_delay;
+thread_local std::unordered_map<const LatencySimulator *, std::deque<uint64_t>> lru_lines;
 }
 
 void LatencySimulator::Configure(bool enabled, uint64_t hwcc_ns,
@@ -42,7 +44,8 @@ void LatencySimulator::ConfigureDetailed(bool enabled, uint64_t hwcc_read_ns,
   cache_capacity_lines_ = cache_capacity_lines;
 }
 
-void LatencySimulator::Record(PoolKind pool, AccessKind kind, uint64_t bytes) {
+void LatencySimulator::Record(PoolKind pool, AccessKind kind, uint64_t bytes,
+                              uint64_t cache_line_id) {
   const uint64_t lines = std::max<uint64_t>(1, (bytes + 63) / 64);
   if (pool == PoolKind::kHwcc) {
     if (kind == AccessKind::kRead) hwcc_reads_.fetch_add(lines);
@@ -56,18 +59,41 @@ void LatencySimulator::Record(PoolKind pool, AccessKind kind, uint64_t bytes) {
     swcc_writes_.fetch_add(lines);
   }
   if (!enabled_.load(std::memory_order_acquire)) return;
-  bool cache_hit = false;
+  uint64_t cache_hits = 0;
+  uint64_t cache_misses = 0;
   if (pool == PoolKind::kSwcc && kind == AccessKind::kRead) {
     if (std::strcmp(cache_model_, "fixed_hit_rate") == 0) {
-      const uint64_t sample = cache_sequence_.fetch_add(lines);
-      cache_hit = (static_cast<double>(sample % 10000) / 10000.0) < fixed_hit_rate_;
-    } else if (std::strcmp(cache_model_, "per_thread_lru") == 0) {
-      thread_local std::unordered_map<const LatencySimulator *, bool> seen;
-      cache_hit = cache_capacity_lines_ != 0 && seen[this];
-      seen[this] = true;
+      for (uint64_t line = 0; line < lines; ++line) {
+        const uint64_t sample = cache_sequence_.fetch_add(1);
+        if (static_cast<double>(sample % 10000) / 10000.0 < fixed_hit_rate_)
+          ++cache_hits;
+        else
+          ++cache_misses;
+      }
+    } else if (std::strcmp(cache_model_, "per_thread_lru") == 0 &&
+               cache_capacity_lines_ != 0) {
+      auto &lru = lru_lines[this];
+      // Without an address token, bytes is a stable synthetic line identity;
+      // callers that instrument real objects should pass their line token.
+      const uint64_t first_line = cache_line_id == 0 ? bytes / 64 : cache_line_id;
+      for (uint64_t line = 0; line < lines; ++line) {
+        const uint64_t token = first_line + line;
+        auto found = std::find(lru.begin(), lru.end(), token);
+        if (found != lru.end()) {
+          ++cache_hits;
+          lru.erase(found);
+          lru.push_front(token);
+        } else {
+          ++cache_misses;
+          lru.push_front(token);
+          if (lru.size() > cache_capacity_lines_) lru.pop_back();
+        }
+      }
+    } else {
+      cache_misses = lines;
     }
-    if (cache_hit) cache_hits_.fetch_add(lines);
-    else cache_misses_.fetch_add(lines);
+    cache_hits_.fetch_add(cache_hits);
+    cache_misses_.fetch_add(cache_misses);
   }
   uint64_t delay = 0;
   if (pool == PoolKind::kHwcc) {
@@ -75,7 +101,7 @@ void LatencySimulator::Record(PoolKind pool, AccessKind kind, uint64_t bytes) {
     else if (kind == AccessKind::kWrite) delay = hwcc_write_ns_ * lines;
     else delay = hwcc_atomic_ns_ * lines;
   }
-  else if (kind == AccessKind::kRead) delay = cache_hit ? 0 : swcc_read_ns_ * lines;
+  else if (kind == AccessKind::kRead) delay = swcc_read_ns_ * cache_misses;
   else if (kind == AccessKind::kFlush) delay = swcc_flush_ns_ * lines;
   else delay = swcc_write_ns_ * lines;
   delayed_ns_.fetch_add(delay);
@@ -101,6 +127,7 @@ void LatencySimulator::Reset() {
   swcc_reads_ = swcc_writes_ = swcc_flushes_ = delayed_ns_ = 0;
   cache_hits_ = cache_misses_ = cache_sequence_ = 0;
   pending_delay.erase(this);
+  lru_lines.erase(this);
 }
 
 NonCoherentSwccTestBackend::NonCoherentSwccTestBackend(size_t bytes)

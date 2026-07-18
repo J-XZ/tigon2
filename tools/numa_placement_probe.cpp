@@ -26,12 +26,15 @@ int main(int argc, char **argv) {
   const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
   const size_t pages = (static_cast<size_t>(st.st_size) + page_size - 1) / page_size;
   const int expected_node = argc == 3 ? std::stoi(argv[2]) : -1;
+  const char *mode = expected_node >= 0 ? "performance" : "functional";
   std::vector<void *> addresses(pages);
   std::vector<int> nodes(pages, -1);
   for (size_t i = 0; i < pages; ++i)
     addresses[i] = static_cast<char *>(mapping) + i * page_size;
   const long query = syscall(SYS_move_pages, 0, pages, addresses.data(), nullptr,
                              nodes.data(), 0);
+  const int query_errno = query == 0 ? 0 : errno;
+  int exit_code = 0;
   std::cout << "TIGONKV_NUMA_STATS\n";
   if (query == 0) {
     size_t resident = 0, misplaced = 0;
@@ -49,15 +52,17 @@ int main(int argc, char **argv) {
         dominant_node = static_cast<int>(node);
     std::cout << "node=host vm_numa=unknown shared_numa=" << dominant_node
               << " misplaced_pages=" << (expected_node >= 0 ? std::to_string(misplaced) : "unknown")
-              << " mode=functional resident_pages=" << resident << "\n";
+              << " mode=" << mode << " resident_pages=" << resident << "\n";
     for (size_t node = 0; node < counts.size(); ++node)
       if (counts[node] != 0) std::cout << "shared_numa_node_" << node << "_pages=" << counts[node] << "\n";
+    if (expected_node >= 0 && (resident == 0 || misplaced != 0)) exit_code = 3;
   } else {
-    std::cout << "node=host vm_numa=unknown shared_numa=unknown misplaced_pages=unknown mode=functional"
-              << " query_errno=" << errno << " query_error=" << std::strerror(errno) << "\n";
+    std::cout << "node=host vm_numa=unknown shared_numa=unknown misplaced_pages=unknown mode=" << mode
+              << " query_errno=" << query_errno << " query_error=" << std::strerror(query_errno) << "\n";
+    if (expected_node >= 0) exit_code = 3;
   }
   std::cout << "sampled_pages=" << pages << " bytes=" << st.st_size << "\n";
   std::cout << "note=read-only move_pages query; this probe does not move pages or change policy\n";
   munmap(mapping, static_cast<size_t>(st.st_size)); close(fd);
-  return 0;
+  return exit_code;
 }
