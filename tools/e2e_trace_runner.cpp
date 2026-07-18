@@ -54,10 +54,19 @@ void Barrier(const std::string &phase, uint32_t node, bool final) {
 }
 
 int main() {
+  std::unique_ptr<KVStore> store;
+  std::string trace;
+  std::string phase;
+  std::string last_op;
+  std::string last_key;
+  uint32_t node = 0;
+  uint64_t line_no = 0;
+  uint64_t ops = 0;
   try {
     const std::string experiment = Env("TIGONKV_EXPERIMENT_CONFIG_JSONC", "CXLKV_EXPERIMENT_CONFIG_JSONC", "experiment_config.jsonc");
     Config config = Config::FromJsonc(experiment);
     config.node_id = static_cast<uint32_t>(ParseUnsigned(Env("TIGONKV_NODE_ID", "CXLKV_NODE_ID", "0"), "node id"));
+    node = config.node_id;
     const std::string trace_config = Env("TIGONKV_E2E_TRACE_CONFIG_JSONC", "CXLKV_E2E_TRACE_CONFIG_JSONC");
     if (!trace_config.empty()) {
       std::ifstream config_file(trace_config);
@@ -65,15 +74,14 @@ int main() {
     }
     const std::string policy_config = Env("TIGONKV_POLICY_CONFIG_JSON", "CXLKV_POLICY_CONFIG_JSON");
     (void)policy_config;  // policy is intentionally independent of the KV API.
-    const std::string trace = Env("TIGONKV_E2E_TRACE_FILE", "CXLKV_E2E_TRACE_FILE");
+    trace = Env("TIGONKV_E2E_TRACE_FILE", "CXLKV_E2E_TRACE_FILE");
     if (trace.empty()) Fail("TIGONKV_E2E_TRACE_FILE is required for direct trace replay");
     const bool reset = Env("TIGONKV_E2E_RESET", "CXLKV_E2E_RESET", "0") == "1";
-    auto store = KVStore::Create(config, reset);
+    store = KVStore::Create(config, reset);
     std::ifstream input(trace);
     if (!input) Fail("cannot open trace: " + trace);
-    const std::string phase = Env("TIGONKV_E2E_TRACE_PHASE", "CXLKV_E2E_TRACE_PHASE", "run");
+    phase = Env("TIGONKV_E2E_TRACE_PHASE", "CXLKV_E2E_TRACE_PHASE", "run");
     Barrier(phase, config.node_id, false);
-    uint64_t ops = 0, line_no = 0;
     auto start = std::chrono::steady_clock::now();
     std::string line;
     while (std::getline(input, line)) {
@@ -85,6 +93,7 @@ int main() {
       while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') ++pos;
       if (op_begin == pos) Fail(trace + ": malformed line " + std::to_string(line_no));
       const std::string op = line.substr(op_begin, pos - op_begin);
+      last_op = op;
       while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
       const size_t key_len = ReadDecimal(line, &pos, "key length");
       if (pos >= line.size() || (line[pos] != ' ' && line[pos] != '\t')) Fail(trace + ": missing LEN separator at line " + std::to_string(line_no));
@@ -95,6 +104,7 @@ int main() {
       while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
       if (pos > line.size() || line.size() - pos < key_len) Fail(trace + ": key length mismatch at line " + std::to_string(line_no));
       const std::string key = line.substr(pos, key_len);
+      last_key = key;
       for (size_t tail = pos + key_len; tail < line.size(); ++tail)
         if (line[tail] != ' ' && line[tail] != '\t') Fail(trace + ": trailing bytes after key at line " + std::to_string(line_no));
       Status status;
@@ -127,6 +137,23 @@ int main() {
     return 0;
   } catch (const std::exception &e) {
     std::cerr << "e2e_trace_runner: hard failure: " << e.what() << "\n";
+    std::cerr << "E2E_TRACE_FAILURE\n"
+              << "node=" << node << "\n"
+              << "trace=" << trace << "\n"
+              << "phase=" << phase << "\n"
+              << "line=" << line_no << "\n"
+              << "op=" << last_op << "\n"
+              << "key=" << last_key << "\n"
+              << "ops_completed=" << ops << "\n";
+    if (store) {
+      try {
+        std::cerr << "partition=" << store->StablePartitionForKey(last_key)
+                  << " owner=" << store->OwnerForKey(last_key) << "\n";
+        std::cerr << store->DumpStats();
+      } catch (const std::exception &diagnostic_error) {
+        std::cerr << "diagnostic_error=" << diagnostic_error.what() << "\n";
+      }
+    }
     return 2;
   }
 }

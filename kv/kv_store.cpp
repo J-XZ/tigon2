@@ -316,6 +316,18 @@ struct KVStore::Impl {
     else if (state == kShared) header->shared_payload_bytes += bytes;
   }
 
+  void AcquireRef(Slot *row) {
+    if (row->ref_count == UINT32_MAX)
+      throw std::runtime_error("shared row reference count overflow");
+    ++row->ref_count;
+  }
+
+  void ReleaseRef(Slot *row) {
+    if (row->ref_count == 0)
+      throw std::runtime_error("shared row reference count underflow");
+    --row->ref_count;
+  }
+
   void TransitionPayload(Slot *row, uint8_t new_state) {
     if (row->state == new_state) return;
     const uint64_t bytes = PayloadBytes(*row);
@@ -751,10 +763,13 @@ GetResult KVStore::Get(std::string_view key) {
         SyncRangeOrThrow(&row, sizeof(Slot), "shared promotion write-back");
       }
       bool shared = row.state == kShared;
-      if (shared) { ++runtime_.shared_gets; impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, row.value_len, CacheLineToken(&row)); }
-      else { ++runtime_.private_gets; impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, row.value_len, CacheLineToken(&row)); }
+      impl_->AcquireRef(&row);
+      const std::string value(row.value, row.value_len);
+      impl_->ReleaseRef(&row);
+      if (shared) { ++runtime_.shared_gets; impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, value.size(), CacheLineToken(&row)); }
+      else { ++runtime_.private_gets; impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, value.size(), CacheLineToken(&row)); }
       ++runtime_.commits;
-      return {Status::Ok(), std::string(row.value, row.value_len)};
+      return {Status::Ok(), value};
   }
   ++runtime_.commits;
   return {Status::Error(StatusCode::kNotFound, "key not found"), {}};
@@ -774,6 +789,8 @@ Status KVStore::Delete(std::string_view key) {
           return Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded");
         impl_->TransitionPayload(&row, kShared); ++impl_->header->active_shared_rows; ++runtime_.migration_in; shared = true;
       }
+      if (row.ref_count != 0)
+        return Status::Error(StatusCode::kOwnerViolation, "cannot retire a referenced row");
       impl_->RetireIndex(&row);
       impl_->RemovePayload(row);
       row.state = kTombstone; row.key_len = 0; row.value_len = 0; ++row.generation;
@@ -849,11 +866,14 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
       impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(&row));
       SyncRangeOrThrow(&row, sizeof(Slot), "shared scan promotion write-back");
     }
+    impl_->AcquireRef(&row);
+    const std::string value(row.value, row.value_len);
+    impl_->ReleaseRef(&row);
     if (row.state == kPrivate) ++runtime_.private_gets;
     else ++runtime_.shared_gets;
-    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, row.value_len,
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, value.size(),
                           CacheLineToken(&row));
-    all.push_back({std::string(row.key, row.key_len), std::string(row.value, row.value_len)});
+    all.push_back({std::string(row.key, row.key_len), value});
   }
   ++runtime_.logical_ops; ++runtime_.commits;
   return {Status::Ok(), std::move(all)};
