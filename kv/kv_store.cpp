@@ -1,6 +1,7 @@
 #include "kv/kv_store.h"
 
 #include "kv/latency_simulator.h"
+#include "kv/memory_domains.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -20,8 +21,9 @@ namespace tigonkv {
 namespace {
 
 constexpr uint64_t kMagic = 0x5449474f4e4b5632ULL;  // TIGONKV2
-constexpr uint32_t kLayoutVersion = 1;
+constexpr uint32_t kLayoutVersion = 2;
 constexpr uint8_t kEmpty = 0, kPrivate = 1, kShared = 2, kTombstone = 3;
+constexpr uint32_t kIndexTombstone = UINT32_MAX;
 constexpr size_t kMaxKey = 256;
 constexpr size_t kMaxValue = 4096;
 constexpr uint64_t kSharedMetadataBytes = 128;
@@ -126,6 +128,8 @@ struct SharedHeader {
   uint64_t attached_count;
   uint64_t active_shared_rows;
   uint64_t reclaimed_total_bytes;
+  uint64_t index_count;
+  uint64_t next_slot_hint;
   pthread_mutex_t mutex;
 };
 
@@ -151,9 +155,66 @@ struct KVStore::Impl {
   size_t bytes = 0;
   void *mapping = MAP_FAILED;
   SharedHeader *header = nullptr;
+  uint32_t *index = nullptr;
   Slot *slots = nullptr;
   size_t slot_count = 0;
   LatencySimulator latency;
+
+  uint64_t LogicalHwccBytes(uint64_t active_rows) const {
+    return sizeof(SharedHeader) + header->index_count * sizeof(uint32_t) +
+           active_rows * kSharedMetadataBytes;
+  }
+
+  Slot *Find(std::string_view key) const {
+    if (header->index_count == 0) return nullptr;
+    uint64_t bucket = HashBytes(key) & (header->index_count - 1);
+    for (uint64_t probe = 0; probe < header->index_count; ++probe) {
+      const uint32_t entry = index[(bucket + probe) & (header->index_count - 1)];
+      if (entry == 0) return nullptr;
+      if (entry == kIndexTombstone) continue;
+      const size_t slot = static_cast<size_t>(entry - 1);
+      if (slot >= slot_count) throw std::runtime_error("shared index points outside slot arena");
+      Slot &row = slots[slot];
+      if ((row.state == kPrivate || row.state == kShared) && row.key_len == key.size() &&
+          std::memcmp(row.key, key.data(), key.size()) == 0) return &row;
+    }
+    return nullptr;
+  }
+
+  void PublishIndex(Slot *row) {
+    const uint32_t slot = static_cast<uint32_t>(row - slots);
+    uint64_t bucket = HashBytes(std::string_view(row->key, row->key_len)) & (header->index_count - 1);
+    uint64_t tombstone = header->index_count;
+    for (uint64_t probe = 0; probe < header->index_count; ++probe) {
+      uint32_t &entry = index[(bucket + probe) & (header->index_count - 1)];
+      if (entry == 0) { index[tombstone == header->index_count ? ((bucket + probe) & (header->index_count - 1)) : tombstone] = slot + 1; return; }
+      if (entry == kIndexTombstone && tombstone == header->index_count) tombstone = (bucket + probe) & (header->index_count - 1);
+      else if (entry == slot + 1) return;
+    }
+    if (tombstone != header->index_count) { index[tombstone] = slot + 1; return; }
+    throw std::runtime_error("shared index is full");
+  }
+
+  void RetireIndex(Slot *row) {
+    const uint32_t slot = static_cast<uint32_t>(row - slots);
+    uint64_t bucket = HashBytes(std::string_view(row->key, row->key_len)) & (header->index_count - 1);
+    for (uint64_t probe = 0; probe < header->index_count; ++probe) {
+      uint32_t &entry = index[(bucket + probe) & (header->index_count - 1)];
+      if (entry == 0) return;
+      if (entry == slot + 1) { entry = kIndexTombstone; return; }
+    }
+  }
+
+  Slot *AllocateSlot() {
+    for (size_t probe = 0; probe < slot_count; ++probe) {
+      const size_t pos = (static_cast<size_t>(header->next_slot_hint) + probe) % slot_count;
+      if (slots[pos].state == kEmpty || slots[pos].state == kTombstone) {
+        header->next_slot_hint = (pos + 1) % slot_count;
+        return &slots[pos];
+      }
+    }
+    return nullptr;
+  }
 };
 
 Config Config::FromJsonc(const std::string &path) {
@@ -195,7 +256,9 @@ Config Config::FromJsonc(const std::string &path) {
 void Config::Validate() const {
   if (size_mb == 0 || hwcc_size_mb > 1024 || hwcc_size_mb > size_mb ||
       swcc_size_mb > size_mb || hwcc_offset_mb + hwcc_size_mb > size_mb ||
-      swcc_offset_mb + swcc_size_mb > size_mb)
+      swcc_offset_mb + swcc_size_mb > size_mb || fixed_value_size == 0 ||
+      (hwcc_offset_mb < swcc_offset_mb + swcc_size_mb &&
+       swcc_offset_mb < hwcc_offset_mb + hwcc_size_mb))
     throw std::invalid_argument("invalid shared-memory capacity or HWCC budget");
   if (vm_count == 0 || partition_count == 0 || fixed_key_size == 0 || fixed_key_size > kMaxKey ||
       fixed_value_size > kMaxValue)
@@ -249,6 +312,16 @@ void KVStore::Open(bool reset) {
     impl_->header->total_pool_bytes = impl_->bytes;
     impl_->header->logical_hwcc_capacity_bytes = config_.hwcc_size_mb * 1024ULL * 1024ULL;
     impl_->header->logical_swcc_capacity_bytes = config_.swcc_size_mb * 1024ULL * 1024ULL;
+    size_t possible_slots = (impl_->bytes - sizeof(SharedHeader)) / sizeof(Slot);
+    uint64_t index_count = 1;
+    while (index_count < possible_slots * 2) index_count <<= 1;
+    while (index_count > 1 && sizeof(SharedHeader) + index_count * sizeof(uint32_t) + sizeof(Slot) > impl_->bytes)
+      index_count >>= 1;
+    impl_->header->index_count = index_count;
+    impl_->header->next_slot_hint = 0;
+    if (impl_->header->index_count * sizeof(uint32_t) + sizeof(SharedHeader) >
+        impl_->header->logical_hwcc_capacity_bytes)
+      throw std::invalid_argument("shared index exceeds logical HWCC budget");
     impl_->header->init_state = 1;
   } else {
     if (impl_->header->init_state == 2 && impl_->header->attached_count == 0)
@@ -260,8 +333,11 @@ void KVStore::Open(bool reset) {
         impl_->header->fixed_value_size != config_.fixed_value_size)
       throw std::runtime_error("shared layout/config mismatch");
   }
-  impl_->slots = reinterpret_cast<Slot *>(static_cast<char *>(impl_->mapping) + sizeof(SharedHeader));
-  impl_->slot_count = (impl_->bytes - sizeof(SharedHeader)) / sizeof(Slot);
+  impl_->index = reinterpret_cast<uint32_t *>(static_cast<char *>(impl_->mapping) + sizeof(SharedHeader));
+  impl_->slots = reinterpret_cast<Slot *>(static_cast<char *>(impl_->mapping) + sizeof(SharedHeader) + impl_->header->index_count * sizeof(uint32_t));
+  impl_->slot_count = (impl_->bytes - sizeof(SharedHeader) - impl_->header->index_count * sizeof(uint32_t)) / sizeof(Slot);
+  if (impl_->header->index_count == 0 || (impl_->header->index_count & (impl_->header->index_count - 1)) != 0 || impl_->slot_count == 0)
+    throw std::runtime_error("invalid shared index/layout capacity");
   {
     Lock lock(&impl_->header->mutex);
     ++impl_->header->attached_count;
@@ -308,21 +384,15 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
   ValidateKeyValue(key, value);
   Lock lock(&impl_->header->mutex);
   ++runtime_.logical_ops;
-  Slot *row = nullptr;
-  for (size_t i = 0; i < impl_->slot_count; ++i)
-    if (impl_->slots[i].state != kEmpty && impl_->slots[i].state != kTombstone &&
-        impl_->slots[i].key_len == key.size() && std::memcmp(impl_->slots[i].key, key.data(), key.size()) == 0) { row = &impl_->slots[i]; break; }
-  if (!row) {
-    for (size_t i = 0; i < impl_->slot_count; ++i)
-      if (impl_->slots[i].state == kEmpty || impl_->slots[i].state == kTombstone) { row = &impl_->slots[i]; break; }
-  }
+  Slot *row = impl_->Find(key);
+  if (!row) row = impl_->AllocateSlot();
   if (!row) return Status::Error(StatusCode::kOutOfMemory, "shared pool has no free KV slot");
   bool was_shared = row->state == kShared;
   bool existing = row->state != kEmpty && row->state != kTombstone;
   if (!existing) {
-    row->owner = static_cast<uint8_t>(OwnerForKey(key));
+    row->owner = OwnerForKey(key);
     if (row->owner != config_.node_id) {
-      if (sizeof(SharedHeader) + (impl_->header->active_shared_rows + 1) * kSharedMetadataBytes > impl_->header->logical_hwcc_capacity_bytes)
+      if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
         return Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded");
       row->state = kShared; ++impl_->header->active_shared_rows; ++runtime_.migration_in; was_shared = true;
     } else {
@@ -332,7 +402,7 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
     std::memcpy(row->key, key.data(), key.size());
     row->version = 0;
   } else if (!was_shared && row->owner != config_.node_id) {
-    if (sizeof(SharedHeader) + (impl_->header->active_shared_rows + 1) * kSharedMetadataBytes > impl_->header->logical_hwcc_capacity_bytes)
+    if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
       return Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded");
     row->state = kShared;
     ++impl_->header->active_shared_rows;
@@ -354,6 +424,7 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
     ++runtime_.private_puts;
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kWrite, value.size());
   }
+  if (!existing) impl_->PublishIndex(row);
   return Status::Ok();
 }
 
@@ -361,12 +432,11 @@ GetResult KVStore::Get(std::string_view key) {
   if (key.empty() || key.size() > config_.fixed_key_size) return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
   Lock lock(&impl_->header->mutex);
   ++runtime_.logical_ops;
-  for (size_t i = 0; i < impl_->slot_count; ++i) {
-    Slot &row = impl_->slots[i];
-    if ((row.state == kPrivate || row.state == kShared) && row.key_len == key.size() && std::memcmp(row.key, key.data(), key.size()) == 0) {
+  if (Slot *found = impl_->Find(key)) {
+    Slot &row = *found;
       if (row.state == kPrivate && row.owner != config_.node_id) {
         if (config_.strict_swcc_access) return {Status::Error(StatusCode::kOwnerViolation, "non-owner private SWCC access"), {}};
-        if (sizeof(SharedHeader) + (impl_->header->active_shared_rows + 1) * kSharedMetadataBytes > impl_->header->logical_hwcc_capacity_bytes)
+        if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
           return {Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded"), {}};
         row.state = kShared; ++impl_->header->active_shared_rows; ++runtime_.migration_in;
         // Publication is the linearization point: the complete source value is
@@ -379,7 +449,6 @@ GetResult KVStore::Get(std::string_view key) {
       else { ++runtime_.private_gets; impl_->latency.Record(PoolKind::kSwcc, AccessKind::kRead, row.value_len); }
       ++runtime_.commits;
       return {Status::Ok(), std::string(row.value, row.value_len)};
-    }
   }
   ++runtime_.commits;
   return {Status::Error(StatusCode::kNotFound, "key not found"), {}};
@@ -388,22 +457,23 @@ GetResult KVStore::Get(std::string_view key) {
 Status KVStore::Delete(std::string_view key) {
   Lock lock(&impl_->header->mutex);
   ++runtime_.logical_ops;
-  for (size_t i = 0; i < impl_->slot_count; ++i) {
-    Slot &row = impl_->slots[i];
-    if ((row.state == kPrivate || row.state == kShared) && row.key_len == key.size() && std::memcmp(row.key, key.data(), key.size()) == 0) {
+  if (Slot *found = impl_->Find(key)) {
+    Slot &row = *found;
       bool shared = row.state == kShared;
       if (!shared && row.owner != config_.node_id) {
         if (config_.strict_swcc_access) return Status::Error(StatusCode::kOwnerViolation, "non-owner private SWCC access");
-        if (sizeof(SharedHeader) + (impl_->header->active_shared_rows + 1) * kSharedMetadataBytes > impl_->header->logical_hwcc_capacity_bytes)
+        if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
           return Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded");
         row.state = kShared; ++impl_->header->active_shared_rows; ++runtime_.migration_in; shared = true;
       }
+      impl_->RetireIndex(&row);
       row.state = kTombstone; row.key_len = 0; row.value_len = 0; ++row.generation;
+      const size_t slot = static_cast<size_t>(&row - impl_->slots);
+      if (slot < impl_->header->next_slot_hint) impl_->header->next_slot_hint = slot;
       if (shared) { if (impl_->header->active_shared_rows) --impl_->header->active_shared_rows; ++runtime_.shared_deletes; ++runtime_.shared_swcc_flushes; msync(&row, sizeof(Slot), MS_SYNC); }
       else ++runtime_.private_deletes;
       impl_->header->reclaimed_total_bytes += sizeof(Slot); ++runtime_.commits;
       return Status::Ok();
-    }
   }
   ++runtime_.commits;
   return Status::Error(StatusCode::kNotFound, "key not found");
@@ -427,22 +497,23 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
   Lock lock(&impl_->header->mutex);
   ++runtime_.logical_ops;
   Slot *row = nullptr;
-  for (size_t i = 0; i < impl_->slot_count; ++i) if ((impl_->slots[i].state == kPrivate || impl_->slots[i].state == kShared) && impl_->slots[i].key_len == key.size() && std::memcmp(impl_->slots[i].key, key.data(), key.size()) == 0) { row = &impl_->slots[i]; break; }
+  row = impl_->Find(key);
   const bool match = row ? std::string_view(row->value, row->value_len) == expected : expected.empty();
   if (!match) { ++runtime_.aborts; return {Status::Error(StatusCode::kCompareFailed, "CAS comparison failed"), false}; }
-  if (!row) { for (size_t i = 0; i < impl_->slot_count; ++i) if (impl_->slots[i].state == kEmpty || impl_->slots[i].state == kTombstone) { row = &impl_->slots[i]; break; } }
+  if (!row) row = impl_->AllocateSlot();
   if (!row) return {Status::Error(StatusCode::kOutOfMemory, "shared pool has no free KV slot"), false};
+  const bool new_row = row->state == kEmpty || row->state == kTombstone;
   if (row->state == kPrivate && row->owner != config_.node_id) {
     if (config_.strict_swcc_access) return {Status::Error(StatusCode::kOwnerViolation, "non-owner private SWCC access"), false};
-    if (sizeof(SharedHeader) + (impl_->header->active_shared_rows + 1) * kSharedMetadataBytes > impl_->header->logical_hwcc_capacity_bytes)
+    if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
       return {Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded"), false};
     row->state = kShared; ++impl_->header->active_shared_rows; ++runtime_.migration_in;
     ++runtime_.shared_swcc_flushes; msync(row, sizeof(Slot), MS_SYNC);
   }
   if (row->state == kEmpty || row->state == kTombstone) {
-    row->owner = static_cast<uint8_t>(OwnerForKey(key));
+    row->owner = OwnerForKey(key);
     if (row->owner != config_.node_id) {
-      if (sizeof(SharedHeader) + (impl_->header->active_shared_rows + 1) * kSharedMetadataBytes > impl_->header->logical_hwcc_capacity_bytes)
+      if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
         return {Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded"), false};
       row->state = kShared; ++impl_->header->active_shared_rows; ++runtime_.migration_in;
     } else row->state = kPrivate;
@@ -451,6 +522,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
   std::memset(row->value, 0, kMaxValue); std::memcpy(row->value, desired.data(), desired.size()); row->value_len = desired.size(); ++row->version;
   if (row->state == kShared) { ++runtime_.shared_puts; ++runtime_.shared_swcc_flushes; msync(row, sizeof(Slot), MS_SYNC); }
   else ++runtime_.private_puts;
+  if (new_row) impl_->PublishIndex(row);
   ++runtime_.commits;
   return {Status::Ok(), true};
 }
@@ -458,12 +530,11 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
 IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   Lock lock(&impl_->header->mutex);
   ++runtime_.logical_ops;
-  Slot *row = nullptr;
-  for (size_t i = 0; i < impl_->slot_count; ++i) if ((impl_->slots[i].state == kPrivate || impl_->slots[i].state == kShared) && impl_->slots[i].key_len == key.size() && std::memcmp(impl_->slots[i].key, key.data(), key.size()) == 0) { row = &impl_->slots[i]; break; }
+  Slot *row = impl_->Find(key);
   int64_t old = 0;
   if (row && row->state == kPrivate && row->owner != config_.node_id) {
     if (config_.strict_swcc_access) return {Status::Error(StatusCode::kOwnerViolation, "non-owner private SWCC access"), 0};
-    if (sizeof(SharedHeader) + (impl_->header->active_shared_rows + 1) * kSharedMetadataBytes > impl_->header->logical_hwcc_capacity_bytes)
+    if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
       return {Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded"), 0};
     row->state = kShared; ++impl_->header->active_shared_rows; ++runtime_.migration_in;
     ++runtime_.shared_swcc_flushes; msync(row, sizeof(Slot), MS_SYNC);
@@ -472,12 +543,13 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   int64_t value = old + delta;
   std::string encoded = std::to_string(value);
   if (encoded.size() > config_.fixed_value_size) return {Status::Error(StatusCode::kInvalidArgument, "increment overflows fixed value size"), 0};
-  if (!row) { for (size_t i = 0; i < impl_->slot_count; ++i) if (impl_->slots[i].state == kEmpty || impl_->slots[i].state == kTombstone) { row = &impl_->slots[i]; break; } }
+  if (!row) row = impl_->AllocateSlot();
   if (!row) return {Status::Error(StatusCode::kOutOfMemory, "shared pool has no free KV slot"), 0};
+  const bool new_row = row->state == kEmpty || row->state == kTombstone;
   if (row->state == kEmpty || row->state == kTombstone) {
     row->owner = OwnerForKey(key);
     if (row->owner != config_.node_id) {
-      if (sizeof(SharedHeader) + (impl_->header->active_shared_rows + 1) * kSharedMetadataBytes > impl_->header->logical_hwcc_capacity_bytes)
+      if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
         return {Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded"), 0};
       row->state = kShared; ++impl_->header->active_shared_rows; ++runtime_.migration_in;
     } else row->state = kPrivate;
@@ -486,6 +558,7 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   std::memcpy(row->value, encoded.data(), encoded.size()); row->value_len = encoded.size(); ++row->version;
   if (row->state == kShared) { ++runtime_.shared_puts; ++runtime_.shared_swcc_flushes; msync(row, sizeof(Slot), MS_SYNC); }
   else ++runtime_.private_puts;
+  if (new_row) impl_->PublishIndex(row);
   ++runtime_.commits;
   return {Status::Ok(), value};
 }
@@ -505,9 +578,9 @@ MemoryStats KVStore::Memory() const {
   out.total_pool_capacity_bytes = impl_->bytes;
   out.logical_hwcc_capacity_bytes = config_.hwcc_size_mb * 1024ULL * 1024ULL;
   out.logical_swcc_capacity_bytes = config_.swcc_size_mb * 1024ULL * 1024ULL;
-  out.logical_hwcc_used_bytes = sizeof(SharedHeader) + impl_->header->active_shared_rows * kSharedMetadataBytes;
+  out.logical_hwcc_used_bytes = impl_->LogicalHwccBytes(impl_->header->active_shared_rows);
   out.active_shared_rows = impl_->header->active_shared_rows;
-  out.allocator_shared_overhead_bytes = sizeof(SharedHeader);
+  out.allocator_shared_overhead_bytes = sizeof(SharedHeader) + impl_->header->index_count * sizeof(uint32_t);
   out.allocator_local_dram_bytes = sizeof(Impl) + sizeof(Config) + sizeof(RuntimeStats);
   out.reclaimed_total_bytes = impl_->header->reclaimed_total_bytes;
   for (size_t i = 0; i < impl_->slot_count; ++i) {

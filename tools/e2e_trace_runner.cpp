@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 #include <string>
 
 using namespace tigonkv;
@@ -22,6 +21,12 @@ uint64_t ParseUnsigned(const std::string &text, const std::string &label) {
   return value;
 }
 [[noreturn]] void Fail(const std::string &message) { throw std::runtime_error(message); }
+uint64_t ReadDecimal(const std::string &line, size_t *pos, const std::string &label) {
+  const size_t begin = *pos;
+  while (*pos < line.size() && line[*pos] >= '0' && line[*pos] <= '9') ++*pos;
+  if (begin == *pos) Fail("missing " + label);
+  return ParseUnsigned(line.substr(begin, *pos - begin), label);
+}
 }
 
 int main() {
@@ -38,7 +43,8 @@ int main() {
     (void)policy_config;  // policy is intentionally independent of the KV API.
     const std::string trace = Env("TIGONKV_E2E_TRACE_FILE", "CXLKV_E2E_TRACE_FILE");
     if (trace.empty()) Fail("TIGONKV_E2E_TRACE_FILE is required for direct trace replay");
-    auto store = KVStore::Create(config, false);
+    const bool reset = Env("TIGONKV_E2E_RESET", "CXLKV_E2E_RESET", "0") == "1";
+    auto store = KVStore::Create(config, reset);
     std::ifstream input(trace);
     if (!input) Fail("cannot open trace: " + trace);
     uint64_t ops = 0, line_no = 0;
@@ -47,15 +53,24 @@ int main() {
     while (std::getline(input, line)) {
       ++line_no;
       if (line.empty() || line[0] == '#') continue;
-      std::istringstream header(line);
-      std::string op, key_len_text, len_text;
-      if (!(header >> op >> key_len_text >> len_text)) Fail(trace + ": malformed line " + std::to_string(line_no));
-      const size_t key_len = ParseUnsigned(key_len_text, "key length");
-      const size_t len = ParseUnsigned(len_text, "operation length");
-      size_t prefix = line.find(len_text);
-      prefix = line.find_first_not_of(" \t", prefix + len_text.size());
-      if (prefix == std::string::npos || line.size() - prefix != key_len) Fail(trace + ": key length mismatch at line " + std::to_string(line_no));
-      const std::string key = line.substr(prefix, key_len);
+      size_t pos = 0;
+      while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+      const size_t op_begin = pos;
+      while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') ++pos;
+      if (op_begin == pos) Fail(trace + ": malformed line " + std::to_string(line_no));
+      const std::string op = line.substr(op_begin, pos - op_begin);
+      while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+      const size_t key_len = ReadDecimal(line, &pos, "key length");
+      if (pos >= line.size() || (line[pos] != ' ' && line[pos] != '\t')) Fail(trace + ": missing LEN separator at line " + std::to_string(line_no));
+      while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+      const size_t len = ReadDecimal(line, &pos, "operation length");
+      // cxlkv's format starts KEY immediately after LEN; accept one or more
+      // spaces as well for hand-written traces.
+      while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+      if (pos > line.size() || line.size() - pos < key_len) Fail(trace + ": key length mismatch at line " + std::to_string(line_no));
+      const std::string key = line.substr(pos, key_len);
+      for (size_t tail = pos + key_len; tail < line.size(); ++tail)
+        if (line[tail] != ' ' && line[tail] != '\t') Fail(trace + ": trailing bytes after key at line " + std::to_string(line_no));
       Status status;
       if (op == "PUT") status = store->Put(key, std::string(len, 'x'));
       else if (op == "GET") { if (len != 0) Fail("GET LEN must be zero"); status = store->Get(key).status; if (status.code == StatusCode::kNotFound) status = Status::Ok(); }

@@ -12,8 +12,9 @@ ops=${YCSB_OPERATION_COUNT:-100000}
 workers=${YCSB_WORKERS:-1}
 mkdir -p "$out"
 for workload in A B C D; do
+  workload_file=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
   "$ycsb/scripts/generate_cxlkv_trace.sh" --output-dir "$out/workload$workload" \
-    --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workload$workload" \
+    --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workload$workload_file" \
     --run-name run --nodes "${TIGONKV_VM_COUNT:-2}" --threads-per-node "$workers" \
     --record-count "$records" --operation-count "$ops" --phase both --force
 done

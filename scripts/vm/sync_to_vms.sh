@@ -6,6 +6,6 @@ if [[ -z "${TIGONKV_VM_HOSTS:-}" ]]; then
   exit 2
 fi
 for host in $TIGONKV_VM_HOSTS; do
-  rsync -a --delete --exclude .git --exclude build --exclude results \
+  rsync -a --exclude .git --exclude build --exclude results \
     "$root/" "${host}:/root/code/tigon2/"
 done

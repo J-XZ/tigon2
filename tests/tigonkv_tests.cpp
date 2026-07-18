@@ -1,6 +1,9 @@
 #include "kv/kv_store.h"
 #include "kv/latency_simulator.h"
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <cstdio>
 #include <fstream>

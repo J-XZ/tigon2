@@ -1,5 +1,10 @@
 # Tigon
-Tigon[^1] is a research distributed transactional in-memory database that synchronizes cross-host concurrent data accesses over shared CXL memory. Tigon adopts the Pasha architecture[^2].
+Tigon[^1] is a research distributed transactional in-memory database that synchronizes
+cross-host concurrent data accesses over shared memory. Tigon adopts the Pasha
+architecture[^2]. The independent `tigonkv` path in this repository models CXL-style
+sharing with NUMA-based host DRAM, ivshmem mappings, explicit software cache-coherence
+protocols, and optional software latency injection; it is not a claim of real CXL
+hardware performance.
 This repository is implemented based on the [lotus](https://github.com/DBOS-project/lotus) codebase from Xinjing Zhou.
 The in-memory B+Tree implementation is adapted from [btreeolc](https://github.com/zxjcarrot/2-Tree/tree/master/backend/btreeolc).
 The lock-free MPSC ringbuffer used for implementing CXL transport is adapted from [waitfree-mpsc-queue](https://github.com/dbittman/waitfree-mpsc-queue).
@@ -49,7 +54,14 @@ By running the experiments, you should be able to reproduce the numbers shown in
 * **Figure 8**: Comparison of different software cache-coherence protocols
 
 ## Emulate a CXL Pod using VMs
-We emulate a CXL pod by running multiple virtual machines (VMs) on a single host connected to a CXL 1.1 memory module because there are no commercially available (or hardware prototype) CXL devices that support fine-grained memory sharing with hardware cache coherence. Each physical host running on a real CXL pod is emulated by a VM running on a single host. The cache coherence across VMs is maintained by hardware as the CXL 1.1 memory device is cache-coherent to its connected physical machine.
+The safe `tigonkv` emulation path runs multiple virtual machines (VMs) on one host and
+maps the same host-DRAM backing file through ivshmem. The shared pages should be placed
+on a NUMA node different from VM compute/local-RAM placement. HWCC and SWCC are logical
+database accounting/protocol categories; cross-VM visibility is tested with explicit
+software coherence, while the latency simulator adds configurable software delay. Host
+physical coherence can mask protocol bugs, so non-coherent correctness tests are also
+provided. Results from this path are NUMA-based CXL shared-memory emulation results,
+not real CXL hardware measurements.
 
 ![](emulation.png)
 
@@ -59,7 +71,11 @@ We emulate a CXL pod by running multiple virtual machines (VMs) on a single host
 
 ## Testbed Setup
 
-### Hardware Requirements
+### Legacy/original Tigon path requirements
+
+The following are retained for the original benchmark scripts. They are not required
+for the independent `tigonkv` file-backed emulation path, and those scripts may change
+host/VM state; inspect and explicitly authorize them before use.
 
 **Option A**
 * A machine with at least 40 cores in one socket
