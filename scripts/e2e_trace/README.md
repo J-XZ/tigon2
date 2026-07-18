@@ -44,3 +44,20 @@ TIGONKV_VM_COUNT=4 \
 This is NUMA-based ivshmem shared-memory emulation backed by host DRAM, not real CXL
 hardware. The script's pass markers cover replay only; initialization and SSH/file
 synchronization are outside workload timing.
+
+For cxlkv-style multi-VM e2e08/e2e09, use
+`scripts/e2e/run_guest_e2e_workflows.sh`. It launches one independent process per VM
+and four worker threads per process by default, with e2e08 phases
+`fill/rebuild/read` and e2e09 phases `fill/update/rebuild/read`. The default binary
+directory is `build-rel`, and each round starts with a fresh shared-pool reset.
+
+```sh
+TIGONKV_VM_COUNT=4 TIGONKV_E2E_THREADS=4 \
+  scripts/e2e/run_guest_e2e_workflows.sh \
+  /mnt/xz_vm_storage/tigon2-formal-20260718/multivm-e2e-rel-5rounds \
+  5 '08 09'
+```
+
+The explicit batch mode defers sorted SCAN-index construction until `rebuild`; this
+avoids O(n²) online insertion during bulk fill while preserving the sorted index
+before the read phase.

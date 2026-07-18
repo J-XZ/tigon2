@@ -10,6 +10,8 @@
 #include <iostream>
 #include <random>
 #include <string>
+
+#include "e2e_vm_workflow.h"
 #include <unistd.h>
 
 using namespace tigonkv;
@@ -45,6 +47,8 @@ std::string Value(uint32_t generation, uint32_t i) {
 }
 
 int main() {
+  if (std::getenv("TIGONKV_E2E_MULTI_VM") != nullptr)
+    return tigonkv::e2e_vm_workflow::RunE2E09MultiVm();
   const std::string path = EnvOr("TIGONKV_E2E_BACKING", "/tmp/tigonkv-e2e-09-" + std::to_string(getpid()));
   std::remove(path.c_str());
   auto owner = KVStore::Create(ConfigFor(path, 0), true);

@@ -156,6 +156,9 @@ class KVStore {
   IncrementResult Increment(std::string_view key, int64_t delta);
 
   Status Checkpoint();
+  // Rebuild the persistent sorted SCAN index after an explicitly batched
+  // ingest. Normal PUTs maintain this index online.
+  Status RebuildSortedIndex();
   MemoryStats Memory() const;
   RuntimeStats Runtime() const { return runtime_; }
   uint32_t StablePartitionForKey(std::string_view key) const;

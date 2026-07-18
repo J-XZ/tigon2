@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -398,6 +399,7 @@ struct KVStore::Impl {
   }
 
   void PublishSortedIndex(Slot *row) {
+    if (std::getenv("TIGONKV_E2E_BATCH_SORTED_INDEX") != nullptr) return;
     latency.Record(PoolKind::kHwcc, AccessKind::kWrite, sizeof(uint32_t));
     if (header->sorted_index_count >= header->sorted_index_capacity)
       throw std::runtime_error("sorted shared index is full");
@@ -581,7 +583,7 @@ void KVStore::Open(bool reset) {
   if (impl_->mapping == MAP_FAILED) throw std::runtime_error("mmap backing file");
   impl_->header = static_cast<SharedHeader *>(impl_->mapping);
   const bool device_backing_was_zeroed =
-      impl_->device_backed && reset && impl_->header->magic != kMagic &&
+      impl_->device_backed && reset &&
       std::getenv("TIGONKV_DEVICE_BACKING_ZEROED") != nullptr;
   if (reset && impl_->header->magic == kMagic && impl_->header->attached_count != 0)
     throw std::runtime_error("refusing pool reset while a TigonKV process is attached");
@@ -631,6 +633,15 @@ void KVStore::Open(bool reset) {
       const size_t index_bytes = impl_->header->index_count * sizeof(uint32_t) +
                                  impl_->header->sorted_index_capacity * sizeof(uint32_t);
       std::memset(index_begin, 0, index_bytes);
+      // ivshmem BAR writes are not guaranteed to update the server's original
+      // memory-path file. Reset every slot's metadata in the guest mapping so
+      // stale payload bytes can never be reached through an old index entry;
+      // Put overwrites the value payload before publishing a new index entry.
+      char *slot_begin = index_begin + index_bytes;
+      const size_t slot_count =
+          (impl_->bytes - sizeof(SharedHeader) - index_bytes) / sizeof(Slot);
+      for (size_t slot = 0; slot < slot_count; ++slot)
+        std::memset(slot_begin + slot * sizeof(Slot), 0, offsetof(Slot, key));
     }
     impl_->header->init_state = 1;
   } else {
@@ -1022,6 +1033,37 @@ Status KVStore::Checkpoint() {
                           config_.swcc_size_mb * 1024ULL * 1024ULL);
     ++impl_->header->clean_epoch;
     ++runtime_.checkpoint_swcc_flushes;
+    return Status::Ok();
+  } catch (const std::exception &error) {
+    return Status::Error(StatusCode::kCorruption, error.what());
+  }
+}
+
+Status KVStore::RebuildSortedIndex() {
+  if (impl_->mapping == MAP_FAILED)
+    return Status::Error(StatusCode::kCorruption, "store is closed");
+  try {
+    Lock lock(&impl_->header->lock_word, &impl_->latency);
+    std::vector<uint32_t> entries;
+    entries.reserve(static_cast<size_t>(impl_->header->sorted_index_count));
+    for (uint64_t i = 0; i < impl_->header->index_count; ++i) {
+      const uint32_t entry = impl_->index[i];
+      if (entry == 0 || entry == kIndexTombstone) continue;
+      const size_t slot = static_cast<size_t>(entry - 1);
+      if (slot >= impl_->slot_count)
+        return Status::Error(StatusCode::kCorruption, "shared index points outside slot arena");
+      const Slot &row = impl_->slots[slot];
+      if (row.state == kPrivate || row.state == kShared) entries.push_back(entry);
+    }
+    if (entries.size() > impl_->header->sorted_index_capacity)
+      return Status::Error(StatusCode::kOutOfMemory, "sorted shared index is full");
+    std::sort(entries.begin(), entries.end(), [&](uint32_t left, uint32_t right) {
+      return std::string_view(impl_->slots[left - 1].key, impl_->slots[left - 1].key_len) <
+             std::string_view(impl_->slots[right - 1].key, impl_->slots[right - 1].key_len);
+    });
+    if (!entries.empty())
+      std::memcpy(impl_->sorted_index, entries.data(), entries.size() * sizeof(uint32_t));
+    impl_->header->sorted_index_count = entries.size();
     return Status::Ok();
   } catch (const std::exception &error) {
     return Status::Error(StatusCode::kCorruption, error.what());

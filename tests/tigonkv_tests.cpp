@@ -6,6 +6,7 @@
 #endif
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -277,9 +278,12 @@ void TestSwccBudgetAndSortedScan() {
          memory.logical_swcc_capacity_bytes);
 
   store.reset();
+  setenv("TIGONKV_E2E_BATCH_SORTED_INDEX", "1", 1);
   auto ordered = KVStore::Create(TestConfig(path, 0), true);
   for (int i = 0; i < 100; ++i)
     assert(ordered->Put("ordered-" + std::to_string(100 - i), "v").ok());
+  assert(ordered->RebuildSortedIndex().ok());
+  unsetenv("TIGONKV_E2E_BATCH_SORTED_INDEX");
   auto scan = ordered->Scan("ordered-", 100);
   assert(scan.status.ok());
   for (size_t i = 1; i < scan.items.size(); ++i) assert(scan.items[i - 1].key < scan.items[i].key);
