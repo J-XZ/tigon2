@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -15,14 +16,14 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <unistd.h>
-#include <pthread.h>
+#include <sched.h>
 #include <unordered_set>
 
 namespace tigonkv {
 namespace {
 
 constexpr uint64_t kMagic = 0x5449474f4e4b5632ULL;  // TIGONKV2
-constexpr uint32_t kLayoutVersion = 3;
+constexpr uint32_t kLayoutVersion = 4;
 constexpr uint8_t kEmpty = 0, kPrivate = 1, kShared = 2, kTombstone = 3;
 constexpr uint32_t kIndexTombstone = UINT32_MAX;
 constexpr size_t kMaxKey = 256;
@@ -145,7 +146,9 @@ void ValidateKnownKeys(const std::string &s) {
       "shared_memory", "size_mb", "path", "device_path", "numa_node",
       "hwcc", "offset_mb", "swcc", "host_cpu", "reserved_cores",
       "ivshmem_server_cores", "vm_cores", "vm", "count", "core_count_per_vm",
-      "storage_path", "network", "base_ssh_port", "sync", "e2e",
+      "storage_path", "mem_size_mb_per_vm", "first_ip", "bridge_tap_ip",
+      "copy_root_img", "use_ivshmem_doorbell", "local_ssh_pub_key",
+      "network", "base_ssh_port", "sync", "e2e",
       "foreground_worker_count_per_vm", "tigon_kv", "partition_count",
       "timeout_sec",
       "fixed_key_size", "fixed_value_size", "hwcc_budget_mb", "hwcc_reserved_mb",
@@ -200,18 +203,24 @@ struct SharedHeader {
   uint64_t sorted_index_capacity;
   uint64_t sorted_index_count;
   uint64_t next_slot_hint;
-  pthread_mutex_t mutex;
+  // A guest futex cannot wait on a physical page owned by another guest.
+  // Keep the protocol lock entirely in the shared BAR and acquire it with
+  // inter-VM atomic operations instead of pthread_mutex/PTHREAD_PROCESS_SHARED.
+  uint32_t lock_word;
 };
 
 static_assert(sizeof(Slot) < 5000, "slot accounting unexpectedly grew");
 
-void CheckPthread(int rc, const char *what) {
-  if (rc == 0) return;
-  throw std::runtime_error(std::string(what) + ": " + std::strerror(rc));
-}
-
-void SyncRangeOrThrow(const void *address, size_t length, const char *what) {
+void SyncRangeOrThrow(const void *address, size_t length, const char *what,
+                      bool device_backed = false) {
   if (length == 0) return;
+  // A guest maps the ivshmem BAR through /dev/ivpci0 rather than a host file.
+  // The PCI mapping is already the shared publication surface; msync is only
+  // meaningful for the file-backed host-process fallback.
+  if (device_backed) {
+    __sync_synchronize();
+    return;
+  }
   const long page_size = ::sysconf(_SC_PAGESIZE);
   if (page_size <= 0) throw std::runtime_error("cannot determine page size");
   const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(address);
@@ -229,16 +238,24 @@ uint64_t CacheLineToken(const void *address) {
 
 class Lock {
  public:
-  explicit Lock(pthread_mutex_t *mutex, LatencySimulator *latency = nullptr)
-      : mutex_(mutex), latency_(latency) {
-    CheckPthread(pthread_mutex_lock(mutex_), "shared lock");
+  explicit Lock(uint32_t *lock_word, LatencySimulator *latency = nullptr)
+      : lock_word_(lock_word), latency_(latency) {
+    for (;;) {
+      uint32_t expected = 0;
+      if (__atomic_compare_exchange_n(lock_word_, &expected, 1, false,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        break;
+      for (unsigned spin = 0; spin < 256; ++spin)
+        __asm__ __volatile__("pause" ::: "memory");
+      sched_yield();
+    }
   }
   ~Lock() {
-    pthread_mutex_unlock(mutex_);
+    __atomic_store_n(lock_word_, 0, __ATOMIC_RELEASE);
     if (latency_ != nullptr) latency_->DrainPending();
   }
  private:
-  pthread_mutex_t *mutex_;
+  uint32_t *lock_word_;
   LatencySimulator *latency_;
 };
 
@@ -261,6 +278,7 @@ struct KVStore::Impl {
   int fd = -1;
   size_t bytes = 0;
   void *mapping = MAP_FAILED;
+  bool device_backed = false;
   bool attached = false;
   SharedHeader *header = nullptr;
   uint32_t *index = nullptr;
@@ -530,34 +548,52 @@ KVStore::KVStore(const Config &config) : impl_(new Impl()), config_(config) {
 }
 
 void KVStore::Open(bool reset) {
-  impl_->fd = ::open(config_.shared_memory_path.c_str(), O_RDWR | O_CREAT, 0660);
-  if (impl_->fd < 0) throw std::runtime_error("open backing file: " + std::string(std::strerror(errno)));
-  // pthread_mutex_t is not initialized until the first process has built the
-  // layout.  Serialize the file-size/layout/attach transition with an OS file
+  // On a VM the ivshmem BAR is exposed as /dev/ivpci0.  On the host and in
+  // unit tests that device is absent, so use the ordinary shared backing file.
+  impl_->device_backed = ::access(config_.device_path.c_str(), F_OK) == 0;
+  const std::string mapping_path = impl_->device_backed ? config_.device_path : config_.shared_memory_path;
+  const int open_flags = O_RDWR | (impl_->device_backed ? 0 : O_CREAT);
+  impl_->fd = ::open(mapping_path.c_str(), open_flags, 0660);
+  if (impl_->fd < 0) throw std::runtime_error("open shared memory mapping: " + std::string(std::strerror(errno)));
+  // The inter-VM atomic lock is not initialized until the first process has
+  // built the layout. Serialize the file-size/layout/attach transition with an OS file
   // lock so concurrent workers cannot both observe an empty header and reset
   // the same backing.
-  FileLock file_lock(impl_->fd);
-  if (reset && ftruncate(impl_->fd, static_cast<off_t>(config_.size_mb * 1024ULL * 1024ULL)) != 0)
+  std::unique_ptr<FileLock> file_lock;
+  if (!impl_->device_backed) file_lock = std::make_unique<FileLock>(impl_->fd);
+  if (!impl_->device_backed && reset && ftruncate(impl_->fd, static_cast<off_t>(config_.size_mb * 1024ULL * 1024ULL)) != 0)
     throw std::runtime_error("resize backing file: " + std::string(std::strerror(errno)));
-  struct stat st{};
-  if (fstat(impl_->fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(SharedHeader) + sizeof(Slot)))
-    throw std::runtime_error("backing file is missing or too small; use an explicit reset");
   const off_t expected_bytes = static_cast<off_t>(config_.size_mb * 1024ULL * 1024ULL);
-  if (st.st_size != expected_bytes)
-    throw std::runtime_error("backing file size does not match shared_memory.size_mb");
-  impl_->bytes = static_cast<size_t>(st.st_size);
+  if (impl_->device_backed) {
+    // Character devices do not expose the BAR length through fstat.  QEMU and
+    // the guest driver establish the configured BAR size, so map exactly the
+    // experiment's shared_memory.size_mb bytes.
+    impl_->bytes = static_cast<size_t>(expected_bytes);
+  } else {
+    struct stat st{};
+    if (fstat(impl_->fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(SharedHeader) + sizeof(Slot)))
+      throw std::runtime_error("backing file is missing or too small; use an explicit reset");
+    if (st.st_size != expected_bytes)
+      throw std::runtime_error("backing file size does not match shared_memory.size_mb");
+    impl_->bytes = static_cast<size_t>(st.st_size);
+  }
   impl_->mapping = mmap(nullptr, impl_->bytes, PROT_READ | PROT_WRITE, MAP_SHARED, impl_->fd, 0);
   if (impl_->mapping == MAP_FAILED) throw std::runtime_error("mmap backing file");
   impl_->header = static_cast<SharedHeader *>(impl_->mapping);
+  const bool device_backing_was_zeroed =
+      impl_->device_backed && reset && impl_->header->magic != kMagic &&
+      std::getenv("TIGONKV_DEVICE_BACKING_ZEROED") != nullptr;
   if (reset && impl_->header->magic == kMagic && impl_->header->attached_count != 0)
     throw std::runtime_error("refusing pool reset while a TigonKV process is attached");
   if (reset || impl_->header->magic != kMagic) {
-    std::memset(impl_->mapping, 0, impl_->bytes);
-    pthread_mutexattr_t attr;
-    CheckPthread(pthread_mutexattr_init(&attr), "mutex attributes");
-    CheckPthread(pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED), "process-shared mutex");
-    CheckPthread(pthread_mutex_init(&impl_->header->mutex, &attr), "shared mutex");
-    pthread_mutexattr_destroy(&attr);
+    // A fresh device BAR is normally zeroed by the host-side pool initializer.
+    // Avoid touching every byte through a 32 GiB guest PCI mapping in that
+    // explicitly declared case; regular files and untrusted device contents
+    // retain the defensive full reset.
+    if (device_backing_was_zeroed)
+      std::memset(impl_->mapping, 0, sizeof(SharedHeader));
+    else
+      std::memset(impl_->mapping, 0, impl_->bytes);
     impl_->header->magic = kMagic;
     impl_->header->layout_version = kLayoutVersion;
     impl_->header->allocator_mode = 0;  // global logical allocator domains
@@ -590,6 +626,12 @@ void KVStore::Open(bool reset) {
             impl_->header->sorted_index_capacity * sizeof(uint32_t) + sizeof(SharedHeader) >
         impl_->header->logical_hwcc_capacity_bytes)
       throw std::invalid_argument("shared indexes exceed logical HWCC budget");
+    if (device_backing_was_zeroed) {
+      char *index_begin = static_cast<char *>(impl_->mapping) + sizeof(SharedHeader);
+      const size_t index_bytes = impl_->header->index_count * sizeof(uint32_t) +
+                                 impl_->header->sorted_index_capacity * sizeof(uint32_t);
+      std::memset(index_begin, 0, index_bytes);
+    }
     impl_->header->init_state = 1;
   } else {
     if (impl_->header->init_state == 2 && impl_->header->attached_count == 0)
@@ -623,7 +665,7 @@ void KVStore::Open(bool reset) {
           impl_->header->logical_hwcc_capacity_bytes)
     throw std::runtime_error("persisted logical memory budget exceeded");
   {
-    Lock lock(&impl_->header->mutex, &impl_->latency);
+    Lock lock(&impl_->header->lock_word, &impl_->latency);
     ++impl_->header->attached_count;
     impl_->header->init_state = 2;
     ++impl_->header->dirty_epoch;
@@ -651,7 +693,7 @@ void KVStore::Close() {
     checkpoint_ok = Checkpoint().ok();
   }
   try {
-    Lock lock(&impl_->header->mutex, &impl_->latency);
+    Lock lock(&impl_->header->lock_word, &impl_->latency);
     if (impl_->header->attached_count > 0) --impl_->header->attached_count;
     impl_->attached = false;
     if (impl_->header->attached_count == 0) {
@@ -664,7 +706,7 @@ void KVStore::Close() {
         impl_->header->init_state = 1;
         ++impl_->header->clean_epoch;
         try {
-          SyncRangeOrThrow(impl_->mapping, impl_->bytes, "clean close write-back");
+          SyncRangeOrThrow(impl_->mapping, impl_->bytes, "clean close write-back", impl_->device_backed);
         } catch (...) {
           // Destructors cannot report an I/O failure.  Preserve a hard dirty
           // marker so a later attach refuses to trust this backing.
@@ -699,7 +741,7 @@ void KVStore::ValidateKeyValue(std::string_view key, std::string_view value) con
 
 Status KVStore::Put(std::string_view key, std::string_view value) {
   ValidateKeyValue(key, value);
-  Lock lock(&impl_->header->mutex, &impl_->latency);
+  Lock lock(&impl_->header->lock_word, &impl_->latency);
   impl_->ReclaimRetired();
   ++runtime_.logical_ops;
   Slot *row = impl_->Find(key);
@@ -735,7 +777,7 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
     ++runtime_.shared_swcc_flushes;
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kWrite, value.size(), CacheLineToken(row));
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
-    SyncRangeOrThrow(row, sizeof(Slot), "shared promotion write-back");
+    SyncRangeOrThrow(row, sizeof(Slot), "shared promotion write-back", impl_->device_backed);
   } else {
     ++runtime_.private_puts;
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kWrite, value.size(), CacheLineToken(row));
@@ -746,7 +788,7 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
 
 GetResult KVStore::Get(std::string_view key) {
   if (key.empty() || key.size() > config_.fixed_key_size) return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
-  Lock lock(&impl_->header->mutex, &impl_->latency);
+  Lock lock(&impl_->header->lock_word, &impl_->latency);
   impl_->ReclaimRetired();
   ++runtime_.logical_ops;
   if (Slot *found = impl_->Find(key)) {
@@ -760,7 +802,7 @@ GetResult KVStore::Get(std::string_view key) {
         // write-backed before another VM can rely on the shared state.
         ++runtime_.shared_swcc_flushes;
         impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(&row));
-        SyncRangeOrThrow(&row, sizeof(Slot), "shared promotion write-back");
+        SyncRangeOrThrow(&row, sizeof(Slot), "shared promotion write-back", impl_->device_backed);
       }
       bool shared = row.state == kShared;
       impl_->AcquireRef(&row);
@@ -777,7 +819,7 @@ GetResult KVStore::Get(std::string_view key) {
 
 Status KVStore::Delete(std::string_view key) {
   ValidateKeyValue(key, {});
-  Lock lock(&impl_->header->mutex, &impl_->latency);
+  Lock lock(&impl_->header->lock_word, &impl_->latency);
   impl_->ReclaimRetired();
   ++runtime_.logical_ops;
   if (Slot *found = impl_->Find(key)) {
@@ -801,7 +843,7 @@ Status KVStore::Delete(std::string_view key) {
         ++runtime_.shared_deletes;
         ++runtime_.shared_swcc_flushes;
         impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(&row));
-        SyncRangeOrThrow(&row, sizeof(Slot), "shared delete write-back");
+        SyncRangeOrThrow(&row, sizeof(Slot), "shared delete write-back", impl_->device_backed);
       }
       else ++runtime_.private_deletes;
       impl_->header->retired_pending_bytes += sizeof(Slot); ++runtime_.commits;
@@ -813,7 +855,7 @@ Status KVStore::Delete(std::string_view key) {
 
 Status KVStore::MoveOut(std::string_view key) {
   ValidateKeyValue(key, {});
-  Lock lock(&impl_->header->mutex, &impl_->latency);
+  Lock lock(&impl_->header->lock_word, &impl_->latency);
   impl_->ReclaimRetired();
   ++runtime_.logical_ops;
   Slot *row = impl_->Find(key);
@@ -840,7 +882,7 @@ Status KVStore::MoveOut(std::string_view key) {
 
 ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
   if (!config_.enable_scan) return {Status::Error(StatusCode::kInvalidArgument, "SCAN disabled"), {}};
-  Lock lock(&impl_->header->mutex, &impl_->latency);
+  Lock lock(&impl_->header->lock_word, &impl_->latency);
   impl_->ReclaimRetired();
   std::vector<ScanItem> all;
   size_t lo = 0;
@@ -864,7 +906,7 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
       ++runtime_.migration_in;
       ++runtime_.shared_swcc_flushes;
       impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(&row));
-      SyncRangeOrThrow(&row, sizeof(Slot), "shared scan promotion write-back");
+      SyncRangeOrThrow(&row, sizeof(Slot), "shared scan promotion write-back", impl_->device_backed);
     }
     impl_->AcquireRef(&row);
     const std::string value(row.value, row.value_len);
@@ -881,7 +923,7 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
 
 CasResult KVStore::CompareExchange(std::string_view key, std::string_view expected, std::string_view desired) {
   ValidateKeyValue(key, desired);
-  Lock lock(&impl_->header->mutex, &impl_->latency);
+  Lock lock(&impl_->header->lock_word, &impl_->latency);
   impl_->ReclaimRetired();
   ++runtime_.logical_ops;
   Slot *row = nullptr;
@@ -900,7 +942,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
     impl_->TransitionPayload(row, kShared); ++impl_->header->active_shared_rows; ++runtime_.migration_in;
     ++runtime_.shared_swcc_flushes;
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
-    SyncRangeOrThrow(row, sizeof(Slot), "shared CAS promotion write-back");
+    SyncRangeOrThrow(row, sizeof(Slot), "shared CAS promotion write-back", impl_->device_backed);
   }
   if (row->state == kEmpty || row->state == kTombstone) {
     row->owner = OwnerForKey(key);
@@ -914,7 +956,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
     ++runtime_.shared_puts;
     ++runtime_.shared_swcc_flushes;
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
-    SyncRangeOrThrow(row, sizeof(Slot), "shared CAS write-back");
+    SyncRangeOrThrow(row, sizeof(Slot), "shared CAS write-back", impl_->device_backed);
   }
   else ++runtime_.private_puts;
   if (new_row) { impl_->PublishIndex(row); impl_->PublishSortedIndex(row); }
@@ -924,7 +966,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
 
 IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   ValidateKeyValue(key, {});
-  Lock lock(&impl_->header->mutex, &impl_->latency);
+  Lock lock(&impl_->header->lock_word, &impl_->latency);
   impl_->ReclaimRetired();
   ++runtime_.logical_ops;
   Slot *row = impl_->Find(key);
@@ -936,7 +978,7 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
     impl_->TransitionPayload(row, kShared); ++impl_->header->active_shared_rows; ++runtime_.migration_in;
     ++runtime_.shared_swcc_flushes;
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
-    SyncRangeOrThrow(row, sizeof(Slot), "shared increment promotion write-back");
+    SyncRangeOrThrow(row, sizeof(Slot), "shared increment promotion write-back", impl_->device_backed);
   }
   if (row) { auto result = std::from_chars(row->value, row->value + row->value_len, old); if (result.ec != std::errc()) return {Status::Error(StatusCode::kInvalidArgument, "value is not an integer"), 0}; }
   int64_t value = old + delta;
@@ -959,7 +1001,7 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
     ++runtime_.shared_puts;
     ++runtime_.shared_swcc_flushes;
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot), CacheLineToken(row));
-    SyncRangeOrThrow(row, sizeof(Slot), "shared increment write-back");
+    SyncRangeOrThrow(row, sizeof(Slot), "shared increment write-back", impl_->device_backed);
   }
   else ++runtime_.private_puts;
   if (new_row) { impl_->PublishIndex(row); impl_->PublishSortedIndex(row); }
@@ -973,9 +1015,9 @@ Status KVStore::Checkpoint() {
     // Serialize the write-back with every KV operation.  Syncing before the
     // lock could race a writer and produce a checkpoint that was older than
     // the operation which had already acquired the protocol lock.
-    Lock lock(&impl_->header->mutex, &impl_->latency);
+    Lock lock(&impl_->header->lock_word, &impl_->latency);
     impl_->ReclaimRetired();
-    SyncRangeOrThrow(impl_->mapping, impl_->bytes, "checkpoint write-back");
+    SyncRangeOrThrow(impl_->mapping, impl_->bytes, "checkpoint write-back", impl_->device_backed);
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush,
                           config_.swcc_size_mb * 1024ULL * 1024ULL);
     ++impl_->header->clean_epoch;
@@ -987,7 +1029,7 @@ Status KVStore::Checkpoint() {
 }
 
 MemoryStats KVStore::Memory() const {
-  Lock lock(&impl_->header->mutex);
+  Lock lock(&impl_->header->lock_word);
   impl_->ReclaimRetired();
   MemoryStats out;
   out.total_pool_capacity_bytes = impl_->bytes;

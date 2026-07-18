@@ -6,6 +6,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <string>
@@ -14,10 +15,16 @@
 using namespace tigonkv;
 
 namespace {
+std::string EnvOr(const char *name, const std::string &fallback) {
+  const char *value = std::getenv(name);
+  return value && *value ? value : fallback;
+}
+
 Config ConfigFor(const std::string &path, uint32_t node) {
   Config c;
   c.shared_memory_path = path;
-  c.size_mb = 2048;
+  c.device_path = EnvOr("TIGONKV_E2E_DEVICE", "/dev/ivpci0");
+  c.size_mb = std::stoull(EnvOr("TIGONKV_E2E_SIZE_MB", "2048"));
   c.hwcc_size_mb = 1024;
   c.swcc_offset_mb = 1024;
   c.swcc_size_mb = 1024;
@@ -38,7 +45,7 @@ std::string Value(uint32_t generation, uint32_t i) {
 }
 
 int main() {
-  const std::string path = "/tmp/tigonkv-e2e-09-" + std::to_string(getpid());
+  const std::string path = EnvOr("TIGONKV_E2E_BACKING", "/tmp/tigonkv-e2e-09-" + std::to_string(getpid()));
   std::remove(path.c_str());
   auto owner = KVStore::Create(ConfigFor(path, 0), true);
   auto remote = KVStore::Create(ConfigFor(path, 1), false);

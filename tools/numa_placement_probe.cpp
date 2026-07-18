@@ -29,8 +29,16 @@ int main(int argc, char **argv) {
   const char *mode = expected_node >= 0 ? "performance" : "functional";
   std::vector<void *> addresses(pages);
   std::vector<int> nodes(pages, -1);
-  for (size_t i = 0; i < pages; ++i)
+  // move_pages reports -1 for non-resident pages without faulting them in.
+  // Read one byte through each page first; this is read-only and does not
+  // change NUMA policy, but makes the placement query cover the backing that
+  // the experiment actually maps.
+  volatile unsigned char sample = 0;
+  for (size_t i = 0; i < pages; ++i) {
     addresses[i] = static_cast<char *>(mapping) + i * page_size;
+    sample ^= *static_cast<const unsigned char *>(addresses[i]);
+  }
+  (void)sample;
   const long query = syscall(SYS_move_pages, 0, pages, addresses.data(), nullptr,
                              nodes.data(), 0);
   const int query_errno = query == 0 ? 0 : errno;
