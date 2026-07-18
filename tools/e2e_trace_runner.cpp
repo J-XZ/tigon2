@@ -3,8 +3,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <thread>
 
 using namespace tigonkv;
 
@@ -27,6 +29,28 @@ uint64_t ReadDecimal(const std::string &line, size_t *pos, const std::string &la
   if (begin == *pos) Fail("missing " + label);
   return ParseUnsigned(line.substr(begin, *pos - begin), label);
 }
+
+void Barrier(const std::string &phase, uint32_t node, bool final) {
+  const std::string dir = Env("TIGONKV_E2E_BARRIER_DIR", "CXLKV_E2E_BARRIER_DIR");
+  if (dir.empty()) return;
+  const uint64_t count = ParseUnsigned(Env("TIGONKV_E2E_WORKER_COUNT", "CXLKV_E2E_WORKER_COUNT", "1"), "worker count");
+  const uint64_t id = ParseUnsigned(Env("TIGONKV_E2E_WORKER_ID", "CXLKV_E2E_WORKER_ID", std::to_string(node)), "worker id");
+  if (count == 0 || id >= count) Fail("invalid barrier worker identity");
+  std::filesystem::create_directories(dir);
+  const std::string prefix = dir + "/" + phase + (final ? ".done." : ".ready.");
+  { std::ofstream marker(prefix + std::to_string(id)); marker << "ready\n"; }
+  const uint64_t timeout = ParseUnsigned(Env("TIGONKV_E2E_BARRIER_TIMEOUT_SEC", "CXLKV_E2E_BARRIER_TIMEOUT_SEC", "600"), "barrier timeout");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+  for (;;) {
+    uint64_t seen = 0;
+    for (uint64_t i = 0; i < count; ++i)
+      if (std::filesystem::exists(prefix + std::to_string(i))) ++seen;
+    if (seen == count) return;
+    if (std::chrono::steady_clock::now() >= deadline)
+      Fail("E2E barrier timeout for phase " + phase);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+}
 }
 
 int main() {
@@ -47,6 +71,8 @@ int main() {
     auto store = KVStore::Create(config, reset);
     std::ifstream input(trace);
     if (!input) Fail("cannot open trace: " + trace);
+    const std::string phase = Env("TIGONKV_E2E_TRACE_PHASE", "CXLKV_E2E_TRACE_PHASE", "run");
+    Barrier(phase, config.node_id, false);
     uint64_t ops = 0, line_no = 0;
     auto start = std::chrono::steady_clock::now();
     std::string line;
@@ -75,15 +101,27 @@ int main() {
       if (op == "PUT") status = store->Put(key, std::string(len, 'x'));
       else if (op == "GET") { if (len != 0) Fail("GET LEN must be zero"); status = store->Get(key).status; if (status.code == StatusCode::kNotFound) status = Status::Ok(); }
       else if (op == "DELETE") { if (len != 0) Fail("DELETE LEN must be zero"); status = store->Delete(key); if (status.code == StatusCode::kNotFound) status = Status::Ok(); }
-      else if (op == "SCAN") status = store->Scan(key, len).status;
+      else if (op == "SCAN") {
+        ScanResult result = store->Scan(key, len);
+        status = result.status;
+        if (status.ok()) {
+          if (result.items.size() > len) Fail("SCAN returned more than requested at line " + std::to_string(line_no));
+          for (size_t i = 0; i < result.items.size(); ++i) {
+            if (result.items[i].key < key || (i != 0 && result.items[i - 1].key >= result.items[i].key))
+              Fail("SCAN result ordering mismatch at line " + std::to_string(line_no));
+          }
+        }
+      }
       else Fail("unknown operation at line " + std::to_string(line_no));
       if (!status.ok()) Fail("operation failed at line " + std::to_string(line_no) + ": " + status.message);
       ++ops;
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+    if (!store->Checkpoint().ok()) Fail("checkpoint failed before final barrier");
+    Barrier(phase, config.node_id, true);
     const std::string heartbeat = Env("TIGONKV_E2E_TRACE_HEARTBEAT_SEC", "CXLKV_E2E_TRACE_HEARTBEAT_SEC", "0");
-    if (heartbeat != "0") std::cout << "E2E_TRACE_HEARTBEAT phase=" << Env("TIGONKV_E2E_TRACE_PHASE", "CXLKV_E2E_TRACE_PHASE", "run") << " node=" << config.node_id << " ops=" << ops << "\n";
-    std::cout << "E2E_TRACE_TIME_US phase=" << Env("TIGONKV_E2E_TRACE_PHASE", "CXLKV_E2E_TRACE_PHASE", "run") << " node=" << config.node_id << " ops=" << ops << " elapsed_us=" << elapsed << "\n";
+    if (heartbeat != "0") std::cout << "E2E_TRACE_HEARTBEAT phase=" << phase << " node=" << config.node_id << " ops=" << ops << "\n";
+    std::cout << "E2E_TRACE_TIME_US phase=" << phase << " node=" << config.node_id << " ops=" << ops << " elapsed_us=" << elapsed << "\n";
     std::cout << store->DumpStats();
     std::cout << "e2e_trace_runner[node" << config.node_id << "]: passed.\n";
     return 0;

@@ -57,7 +57,11 @@ void TestStore() {
   assert(a->Get("alpha").value == "two");
   assert(a->Increment("counter", 3).value == 3);
   assert(a->Increment("counter", -1).value == 2);
+  const uint64_t reclaimed_before = a->Memory().reclaimed_total_bytes;
   assert(a->Delete("alpha").ok());
+  const auto reclaimed_after = a->Memory();
+  assert(reclaimed_after.retired_pending_bytes == 0);
+  assert(reclaimed_after.reclaimed_total_bytes > reclaimed_before);
   assert(a->Get("alpha").status.code == StatusCode::kNotFound);
   assert(a->Put("alpha", "reinsert").ok());
   assert(a->Get("alpha").value == "reinsert");
@@ -100,7 +104,36 @@ void TestPromotionAndAccessClasses() {
   assert(b->Runtime().shared_swcc_flushes > 0);
   assert(a->Get(key).value == "shared-value");
   assert(a->Memory().active_shared_rows == 1);
+  assert(a->MoveOut(key).ok());
+  assert(a->Memory().active_shared_rows == 0);
+  assert(a->Runtime().migration_out == 1);
+  assert(a->Get(key).value == "shared-value");
   b.reset(); a.reset(); std::remove(path.c_str());
+}
+
+void TestNonOwnerPutStaysPrivateUntilRemoteRead() {
+  const std::string path = "/tmp/tigonkv-forward-" + std::to_string(getpid());
+  std::remove(path.c_str());
+  auto requester = KVStore::Create(TestConfig(path, 0), true);
+  std::string key;
+  for (int i = 0; i < 100; ++i) {
+    if (requester->OwnerForKey("forward-" + std::to_string(i)) == 1) {
+      key = "forward-" + std::to_string(i);
+      break;
+    }
+  }
+  assert(!key.empty());
+  assert(requester->Put(key, "private").ok());
+  assert(requester->Memory().active_shared_rows == 0);
+  assert(requester->Runtime().private_swcc_flushes == 0);
+  assert(requester->Get(key).value == "private");
+  assert(requester->Runtime().migration_in == 1);
+  assert(requester->Memory().active_shared_rows == 1);
+  auto remote = KVStore::Create(TestConfig(path, 1), false);
+  assert(remote->Get(key).value == "private");
+  assert(remote->Runtime().migration_in == 0);
+  assert(remote->Memory().active_shared_rows == 1);
+  remote.reset(); requester.reset(); std::remove(path.c_str());
 }
 
 void TestNonCoherentBackend() {
@@ -108,9 +141,12 @@ void TestNonCoherentBackend() {
   const char first[] = "new";
   char readback[4] = {};
   backend.Write(0, 0, first, 3);
+  assert(!backend.Publish(0, 0, 3));  // early shared-index publication is rejected
   backend.Read(1, 0, readback, 3);
   assert(std::string(readback, 3) != "new");
   backend.WriteBack(0, 0, 3);
+  assert(backend.Publish(0, 0, 3));
+  assert(backend.IsPublished(0));
   backend.Invalidate(1, 0, 3);
   backend.Read(1, 0, readback, 3);
   assert(std::string(readback, 3) == "new");
@@ -122,6 +158,39 @@ void TestNonCoherentBackend() {
   assert(std::string(readback, 3) == "old");
 }
 
+void TestSwccBudgetAndSortedScan() {
+  const std::string path = "/tmp/tigonkv-budget-" + std::to_string(getpid());
+  std::remove(path.c_str());
+  auto c = TestConfig(path, 0);
+  c.size_mb = 4;
+  c.hwcc_size_mb = 1;
+  c.swcc_offset_mb = 1;
+  c.swcc_size_mb = 1;
+  c.fixed_value_size = 4096;
+  auto store = KVStore::Create(c, true);
+  const std::string large(4096, 'b');
+  bool saw_oom = false;
+  for (int i = 0; i < 1000; ++i) {
+    Status status = store->Put("budget-" + std::to_string(i), large);
+    if (status.code == StatusCode::kOutOfMemory) { saw_oom = true; break; }
+    assert(status.ok());
+  }
+  assert(saw_oom);
+  auto memory = store->Memory();
+  assert(memory.owner_private_swcc_used_bytes + memory.shared_payload_swcc_used_bytes <=
+         memory.logical_swcc_capacity_bytes);
+
+  store.reset();
+  auto ordered = KVStore::Create(TestConfig(path, 0), true);
+  for (int i = 0; i < 100; ++i)
+    assert(ordered->Put("ordered-" + std::to_string(100 - i), "v").ok());
+  auto scan = ordered->Scan("ordered-", 100);
+  assert(scan.status.ok());
+  for (size_t i = 1; i < scan.items.size(); ++i) assert(scan.items[i - 1].key < scan.items[i].key);
+  ordered.reset();
+  std::remove(path.c_str());
+}
+
 void TestLatencyAndStrictAccess() {
   LatencySimulator simulator;
   simulator.Configure(true, 7, 3, 5, 11);
@@ -131,6 +200,17 @@ void TestLatencyAndStrictAccess() {
   const auto stats = simulator.Snapshot();
   assert(stats.swcc_reads == 1 && stats.swcc_flushes == 1 && stats.hwcc_atomics == 1);
   assert(stats.delayed_ns == 21);
+  simulator.Reset();
+  simulator.ConfigureDetailed(true, 1, 2, 3, 100, 200, 300, "fixed_hit_rate", 1.0, 1);
+  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64);
+  const auto hit_stats = simulator.Snapshot();
+  assert(hit_stats.cache_hits == 1 && hit_stats.cache_misses == 0 && hit_stats.delayed_ns == 0);
+  simulator.Reset();
+  simulator.ConfigureDetailed(true, 1, 2, 3, 100, 200, 300, "per_thread_lru", 0.0, 1);
+  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64);
+  simulator.Record(PoolKind::kSwcc, AccessKind::kRead, 64);
+  const auto lru_stats = simulator.Snapshot();
+  assert(lru_stats.cache_hits == 1 && lru_stats.cache_misses == 1 && lru_stats.delayed_ns == 100);
 
   const std::string path = "/tmp/tigonkv-strict-" + std::to_string(getpid());
   std::remove(path.c_str());
@@ -149,10 +229,11 @@ void TestLatencyAndStrictAccess() {
 void TestConfig() {
   const std::string path = "/tmp/tigonkv-config-" + std::to_string(getpid()) + ".jsonc";
   std::ofstream out(path);
-  out << R"({"shared_memory":{"size_mb":16,"path":"/tmp/x","device_path":"/dev/ivpci0","hwcc":{"offset_mb":0,"size_mb":1},"swcc":{"offset_mb":1,"size_mb":15}},"vm":{"count":2},"tigon_kv":{"partition_count":8,"fixed_key_size":32,"fixed_value_size":128,"hwcc_budget_mb":1,"enable_scan":true}})";
+  out << R"({"shared_memory":{"size_mb":16,"path":"/tmp/x","device_path":"/dev/ivpci0","hwcc":{"offset_mb":0,"size_mb":1},"swcc":{"offset_mb":1,"size_mb":15}},"vm":{"count":2},"tigon_kv":{"partition_count":8,"fixed_key_size":32,"fixed_value_size":128,"hwcc_budget_mb":1,"enable_scan":true,"latency_inject":{"cache_model":"fixed_hit_rate","cache_fixed_hit_rate":0.5,"cache_capacity_lines":4}}})";
   out.close();
   Config c = Config::FromJsonc(path);
   assert(c.size_mb == 16 && c.vm_count == 2 && c.hwcc_size_mb == 1);
+  assert(c.latency_cache_model == "fixed_hit_rate" && c.latency_cache_fixed_hit_rate == 0.5 && c.latency_cache_capacity_lines == 4);
   std::remove(path.c_str());
 
   std::ofstream bad(path);
@@ -170,7 +251,9 @@ int main(int argc, char **argv) {
   TestConfig();
   TestStore();
   TestPromotionAndAccessClasses();
+  TestNonOwnerPutStaysPrivateUntilRemoteRead();
   TestNonCoherentBackend();
+  TestSwccBudgetAndSortedScan();
   TestLatencyAndStrictAccess();
   std::cout << "tigonkv_tests: passed\n";
   return 0;

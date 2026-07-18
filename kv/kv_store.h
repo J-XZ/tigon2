@@ -60,6 +60,7 @@ struct RuntimeStats {
   uint64_t private_gets = 0;
   uint64_t private_puts = 0;
   uint64_t private_deletes = 0;
+  uint64_t checkpoint_swcc_flushes = 0;
   uint64_t private_swcc_flushes = 0;
   uint64_t shared_gets = 0;
   uint64_t shared_puts = 0;
@@ -86,6 +87,7 @@ struct MemoryStats {
   uint64_t retired_pending_bytes = 0;
   uint64_t reclaimed_total_bytes = 0;
   uint64_t active_shared_rows = 0;
+  uint64_t rss_kb = 0;
 };
 
 struct Config {
@@ -112,6 +114,8 @@ struct Config {
   uint64_t hwcc_write_ns = 0;
   uint64_t hwcc_atomic_ns = 0;
   std::string latency_cache_model = "none";
+  double latency_cache_fixed_hit_rate = 0.0;
+  uint64_t latency_cache_capacity_lines = 0;
 
   static Config FromJsonc(const std::string &path);
   void Validate() const;
@@ -128,6 +132,9 @@ class KVStore {
   Status Put(std::string_view key, std::string_view value);
   GetResult Get(std::string_view key);
   Status Delete(std::string_view key);
+  // Owner-only logical move-out: the shared row becomes private again after
+  // the caller has established that no remote references remain.
+  Status MoveOut(std::string_view key);
   ScanResult Scan(std::string_view start_key, uint64_t limit);
   CasResult CompareExchange(std::string_view key, std::string_view expected,
                             std::string_view desired);

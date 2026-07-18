@@ -10,8 +10,9 @@ out=${1:-"$root/results/ycsb_traces"}
 records=${YCSB_RECORD_COUNT:-100000}
 ops=${YCSB_OPERATION_COUNT:-100000}
 workers=${YCSB_WORKERS:-1}
+workloads=${TIGONKV_YCSB_WORKLOADS:-"A B C D E"}
 mkdir -p "$out"
-for workload in A B C D; do
+for workload in $workloads; do
   workload_file=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
   "$ycsb/scripts/generate_cxlkv_trace.sh" --output-dir "$out/workload$workload" \
     --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workload$workload_file" \
