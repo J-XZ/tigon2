@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <unordered_set>
@@ -201,12 +202,26 @@ class Lock {
   LatencySimulator *latency_;
 };
 
+class FileLock {
+ public:
+  explicit FileLock(int fd) : fd_(fd) {
+    if (flock(fd_, LOCK_EX) != 0)
+      throw std::runtime_error(std::string("shared backing file lock: ") + std::strerror(errno));
+  }
+  ~FileLock() { if (fd_ >= 0) (void)flock(fd_, LOCK_UN); }
+  FileLock(const FileLock &) = delete;
+  FileLock &operator=(const FileLock &) = delete;
+ private:
+  int fd_;
+};
+
 }  // namespace
 
 struct KVStore::Impl {
   int fd = -1;
   size_t bytes = 0;
   void *mapping = MAP_FAILED;
+  bool attached = false;
   SharedHeader *header = nullptr;
   uint32_t *index = nullptr;
   uint32_t *sorted_index = nullptr;
@@ -419,7 +434,16 @@ void Config::Validate() const {
 
 std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
   auto store = std::unique_ptr<KVStore>(new KVStore(config));
-  store->Open(reset);
+  try {
+    store->Open(reset);
+  } catch (...) {
+    // Open can fail after mmap (for example on a dirty marker or config
+    // mismatch).  The C++ destructor is not run for a failed construction, so
+    // release every partially acquired descriptor/mapping here without
+    // changing the persisted state.
+    store->Close();
+    throw;
+  }
   return store;
 }
 
@@ -436,6 +460,11 @@ KVStore::KVStore(const Config &config) : impl_(new Impl()), config_(config) {
 void KVStore::Open(bool reset) {
   impl_->fd = ::open(config_.shared_memory_path.c_str(), O_RDWR | O_CREAT, 0660);
   if (impl_->fd < 0) throw std::runtime_error("open backing file: " + std::string(std::strerror(errno)));
+  // pthread_mutex_t is not initialized until the first process has built the
+  // layout.  Serialize the file-size/layout/attach transition with an OS file
+  // lock so concurrent workers cannot both observe an empty header and reset
+  // the same backing.
+  FileLock file_lock(impl_->fd);
   if (reset && ftruncate(impl_->fd, static_cast<off_t>(config_.size_mb * 1024ULL * 1024ULL)) != 0)
     throw std::runtime_error("resize backing file: " + std::string(std::strerror(errno)));
   struct stat st{};
@@ -526,19 +555,52 @@ void KVStore::Open(bool reset) {
     ++impl_->header->attached_count;
     impl_->header->init_state = 2;
     ++impl_->header->dirty_epoch;
+    impl_->attached = true;
   }
 }
 
 void KVStore::Close() {
-  if (!impl_ || impl_->mapping == MAP_FAILED) return;
+  if (!impl_) return;
+  if (impl_->mapping == MAP_FAILED) {
+    if (impl_->fd >= 0) ::close(impl_->fd);
+    impl_->fd = -1;
+    return;
+  }
+  if (!impl_->attached) {
+    munmap(impl_->mapping, impl_->bytes);
+    ::close(impl_->fd);
+    impl_->mapping = MAP_FAILED;
+    impl_->fd = -1;
+    return;
+  }
+
+  bool checkpoint_ok = false;
+  if (config_.checkpoint_on_clean_exit) {
+    checkpoint_ok = Checkpoint().ok();
+  }
   try {
-    if (config_.checkpoint_on_clean_exit) Checkpoint();
     Lock lock(&impl_->header->mutex, &impl_->latency);
     if (impl_->header->attached_count > 0) --impl_->header->attached_count;
+    impl_->attached = false;
     if (impl_->header->attached_count == 0) {
-      impl_->header->init_state = 1;
-      ++impl_->header->clean_epoch;
-      msync(impl_->mapping, impl_->bytes, MS_SYNC);
+      if (!checkpoint_ok) {
+        // A failed or disabled checkpoint must remain dirty.  The next attach
+        // must not mistake an unflushed process exit for clean state.
+        impl_->header->init_state = 2;
+        ++impl_->header->dirty_epoch;
+      } else {
+        impl_->header->init_state = 1;
+        ++impl_->header->clean_epoch;
+        try {
+          SyncRangeOrThrow(impl_->mapping, impl_->bytes, "clean close write-back");
+        } catch (...) {
+          // Destructors cannot report an I/O failure.  Preserve a hard dirty
+          // marker so a later attach refuses to trust this backing.
+          impl_->header->init_state = 2;
+          ++impl_->header->dirty_epoch;
+          throw;
+        }
+      }
     }
   } catch (...) {
     // Destructors cannot report errors. The dirty marker remains for the next attach.
@@ -600,7 +662,7 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
     ++runtime_.shared_puts;
     ++runtime_.shared_swcc_flushes;
     impl_->latency.Record(PoolKind::kSwcc, AccessKind::kWrite, value.size());
-    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, value.size());
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
     SyncRangeOrThrow(row, sizeof(Slot), "shared promotion write-back");
   } else {
     ++runtime_.private_puts;
@@ -625,6 +687,7 @@ GetResult KVStore::Get(std::string_view key) {
         // Publication is the linearization point: the complete source value is
         // write-backed before another VM can rely on the shared state.
         ++runtime_.shared_swcc_flushes;
+        impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
         SyncRangeOrThrow(&row, sizeof(Slot), "shared promotion write-back");
       }
       bool shared = row.state == kShared;
@@ -656,7 +719,13 @@ Status KVStore::Delete(std::string_view key) {
       row.state = kTombstone; row.key_len = 0; row.value_len = 0; ++row.generation;
       const size_t slot = static_cast<size_t>(&row - impl_->slots);
       if (slot < impl_->header->next_slot_hint) impl_->header->next_slot_hint = slot;
-      if (shared) { if (impl_->header->active_shared_rows) --impl_->header->active_shared_rows; ++runtime_.shared_deletes; ++runtime_.shared_swcc_flushes; SyncRangeOrThrow(&row, sizeof(Slot), "shared delete write-back"); }
+      if (shared) {
+        if (impl_->header->active_shared_rows) --impl_->header->active_shared_rows;
+        ++runtime_.shared_deletes;
+        ++runtime_.shared_swcc_flushes;
+        impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+        SyncRangeOrThrow(&row, sizeof(Slot), "shared delete write-back");
+      }
       else ++runtime_.private_deletes;
       impl_->header->retired_pending_bytes += sizeof(Slot); ++runtime_.commits;
       return Status::Ok();
@@ -717,6 +786,7 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
       ++impl_->header->active_shared_rows;
       ++runtime_.migration_in;
       ++runtime_.shared_swcc_flushes;
+      impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
       SyncRangeOrThrow(&row, sizeof(Slot), "shared scan promotion write-back");
     }
     if (row.state == kPrivate) ++runtime_.private_gets;
@@ -746,7 +816,9 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
     if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
       return {Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded"), false};
     impl_->TransitionPayload(row, kShared); ++impl_->header->active_shared_rows; ++runtime_.migration_in;
-    ++runtime_.shared_swcc_flushes; SyncRangeOrThrow(row, sizeof(Slot), "shared CAS promotion write-back");
+    ++runtime_.shared_swcc_flushes;
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+    SyncRangeOrThrow(row, sizeof(Slot), "shared CAS promotion write-back");
   }
   if (row->state == kEmpty || row->state == kTombstone) {
     row->owner = OwnerForKey(key);
@@ -756,7 +828,12 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
   impl_->SetPayload(row, key.size(), desired.size());
   std::memcpy(row->key, key.data(), key.size());
   std::memset(row->value, 0, kMaxValue); std::memcpy(row->value, desired.data(), desired.size()); ++row->version;
-  if (row->state == kShared) { ++runtime_.shared_puts; ++runtime_.shared_swcc_flushes; SyncRangeOrThrow(row, sizeof(Slot), "shared CAS write-back"); }
+  if (row->state == kShared) {
+    ++runtime_.shared_puts;
+    ++runtime_.shared_swcc_flushes;
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+    SyncRangeOrThrow(row, sizeof(Slot), "shared CAS write-back");
+  }
   else ++runtime_.private_puts;
   if (new_row) { impl_->PublishIndex(row); impl_->PublishSortedIndex(row); }
   ++runtime_.commits;
@@ -775,7 +852,9 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
     if (impl_->LogicalHwccBytes(impl_->header->active_shared_rows + 1) > impl_->header->logical_hwcc_capacity_bytes)
       return {Status::Error(StatusCode::kOutOfMemory, "logical HWCC row-metadata budget exceeded"), 0};
     impl_->TransitionPayload(row, kShared); ++impl_->header->active_shared_rows; ++runtime_.migration_in;
-    ++runtime_.shared_swcc_flushes; SyncRangeOrThrow(row, sizeof(Slot), "shared increment promotion write-back");
+    ++runtime_.shared_swcc_flushes;
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+    SyncRangeOrThrow(row, sizeof(Slot), "shared increment promotion write-back");
   }
   if (row) { auto result = std::from_chars(row->value, row->value + row->value_len, old); if (result.ec != std::errc()) return {Status::Error(StatusCode::kInvalidArgument, "value is not an integer"), 0}; }
   int64_t value = old + delta;
@@ -794,7 +873,12 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   impl_->SetPayload(row, key.size(), encoded.size());
   std::memcpy(row->key, key.data(), key.size());
   std::memcpy(row->value, encoded.data(), encoded.size()); ++row->version;
-  if (row->state == kShared) { ++runtime_.shared_puts; ++runtime_.shared_swcc_flushes; SyncRangeOrThrow(row, sizeof(Slot), "shared increment write-back"); }
+  if (row->state == kShared) {
+    ++runtime_.shared_puts;
+    ++runtime_.shared_swcc_flushes;
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush, sizeof(Slot));
+    SyncRangeOrThrow(row, sizeof(Slot), "shared increment write-back");
+  }
   else ++runtime_.private_puts;
   if (new_row) { impl_->PublishIndex(row); impl_->PublishSortedIndex(row); }
   ++runtime_.commits;
@@ -803,12 +887,21 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
 
 Status KVStore::Checkpoint() {
   if (impl_->mapping == MAP_FAILED) return Status::Error(StatusCode::kCorruption, "store is closed");
-  if (msync(impl_->mapping, impl_->bytes, MS_SYNC) != 0) return Status::Error(StatusCode::kCorruption, "checkpoint msync failed");
-  Lock lock(&impl_->header->mutex, &impl_->latency);
-  impl_->ReclaimRetired();
-  ++impl_->header->clean_epoch;
-  ++runtime_.checkpoint_swcc_flushes;
-  return Status::Ok();
+  try {
+    // Serialize the write-back with every KV operation.  Syncing before the
+    // lock could race a writer and produce a checkpoint that was older than
+    // the operation which had already acquired the protocol lock.
+    Lock lock(&impl_->header->mutex, &impl_->latency);
+    impl_->ReclaimRetired();
+    SyncRangeOrThrow(impl_->mapping, impl_->bytes, "checkpoint write-back");
+    impl_->latency.Record(PoolKind::kSwcc, AccessKind::kFlush,
+                          config_.swcc_size_mb * 1024ULL * 1024ULL);
+    ++impl_->header->clean_epoch;
+    ++runtime_.checkpoint_swcc_flushes;
+    return Status::Ok();
+  } catch (const std::exception &error) {
+    return Status::Error(StatusCode::kCorruption, error.what());
+  }
 }
 
 MemoryStats KVStore::Memory() const {

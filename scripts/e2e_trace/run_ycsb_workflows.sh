@@ -17,18 +17,51 @@ for workload in $workloads; do
     pids=()
     trace_dir="$trace_root/workload$workload/$phase"
     [[ -d "$trace_dir" ]] || { echo "missing trace directory: $trace_dir" >&2; exit 2; }
-    for trace in "$trace_dir"/worker*.txt; do
-      [[ -f "$trace" ]] || { echo "no worker traces in $trace_dir" >&2; exit 2; }
+    mapfile -t traces < <(find "$trace_dir" -maxdepth 1 -type f -name 'worker*.txt' -print | sort)
+    (( ${#traces[@]} > 0 )) || { echo "no worker traces in $trace_dir" >&2; exit 2; }
+    barrier_dir=""
+    if [[ "$concurrent" == 1 ]]; then
+      barrier_root=${TIGONKV_E2E_BARRIER_ROOT:-/mnt/xz_vm_storage}
+      [[ -d "$barrier_root" ]] || { echo "barrier root is missing: $barrier_root" >&2; exit 2; }
+      barrier_dir=$(mktemp -d "$barrier_root/tigonkv-ycsb-${workload}-${phase}.XXXXXX")
+    fi
+    worker_count=${#traces[@]}
+    for trace in "${traces[@]}"; do
       node_id=$((worker_index % vm_count))
-      if [[ "$concurrent" == 1 && "$worker_index" -gt 0 ]]; then
-        TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" TIGONKV_E2E_TRACE_PHASE="$phase" \
-          TIGONKV_NODE_ID="$node_id" TIGONKV_E2E_TRACE_FILE="$trace" \
-          TIGONKV_E2E_RESET="$reset" "$runner" &
+      barrier_env=()
+      if [[ "$concurrent" == 1 ]]; then
+        barrier_env=(
+          "TIGONKV_E2E_BARRIER_DIR=$barrier_dir"
+          "TIGONKV_E2E_WORKER_COUNT=$worker_count"
+          "TIGONKV_E2E_WORKER_ID=$worker_index"
+        )
+      fi
+      run_worker() {
+        env "${barrier_env[@]}" \
+          "TIGONKV_EXPERIMENT_CONFIG_JSONC=$config" \
+          "TIGONKV_E2E_TRACE_PHASE=$phase" "TIGONKV_NODE_ID=$node_id" \
+          "TIGONKV_E2E_TRACE_FILE=$trace" "TIGONKV_E2E_RESET=$reset" "$runner"
+      }
+      if [[ "$concurrent" == 1 ]]; then
+        run_worker &
         pids+=("$!")
+        if [[ "$worker_index" == 0 ]]; then
+          deadline=$((SECONDS + ${TIGONKV_E2E_BARRIER_TIMEOUT_SEC:-600}))
+          while [[ ! -e "$barrier_dir/$phase.ready.0" ]]; do
+            if ! kill -0 "${pids[0]}" 2>/dev/null; then
+              wait "${pids[0]}" || true
+              echo "first YCSB worker exited before initialization barrier" >&2
+              exit 2
+            fi
+            (( SECONDS >= deadline )) && {
+              echo "timeout waiting for first YCSB worker initialization" >&2
+              exit 2
+            }
+            sleep 0.1
+          done
+        fi
       else
-        TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" TIGONKV_E2E_TRACE_PHASE="$phase" \
-          TIGONKV_NODE_ID="$node_id" TIGONKV_E2E_TRACE_FILE="$trace" \
-          TIGONKV_E2E_RESET="$reset" "$runner"
+        run_worker
       fi
       reset=0
       ((worker_index+=1))

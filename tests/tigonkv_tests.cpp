@@ -136,6 +136,88 @@ void TestNonOwnerPutStaysPrivateUntilRemoteRead() {
   remote.reset(); requester.reset(); std::remove(path.c_str());
 }
 
+void TestCrossProcessPromotionAndUpdate() {
+  const std::string path = "/tmp/tigonkv-cross-process-" + std::to_string(getpid());
+  std::remove(path.c_str());
+  auto owner = KVStore::Create(TestConfig(path, 0), true);
+  std::string key;
+  for (int i = 0; i < 100; ++i) {
+    const std::string candidate = "cross-process-" + std::to_string(i);
+    if (owner->OwnerForKey(candidate) == 0) { key = candidate; break; }
+  }
+  assert(!key.empty());
+  assert(owner->Put(key, "generation-0").ok());
+
+  int stats_pipe[2];
+  assert(pipe(stats_pipe) == 0);
+  const pid_t child = fork();
+  assert(child >= 0);
+  if (child == 0) {
+    close(stats_pipe[0]);
+    try {
+      auto remote = KVStore::Create(TestConfig(path, 1), false);
+      if (remote->Get(key).status.code != StatusCode::kOk ||
+          !remote->Put(key, "generation-1").ok()) {
+        remote.reset();
+        close(stats_pipe[1]);
+        _exit(1);
+      }
+      const uint64_t shared_flushes = remote->Runtime().shared_swcc_flushes;
+      if (write(stats_pipe[1], &shared_flushes, sizeof(shared_flushes)) !=
+          static_cast<ssize_t>(sizeof(shared_flushes))) {
+        remote.reset();
+        close(stats_pipe[1]);
+        _exit(1);
+      }
+      remote.reset();
+      close(stats_pipe[1]);
+      _exit(0);
+    } catch (...) {
+      close(stats_pipe[1]);
+      _exit(2);
+    }
+  }
+  close(stats_pipe[1]);
+  int child_status = 0;
+  assert(waitpid(child, &child_status, 0) == child);
+  assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+  uint64_t child_shared_flushes = 0;
+  assert(read(stats_pipe[0], &child_shared_flushes, sizeof(child_shared_flushes)) ==
+         static_cast<ssize_t>(sizeof(child_shared_flushes)));
+  close(stats_pipe[0]);
+  assert(child_shared_flushes > 0);
+  assert(owner->Get(key).value == "generation-1");
+  assert(owner->Memory().active_shared_rows == 1);
+  assert(owner->Runtime().private_swcc_flushes == 0);
+  assert(owner->MoveOut(key).ok());
+  assert(owner->Memory().active_shared_rows == 0);
+  owner.reset();
+  std::remove(path.c_str());
+}
+
+void TestDirtyCloseRequiresExplicitReset() {
+  const std::string path = "/tmp/tigonkv-dirty-close-" + std::to_string(getpid());
+  std::remove(path.c_str());
+  auto config = TestConfig(path, 0);
+  config.checkpoint_on_clean_exit = false;
+  {
+    auto store = KVStore::Create(config, true);
+    assert(store->Put("dirty", "value").ok());
+  }
+  bool rejected = false;
+  try {
+    auto attach = KVStore::Create(config, false);
+    (void)attach;
+  } catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  assert(rejected);
+  auto reset = KVStore::Create(config, true);
+  assert(reset->Put("clean-after-reset", "value").ok());
+  reset.reset();
+  std::remove(path.c_str());
+}
+
 void TestNonCoherentBackend() {
   NonCoherentSwccTestBackend backend;
   const char first[] = "new";
@@ -252,6 +334,8 @@ int main(int argc, char **argv) {
   TestStore();
   TestPromotionAndAccessClasses();
   TestNonOwnerPutStaysPrivateUntilRemoteRead();
+  TestCrossProcessPromotionAndUpdate();
+  TestDirtyCloseRequiresExplicitReset();
   TestNonCoherentBackend();
   TestSwccBudgetAndSortedScan();
   TestLatencyAndStrictAccess();
