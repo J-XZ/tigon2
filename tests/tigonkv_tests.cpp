@@ -17,6 +17,10 @@
 
 using namespace tigonkv;
 
+#ifndef TIGONKV_SOURCE_DIR
+#define TIGONKV_SOURCE_DIR "."
+#endif
+
 namespace {
 Config TestConfig(const std::string &path, uint32_t node = 0) {
   Config c;
@@ -352,8 +356,20 @@ void TestConfig() {
   out.close();
   Config c = Config::FromJsonc(path);
   assert(c.size_mb == 16 && c.vm_count == 2 && c.hwcc_size_mb == 1);
+  assert(c.shared_memory_numa_node == 1 && c.vm_numa_node == 0);
+  assert(c.vm_storage_path == "/mnt/xz_vm_storage" && c.network_base_ssh_port == 2200);
+  assert(c.sync_timeout_sec == 60 && c.foreground_worker_count_per_vm == 1);
+  assert(c.owner_private_swcc_fraction == 0.0 && c.shared_payload_swcc_fraction == 0.0);
   assert(c.latency_cache_model == "fixed_hit_rate" && c.latency_cache_fixed_hit_rate == 0.5 && c.latency_cache_capacity_lines == 4);
   std::remove(path.c_str());
+
+  Config experiment = Config::FromJsonc(std::string(TIGONKV_SOURCE_DIR) + "/experiment_config.jsonc");
+  assert(experiment.shared_memory_numa_node == 1 && experiment.vm_numa_node == 0);
+  assert(experiment.hwcc_reserved_mb == 64);
+  assert(experiment.owner_private_swcc_fraction == 0.75);
+  assert(experiment.shared_payload_swcc_fraction == 0.25);
+  assert(experiment.migration_policy == "Clock" && !experiment.reuse_shared_payload_after_moveout);
+  assert(experiment.vm_storage_path == "/mnt/xz_vm_storage");
 
   std::ofstream bad(path);
   bad << R"({"unknown_field": 1})";

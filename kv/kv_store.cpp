@@ -40,10 +40,18 @@ uint64_t ConfigFingerprint(const Config &config) {
   const uint64_t fields[] = {
       config.size_mb, config.hwcc_offset_mb, config.hwcc_size_mb,
       config.swcc_offset_mb, config.swcc_size_mb, config.vm_count,
-      config.partition_count, config.fixed_key_size, config.fixed_value_size};
+      config.partition_count, config.fixed_key_size, config.fixed_value_size,
+      static_cast<uint64_t>(config.shared_memory_numa_node + 1),
+      config.vm_core_count_per_vm, static_cast<uint64_t>(config.vm_numa_node + 1),
+      config.network_base_ssh_port, config.sync_timeout_sec,
+      config.foreground_worker_count_per_vm, config.hwcc_reserved_mb,
+      static_cast<uint64_t>(config.owner_private_swcc_fraction * 1000000000.0),
+      static_cast<uint64_t>(config.shared_payload_swcc_fraction * 1000000000.0),
+      config.reuse_shared_payload_after_moveout ? 1ULL : 0ULL};
   for (uint64_t field : fields) {
     h ^= field + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
   }
+  h ^= HashBytes(config.migration_policy) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
   return h;
 }
 
@@ -93,6 +101,22 @@ bool JsonDouble(const std::string &s, const char *name, double *out) {
   std::smatch m;
   if (!std::regex_search(s, m, r)) return false;
   *out = std::stod(m[1].str());
+  return true;
+}
+
+template <typename T>
+bool JsonNumberArray(const std::string &s, const char *name, std::vector<T> *out) {
+  std::regex r(std::string("\\\"") + name + R"(\"\s*:\s*\[([^\]]*)\])");
+  std::smatch m;
+  if (!std::regex_search(s, m, r)) return false;
+  out->clear();
+  std::regex number(R"(-?[0-9]+)");
+  for (auto it = std::sregex_iterator(m[1].first, m[1].second, number);
+       it != std::sregex_iterator(); ++it) {
+    const long long value = std::stoll((*it)[0].str());
+    if (value < 0) throw std::invalid_argument(std::string("negative config array field: ") + name);
+    out->push_back(static_cast<T>(value));
+  }
   return true;
 }
 
@@ -391,11 +415,26 @@ Config Config::FromJsonc(const std::string &path) {
   JsonString(text, "path", &c.shared_memory_path);
   JsonString(text, "device_path", &c.device_path);
   JsonNumber(text, "size_mb", &c.size_mb);
+  JsonNumberInObject(text, "shared_memory", "numa_node", &c.shared_memory_numa_node);
+  JsonNumberArray(text, "reserved_cores", &c.host_reserved_cores);
+  JsonNumberArray(text, "ivshmem_server_cores", &c.ivshmem_server_cores);
+  JsonNumberArray(text, "vm_cores", &c.vm_cores);
   JsonNumber(text, "count", &c.vm_count);
+  JsonNumberInObject(text, "vm", "core_count_per_vm", &c.vm_core_count_per_vm);
+  JsonString(text, "storage_path", &c.vm_storage_path);
+  JsonNumberInObject(text, "vm", "numa_node", &c.vm_numa_node);
+  JsonNumber(text, "base_ssh_port", &c.network_base_ssh_port);
+  JsonNumber(text, "timeout_sec", &c.sync_timeout_sec);
+  JsonNumber(text, "foreground_worker_count_per_vm", &c.foreground_worker_count_per_vm);
   JsonNumber(text, "partition_count", &c.partition_count);
   JsonNumber(text, "fixed_key_size", &c.fixed_key_size);
   JsonNumber(text, "fixed_value_size", &c.fixed_value_size);
   JsonNumber(text, "hwcc_budget_mb", &c.hwcc_size_mb);
+  JsonNumber(text, "hwcc_reserved_mb", &c.hwcc_reserved_mb);
+  JsonDouble(text, "owner_private_swcc_fraction", &c.owner_private_swcc_fraction);
+  JsonDouble(text, "shared_payload_swcc_fraction", &c.shared_payload_swcc_fraction);
+  JsonString(text, "migration_policy", &c.migration_policy);
+  JsonBool(text, "reuse_shared_payload_after_moveout", &c.reuse_shared_payload_after_moveout);
   JsonNumberInObject(text, "hwcc", "offset_mb", &c.hwcc_offset_mb);
   JsonNumberInObject(text, "hwcc", "size_mb", &c.hwcc_size_mb);
   JsonNumberInObject(text, "swcc", "offset_mb", &c.swcc_offset_mb);
@@ -427,8 +466,13 @@ void Config::Validate() const {
        swcc_offset_mb < hwcc_offset_mb + hwcc_size_mb))
     throw std::invalid_argument("invalid shared-memory capacity or HWCC budget");
   if (vm_count == 0 || partition_count == 0 || fixed_key_size == 0 || fixed_key_size > kMaxKey ||
-      fixed_value_size > kMaxValue)
+      fixed_value_size > kMaxValue || shared_memory_numa_node < -1 || vm_numa_node < -1 ||
+      network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0)
     throw std::invalid_argument("invalid KV configuration");
+  if (hwcc_reserved_mb > hwcc_size_mb || owner_private_swcc_fraction < 0.0 ||
+      shared_payload_swcc_fraction < 0.0 ||
+      owner_private_swcc_fraction + shared_payload_swcc_fraction > 1.0 + 1e-9)
+    throw std::invalid_argument("invalid allocator budget fractions");
   if (latency_cache_model != "none" && latency_cache_model != "fixed_hit_rate" &&
       latency_cache_model != "per_thread_lru")
     throw std::invalid_argument("unknown latency cache model");
