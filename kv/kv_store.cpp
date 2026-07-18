@@ -51,6 +51,18 @@ uint64_t ConfigFingerprint(const Config &config) {
   for (uint64_t field : fields) {
     h ^= field + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
   }
+  auto mix_string = [&h](const std::string &value) {
+    h ^= HashBytes(value) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+  };
+  auto mix_core_list = [&h](const std::vector<uint32_t> &cores) {
+    h ^= cores.size() + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    for (uint32_t core : cores)
+      h ^= core + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+  };
+  mix_string(config.vm_storage_path);
+  mix_core_list(config.host_reserved_cores);
+  mix_core_list(config.ivshmem_server_cores);
+  mix_core_list(config.vm_cores);
   h ^= HashBytes(config.migration_policy) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
   return h;
 }

@@ -83,6 +83,16 @@ void TestStore() {
   auto b = KVStore::Create(c, false);
   assert(b->Get("alpha").value == "reinsert");
   b.reset();
+  Config mismatch = c;
+  mismatch.vm_numa_node = 1;
+  bool mismatch_rejected = false;
+  try {
+    auto wrong_attach = KVStore::Create(mismatch, false);
+    (void)wrong_attach;
+  } catch (const std::runtime_error &) {
+    mismatch_rejected = true;
+  }
+  assert(mismatch_rejected);
   std::remove(path.c_str());
 }
 
