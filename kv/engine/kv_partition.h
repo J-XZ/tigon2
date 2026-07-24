@@ -47,6 +47,7 @@ class KVPartition {
   uint64_t shared_payload_used_bytes() const;
   uint64_t shared_payload_capacity_bytes() const;
   uint64_t hwcc_used_bytes() const;
+  uint64_t migrated_key_count() const;
 
   // Must be called after an operation which might split or collapse a root.
   // It writes only region-relative offsets into the persistent directory.

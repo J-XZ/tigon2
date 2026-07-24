@@ -40,6 +40,7 @@ class KVEngine {
   CasResult CompareExchange(std::string_view key, std::string_view expected,
                             std::string_view desired);
   IncrementResult Increment(std::string_view key, int64_t delta);
+  MemoryStats Memory() const;
   // Foreground workers call this between operations; synchronous forwarding
   // also polls it while waiting so no dedicated service core is required.
   void PollTransport();

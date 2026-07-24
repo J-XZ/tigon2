@@ -582,6 +582,11 @@ uint64_t KVPartition::hwcc_used_bytes() const {
   return total;
 }
 
+uint64_t KVPartition::migrated_key_count() const {
+  std::lock_guard<std::mutex> lock(clock_mutex_);
+  return clock_keys_.size();
+}
+
 void KVPartition::PersistRoots() {
   directory_.private_root = regions_.swcc().ToOffset(
       private_tree_->root_for_persistence());

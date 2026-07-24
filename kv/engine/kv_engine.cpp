@@ -11,6 +11,8 @@
 #include <chrono>
 #include <charconv>
 #include <map>
+#include <fstream>
+#include <unistd.h>
 
 namespace tigonkv::engine {
 namespace {
@@ -19,6 +21,15 @@ uint64_t Hash(std::string_view key) {
   uint64_t h = 1469598103934665603ULL;
   for (unsigned char c : key) { h ^= c; h *= 1099511628211ULL; }
   return h;
+}
+
+uint64_t CurrentRssKb() {
+  std::ifstream statm("/proc/self/statm");
+  uint64_t pages = 0;
+  uint64_t resident = 0;
+  if (!(statm >> pages >> resident)) return 0;
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  return page_size > 0 ? resident * static_cast<uint64_t>(page_size) / 1024 : 0;
 }
 
 DualRegionConfig RegionConfig(const Config &config) {
@@ -215,6 +226,30 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   } catch (const std::exception &e) {
     return {Status::Error(StatusCode::kCorruption, e.what()), 0};
   }
+}
+
+MemoryStats KVEngine::Memory() const {
+  const auto &regions = pool_->allocator();
+  const auto &layout = regions.layout();
+  MemoryStats stats;
+  stats.allocator_mode = "dual_region";
+  stats.physical_region_split = true;
+  stats.total_pool_capacity_bytes = pool_->bytes();
+  stats.logical_hwcc_capacity_bytes = config_.hwcc_size_mb * 1024ULL * 1024ULL;
+  stats.logical_swcc_capacity_bytes = config_.swcc_size_mb * 1024ULL * 1024ULL;
+  for (size_t domain = 0; domain < static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc);
+       ++domain)
+    stats.logical_hwcc_used_bytes += layout.domains[domain].used_bytes.load(std::memory_order_relaxed);
+  stats.owner_private_swcc_used_bytes = layout.domains[static_cast<size_t>(
+      AllocationDomain::kOwnerPrivateSwcc)].used_bytes.load(std::memory_order_relaxed);
+  stats.shared_payload_swcc_used_bytes = layout.domains[static_cast<size_t>(
+      AllocationDomain::kSharedPayloadSwcc)].used_bytes.load(std::memory_order_relaxed);
+  stats.allocator_shared_overhead_bytes = layout.domains[static_cast<size_t>(
+      AllocationDomain::kAllocatorMetadata)].used_bytes.load(std::memory_order_relaxed);
+  for (const auto &partition : partitions_)
+    stats.active_shared_rows += partition->migrated_key_count();
+  stats.rss_kb = CurrentRssKb();
+  return stats;
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {
