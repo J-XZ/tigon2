@@ -54,6 +54,10 @@ int main() {
     assert(engine->Put("counter", "1").ok());
     const auto incremented = engine->Increment("counter", 2);
     assert(incremented.status.ok() && incremented.value == 3);
+    const auto scan = engine->Scan("alpha", 0);
+    assert(scan.status.ok() && scan.items.size() == 2);
+    assert(scan.items[0].key == "alpha" && scan.items[0].value == "cas-value");
+    assert(scan.items[1].key == "counter" && scan.items[1].value == "3");
     assert(engine->Delete("alpha").ok());
     assert(engine->Get("alpha").status.code == tigonkv::StatusCode::kNotFound);
     assert(engine->Put("persist", "value").ok());

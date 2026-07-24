@@ -36,6 +36,7 @@ class KVEngine {
   GetResult Get(std::string_view key);
   Status Delete(std::string_view key);
   Status MoveOut(std::string_view key);
+  ScanResult Scan(std::string_view start_key, uint64_t limit);
   CasResult CompareExchange(std::string_view key, std::string_view expected,
                             std::string_view desired);
   IncrementResult Increment(std::string_view key, int64_t delta);

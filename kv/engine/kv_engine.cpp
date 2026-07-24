@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <thread>
 #include <chrono>
+#include <map>
 
 namespace tigonkv::engine {
 namespace {
@@ -141,6 +142,34 @@ Status KVEngine::Delete(std::string_view key) {
   if (partition == nullptr) return Forward(KvMessageType::kDelete, key, {}, nullptr);
   return partition->DeletePrivate(key) ? Status::Ok()
                                        : Status::Error(StatusCode::kNotFound, "key not found");
+}
+
+ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
+  constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
+  if (limit > kScanSafetyLimit)
+    return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
+  if (config_.vm_count != 1)
+    return {Status::Error(StatusCode::kOwnerViolation,
+                          "cross-owner scan forwarding is not installed"), {}};
+  std::map<std::string, std::string> merged;
+  const uint64_t per_partition_limit = limit == 0 ? 0 : limit;
+  try {
+    for (const auto &partition : partitions_) {
+      std::vector<std::pair<std::string, std::string>> items;
+      if (!partition->ScanOwned(start_key, per_partition_limit, &items))
+        return {Status::Error(StatusCode::kCorruption,
+                              "partition scan exceeded migration retry budget"), {}};
+      for (auto &item : items) merged.emplace(std::move(item));
+    }
+  } catch (const std::exception &e) {
+    return {Status::Error(StatusCode::kCorruption, e.what()), {}};
+  }
+  ScanResult result{Status::Ok(), {}};
+  for (auto &item : merged) {
+    if (limit != 0 && result.items.size() >= limit) break;
+    result.items.push_back({std::move(item.first), std::move(item.second)});
+  }
+  return result;
 }
 
 CasResult KVEngine::CompareExchange(std::string_view key,
