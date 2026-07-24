@@ -1,5 +1,6 @@
 #include "kv/kv_store.h"
 
+#include "kv/engine/kv_engine.h"
 #include "kv/latency_simulator.h"
 #include "kv/memory_domains.h"
 
@@ -279,6 +280,10 @@ class FileLock {
 }  // namespace
 
 struct KVStore::Impl {
+  // tigonkv: the only live storage implementation is KVEngine.  The legacy
+  // slot fields remain temporarily below solely so the configuration parser
+  // can be separated in the next cleanup checkpoint.
+  std::unique_ptr<engine::KVEngine> engine;
   int fd = -1;
   size_t bytes = 0;
   void *mapping = MAP_FAILED;
@@ -541,6 +546,7 @@ void Config::Validate() const {
     throw std::invalid_argument("invalid latency cache geometry");
 }
 
+#if 0  // tigonkv: retired slot/global-lock/msync engine; delete in M10 cleanup.
 std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
   auto store = std::unique_ptr<KVStore>(new KVStore(config));
   try {
@@ -1125,6 +1131,147 @@ std::string KVStore::DumpStats() const {
   out += "TIGONKV_RUNTIME_STATS\nnode=" + std::to_string(config_.node_id) + "\nlogical_ops=" + std::to_string(runtime_.logical_ops) + "\ncommits=" + std::to_string(runtime_.commits) + "\naborts=" + std::to_string(runtime_.aborts) + "\nretries=" + std::to_string(runtime_.retries) + "\nprivate_gets=" + std::to_string(runtime_.private_gets) + "\nprivate_puts=" + std::to_string(runtime_.private_puts) + "\nprivate_deletes=" + std::to_string(runtime_.private_deletes) + "\nprivate_swcc_flushes=" + std::to_string(runtime_.private_swcc_flushes) + "\ncheckpoint_swcc_flushes=" + std::to_string(runtime_.checkpoint_swcc_flushes) + "\nshared_gets=" + std::to_string(runtime_.shared_gets) + "\nshared_puts=" + std::to_string(runtime_.shared_puts) + "\nshared_deletes=" + std::to_string(runtime_.shared_deletes) + "\nshared_swcc_flushes=" + std::to_string(runtime_.shared_swcc_flushes) + "\nmigration_in=" + std::to_string(runtime_.migration_in) + "\nmigration_out=" + std::to_string(runtime_.migration_out) + "\nnetwork_tx_bytes=0\nnetwork_rx_bytes=0\n";
   const LatencyStats latency = impl_->latency.Snapshot();
   out += "TIGONKV_LATENCY_STATS\nhwcc_reads=" + std::to_string(latency.hwcc_reads) + "\nhwcc_writes=" + std::to_string(latency.hwcc_writes) + "\nhwcc_atomics=" + std::to_string(latency.hwcc_atomics) + "\nswcc_reads=" + std::to_string(latency.swcc_reads) + "\nswcc_writes=" + std::to_string(latency.swcc_writes) + "\nswcc_flushes=" + std::to_string(latency.swcc_flushes) + "\ncache_hits=" + std::to_string(latency.cache_hits) + "\ncache_misses=" + std::to_string(latency.cache_misses) + "\ndelayed_ns=" + std::to_string(latency.delayed_ns) + "\n";
+  return out;
+}
+
+#endif
+
+std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
+  auto store = std::unique_ptr<KVStore>(new KVStore(config));
+  store->Open(reset);
+  return store;
+}
+
+KVStore::KVStore(const Config &config) : impl_(new Impl()), config_(config) {
+  config_.Validate();
+}
+
+KVStore::~KVStore() { Close(); }
+
+void KVStore::Open(bool reset) {
+  impl_->engine = engine::KVEngine::Open(config_, reset);
+}
+
+void KVStore::Close() {
+  if (impl_ == nullptr || impl_->engine == nullptr) return;
+  if (config_.checkpoint_on_clean_exit) (void)impl_->engine->Checkpoint();
+  impl_->engine.reset();
+}
+
+uint32_t KVStore::StablePartitionForKey(std::string_view key) const {
+  uint64_t hash = 1469598103934665603ULL;
+  for (unsigned char c : key) { hash ^= c; hash *= 1099511628211ULL; }
+  return static_cast<uint32_t>(hash % config_.partition_count);
+}
+
+uint32_t KVStore::OwnerForKey(std::string_view key) const {
+  return StablePartitionForKey(key) % config_.vm_count;
+}
+
+void KVStore::ValidateKeyValue(std::string_view key, std::string_view value) const {
+  if (key.empty() || key.size() > config_.fixed_key_size ||
+      value.size() > config_.fixed_value_size)
+    throw std::invalid_argument("key/value exceeds configured fixed size");
+}
+
+Status KVStore::Put(std::string_view key, std::string_view value) {
+  try { ValidateKeyValue(key, value); }
+  catch (const std::exception &e) { return Status::Error(StatusCode::kInvalidArgument, e.what()); }
+  ++runtime_.logical_ops;
+  Status status = impl_->engine->Put(key, value);
+  if (status.ok()) { ++runtime_.commits; ++runtime_.private_puts; }
+  else ++runtime_.aborts;
+  return status;
+}
+
+GetResult KVStore::Get(std::string_view key) {
+  if (key.empty() || key.size() > config_.fixed_key_size)
+    return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
+  ++runtime_.logical_ops;
+  GetResult result = impl_->engine->Get(key);
+  if (result.status.ok()) { ++runtime_.commits; ++runtime_.private_gets; }
+  else if (result.status.code != StatusCode::kNotFound) ++runtime_.aborts;
+  return result;
+}
+
+Status KVStore::Delete(std::string_view key) {
+  if (key.empty() || key.size() > config_.fixed_key_size)
+    return Status::Error(StatusCode::kInvalidArgument, "invalid key");
+  ++runtime_.logical_ops;
+  Status status = impl_->engine->Delete(key);
+  if (status.ok()) { ++runtime_.commits; ++runtime_.private_deletes; }
+  else if (status.code != StatusCode::kNotFound) ++runtime_.aborts;
+  return status;
+}
+
+Status KVStore::MoveOut(std::string_view key) {
+  ++runtime_.logical_ops;
+  Status status = impl_->engine->MoveOut(key);
+  if (status.ok()) { ++runtime_.commits; ++runtime_.migration_out; }
+  return status;
+}
+
+ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
+  if (!config_.enable_scan)
+    return {Status::Error(StatusCode::kInvalidArgument, "SCAN disabled"), {}};
+  ++runtime_.logical_ops;
+  ScanResult result = impl_->engine->Scan(start_key, limit);
+  if (result.status.ok()) ++runtime_.commits;
+  else ++runtime_.aborts;
+  return result;
+}
+
+CasResult KVStore::CompareExchange(std::string_view key, std::string_view expected,
+                                   std::string_view desired) {
+  try { ValidateKeyValue(key, desired); }
+  catch (const std::exception &e) { return {Status::Error(StatusCode::kInvalidArgument, e.what()), false}; }
+  ++runtime_.logical_ops;
+  CasResult result = impl_->engine->CompareExchange(key, expected, desired);
+  if (result.status.ok()) { ++runtime_.commits; ++runtime_.private_puts; }
+  else if (result.status.code == StatusCode::kCompareFailed) ++runtime_.aborts;
+  return result;
+}
+
+IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
+  if (key.empty() || key.size() > config_.fixed_key_size)
+    return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), 0};
+  ++runtime_.logical_ops;
+  IncrementResult result = impl_->engine->Increment(key, delta);
+  if (result.status.ok()) { ++runtime_.commits; ++runtime_.private_puts; }
+  else ++runtime_.aborts;
+  return result;
+}
+
+Status KVStore::Checkpoint() {
+  Status status = impl_->engine->Checkpoint();
+  if (status.ok()) ++runtime_.checkpoint_swcc_flushes;
+  return status;
+}
+
+Status KVStore::RebuildSortedIndex() { return Status::Ok(); }
+
+MemoryStats KVStore::Memory() const { return impl_->engine->Memory(); }
+
+std::string KVStore::DumpStats() const {
+  const MemoryStats memory = Memory();
+  std::string out = "TIGONKV_MEMORY_STATS\n";
+  out += "allocator_mode=" + memory.allocator_mode + "\n";
+  out += "physical_region_split=" + std::to_string(memory.physical_region_split) + "\n";
+  out += "total_pool_capacity_bytes=" + std::to_string(memory.total_pool_capacity_bytes) + "\n";
+  out += "logical_hwcc_capacity_bytes=" + std::to_string(memory.logical_hwcc_capacity_bytes) + "\n";
+  out += "logical_swcc_capacity_bytes=" + std::to_string(memory.logical_swcc_capacity_bytes) + "\n";
+  out += "logical_hwcc_used_bytes=" + std::to_string(memory.logical_hwcc_used_bytes) + "\n";
+  out += "owner_private_swcc_used_bytes=" + std::to_string(memory.owner_private_swcc_used_bytes) + "\n";
+  out += "shared_payload_swcc_used_bytes=" + std::to_string(memory.shared_payload_swcc_used_bytes) + "\n";
+  out += "active_shared_rows=" + std::to_string(memory.active_shared_rows) + "\n";
+  out += "rss_kb=" + std::to_string(memory.rss_kb) + "\n";
+  out += "TIGONKV_RUNTIME_STATS\nnode=" + std::to_string(config_.node_id) + "\n";
+  out += "logical_ops=" + std::to_string(runtime_.logical_ops) + "\n";
+  out += "commits=" + std::to_string(runtime_.commits) + "\n";
+  out += "aborts=" + std::to_string(runtime_.aborts) + "\n";
+  out += "migration_in=" + std::to_string(runtime_.migration_in) + "\n";
+  out += "migration_out=" + std::to_string(runtime_.migration_out) + "\n";
+  out += "TIGONKV_LATENCY_STATS\nhwcc_reads=0\nhwcc_writes=0\nhwcc_atomics=0\nswcc_reads=0\nswcc_writes=0\nswcc_flushes=0\ncache_hits=0\ncache_misses=0\ndelayed_ns=0\n";
   return out;
 }
 

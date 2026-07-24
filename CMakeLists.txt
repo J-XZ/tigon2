@@ -34,7 +34,7 @@ add_library(tigonkv STATIC kv/kv_store.cpp kv/latency_simulator.cpp
   kv/engine/kv_engine.cpp kv/engine/kv_partition.cpp kv/engine/region_allocator.cpp
   common/CXLMemory.cpp common/btree_olc_cxl/BTreeOLC_CXL.cpp
   protocol/Pasha/SCCManager.cpp)
-target_link_libraries(tigonkv PUBLIC pthread)
+target_link_libraries(tigonkv PUBLIC pthread glog)
 
 # tigonkv: legacy transaction benchmarks retain source-only reference status.
 # The redesigned KV target must not link the obsolete cxlalloc implementation.
