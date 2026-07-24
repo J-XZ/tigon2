@@ -7,6 +7,8 @@
 #include <cstring>
 #include <cstdio>
 #include <string>
+#include <utility>
+#include <vector>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -136,6 +138,18 @@ int main() {
   assert(partition.GetPrivate("clock", &value) && value == "victim");
   assert(partition.hwcc_used_bytes() > 0);
   assert(partition.shared_payload_used_bytes() < partition.shared_payload_capacity_bytes());
+
+  // A partition scan merges the private and shared authorities in key order,
+  // without resurrecting tombstones or duplicate migrated locator rows.
+  std::vector<std::pair<std::string, std::string>> scan;
+  assert(partition.ScanOwned("alpha", 0, &scan));
+  assert(scan.size() == 3);
+  assert(scan[0] == std::make_pair(std::string("alpha"), std::string("shared-update")));
+  assert(scan[1] == std::make_pair(std::string("clock"), std::string("victim")));
+  assert(scan[2] == std::make_pair(std::string("gamma"), std::string("replacement")));
+  assert(partition.ScanOwned("alpha", 2, &scan));
+  assert(scan.size() == 2);
+  assert(scan[0].first == "alpha" && scan[1].first == "clock");
   star::scc_manager = nullptr;
 
   const pid_t child = fork();

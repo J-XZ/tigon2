@@ -10,6 +10,8 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace tigonkv::engine {
 
@@ -34,6 +36,8 @@ class KVPartition {
   bool DeletePrivate(std::string_view key);
   bool PromotePrivate(std::string_view key, uint32_t host_id);
   bool MoveOutPrivate(std::string_view key, uint32_t host_id);
+  bool ScanOwned(std::string_view start_key, uint64_t limit,
+                 std::vector<std::pair<std::string, std::string>> *items) const;
   // Owner-local Clock tracker. Returns true only when a quiescent shared
   // victim was copied back and retired.
   bool MoveOutClockVictim(uint32_t host_id);
@@ -54,6 +58,7 @@ class KVPartition {
   void TrackMigratedKey(const FixedKey &key);
   void UntrackMigratedKey(const FixedKey &key);
   void RebuildClockTracker();
+  std::string KeyString(const FixedKey &key) const;
 
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;

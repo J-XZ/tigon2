@@ -1,6 +1,7 @@
 #include "kv/engine/kv_partition.h"
 
 #include <cstring>
+#include <map>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -259,6 +260,69 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   directory_.migration_out_seq.fetch_add(1, std::memory_order_relaxed);
   UntrackMigratedKey(fixed_key);
   return true;
+}
+
+std::string KVPartition::KeyString(const FixedKey &key) const {
+  const auto bytes = regions_.layout().fixed_key_size;
+  size_t length = bytes;
+  while (length != 0 && key.bytes[length - 1] == '\0') --length;
+  return std::string(key.bytes, length);
+}
+
+bool KVPartition::ScanOwned(
+    std::string_view start_key, uint64_t limit,
+    std::vector<std::pair<std::string, std::string>> *items) const {
+  if (items == nullptr) throw std::invalid_argument("null partition scan output");
+  const FixedKey low = MakeKey(start_key);
+  FixedKey high{};
+  std::memset(high.bytes, 0xff, sizeof(high.bytes));
+  for (uint32_t attempt = 0; attempt < 8; ++attempt) {
+    const uint64_t in_before = directory_.migration_in_seq.load(std::memory_order_acquire);
+    const uint64_t out_before = directory_.migration_out_seq.load(std::memory_order_acquire);
+    std::vector<PrivateTree::KeyValuePair> private_rows;
+    std::vector<SharedTree::KeyValuePair> shared_rows;
+    private_tree_->scan(low, high, true, true, 0, private_rows);
+    shared_tree_->scan(low, high, true, true, 0, shared_rows);
+    std::map<std::string, std::string> merged;
+    for (const auto &entry : private_rows) {
+      auto *row = RowFromOffset(entry.second);
+      LockRow(row);
+      if (!row->is_tombstone && !row->is_migrated)
+        merged.emplace(KeyString(entry.first),
+                       std::string(row->kv + row->key_len, row->value_len));
+      UnlockRow(row);
+    }
+    for (const auto &entry : shared_rows) {
+      RegionOffset private_offset = kNullOffset;
+      if (!private_tree_->lookup(entry.first, private_offset)) continue;
+      auto *row = RowFromOffset(private_offset);
+      LockRow(row);
+      const bool live = !row->is_tombstone && row->is_migrated &&
+                        row->migrated_smeta_off == entry.second;
+      const uint32_t value_len = row->value_len;
+      if (!live) {
+        UnlockRow(row);
+        continue;
+      }
+      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+          regions_.hwcc().FromOffset(entry.second));
+      std::string value(value_len, '\0');
+      const bool read = star::TwoPLPashaHelper::kv_shared_read(
+          smeta, owner_shard_, value.data(), value.size());
+      if (read) merged[KeyString(entry.first)] = std::move(value);
+      UnlockRow(row);
+    }
+    const uint64_t in_after = directory_.migration_in_seq.load(std::memory_order_acquire);
+    const uint64_t out_after = directory_.migration_out_seq.load(std::memory_order_acquire);
+    if (in_before != in_after || out_before != out_after) continue;
+    items->clear();
+    for (auto &entry : merged) {
+      if (limit != 0 && items->size() >= limit) break;
+      items->emplace_back(std::move(entry));
+    }
+    return true;
+  }
+  return false;
 }
 
 bool KVPartition::DeletePrivate(std::string_view key) {
