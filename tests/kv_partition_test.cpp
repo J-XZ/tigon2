@@ -141,6 +141,10 @@ int main() {
   int64_t incremented = 0;
   assert(partition.IncrementPrivate("counter", 2, &incremented) && incremented == 3);
   assert(partition.GetPrivate("counter", &value) && value == "3");
+  assert(partition.IncrementPrivate("new-counter", -2, &incremented) && incremented == -2);
+  assert(partition.GetPrivate("new-counter", &value) && value == "-2");
+  assert(partition.CompareExchangePrivate("new-cas", "", "created", &exchanged));
+  assert(exchanged && partition.GetPrivate("new-cas", &value) && value == "created");
 
   // PolicyClock's first pass consumes the shared metadata second-chance bit;
   // the next pass selects the same quiescent key and performs real move-out.
@@ -156,11 +160,13 @@ int main() {
   // without resurrecting tombstones or duplicate migrated locator rows.
   std::vector<std::pair<std::string, std::string>> scan;
   assert(partition.ScanOwned("alpha", 0, &scan));
-  assert(scan.size() == 4);
+  assert(scan.size() == 6);
   assert(scan[0] == std::make_pair(std::string("alpha"), std::string("shared-update")));
   assert(scan[1] == std::make_pair(std::string("clock"), std::string("victim")));
   assert(scan[2] == std::make_pair(std::string("counter"), std::string("3")));
   assert(scan[3] == std::make_pair(std::string("gamma"), std::string("cas-shared")));
+  assert(scan[4] == std::make_pair(std::string("new-cas"), std::string("created")));
+  assert(scan[5] == std::make_pair(std::string("new-counter"), std::string("-2")));
   assert(partition.ScanOwned("alpha", 2, &scan));
   assert(scan.size() == 2);
   assert(scan[0].first == "alpha" && scan[1].first == "clock");

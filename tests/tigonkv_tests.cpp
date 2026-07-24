@@ -445,8 +445,6 @@ int main() {
   const auto scan = store->Scan("alpha", 0);
   assert(scan.status.ok() && scan.items.size() == 2);
   assert(store->CompareExchange("alpha", "one", "three").exchanged);
-  assert(store->Increment("counter", 3).status.code == StatusCode::kNotFound);
-  assert(store->Put("counter", "0").ok());
   assert(store->Increment("counter", 3).value == 3);
   assert(store->Checkpoint().ok());
   assert(store->Memory().physical_region_split);

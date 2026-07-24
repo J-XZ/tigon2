@@ -170,7 +170,15 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   *exchanged = false;
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
-  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  if (!private_tree_->lookup(fixed_key, row_offset)) {
+    if (!expected.empty()) return false;
+    auto *row = AllocateRow(fixed_key, desired);
+    if (!private_tree_->insert(fixed_key, regions_.swcc().ToOffset(row)))
+      throw std::runtime_error("private tree CAS insert race without owner serialization");
+    PersistRoots();
+    *exchanged = true;
+    return true;
+  }
   auto *row = RowFromOffset(row_offset);
   LockRow(row);
   if (row->is_tombstone) {
@@ -222,7 +230,15 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
   if (value == nullptr) throw std::invalid_argument("null increment result");
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
-  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  if (!private_tree_->lookup(fixed_key, row_offset)) {
+    const std::string encoded = std::to_string(delta);
+    auto *row = AllocateRow(fixed_key, encoded);
+    if (!private_tree_->insert(fixed_key, regions_.swcc().ToOffset(row)))
+      throw std::runtime_error("private tree increment insert race without owner serialization");
+    PersistRoots();
+    *value = delta;
+    return true;
+  }
   auto *row = RowFromOffset(row_offset);
   LockRow(row);
   if (row->is_tombstone) {
