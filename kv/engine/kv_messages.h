@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string_view>
 
 namespace tigonkv::engine {
