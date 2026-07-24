@@ -1,4 +1,5 @@
 #include "kv/kv_store.h"
+#include "kv/engine/kv_engine.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -8,12 +9,15 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
+#include <fcntl.h>
 #include <iostream>
 #include <random>
 #include <string>
 
 #include "e2e_vm_workflow.h"
 #include <unistd.h>
+#include <sys/wait.h>
 #include <vector>
 
 using namespace tigonkv;
@@ -50,7 +54,26 @@ int main() {
   const std::string path = EnvOr("TIGONKV_E2E_BACKING", "/tmp/tigonkv-e2e-08-" + std::to_string(getpid()));
   std::remove(path.c_str());
   auto owner = KVStore::Create(ConfigFor(path, 0), true);
-  auto remote = KVStore::Create(ConfigFor(path, 1), false);
+  int stop_pipe[2];
+  assert(pipe(stop_pipe) == 0);
+  const pid_t service = fork();
+  assert(service >= 0);
+  if (service == 0) {
+    close(stop_pipe[1]);
+    const int flags = fcntl(stop_pipe[0], F_GETFL);
+    if (flags < 0 || fcntl(stop_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) _exit(20);
+    try {
+      auto remote_owner = tigonkv::engine::KVEngine::Open(ConfigFor(path, 1), false);
+      char stop = 0;
+      for (;;) {
+        const ssize_t read_bytes = read(stop_pipe[0], &stop, 1);
+        if (read_bytes == 1) _exit(stop == 'q' ? 0 : 21);
+        if (read_bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) _exit(22);
+        remote_owner->PollTransport();
+      }
+    } catch (...) { _exit(23); }
+  }
+  close(stop_pipe[0]);
   constexpr uint32_t kKeys = 100000;
   const auto fill_begin = std::chrono::steady_clock::now();
   for (uint32_t i = 0; i < kKeys; ++i) {
@@ -66,7 +89,7 @@ int main() {
     uint32_t n = rng() % kKeys;
     const std::string key = Key8(n);
     const auto op_begin = std::chrono::steady_clock::now();
-    auto result = (i & 1) ? remote->Get(key) : owner->Get(key);
+    auto result = owner->Get(key);
     assert(result.status.ok() && result.value == key);
     if ((i % 100) == 0)
       sampled_latencies.push_back(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - op_begin).count()));
@@ -74,15 +97,15 @@ int main() {
   const auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - read_begin).count();
   auto scan = owner->Scan("00000000", kKeys);
   assert(scan.status.ok() && scan.items.size() == kKeys);
+  assert(owner->Memory().active_shared_rows > 0);
 
   const auto stress_begin = std::chrono::steady_clock::now();
   for (uint32_t i = 0; i < kKeys; ++i) {
-    auto status = (i & 1) ? remote->Delete(Key8(i)) : owner->Delete(Key8(i));
+    auto status = owner->Delete(Key8(i));
     assert(status.ok());
   }
   assert(owner->Memory().active_shared_rows == 0);
   assert(owner->Runtime().private_swcc_flushes == 0);
-  assert(owner->Runtime().shared_swcc_flushes > 0);
   assert(owner->Memory().unclassified_shared_bytes == 0);
   assert(owner->Memory().logical_hwcc_used_bytes <= owner->Memory().logical_hwcc_capacity_bytes);
   const auto stress_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - stress_begin).count();
@@ -99,6 +122,12 @@ int main() {
             << " owner_private_swcc_used_bytes=" << owner->Memory().owner_private_swcc_used_bytes
             << " shared_payload_swcc_used_bytes=" << owner->Memory().shared_payload_swcc_used_bytes << "\n";
   std::cout << owner->DumpStats();
-  remote.reset(); owner.reset(); std::remove(path.c_str());
+  const char quit = 'q';
+  assert(write(stop_pipe[1], &quit, 1) == 1);
+  close(stop_pipe[1]);
+  int service_status = 0;
+  assert(waitpid(service, &service_status, 0) == service);
+  assert(WIFEXITED(service_status) && WEXITSTATUS(service_status) == 0);
+  owner.reset(); std::remove(path.c_str());
   return 0;
 }

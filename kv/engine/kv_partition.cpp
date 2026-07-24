@@ -773,8 +773,12 @@ uint64_t KVPartition::hwcc_used_bytes() const {
 }
 
 uint64_t KVPartition::migrated_key_count() const {
-  std::lock_guard<std::mutex> lock(clock_mutex_);
-  return clock_keys_.size();
+  FixedKey low{};
+  FixedKey high{};
+  std::memset(high.bytes, 0xff, sizeof(high.bytes));
+  std::vector<SharedTree::KeyValuePair> entries;
+  shared_tree_->scan(low, high, true, true, 0, entries);
+  return entries.size();
 }
 
 void KVPartition::PersistRoots() {
