@@ -154,6 +154,68 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id) {
   return true;
 }
 
+bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
+  if (star::scc_manager == nullptr) return false;
+  RegionOffset row_offset = kNullOffset;
+  const FixedKey fixed_key = MakeKey(key);
+  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  if (!row->is_migrated || row->migrated_smeta_off == kNullOffset) {
+    UnlockRow(row);
+    return false;
+  }
+  const RegionOffset smeta_offset = row->migrated_smeta_off;
+  RegionOffset indexed_offset = kNullOffset;
+  if (!shared_tree_->lookup(fixed_key, indexed_offset) || indexed_offset != smeta_offset) {
+    UnlockRow(row);
+    return false;
+  }
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  smeta->lock();
+  auto *payload = smeta->get_scc_data();
+  if (payload->ref_cnt != 0 || smeta->get_reader_count() != 0 || smeta->is_write_locked()) {
+    smeta->unlock();
+    UnlockRow(row);
+    return false;
+  }
+  smeta->set_write_locked();
+  star::scc_manager->prepare_read(smeta, host_id, payload,
+                                  sizeof(star::TwoPLPashaSharedDataSCC) + row->value_len);
+  if (!payload->get_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index)) {
+    smeta->clear_write_locked();
+    smeta->unlock();
+    UnlockRow(row);
+    return false;
+  }
+  star::scc_manager->do_read(smeta, host_id, row->kv + row->key_len, payload->data,
+                             row->value_len);
+  row->is_migrated = 0;
+  row->migrated_smeta_off = kNullOffset;
+  if (!shared_tree_->remove(fixed_key)) {
+    // Restore the only published owner state before exposing the failure.
+    row->is_migrated = 1;
+    row->migrated_smeta_off = smeta_offset;
+    smeta->clear_write_locked();
+    smeta->unlock();
+    UnlockRow(row);
+    return false;
+  }
+  smeta->clear_write_locked();
+  smeta->unlock();
+  ebr_.add_retired_object(smeta, sizeof(star::TwoPLPashaMetadataShared),
+                          star::CXLMemory::METADATA_FREE, owner_shard_);
+  ebr_.add_retired_object(payload,
+                          sizeof(star::TwoPLPashaSharedDataSCC) +
+                              regions_.layout().fixed_value_size,
+                          star::CXLMemory::DATA_FREE, owner_shard_);
+  UnlockRow(row);
+  PersistRoots();
+  directory_.migration_out_seq.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 bool KVPartition::DeletePrivate(std::string_view key) {
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);

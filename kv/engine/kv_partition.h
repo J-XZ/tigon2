@@ -32,6 +32,7 @@ class KVPartition {
   bool GetPrivate(std::string_view key, std::string *value) const;
   bool DeletePrivate(std::string_view key);
   bool PromotePrivate(std::string_view key, uint32_t host_id);
+  bool MoveOutPrivate(std::string_view key, uint32_t host_id);
 
   // Must be called after an operation which might split or collapse a root.
   // It writes only region-relative offsets into the persistent directory.

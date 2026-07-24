@@ -93,6 +93,9 @@ int main() {
   assert(partition.PromotePrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   assert(regions.layout().partitions[5].migration_in_seq.load() == 1);
+  assert(partition.MoveOutPrivate("alpha", 1));
+  assert(partition.GetPrivate("alpha", &value) && value == "updated");
+  assert(regions.layout().partitions[5].migration_out_seq.load() == 1);
   star::scc_manager = nullptr;
   assert(partition.DeletePrivate("beta"));
   assert(!partition.GetPrivate("beta", &value));
