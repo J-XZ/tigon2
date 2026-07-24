@@ -532,7 +532,7 @@ void Config::Validate() const {
     throw std::invalid_argument("invalid KV configuration");
   if (hw_cc_budget_mb == 0 || hw_cc_budget_mb > hwcc_size_mb ||
       owner_private_swcc_fraction <= 0.0 || owner_private_swcc_fraction >= 1.0 ||
-      partition_count % vm_count != 0 || node_id >= vm_count ||
+      node_id >= vm_count ||
       transport_ring_total_mb == 0 || transport_ring_total_mb > hwcc_size_mb ||
       migration_policy != "Clock" || when_to_move_out != "OnDemand" ||
       scc_mechanism != "WriteThrough")

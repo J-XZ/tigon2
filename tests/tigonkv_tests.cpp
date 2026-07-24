@@ -425,6 +425,17 @@ int main(int argc, char **argv) {
 #endif
 
 int main() {
+  Config uneven;
+  uneven.size_mb = 16;
+  uneven.hwcc_size_mb = 4;
+  uneven.swcc_offset_mb = 4;
+  uneven.swcc_size_mb = 12;
+  uneven.hw_cc_budget_mb = 4;
+  uneven.vm_count = 2;
+  uneven.node_id = 1;
+  uneven.partition_count = 7;
+  uneven.transport_ring_total_mb = 1;
+  uneven.Validate();
   const std::string path = "/tmp/tigonkv-facade-" + std::to_string(getpid());
   std::remove(path.c_str());
   Config config;
