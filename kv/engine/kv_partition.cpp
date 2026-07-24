@@ -93,6 +93,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
           : nullptr;
       // Keep the private latch through the shared operation so move-out cannot
       // remove the shared authority between lookup and the SCC write.
+      mem_access::SharedPayloadWrite(smeta, value.size());
       const bool written = star::TwoPLPashaHelper::kv_shared_write(
           smeta, owner_shard_, value.data(), value.size());
       if (written) {
@@ -150,6 +151,7 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(smeta_offset));
   std::string shared(value_len, '\0');
+  mem_access::SharedPayloadRead(smeta, value_len);
   const bool read = star::TwoPLPashaHelper::kv_shared_read(
       smeta, owner_shard_, shared.data(), value_len);
   if (read) {
@@ -211,9 +213,11 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(smeta_offset));
   std::string current(row->value_len, '\0');
+  mem_access::SharedPayloadRead(smeta, current.size());
   const bool read = star::TwoPLPashaHelper::kv_shared_read(
       smeta, owner_shard_, current.data(), current.size());
   if (read && current == expected) {
+    mem_access::SharedPayloadWrite(smeta, desired.size());
     if (!star::TwoPLPashaHelper::kv_shared_write(
             smeta, owner_shard_, desired.data(), desired.size())) {
       UnlockRow(row);
@@ -266,6 +270,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
     smeta = static_cast<star::TwoPLPashaMetadataShared *>(
         regions_.hwcc().FromOffset(smeta_offset));
     current.resize(row->value_len);
+    mem_access::SharedPayloadRead(smeta, current.size());
     if (!star::TwoPLPashaHelper::kv_shared_read(
             smeta, owner_shard_, current.data(), current.size())) {
       UnlockRow(row);
@@ -283,6 +288,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
   const int64_t next = previous + delta;
   const std::string encoded = std::to_string(next);
   if (smeta != nullptr) {
+    mem_access::SharedPayloadWrite(smeta, encoded.size());
     if (!star::TwoPLPashaHelper::kv_shared_write(
             smeta, owner_shard_, encoded.data(), encoded.size())) {
       UnlockRow(row);
@@ -321,6 +327,7 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id) {
       AllocationDomain::kHwccMetadata, owner_shard_)) star::TwoPLPashaMetadataShared(payload);
   star::scc_manager->init_scc_metadata(smeta, host_id);
   smeta->lock();
+  mem_access::SharedPayloadWrite(payload->data, row->value_len);
   star::scc_manager->do_write(smeta, host_id, payload->data, row->kv + row->key_len,
                                row->value_len);
   payload->set_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
@@ -378,6 +385,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
     UnlockRow(row);
     return false;
   }
+  mem_access::SharedPayloadRead(payload->data, row->value_len);
   star::scc_manager->do_read(smeta, host_id, row->kv + row->key_len, payload->data,
                              row->value_len);
   row->is_migrated = 0;
@@ -451,6 +459,7 @@ bool KVPartition::ScanOwned(
       auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
           regions_.hwcc().FromOffset(entry.second));
       std::string value(value_len, '\0');
+      mem_access::SharedPayloadRead(smeta, value.size());
       const bool read = star::TwoPLPashaHelper::kv_shared_read(
           smeta, owner_shard_, value.data(), value.size());
       if (read) merged[KeyString(entry.first)] = std::move(value);
