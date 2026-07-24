@@ -1175,6 +1175,7 @@ void KVStore::ValidateKeyValue(std::string_view key, std::string_view value) con
 }
 
 Status KVStore::Put(std::string_view key, std::string_view value) {
+  impl_->engine->PollTransport();
   try { ValidateKeyValue(key, value); }
   catch (const std::exception &e) { return Status::Error(StatusCode::kInvalidArgument, e.what()); }
   ++runtime_.logical_ops;
@@ -1185,6 +1186,7 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
 }
 
 GetResult KVStore::Get(std::string_view key) {
+  impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
   ++runtime_.logical_ops;
@@ -1195,6 +1197,7 @@ GetResult KVStore::Get(std::string_view key) {
 }
 
 Status KVStore::Delete(std::string_view key) {
+  impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return Status::Error(StatusCode::kInvalidArgument, "invalid key");
   ++runtime_.logical_ops;
@@ -1205,6 +1208,7 @@ Status KVStore::Delete(std::string_view key) {
 }
 
 Status KVStore::MoveOut(std::string_view key) {
+  impl_->engine->PollTransport();
   ++runtime_.logical_ops;
   Status status = impl_->engine->MoveOut(key);
   if (status.ok()) { ++runtime_.commits; ++runtime_.migration_out; }
@@ -1212,6 +1216,7 @@ Status KVStore::MoveOut(std::string_view key) {
 }
 
 ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
+  impl_->engine->PollTransport();
   if (!config_.enable_scan)
     return {Status::Error(StatusCode::kInvalidArgument, "SCAN disabled"), {}};
   ++runtime_.logical_ops;
@@ -1223,6 +1228,7 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
 
 CasResult KVStore::CompareExchange(std::string_view key, std::string_view expected,
                                    std::string_view desired) {
+  impl_->engine->PollTransport();
   try { ValidateKeyValue(key, desired); }
   catch (const std::exception &e) { return {Status::Error(StatusCode::kInvalidArgument, e.what()), false}; }
   ++runtime_.logical_ops;
@@ -1233,6 +1239,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
 }
 
 IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
+  impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), 0};
   ++runtime_.logical_ops;
