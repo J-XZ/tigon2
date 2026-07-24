@@ -51,10 +51,16 @@ struct TreeNodeAllocation {
 	tigonkv::engine::DualRegionAllocator *regions = nullptr;
 	tigonkv::engine::AllocationDomain domain = tigonkv::engine::AllocationDomain::kHwccIndex;
 	uint32_t owner_shard = 0;
+	star::CXL_EBR *ebr = nullptr;
 
 	void *Allocate(uint64_t bytes) const {
 		if (regions == nullptr) throw std::invalid_argument("BPlusTree requires a region allocation binding");
 		return regions->Allocate(bytes, domain, owner_shard);
+	}
+
+	void Retire(void *pointer, uint64_t bytes) const {
+		if (ebr == nullptr) throw std::runtime_error("BPlusTree requires an EBR binding for node retirement");
+		ebr->add_retired_object(pointer, bytes, star::CXLMemory::INDEX_FREE, owner_shard);
 	}
 };
 
@@ -584,7 +590,7 @@ class BPlusTree {
 	 */
 	class BTreeLeaf : public NodeBase {
 	    public:
-		static constexpr uint64_t maxEntries = (LeafPageSize - sizeof(NodeBase) - sizeof(TreeNodeAllocation *) - sizeof(boost::interprocess::offset_ptr<BTreeLeaf>) * 2) / (sizeof(KeyValuePair));
+		static constexpr uint64_t maxEntries = (LeafPageSize - sizeof(NodeBase) - sizeof(boost::interprocess::offset_ptr<BTreeLeaf>) * 2) / (sizeof(KeyValuePair));
 		static_assert(maxEntries >= 3, "maxEntries of BTreeLeaf must >= 3");
 
 		boost::interprocess::offset_ptr<BTreeLeaf> pre_;
@@ -593,14 +599,12 @@ class BPlusTree {
 		/** This is the array that we perform search on */
 		KeyType keys_[maxEntries];
 		ValueType values_[maxEntries];
-		const TreeNodeAllocation *allocation_;
 		// KeyValuePair data_[0];
 
-		BTreeLeaf(const TreeNodeAllocation *allocation)
+		BTreeLeaf()
 			: NodeBase(NodeType::BTreeLeaf)
 			, pre_(nullptr)
 			, next_(nullptr)
-			, allocation_(allocation)
 		{
 		}
 
@@ -691,7 +695,7 @@ class BPlusTree {
 		 * merge right `sibling`
 		 * `sibling` need to be reclaimed
 		 */
-		void merge(BTreeLeaf *sibling)
+		void merge(BTreeLeaf *sibling, const TreeNodeAllocation &allocation)
 		{
 			assert(hasEnoughSpace(sibling->getCount()));
 			for (uint16_t i = this->getCount(); i < sibling->getCount() + this->getCount(); i++) {
@@ -705,8 +709,7 @@ class BPlusTree {
                         if (this->next_.get())
                                 sibling->next_->pre_ = this;
 			assert(((uint64_t)sibling) != 0xffffffffffffffffull);
-                        star::cxl_memory.cxlalloc_free_wrapper(sibling, kLeafPageSize, star::CXLMemory::INDEX_FREE);
-                        star::global_ebr_meta->add_retired_object(sibling, kLeafPageSize, star::CXLMemory::INDEX_FREE);
+			allocation.Retire(sibling, kLeafPageSize);
 		}
 
 		bool needMerge()
@@ -878,10 +881,10 @@ class BPlusTree {
 		/**
 		 * split leaf node
 		 */
-		BTreeLeaf *split(KeyType &sep)
+		BTreeLeaf *split(KeyType &sep, const TreeNodeAllocation &allocation)
 		{
-			char *base = reinterpret_cast<char *>(allocation_->Allocate(LeafPageSize));
-			BTreeLeaf *newLeaf = new (base) BTreeLeaf(allocation_); // Placement new
+			char *base = reinterpret_cast<char *>(allocation.Allocate(LeafPageSize));
+			BTreeLeaf *newLeaf = new (base) BTreeLeaf(); // Placement new
 
 			newLeaf->setCount(this->getCount() - (this->getCount() / 2));
 			newLeaf->next_ = next_.get();
@@ -930,7 +933,7 @@ class BPlusTree {
 	 */
 	class BTreeInner : public NodeBase {
 	    public:
-		static constexpr uint64_t maxEntries = (InnerPageSize - sizeof(NodeBase) - sizeof(TreeNodeAllocation *)) / (sizeof(KeyType) + sizeof(boost::interprocess::offset_ptr<NodeBase>));
+		static constexpr uint64_t maxEntries = (InnerPageSize - sizeof(NodeBase)) / (sizeof(KeyType) + sizeof(boost::interprocess::offset_ptr<NodeBase>));
 		static_assert(maxEntries >= 3, "maxEntries of BTreeInner must >= 3");
 
 		static constexpr uint64_t childOffset = maxEntries * sizeof(KeyType);
@@ -941,12 +944,10 @@ class BPlusTree {
 		 *  | Key 0 | Key 1 | ... | Key N | Child 0 | Child 1 | ... | Child N |
 		 *  -------------------------------------------------------------------
 		 */
-		const TreeNodeAllocation *allocation_;
 		char data_[0];
 
-		BTreeInner(const TreeNodeAllocation *allocation)
+		BTreeInner()
 			: NodeBase(NodeType::BTreeInner)
-			, allocation_(allocation)
 		{
 		}
 
@@ -978,9 +979,9 @@ class BPlusTree {
 		 *
 		 * NOTE: return true, if need to change root node
 		 */
-		bool erase(int pos)
+		bool erase(int pos, const TreeNodeAllocation &allocation)
 		{
-			__adjust_elements_in_erase(pos);
+			__adjust_elements_in_erase(pos, allocation);
 
 			this->setCount(this->getCount() - 1);
 			return this->getCount() == 0;
@@ -988,7 +989,7 @@ class BPlusTree {
 		/**
 		 * @note Used when KeyType is trivial, e.g. `OLTPBtreeFixedLenKey`.
 		 */
-		template <typename T = KeyType> typename std::enable_if<std::is_trivial<T>::value == true, void>::type __adjust_elements_in_erase(int pos)
+		template <typename T = KeyType> typename std::enable_if<std::is_trivial<T>::value == true, void>::type __adjust_elements_in_erase(int pos, const TreeNodeAllocation &allocation)
 		{
 			for (int i = pos; i < this->getCount() - 1; i++) {
 				keyAt(i) = keyAt(i + 1);
@@ -1004,7 +1005,7 @@ class BPlusTree {
 		/**
 		 * @note Used when KeyType is non-trivial, e.g. `OLTPBtreeVarlenKey`.
 		 */
-		template <typename T = KeyType> typename std::enable_if<std::is_trivial<T>::value == false, void>::type __adjust_elements_in_erase(int pos)
+		template <typename T = KeyType> typename std::enable_if<std::is_trivial<T>::value == false, void>::type __adjust_elements_in_erase(int pos, const TreeNodeAllocation &allocation)
 		{
 			assert(false);
 			/*
@@ -1022,8 +1023,7 @@ class BPlusTree {
 			 * the pointer to EBR, it will delete the pointer safely.
 			 */
 			assert(((uint64_t)ptr) != 0xffffffffffffffffull);
-			star::cxl_memory.cxlalloc_free_wrapper(ptr, kLeafPageSize, star::CXLMemory::INDEX_FREE);
-                        star::global_ebr_meta->add_retired_object(ptr, kLeafPageSize, star::CXLMemory::INDEX_FREE);
+			allocation.Retire(ptr, kLeafPageSize);
 
 			// always merge nodes to the left node, so remove the `pos + 1` child
 			// memmove(&childAt(pos + 1), &childAt(pos + 2), sizeof(boost::interprocess::offset_ptr<NodeBase>) * (this->getCount() - pos - 1));
@@ -1032,7 +1032,7 @@ class BPlusTree {
                         }
 		}
 
-		void merge(BTreeInner *sibling, const KeyType &subTreeMaxKey)
+		void merge(BTreeInner *sibling, const KeyType &subTreeMaxKey, const TreeNodeAllocation &allocation)
 		{
 			__adjust_elements_in_merge(sibling, subTreeMaxKey);
 
@@ -1040,8 +1040,7 @@ class BPlusTree {
 			this->setCount(this->getCount() + sibling->getCount());
 
 			assert(((uint64_t)sibling) != 0xffffffffffffffffull);
-			star::cxl_memory.cxlalloc_free_wrapper(sibling, kLeafPageSize, star::CXLMemory::INDEX_FREE);
-                        star::global_ebr_meta->add_retired_object(sibling, kLeafPageSize, star::CXLMemory::INDEX_FREE);
+			allocation.Retire(sibling, kLeafPageSize);
 		}
 		/**
 		 * @note Used when KeyType is trivial, e.g. `OLTPBtreeFixedLenKey`.
@@ -1126,10 +1125,10 @@ class BPlusTree {
 			return this->getCount() - threshold;
 		}
 
-		BTreeInner *split(KeyType &sep)
+		BTreeInner *split(KeyType &sep, const TreeNodeAllocation &allocation)
 		{
-			char *base = reinterpret_cast<char *>(allocation_->Allocate(InnerPageSize));
-			BTreeInner *newInner = new (base) BTreeInner(allocation_); // Placement new
+			char *base = reinterpret_cast<char *>(allocation.Allocate(InnerPageSize));
+			BTreeInner *newInner = new (base) BTreeInner(); // Placement new
 
 			newInner->setCount(this->getCount() - (this->getCount() / 2));
 			this->setCount(this->getCount() - newInner->getCount() - 1);
@@ -1453,16 +1452,35 @@ class BPlusTree {
 		, allocation_(allocation)
 	{
 		char *base = reinterpret_cast<char *>(allocation_.Allocate(LeafPageSize));
-		root_.store(new (base) BTreeLeaf(&allocation_)); // Placement new
+		root_.store(new (base) BTreeLeaf()); // Placement new
 		stats_.leaf_nodes++;
 		// std::cout << "BTreeLeaf::maxEntries = " << BTreeLeaf::maxEntries << ", "
 		//           << "BTreeInner::maxEntries = " << BTreeInner::maxEntries << ".\n";
 	}
 
+	// The root is persisted separately as a region-relative offset.  Nodes keep
+	// only offset_ptr links, while the process-local tree instance supplies the
+	// allocator/EBR binding for future mutations and reclamation.
+	BPlusTree(const TreeNodeAllocation &allocation, void *persisted_root,
+	          bool isUnique = false, const KeyComparator &keyComp = KeyComparator{},
+	          const ValueComparator &valueComp = ValueComparator{})
+		: keyComp_(keyComp)
+		, valueComp_(valueComp)
+		, keyUnique_(isUnique)
+		, allocation_(allocation)
+	{
+		if (persisted_root == nullptr) {
+			throw std::invalid_argument("BPlusTree attach requires a persisted root");
+		}
+		root_.store(static_cast<NodeBase *>(persisted_root));
+	}
+
+	void *root_for_persistence() const { return root_.load(); }
+
 	void makeRoot(const KeyType &k, NodeBase *leftChild, NodeBase *rightChild)
 	{
 		char *base = reinterpret_cast<char *>(allocation_.Allocate(InnerPageSize));
-		auto inner = new (base) BTreeInner(&allocation_); // Placement new
+		auto inner = new (base) BTreeInner(); // Placement new
 
 		inner->setCount(1);
 		inner->newKey(0, k);
@@ -1678,8 +1696,7 @@ class BPlusTree {
 		p->keyAt(pos) = key.deepCopy();
 
 		assert(((uint64_t)ptr) != 0xffffffffffffffffull);
-		star::cxl_memory.cxlalloc_free_wrapper(ptr, kLeafPageSize, star::CXLMemory::INDEX_FREE);
-                star::global_ebr_meta->add_retired_object(ptr, kLeafPageSize, star::CXLMemory::INDEX_FREE);
+		allocation_.Retire(ptr, kLeafPageSize);
 	}
 
 	/**
@@ -1733,7 +1750,7 @@ restart:
 				}
 				// Split
 				KeyType sep;
-				BTreeInner *newInner = inner->split(sep);
+				BTreeInner *newInner = inner->split(sep, allocation_);
 				stats_.inner_nodes++;
 				if (parent)
 					parent->insert(sep, newInner, keyComp_);
@@ -1801,7 +1818,7 @@ restart:
 			}
 			// Split
 			KeyType sep;
-			BTreeLeaf *newLeaf = leaf->split(sep);
+			BTreeLeaf *newLeaf = leaf->split(sep, allocation_);
 			stats_.leaf_nodes++;
 			if (keyComp_(k, sep) > 0) {
 				success = newLeaf->insert(k, v, keyComp_);
@@ -1897,7 +1914,7 @@ restart:
 				}
 				// Split
 				KeyType sep;
-				BTreeInner *newInner = inner->split(sep);
+				BTreeInner *newInner = inner->split(sep, allocation_);
 				stats_.inner_nodes++;
 				if (parent)
 					parent->insert(sep, newInner, keyComp_);
@@ -1967,7 +1984,7 @@ restart:
 			}
 			// Split
 			KeyType sep;
-			BTreeLeaf *newLeaf = leaf->split(sep);
+			BTreeLeaf *newLeaf = leaf->split(sep, allocation_);
 			stats_.leaf_nodes++;
 			if (keyComp_(k, sep) > 0) {
 				insertRes = newLeaf->insert(k, v, keyComp_, success);
@@ -2068,7 +2085,7 @@ restart:
 				}
 				// Split
 				KeyType sep;
-				BTreeInner *newInner = inner->split(sep);
+				BTreeInner *newInner = inner->split(sep, allocation_);
 				stats_.inner_nodes++;
 				if (parent)
 					parent->insert(sep, newInner, keyComp_);
@@ -2139,7 +2156,7 @@ restart:
 			}
 			// Split
 			KeyType sep;
-			BTreeLeaf *newLeaf = leaf->split(sep);
+			BTreeLeaf *newLeaf = leaf->split(sep, allocation_);
 			stats_.leaf_nodes++;
 			if (keyComp_(k, sep) > 0) {
 				insertRes = newLeaf->getValue(k, keyComp_, createValue, success);
@@ -2574,30 +2591,28 @@ restart:
 			auto child = static_cast<BTreeLeaf *>(childNode);
 			auto sibling = static_cast<BTreeLeaf *>(siblingNode);
 			if (opt == MergeOperation::LeftToRight) {
-				child->merge(sibling);
+				child->merge(sibling, allocation_);
 				stats_.leaf_nodes--;
 				// KeyType siblingMaxKey = sibling->max_key();
 				// parentNode->keys_[childPos] = siblingMaxKey;
-				changeRoot = parentNode->erase(childPos);
+				changeRoot = parentNode->erase(childPos, allocation_);
 				// if (changeRoot && parentNode == root_.load()) {
 				if (changeRoot && parentNode == root_.load()) {
 					assert(((uint64_t)parentNode) != 0xffffffffffffffffull);
-					star::cxl_memory.cxlalloc_free_wrapper(parentNode, kLeafPageSize, star::CXLMemory::INDEX_FREE);
-                                        star::global_ebr_meta->add_retired_object(parentNode, kLeafPageSize, star::CXLMemory::INDEX_FREE);
+					allocation_.Retire(parentNode, kLeafPageSize);
 					root_.store(child);
 					// if (parentNode == root_.load()) root_.store(child);
 				}
 			} else if (opt == MergeOperation::RightToLeft) {
-				sibling->merge(child);
+				sibling->merge(child, allocation_);
 				stats_.leaf_nodes--;
 				// KeyType childMaxKey = child->max_key();
 				// parentNode->keys_[siblingPos] = childMaxKey;
-				changeRoot = parentNode->erase(siblingPos);
+				changeRoot = parentNode->erase(siblingPos, allocation_);
 				if (changeRoot && parentNode == root_.load()) {
 					// if (changeRoot) {
 					assert(((uint64_t)parentNode) != 0xffffffffffffffffull);
-					star::cxl_memory.cxlalloc_free_wrapper(parentNode, kLeafPageSize, star::CXLMemory::INDEX_FREE);
-                                        star::global_ebr_meta->add_retired_object(parentNode, kLeafPageSize, star::CXLMemory::INDEX_FREE);
+					allocation_.Retire(parentNode, kLeafPageSize);
 					root_.store(sibling);
 				}
 			} else if (opt == MergeOperation::BorrowFromRight) {
@@ -2610,27 +2625,25 @@ restart:
 			auto sibling = static_cast<BTreeInner *>(siblingNode);
 			if (opt == MergeOperation::LeftToRight) {
 				const KeyType &subTreeMaxKey = _getSubTreeMaxKey(child->childAt(child->getCount()).get());
-				child->merge(sibling, subTreeMaxKey);
+				child->merge(sibling, subTreeMaxKey, allocation_);
 				stats_.inner_nodes--;
 				// KeyType siblingSubTreeMaxKey = _getSubTreeMaxKey(sibling);
-				changeRoot = parentNode->erase(childPos);
+				changeRoot = parentNode->erase(childPos, allocation_);
 				if (changeRoot && parentNode == root_.load()) {
 					// if (changeRoot) {
 					assert(((uint64_t)parentNode) != 0xffffffffffffffffull);
-					star::cxl_memory.cxlalloc_free_wrapper(parentNode, kLeafPageSize, star::CXLMemory::INDEX_FREE);
-                                        star::global_ebr_meta->add_retired_object(parentNode, kLeafPageSize, star::CXLMemory::INDEX_FREE);
+					allocation_.Retire(parentNode, kLeafPageSize);
 					root_.store(child);
 				}
 			} else if (opt == MergeOperation::RightToLeft) {
 				const KeyType &subTreeMaxKey = _getSubTreeMaxKey(sibling->childAt(sibling->getCount()).get());
-				sibling->merge(child, subTreeMaxKey);
+				sibling->merge(child, subTreeMaxKey, allocation_);
 				stats_.inner_nodes--;
-				changeRoot = parentNode->erase(siblingPos);
+				changeRoot = parentNode->erase(siblingPos, allocation_);
 				if (changeRoot && parentNode == root_.load()) {
 					// if (changeRoot) {
 					assert(((uint64_t)parentNode) != 0xffffffffffffffffull);
-					star::cxl_memory.cxlalloc_free_wrapper(parentNode, kLeafPageSize, star::CXLMemory::INDEX_FREE);
-                                        star::global_ebr_meta->add_retired_object(parentNode, kLeafPageSize, star::CXLMemory::INDEX_FREE);
+					allocation_.Retire(parentNode, kLeafPageSize);
 					root_.store(sibling);
 				}
 			} else if (opt == MergeOperation::BorrowFromRight) {
