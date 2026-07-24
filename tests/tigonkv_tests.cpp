@@ -459,6 +459,10 @@ int main() {
   assert(store->Increment("counter", 3).value == 3);
   assert(store->Checkpoint().ok());
   assert(store->Memory().physical_region_split);
+  const std::string stats = store->DumpStats();
+  assert(stats.find("allocator_shared_overhead_bytes=") != std::string::npos);
+  assert(stats.find("reclaimed_total_bytes=") != std::string::npos);
+  assert(stats.find("network_tx_bytes=") != std::string::npos);
   store.reset();
   auto attached = KVStore::Create(config, false);
   assert(attached->Get("alpha").value == "three");
