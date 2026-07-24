@@ -38,9 +38,9 @@ history) as the current target architecture.
 Build and local verification:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build -j2
-ctest --test-dir build --output-on-failure
+cmake -S . -B build-relwithdebinfo -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-relwithdebinfo -j2
+ctest --test-dir build-relwithdebinfo --output-on-failure
 ```
 
 The repository's original `bench_ycsb` and `bench_tpcc` targets remain available.
