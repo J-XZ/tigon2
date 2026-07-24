@@ -62,6 +62,20 @@ class CXLMemory {
                 owner_shard_ = owner_shard;
         }
 
+        static uint64_t pointer_to_pool_offset(const void *pointer)
+        {
+                if (dual_regions_ == nullptr)
+                        throw std::runtime_error("tigonkv: dual-region allocator is not bound");
+                return dual_regions_->ToPoolOffset(pointer);
+        }
+
+        static void *pool_offset_to_pointer(uint64_t offset)
+        {
+                if (dual_regions_ == nullptr)
+                        throw std::runtime_error("tigonkv: dual-region allocator is not bound");
+                return dual_regions_->FromPoolOffset(offset);
+        }
+
         void init_cxlalloc_for_given_thread(uint64_t threads_num_per_host, uint64_t thread_id, uint64_t hosts_num, uint64_t host_id)
         {
                 (void)threads_num_per_host; (void)thread_id; (void)hosts_num;

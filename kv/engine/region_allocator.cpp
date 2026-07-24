@@ -426,6 +426,19 @@ bool DualRegionAllocator::IsSwccAddress(const void *pointer) const {
          p < base + header_->owner_private_arenas_offset + header_->owner_private_arenas_bytes;
 }
 
+uint64_t DualRegionAllocator::ToPoolOffset(const void *pointer) const {
+  const auto *p = static_cast<const std::byte *>(pointer);
+  if (p == nullptr || p < pool_ || p >= pool_ + config_.total_pool_bytes)
+    throw std::invalid_argument("pointer outside dual-region pool");
+  return static_cast<uint64_t>(p - pool_);
+}
+
+void *DualRegionAllocator::FromPoolOffset(uint64_t offset) const {
+  if (offset >= config_.total_pool_bytes)
+    throw std::invalid_argument("offset outside dual-region pool");
+  return pool_ + offset;
+}
+
 bool DualRegionAllocator::IsInOwnerPrivateArena(const void *pointer,
                                                 uint32_t partition_id) const {
   const auto *arena = Arena(partition_id);

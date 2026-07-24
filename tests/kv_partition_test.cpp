@@ -43,6 +43,9 @@ int main() {
       128, star::CXLMemory::DATA_ALLOCATION);
   assert(regions.IsHwccAddress(index_object));
   assert(regions.IsSwccAddress(payload_object));
+  const uint64_t payload_offset = star::CXLMemory::pointer_to_pool_offset(payload_object);
+  assert(payload_offset < (1ull << 37));
+  assert(star::CXLMemory::pool_offset_to_pointer(payload_offset) == payload_object);
   star::CXLMemory::commit_shared_data_initialization(
       star::CXLMemory::cxl_global_epoch_root_index, index_object);
   void *recovered_root = nullptr;

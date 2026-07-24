@@ -154,6 +154,8 @@ class DualRegionAllocator {
             uint32_t owner_shard, uint32_t current_shard);
   bool IsHwccAddress(const void *pointer) const;
   bool IsSwccAddress(const void *pointer) const;
+  uint64_t ToPoolOffset(const void *pointer) const;
+  void *FromPoolOffset(uint64_t offset) const;
   bool IsInOwnerPrivateArena(const void *pointer, uint32_t partition_id) const;
   RegionOffset OwnerPrivateArenaOffset(uint32_t partition_id) const;
   const SharedLayoutHeader &layout() const { return header_->layout; }
