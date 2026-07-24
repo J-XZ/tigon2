@@ -462,7 +462,9 @@ experiment_config 段）与根 `experiment_config.jsonc`。
 
 对照基准（拷贝与公平合同均以此为准，M0 抄入 `修改日志.md`）：
 
-- cxlkv 对照 = branch `my-work` @ `e282a65a7e4f76ac1f9f772f99301d96f7fca5de`；
+- cxlkv 对照 = branch `my-work` @ `984ad91a614ae65b57d0fe53ccc174bb6e962bcd`
+  （M0 更新：原钉死 `e282a65a7e4f76ac1f9f772f99301d96f7fca5de` 后上游新增
+  CloudLab R650 配置与 VM 清理脚本修正；本仓将按当前提交的正式配置合同对齐）；
 - YCSB-cpp submodule gitlink = `746415127173e7711f134944dbcd92b8216c47e7`
   （url `https://github.com/J-XZ/YCSB-cpp.git`）；
 - 本仓起点 = HEAD `8ab9294`；引擎对照基准 = 原始 Tigon `ccd567a…`。

@@ -16,7 +16,14 @@ add_compile_options(-Wall -Wextra -Wpedantic -fno-omit-frame-pointer
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_compile_options(-O0 -g3)
 elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+  # tigonkv: keep the release-with-symbols contract aligned with the fairness
+  # plan.  GCC spells full-program LTO as bare -flto; Clang uses -flto=full.
   add_compile_options(-O3 -g3 -march=native)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-flto)
+  else()
+    add_compile_options(-flto=full)
+  endif()
 elseif(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
