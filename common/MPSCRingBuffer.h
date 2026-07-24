@@ -6,6 +6,7 @@
 
 #include "common/Message.h"
 #include "common/CXLMemory.h"
+#include "kv/engine/mem_access.h"
 #include <boost/interprocess/offset_ptr.hpp>
 #include <stddef.h>
 #include <atomic>
@@ -86,6 +87,7 @@ class MPSCRingBuffer {
                 entry = reinterpret_cast<Entry *>(entries_buffer.get() + cur_tail * entry_struct_size);
 
                 /* memcpy the data to the target endpoint's receive queue */
+                tigonkv::engine::mem_access::TransportWrite(entry->data, data_size);
                 memcpy(entry->data, data, data_size);
                 clwb(entry->data, data_size);
 
@@ -131,6 +133,7 @@ class MPSCRingBuffer {
 
                 /* memcpy the data to the user-provided buffer and update the metadata */
                 clflush(entry->data, dequeue_size);
+                tigonkv::engine::mem_access::TransportRead(entry->data, dequeue_size);
                 memcpy(data_buffer, entry->data, dequeue_size);
                 entry->dequeue_offset += dequeue_size;
                 entry->remaining_size -= dequeue_size;

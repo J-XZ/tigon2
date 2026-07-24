@@ -26,5 +26,10 @@ inline void TransportWrite(const void *address, size_t bytes) {
     GlobalLatencySimulator().Record(PoolKind::kHwcc, AccessKind::kWrite, bytes,
                                     reinterpret_cast<uintptr_t>(address) / 64);
 }
+inline void SwccFlush(const void *address, size_t bytes) {
+  if (InstrumentationEnabledFast())
+    GlobalLatencySimulator().Record(PoolKind::kSwcc, AccessKind::kFlush, bytes,
+                                    reinterpret_cast<uintptr_t>(address) / 64);
+}
 
 }  // namespace tigonkv::engine::mem_access

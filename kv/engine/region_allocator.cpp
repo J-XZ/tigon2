@@ -1,4 +1,5 @@
 #include "kv/engine/region_allocator.h"
+#include "kv/engine/mem_access.h"
 
 #include <algorithm>
 #include <cstring>
@@ -14,6 +15,7 @@ namespace tigonkv::engine {
 namespace {
 
 void FlushForRemoteVisibility(const void *address, size_t bytes) {
+  mem_access::SwccFlush(address, bytes);
 #if defined(__x86_64__) || defined(__i386__)
   const auto begin = reinterpret_cast<uintptr_t>(address) & ~(RegionAllocator::kAlignment - 1);
   const auto end = reinterpret_cast<uintptr_t>(address) + bytes;

@@ -9,6 +9,7 @@
 #include <immintrin.h>
 #include <xmmintrin.h>
 #include <glog/logging.h>
+#include "kv/engine/mem_access.h"
 
 /*
  * memory ordering:
@@ -50,6 +51,7 @@ class SCCManager {
 
         inline void clflush(const void *addr, uint64_t len)
         {
+                tigonkv::engine::mem_access::SwccFlush(addr, len);
                 // statistics
                 num_clflush.fetch_add(1);
 
@@ -67,6 +69,7 @@ class SCCManager {
 
         inline void clwb(const void *addr, uint64_t len)
         {
+                tigonkv::engine::mem_access::SwccFlush(addr, len);
                 // statistics
                 num_clwb.fetch_add(1);
 

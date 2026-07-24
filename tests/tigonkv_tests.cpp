@@ -467,8 +467,9 @@ int main() {
   assert(stats.find("allocator_shared_overhead_bytes=") != std::string::npos);
   assert(stats.find("reclaimed_total_bytes=") != std::string::npos);
   assert(stats.find("network_tx_bytes=") != std::string::npos);
-  assert(stats.find("swcc_reads=0") == std::string::npos);
-  assert(stats.find("swcc_writes=0") == std::string::npos);
+  assert(stats.find("\nswcc_reads=0\n") == std::string::npos);
+  assert(stats.find("\nswcc_writes=0\n") == std::string::npos);
+  assert(stats.find("\nswcc_flushes=0\n") == std::string::npos);
   store.reset();
   auto attached = KVStore::Create(config, false);
   assert(attached->Get("alpha").value == "three");
