@@ -7,7 +7,7 @@ source "$root/scripts/tigonkv_vm_common.sh"
 tigonkv_load_vm_config "$config"
 binary_dir=${TIGONKV_E2E_BINARY_DIR:-$root/build-rel}
 log_root=${1:?usage: $0 LOG_ROOT [ROUNDS] [SUITES]}
-rounds=${2:-${TIGONKV_E2E_ROUNDS:-5}}
+rounds=${2:-${TIGONKV_E2E_ROUNDS:-10}}
 suites=${3:-${TIGONKV_E2E_SUITES:-"08 09"}}
 vm_count=${TIGONKV_VM_COUNT:-4}
 threads=${TIGONKV_E2E_THREADS:-4}

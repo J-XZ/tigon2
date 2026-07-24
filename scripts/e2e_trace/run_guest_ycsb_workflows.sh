@@ -7,7 +7,7 @@ source "$root/scripts/tigonkv_vm_common.sh"
 tigonkv_load_vm_config "$config"
 trace_root=${1:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 log_root=${2:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
-rounds=${3:-${TIGONKV_E2E_ROUNDS:-5}}
+rounds=${3:-${TIGONKV_E2E_ROUNDS:-10}}
 workloads=${4:-${TIGONKV_YCSB_WORKLOADS:-"A B C D E"}}
 vm_count=${TIGONKV_VM_COUNT:-4}
 threads_per_vm=${TIGONKV_YCSB_THREADS_PER_VM:-${TIGONKV_E2E_THREADS:-4}}
