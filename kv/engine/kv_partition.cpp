@@ -71,10 +71,35 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
   RegionOffset row_offset = kNullOffset;
   if (private_tree_->lookup(fixed_key, row_offset)) {
     auto *row = RowFromOffset(row_offset);
+    LockRow(row);
+    if (row->is_tombstone) {
+      UnlockRow(row);
+      return false;
+    }
+    if (row->is_migrated) {
+      const RegionOffset smeta_offset = row->migrated_smeta_off;
+      RegionOffset indexed_offset = kNullOffset;
+      const bool shared_present = smeta_offset != kNullOffset &&
+          shared_tree_->lookup(fixed_key, indexed_offset) && indexed_offset == smeta_offset;
+      auto *smeta = shared_present
+          ? static_cast<star::TwoPLPashaMetadataShared *>(regions_.hwcc().FromOffset(smeta_offset))
+          : nullptr;
+      // Keep the private latch through the shared operation so move-out cannot
+      // remove the shared authority between lookup and the SCC write.
+      const bool written = star::TwoPLPashaHelper::kv_shared_write(
+          smeta, owner_shard_, value.data(), value.size());
+      if (written) {
+        row->value_len = static_cast<uint32_t>(value.size());
+        ++row->version;
+      }
+      UnlockRow(row);
+      if (!written) throw std::runtime_error("migrated row shared write rejected");
+      return false;
+    }
     row->value_len = static_cast<uint32_t>(value.size());
     std::memcpy(row->kv + row->key_len, value.data(), value.size());
     ++row->version;
-    row->is_tombstone = 0;
+    UnlockRow(row);
     return false;
   }
   auto *row = AllocateRow(fixed_key, value);
@@ -101,15 +126,22 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   }
   const RegionOffset smeta_offset = row->migrated_smeta_off;
   const uint32_t value_len = row->value_len;
-  UnlockRow(row);
-  if (smeta_offset == kNullOffset) return false;
-  RegionOffset shared_value = kNullOffset;
-  if (!shared_tree_->lookup(MakeKey(key), shared_value) || shared_value != smeta_offset)
+  if (smeta_offset == kNullOffset) {
+    UnlockRow(row);
     return false;
+  }
+  RegionOffset shared_value = kNullOffset;
+  if (!shared_tree_->lookup(MakeKey(key), shared_value) || shared_value != smeta_offset) {
+    UnlockRow(row);
+    return false;
+  }
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(smeta_offset));
   std::string shared(value_len, '\0');
-  if (!star::TwoPLPashaHelper::kv_shared_read(smeta, owner_shard_, shared.data(), value_len))
+  const bool read = star::TwoPLPashaHelper::kv_shared_read(
+      smeta, owner_shard_, shared.data(), value_len);
+  UnlockRow(row);
+  if (!read)
     return false;
   *value = std::move(shared);
   return true;
@@ -221,10 +253,57 @@ bool KVPartition::DeletePrivate(std::string_view key) {
   const FixedKey fixed_key = MakeKey(key);
   if (!private_tree_->lookup(fixed_key, row_offset)) return false;
   auto *row = RowFromOffset(row_offset);
+  LockRow(row);
   row->is_tombstone = 1;
-  if (!private_tree_->remove(fixed_key)) return false;
-  // Row reclamation is deferred until the partition's migration/EBR protocol
-  // owns it; immediate free here could race a future shared-row transition.
+  const uint64_t row_bytes = sizeof(PrivateRow) + regions_.layout().fixed_key_size +
+                             regions_.layout().fixed_value_size;
+  if (row->is_migrated) {
+    const RegionOffset smeta_offset = row->migrated_smeta_off;
+    RegionOffset indexed_offset = kNullOffset;
+    if (smeta_offset == kNullOffset || !shared_tree_->lookup(fixed_key, indexed_offset) ||
+        indexed_offset != smeta_offset) {
+      row->is_tombstone = 0;
+      UnlockRow(row);
+      return false;
+    }
+    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+        regions_.hwcc().FromOffset(smeta_offset));
+    smeta->lock();
+    auto *payload = smeta->get_scc_data();
+    if (payload->ref_cnt != 0 || smeta->get_reader_count() != 0 || smeta->is_write_locked()) {
+      smeta->unlock();
+      row->is_tombstone = 0;
+      UnlockRow(row);
+      return false;
+    }
+    smeta->set_write_locked();
+    payload->clear_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
+    if (!shared_tree_->remove(fixed_key)) {
+      payload->set_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
+      smeta->clear_write_locked();
+      smeta->unlock();
+      row->is_tombstone = 0;
+      UnlockRow(row);
+      return false;
+    }
+    row->is_migrated = 0;
+    row->migrated_smeta_off = kNullOffset;
+    smeta->clear_write_locked();
+    smeta->unlock();
+    ebr_.add_retired_object(smeta, sizeof(star::TwoPLPashaMetadataShared),
+                            star::CXLMemory::METADATA_FREE, owner_shard_);
+    ebr_.add_retired_object(payload,
+                            sizeof(star::TwoPLPashaSharedDataSCC) +
+                                regions_.layout().fixed_value_size,
+                            star::CXLMemory::DATA_FREE, owner_shard_);
+  }
+  if (!private_tree_->remove(fixed_key)) {
+    UnlockRow(row);
+    throw std::runtime_error("private tree remove failed after shared delete");
+  }
+  ebr_.add_retired_object(row, row_bytes, star::CXLMemory::MISC_FREE,
+                          owner_shard_, partition_id_);
+  UnlockRow(row);
   PersistRoots();
   return true;
 }

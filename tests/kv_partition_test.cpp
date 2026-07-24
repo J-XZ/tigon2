@@ -95,13 +95,17 @@ int main() {
   star::scc_manager = &scc;
   assert(partition.PromotePrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
+  // Once migrated, PUT must update the shared SCC authority rather than the
+  // retained private locator row.
+  assert(!partition.PutPrivate("alpha", "shared-update"));
+  assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
   assert(regions.layout().partitions[5].migration_in_seq.load() == 1);
   const auto hwcc_before_moveout = regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load();
   const auto swcc_before_moveout = regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load();
   assert(partition.MoveOutPrivate("alpha", 1));
-  assert(partition.GetPrivate("alpha", &value) && value == "updated");
+  assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
   assert(regions.layout().partitions[5].migration_out_seq.load() == 1);
   assert(ebr.drain_quiescent() > 0);
   assert(regions.layout().domains[
@@ -111,6 +115,18 @@ int main() {
   star::scc_manager = nullptr;
   assert(partition.DeletePrivate("beta"));
   assert(!partition.GetPrivate("beta", &value));
+
+  // Deleting a migrated key must remove both the shared authority and its
+  // private locator, then retire all three objects through EBR.
+  star::scc_manager = &scc;
+  assert(partition.PutPrivate("gamma", "three"));
+  assert(partition.PromotePrivate("gamma", 1));
+  assert(partition.DeletePrivate("gamma"));
+  assert(!partition.GetPrivate("gamma", &value));
+  assert(ebr.drain_quiescent() > 0);
+  assert(partition.PutPrivate("gamma", "replacement"));
+  assert(partition.GetPrivate("gamma", &value) && value == "replacement");
+  star::scc_manager = nullptr;
 
   const pid_t child = fork();
   assert(child >= 0);
@@ -123,7 +139,7 @@ int main() {
     star::scc_manager = &attached_scc;
     tigonkv::engine::KVPartition attached(attached_regions, attached_ebr, 5, 1, true);
     std::string child_value;
-    if (!attached.GetPrivate("alpha", &child_value) || child_value != "updated") _exit(1);
+    if (!attached.GetPrivate("alpha", &child_value) || child_value != "shared-update") _exit(1);
     if (attached.GetPrivate("beta", &child_value)) _exit(1);
     _exit(0);
   }
