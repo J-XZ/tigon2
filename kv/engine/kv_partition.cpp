@@ -1,6 +1,8 @@
 #include "kv/engine/kv_partition.h"
 
+#include <charconv>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <new>
 #include <stdexcept>
@@ -155,6 +157,125 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   if (!read)
     return false;
   *value = std::move(shared);
+  return true;
+}
+
+bool KVPartition::CompareExchangePrivate(std::string_view key,
+                                         std::string_view expected,
+                                         std::string_view desired,
+                                         bool *exchanged) {
+  if (exchanged == nullptr) throw std::invalid_argument("null CAS result");
+  if (desired.size() > regions_.layout().fixed_value_size)
+    throw std::invalid_argument("CAS desired value exceeds fixed value size");
+  *exchanged = false;
+  RegionOffset row_offset = kNullOffset;
+  const FixedKey fixed_key = MakeKey(key);
+  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  if (row->is_tombstone) {
+    UnlockRow(row);
+    return false;
+  }
+  if (!row->is_migrated) {
+    const std::string_view current(row->kv + row->key_len, row->value_len);
+    if (current == expected) {
+      row->value_len = static_cast<uint32_t>(desired.size());
+      std::memcpy(row->kv + row->key_len, desired.data(), desired.size());
+      ++row->version;
+      *exchanged = true;
+    }
+    UnlockRow(row);
+    return true;
+  }
+  const RegionOffset smeta_offset = row->migrated_smeta_off;
+  RegionOffset indexed_offset = kNullOffset;
+  if (smeta_offset == kNullOffset || !shared_tree_->lookup(fixed_key, indexed_offset) ||
+      indexed_offset != smeta_offset) {
+    UnlockRow(row);
+    return false;
+  }
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  std::string current(row->value_len, '\0');
+  const bool read = star::TwoPLPashaHelper::kv_shared_read(
+      smeta, owner_shard_, current.data(), current.size());
+  if (read && current == expected) {
+    if (!star::TwoPLPashaHelper::kv_shared_write(
+            smeta, owner_shard_, desired.data(), desired.size())) {
+      UnlockRow(row);
+      throw std::runtime_error("migrated CAS shared write rejected");
+    }
+    row->value_len = static_cast<uint32_t>(desired.size());
+    ++row->version;
+    smeta->lock();
+    smeta->set_bit(37);
+    smeta->unlock();
+    *exchanged = true;
+  }
+  UnlockRow(row);
+  return read;
+}
+
+bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
+                                   int64_t *value) {
+  if (value == nullptr) throw std::invalid_argument("null increment result");
+  RegionOffset row_offset = kNullOffset;
+  const FixedKey fixed_key = MakeKey(key);
+  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  if (row->is_tombstone) {
+    UnlockRow(row);
+    return false;
+  }
+  std::string current;
+  star::TwoPLPashaMetadataShared *smeta = nullptr;
+  if (!row->is_migrated) {
+    current.assign(row->kv + row->key_len, row->value_len);
+  } else {
+    const RegionOffset smeta_offset = row->migrated_smeta_off;
+    RegionOffset indexed_offset = kNullOffset;
+    if (smeta_offset == kNullOffset || !shared_tree_->lookup(fixed_key, indexed_offset) ||
+        indexed_offset != smeta_offset) {
+      UnlockRow(row);
+      return false;
+    }
+    smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+        regions_.hwcc().FromOffset(smeta_offset));
+    current.resize(row->value_len);
+    if (!star::TwoPLPashaHelper::kv_shared_read(
+            smeta, owner_shard_, current.data(), current.size())) {
+      UnlockRow(row);
+      return false;
+    }
+  }
+  int64_t previous = 0;
+  const auto parsed = std::from_chars(current.data(), current.data() + current.size(), previous);
+  if (parsed.ec != std::errc{} || parsed.ptr != current.data() + current.size() ||
+      (delta > 0 && previous > std::numeric_limits<int64_t>::max() - delta) ||
+      (delta < 0 && previous < std::numeric_limits<int64_t>::min() - delta)) {
+    UnlockRow(row);
+    throw std::invalid_argument("increment requires a non-overflowing int64 value");
+  }
+  const int64_t next = previous + delta;
+  const std::string encoded = std::to_string(next);
+  if (smeta != nullptr) {
+    if (!star::TwoPLPashaHelper::kv_shared_write(
+            smeta, owner_shard_, encoded.data(), encoded.size())) {
+      UnlockRow(row);
+      throw std::runtime_error("migrated increment shared write rejected");
+    }
+    smeta->lock();
+    smeta->set_bit(37);
+    smeta->unlock();
+  } else {
+    std::memcpy(row->kv + row->key_len, encoded.data(), encoded.size());
+  }
+  row->value_len = static_cast<uint32_t>(encoded.size());
+  ++row->version;
+  *value = next;
+  UnlockRow(row);
   return true;
 }
 

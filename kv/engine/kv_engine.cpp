@@ -143,6 +143,46 @@ Status KVEngine::Delete(std::string_view key) {
                                        : Status::Error(StatusCode::kNotFound, "key not found");
 }
 
+CasResult KVEngine::CompareExchange(std::string_view key,
+                                    std::string_view expected,
+                                    std::string_view desired) {
+  auto *partition = OwnedPartition(key);
+  if (partition == nullptr) {
+    return {Status::Error(StatusCode::kOwnerViolation,
+                          "remote CAS forwarding is not installed"), false};
+  }
+  try {
+    bool exchanged = false;
+    if (!partition->CompareExchangePrivate(key, expected, desired, &exchanged))
+      return {Status::Error(StatusCode::kNotFound, "key not found"), false};
+    return {exchanged ? Status::Ok()
+                      : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
+            exchanged};
+  } catch (const std::bad_alloc &) {
+    return {Status::Error(StatusCode::kOutOfMemory, "allocator exhausted"), false};
+  } catch (const std::exception &e) {
+    return {Status::Error(StatusCode::kInvalidArgument, e.what()), false};
+  }
+}
+
+IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
+  auto *partition = OwnedPartition(key);
+  if (partition == nullptr) {
+    return {Status::Error(StatusCode::kOwnerViolation,
+                          "remote increment forwarding is not installed"), 0};
+  }
+  try {
+    int64_t value = 0;
+    if (!partition->IncrementPrivate(key, delta, &value))
+      return {Status::Error(StatusCode::kNotFound, "key not found"), 0};
+    return {Status::Ok(), value};
+  } catch (const std::invalid_argument &e) {
+    return {Status::Error(StatusCode::kInvalidArgument, e.what()), 0};
+  } catch (const std::exception &e) {
+    return {Status::Error(StatusCode::kCorruption, e.what()), 0};
+  }
+}
+
 void KVEngine::SendTransportMessage(const KvMessage &message) {
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {

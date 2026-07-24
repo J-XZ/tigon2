@@ -34,6 +34,9 @@ class KVPartition {
   // Owner read: follows is_migrated to the shared SCC payload when present.
   bool GetPrivate(std::string_view key, std::string *value) const;
   bool DeletePrivate(std::string_view key);
+  bool CompareExchangePrivate(std::string_view key, std::string_view expected,
+                              std::string_view desired, bool *exchanged);
+  bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value);
   bool PromotePrivate(std::string_view key, uint32_t host_id);
   bool MoveOutPrivate(std::string_view key, uint32_t host_id);
   bool ScanOwned(std::string_view start_key, uint64_t limit,

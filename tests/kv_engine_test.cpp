@@ -47,6 +47,13 @@ int main() {
     assert(engine->Put("alpha", "updated").ok());
     const auto found = engine->Get("alpha");
     assert(found.status.ok() && found.value == "updated");
+    const auto cas = engine->CompareExchange("alpha", "updated", "cas-value");
+    assert(cas.status.ok() && cas.exchanged);
+    const auto cas_failed = engine->CompareExchange("alpha", "updated", "ignored");
+    assert(cas_failed.status.code == tigonkv::StatusCode::kCompareFailed && !cas_failed.exchanged);
+    assert(engine->Put("counter", "1").ok());
+    const auto incremented = engine->Increment("counter", 2);
+    assert(incremented.status.ok() && incremented.value == 3);
     assert(engine->Delete("alpha").ok());
     assert(engine->Get("alpha").status.code == tigonkv::StatusCode::kNotFound);
     assert(engine->Put("persist", "value").ok());
