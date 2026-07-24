@@ -78,12 +78,15 @@ class CXL_EBR {
 
         void thread_init_ebr_meta(uint64_t coordinator_id, uint64_t thread_id)
         {
-                static std::atomic<uint64_t> thread_id_candidate{ 0 };
-
                 EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
 
+                CHECK(coordinator_id < coordinator_num);
+                CHECK(thread_id < thread_num);
                 local_ebr_meta.coordinator_id = coordinator_id;
-                local_ebr_meta.thread_id = thread_id_candidate++;
+                // The caller owns the worker identity.  A process-global
+                // counter leaked identities across independent engines and
+                // could eventually index beyond this EBR instance's grid.
+                local_ebr_meta.thread_id = thread_id;
 
                 local_ebr_meta.last_freed_epoch = 0;
 
