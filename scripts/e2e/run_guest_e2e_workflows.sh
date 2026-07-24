@@ -116,8 +116,12 @@ for suite in $suites; do
   case "$suite" in
     08) phases=(fill read) ;;
     09)
-      phases=(fill update read)
-      if [[ "${TIGONKV_E2E09_INCLUDE_MIXED:-0}" == 1 ]]; then
+      if [[ "${TIGONKV_E2E09_MIXED_ONLY:-0}" == 1 ]]; then
+        phases=(mixed)
+      else
+        phases=(fill update read)
+      fi
+      if [[ "${TIGONKV_E2E09_INCLUDE_MIXED:-0}" == 1 && "${TIGONKV_E2E09_MIXED_ONLY:-0}" != 1 ]]; then
         phases+=(mixed)
       fi
       ;;

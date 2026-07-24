@@ -170,9 +170,10 @@ inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
       try {
         while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
-        const std::string key = Key09((static_cast<uint64_t>(base.node_id) << 32U) | worker);
+        const std::string key = Key09(static_cast<uint64_t>(base.node_id) * threads + worker);
         while (std::chrono::steady_clock::now() < deadline) {
-          if (!store.Put(key, "0").ok()) throw std::runtime_error("mixed PUT failed");
+          const Status put = store.Put(key, "0");
+          if (!put.ok()) throw std::runtime_error("mixed PUT failed: " + put.message);
           const GetResult promoted = store.Get(key);
           if (!promoted.status.ok() || promoted.value != "0")
             throw std::runtime_error("mixed GET promotion verification failed");
@@ -185,9 +186,12 @@ inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
           const GetResult verified = store.Get(key);
           if (!verified.status.ok() || verified.value != "2")
             throw std::runtime_error("mixed GET after CAS verification failed");
-          if (!store.Delete(key).ok()) throw std::runtime_error("mixed DELETE failed");
-          operations.fetch_add(6, std::memory_order_relaxed);
+          operations.fetch_add(5, std::memory_order_relaxed);
         }
+        if (!store.Delete(key).ok()) throw std::runtime_error("mixed DELETE failed");
+        const GetResult deleted = store.Get(key);
+        if (deleted.status.code != StatusCode::kNotFound)
+          throw std::runtime_error("mixed DELETE visibility verification failed");
       } catch (...) {
         std::lock_guard<std::mutex> guard(error_mutex);
         if (!error) error = std::current_exception();
