@@ -8,6 +8,7 @@
 
 #include <stdexcept>
 #include <thread>
+#include <chrono>
 
 namespace tigonkv::engine {
 namespace {
@@ -155,11 +156,15 @@ Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_v
   const uint32_t owner = OwnerForKey(key);
   const uint64_t request_id = (static_cast<uint64_t>(config_.node_id) << 56) | next_request_id_++;
   SendTransportMessage(MakeRequest(type, config_.node_id, owner, request_id, key, value));
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::seconds(config_.sync_timeout_sec);
   for (;;) {
     PollTransport();
     std::lock_guard<std::mutex> lock(response_mutex_);
     auto it = responses_.find(request_id);
     if (it == responses_.end()) {
+      if (std::chrono::steady_clock::now() >= deadline)
+        return Status::Error(StatusCode::kCorruption, "forwarded owner response timed out");
       std::this_thread::yield();
       continue;
     }
