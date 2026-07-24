@@ -363,6 +363,12 @@ class TwoPLPashaHelper {
                 smeta->set_write_locked();
                 auto *scc_data = smeta->get_scc_data();
                 smeta->unlock();
+                // The write-through SCC protocol requires the writer's
+                // cache-valid bit before finish_write invalidates all peers.
+                // Transactional callers normally establish it on their read
+                // path; the standalone KV shared-write path must do so here.
+                scc_manager->prepare_read(smeta, host_id, scc_data,
+                                          sizeof(TwoPLPashaSharedDataSCC) + size);
                 scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
                 scc_data->set_flag(TwoPLPashaSharedDataSCC::valid_flag_index);
                 scc_manager->finish_write(smeta, host_id, scc_data,

@@ -59,6 +59,19 @@ void Barrier(const std::string &phase, uint32_t node, bool final, KVStore *store
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 }
+
+void DrainTransport(KVStore &store) {
+  const uint64_t drain_ms = ParseUnsigned(
+      Env("TIGONKV_E2E_TRANSPORT_DRAIN_MS", "CXLKV_E2E_TRANSPORT_DRAIN_MS", "5000"),
+      "transport drain duration");
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(drain_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    const Status status = store.PollTransport();
+    if (!status.ok()) Fail("transport poll failed while draining: " + status.message);
+    std::this_thread::yield();
+  }
+}
 }
 
 int main() {
@@ -135,6 +148,7 @@ int main() {
       ++ops;
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+    DrainTransport(*store);
     Barrier(phase, config.node_id, true, store.get());
     if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
     const std::string heartbeat = Env("TIGONKV_E2E_TRACE_HEARTBEAT_SEC", "CXLKV_E2E_TRACE_HEARTBEAT_SEC", "0");
