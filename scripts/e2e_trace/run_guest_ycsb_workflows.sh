@@ -73,7 +73,10 @@ run_fixed() {
   local trace_dir="$remote_root/ycsb-guest-traces/round$round/workload$workload/$phase"
   local zeroed=""
   [[ "$reset" == 1 ]] && zeroed="TIGONKV_DEVICE_BACKING_ZEROED=1"
-  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_VERBOSE=${TIGONKV_E2E_VERBOSE:-0} TIGONKV_E2E_RESET=$reset $zeroed '$remote_runner'"
+  # The phase orchestrator consumes stage=opened to release peer VMs.  This
+  # control-plane marker is outside the timed replay window and must not rely
+  # on a caller remembering to enable verbose output.
+  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_VERBOSE=1 TIGONKV_E2E_RESET=$reset $zeroed '$remote_runner'"
   timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$command" >"$log" 2>&1
 }
 
