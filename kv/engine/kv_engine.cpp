@@ -244,6 +244,7 @@ ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t li
   const uint64_t per_partition_limit = limit == 0 ? 0 : limit;
   try {
     for (const auto &partition : partitions_) {
+      if (OwnerForPartition(partition->partition_id()) != config_.node_id) continue;
       std::vector<std::pair<std::string, std::string>> items;
       if (!partition->ScanOwned(start_key, per_partition_limit, &items))
         return {Status::Error(StatusCode::kCorruption,
