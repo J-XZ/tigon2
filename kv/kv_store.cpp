@@ -4,6 +4,7 @@
 #include "kv/engine/latency_inject.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <charconv>
 #include <cstddef>
@@ -19,6 +20,7 @@
 #include <unistd.h>
 #include <sched.h>
 #include <unordered_set>
+#include <thread>
 
 namespace tigonkv {
 namespace {
@@ -263,7 +265,19 @@ KVStore::KVStore(const Config &config) : impl_(new Impl()), config_(config) {
 KVStore::~KVStore() { Close(); }
 
 void KVStore::Open(bool reset) {
-  impl_->engine = engine::KVEngine::Open(config_, reset);
+  constexpr uint32_t kAttachAttempts = 100;
+  for (uint32_t attempt = 0;; ++attempt) {
+    try {
+      impl_->engine = engine::KVEngine::Open(config_, reset);
+      return;
+    } catch (const std::runtime_error &error) {
+      const std::string_view message(error.what());
+      if (reset || attempt + 1 == kAttachAttempts ||
+          message.find("layout attachment validation failed") == std::string_view::npos)
+        throw;
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+  }
 }
 
 void KVStore::Close() {
