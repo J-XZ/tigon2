@@ -166,6 +166,16 @@ inline void CheckpointOrThrow(KVStore &store) {
   if (!status.ok()) throw std::runtime_error("phase checkpoint failed: " + status.message);
 }
 
+inline void DrainTransport(KVStore &store) {
+  const uint64_t drain_ms = PositiveEnv("TIGONKV_E2E_TRANSPORT_DRAIN_MS", 5000);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(drain_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    const Status status = store.PollTransport();
+    if (!status.ok()) throw std::runtime_error("phase transport drain failed: " + status.message);
+    std::this_thread::yield();
+  }
+}
+
 inline int RunE2E08MultiVm() {
   Config config = LoadConfig();
   const bool init_only = Env("TIGONKV_E2E_MULTI_VM_INIT_ONLY") == "1";
@@ -206,6 +216,7 @@ inline int RunE2E08MultiVm() {
   } else {
     throw std::invalid_argument("e2e08 phase must be fill or read");
   }
+  DrainTransport(*main_store);
   std::cout << "E2E_08_PHASE_TIME_US node=" << config.node_id << " phase=" << phase
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";
   std::cout << "E2E_08_THREADS node=" << config.node_id << " threads="
@@ -255,6 +266,7 @@ inline int RunE2E09MultiVm() {
   } else {
     throw std::invalid_argument("e2e09 phase must be fill, update, or read");
   }
+  DrainTransport(*main_store);
   std::cout << "E2E_09_PHASE_TIME_US node=" << config.node_id << " phase=" << phase
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";
   std::cout << "E2E_09_THREADS node=" << config.node_id << " threads="

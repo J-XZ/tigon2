@@ -370,6 +370,13 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   return result;
 }
 
+Status KVStore::PollTransport() {
+  if (impl_ == nullptr || impl_->engine == nullptr)
+    return Status::Error(StatusCode::kCorruption, "KVStore is closed");
+  impl_->engine->PollTransport();
+  return Status::Ok();
+}
+
 Status KVStore::Checkpoint() {
   ForegroundLatencyScope latency_scope;
   Status status = impl_->engine->Checkpoint();

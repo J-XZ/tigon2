@@ -165,6 +165,8 @@ class KVStore {
   CasResult CompareExchange(std::string_view key, std::string_view expected,
                             std::string_view desired);
   IncrementResult Increment(std::string_view key, int64_t delta);
+  // Serve inbound owner requests while this foreground worker is otherwise idle.
+  Status PollTransport();
 
   Status Checkpoint();
   // Rebuild the persistent sorted SCAN index after an explicitly batched
