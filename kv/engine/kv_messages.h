@@ -20,6 +20,9 @@ enum class KvMessageType : uint8_t {
   kCasPrepare = 5,
   kCasCommit = 6,
   kResponse = 7,
+  kScanRequest = 8,
+  kScanItem = 9,
+  kScanDone = 10,
 };
 
 struct KvMessage {

@@ -91,27 +91,43 @@ int main() {
       if (engine->OwnerForKey(key) == 0) { owner_zero_key = key; break; }
     }
     assert(!owner_zero_key.empty());
+    std::string owner_one_key;
+    for (uint32_t i = 0; i < 100; ++i) {
+      const std::string key = "scan-node-one-" + std::to_string(i);
+      if (engine->OwnerForKey(key) == 1) { owner_one_key = key; break; }
+    }
+    assert(!owner_one_key.empty());
+    assert(engine->Put(owner_zero_key, "owner-zero").ok());
     const pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
       auto node_one = tigonkv::engine::KVEngine::Open(ConfigFor(routed_path, 2, 1), false);
-      if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(1);
+      if (!node_one->Put(owner_one_key, "owner-one").ok()) _exit(1);
+      const auto distributed_scan = node_one->Scan("", 0);
+      bool saw_owner_zero = false;
+      bool saw_owner_one = false;
+      for (const auto &item : distributed_scan.items) {
+        saw_owner_zero = saw_owner_zero || (item.key == owner_zero_key && item.value == "owner-zero");
+        saw_owner_one = saw_owner_one || (item.key == owner_one_key && item.value == "owner-one");
+      }
+      if (!distributed_scan.status.ok() || !saw_owner_zero || !saw_owner_one) _exit(2);
+      if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(3);
       const auto read = node_one->Get(owner_zero_key);
-      if (!read.status.ok() || read.value != "forwarded") _exit(2);
+      if (!read.status.ok() || read.value != "forwarded") _exit(4);
       const auto cas = node_one->CompareExchange(owner_zero_key, "forwarded", "cas-forwarded");
-      if (!cas.status.ok() || !cas.exchanged) _exit(3);
+      if (!cas.status.ok() || !cas.exchanged) _exit(5);
       const auto cas_miss = node_one->CompareExchange(owner_zero_key, "forwarded", "ignored");
-      if (cas_miss.status.code != tigonkv::StatusCode::kCompareFailed || cas_miss.exchanged) _exit(4);
+      if (cas_miss.status.code != tigonkv::StatusCode::kCompareFailed || cas_miss.exchanged) _exit(6);
       std::string counter_key;
       for (uint32_t i = 0; i < 100; ++i) {
         const std::string candidate = "cross-counter-" + std::to_string(i);
         if (node_one->OwnerForKey(candidate) == 0) { counter_key = candidate; break; }
       }
-      if (counter_key.empty() || !node_one->Put(counter_key, "1").ok()) _exit(5);
+      if (counter_key.empty() || !node_one->Put(counter_key, "1").ok()) _exit(7);
       const auto increment = node_one->Increment(counter_key, 2);
-      if (!increment.status.ok() || increment.value != 3) _exit(6);
-      if (!node_one->Delete(owner_zero_key).ok()) _exit(7);
-      if (node_one->Get(owner_zero_key).status.code != tigonkv::StatusCode::kNotFound) _exit(8);
+      if (!increment.status.ok() || increment.value != 3) _exit(8);
+      if (!node_one->Delete(owner_zero_key).ok()) _exit(9);
+      if (node_one->Get(owner_zero_key).status.code != tigonkv::StatusCode::kNotFound) _exit(10);
       _exit(0);
     }
     int status = 0;

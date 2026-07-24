@@ -59,6 +59,8 @@ class KVEngine {
   CasResult ForwardCompareExchange(std::string_view key, std::string_view expected,
                                    std::string_view desired);
   Status AwaitResponse(uint64_t request_id, std::string *response_value);
+  ScanResult ScanOwnedPartitions(std::string_view start_key, uint64_t limit);
+  Status AwaitScan(uint64_t request_id, std::vector<ScanItem> *items);
   void HandleTransportMessage(const KvMessage &message);
   void SendTransportMessage(const KvMessage &message);
   void EnforceMigrationBudget(KVPartition &partition);
@@ -71,6 +73,13 @@ class KVEngine {
   star::MPSCRingBuffer *rings_ = nullptr;
   std::mutex response_mutex_;
   std::unordered_map<uint64_t, KvMessage> responses_;
+  struct PendingScan {
+    StatusCode status = StatusCode::kOk;
+    bool done = false;
+    std::vector<ScanItem> items;
+  };
+  std::mutex pending_scan_mutex_;
+  std::unordered_map<uint64_t, PendingScan> pending_scans_;
   struct PendingCas {
     uint32_t source_node = 0;
     std::string key;

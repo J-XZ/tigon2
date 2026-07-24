@@ -32,6 +32,21 @@ uint64_t CurrentRssKb() {
   return page_size > 0 ? resident * static_cast<uint64_t>(page_size) / 1024 : 0;
 }
 
+std::string EncodeU64(uint64_t value) {
+  std::string encoded(sizeof(value), '\0');
+  for (size_t i = 0; i < encoded.size(); ++i)
+    encoded[i] = static_cast<char>(value >> (i * 8));
+  return encoded;
+}
+
+bool DecodeU64(std::string_view encoded, uint64_t *value) {
+  if (encoded.size() != sizeof(*value)) return false;
+  *value = 0;
+  for (size_t i = 0; i < encoded.size(); ++i)
+    *value |= static_cast<uint64_t>(static_cast<unsigned char>(encoded[i])) << (i * 8);
+  return true;
+}
+
 DualRegionConfig RegionConfig(const Config &config) {
   DualRegionConfig region;
   region.total_pool_bytes = config.size_mb * 1024ULL * 1024ULL;
@@ -160,9 +175,39 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
   if (limit > kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
-  if (config_.vm_count != 1)
-    return {Status::Error(StatusCode::kOwnerViolation,
-                          "cross-owner scan forwarding is not installed"), {}};
+  ScanResult local = ScanOwnedPartitions(start_key, limit);
+  if (!local.status.ok()) return local;
+  std::map<std::string, std::string> merged;
+  for (auto &item : local.items) merged.emplace(std::move(item.key), std::move(item.value));
+  for (uint32_t node = 0; node < config_.vm_count; ++node) {
+    if (node == config_.node_id) continue;
+    const uint64_t request_id = (static_cast<uint64_t>(config_.node_id) << 56) | next_request_id_++;
+    {
+      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+      pending_scans_.emplace(request_id, PendingScan{});
+    }
+    try {
+      SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id, node,
+                                       request_id, start_key, EncodeU64(limit)));
+    } catch (const std::exception &e) {
+      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+      pending_scans_.erase(request_id);
+      return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
+    }
+    std::vector<ScanItem> remote;
+    const Status status = AwaitScan(request_id, &remote);
+    if (!status.ok()) return {status, {}};
+    for (auto &item : remote) merged.emplace(std::move(item.key), std::move(item.value));
+  }
+  ScanResult result{Status::Ok(), {}};
+  for (auto &item : merged) {
+    if (limit != 0 && result.items.size() >= limit) break;
+    result.items.push_back({std::move(item.first), std::move(item.second)});
+  }
+  return result;
+}
+
+ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t limit) {
   std::map<std::string, std::string> merged;
   const uint64_t per_partition_limit = limit == 0 ? 0 : limit;
   try {
@@ -303,6 +348,30 @@ Status KVEngine::AwaitResponse(uint64_t request_id, std::string *response_value)
   }
 }
 
+Status KVEngine::AwaitScan(uint64_t request_id, std::vector<ScanItem> *items) {
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::seconds(config_.sync_timeout_sec);
+  for (;;) {
+    PollTransport();
+    std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+    auto it = pending_scans_.find(request_id);
+    if (it == pending_scans_.end())
+      return Status::Error(StatusCode::kCorruption, "missing forwarded scan state");
+    if (it->second.done) {
+      const Status status{it->second.status,
+          it->second.status == StatusCode::kOk ? "" : "forwarded owner scan failed"};
+      if (status.ok() && items != nullptr) *items = std::move(it->second.items);
+      pending_scans_.erase(it);
+      return status;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      pending_scans_.erase(it);
+      return Status::Error(StatusCode::kCorruption, "forwarded owner scan timed out");
+    }
+    std::this_thread::yield();
+  }
+}
+
 CasResult KVEngine::ForwardCompareExchange(std::string_view key,
                                            std::string_view expected,
                                            std::string_view desired) {
@@ -338,8 +407,44 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
     responses_.emplace(message.request_id, message);
     return;
   }
+  if (message.type == KvMessageType::kScanItem || message.type == KvMessageType::kScanDone) {
+    std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+    auto it = pending_scans_.find(message.request_id);
+    if (it == pending_scans_.end()) return;
+    if (message.type == KvMessageType::kScanItem) {
+      it->second.items.push_back({std::string(message.key.data(), message.key_size),
+                                  std::string(message.value.data(), message.value_size)});
+    } else {
+      it->second.status = static_cast<StatusCode>(message.status);
+      it->second.done = true;
+    }
+    return;
+  }
   const std::string_view key(message.key.data(), message.key_size);
   const std::string_view value(message.value.data(), message.value_size);
+  if (message.type == KvMessageType::kScanRequest) {
+    uint64_t limit = 0;
+    Status status = Status::Ok();
+    std::vector<ScanItem> items;
+    if (!DecodeU64(value, &limit)) {
+      status = Status::Error(StatusCode::kInvalidArgument, "invalid scan limit payload");
+    } else {
+      const auto scan = ScanOwnedPartitions(key, limit);
+      status = scan.status;
+      items = scan.items;
+    }
+    if (status.ok()) {
+      for (const auto &item : items)
+        SendTransportMessage(MakeRequest(KvMessageType::kScanItem, config_.node_id,
+                                         message.source_node, message.request_id,
+                                         item.key, item.value));
+    }
+    KvMessage done = MakeRequest(KvMessageType::kScanDone, config_.node_id,
+                                 message.source_node, message.request_id, {});
+    done.status = static_cast<uint32_t>(status.code);
+    SendTransportMessage(done);
+    return;
+  }
   KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
                                    message.source_node, message.request_id, key);
   auto *partition = OwnedPartition(key);
