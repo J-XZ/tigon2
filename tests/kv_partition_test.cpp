@@ -71,6 +71,9 @@ int main() {
   assert(recovered_root == index_object);
   star::CXL_EBR ebr(2, 1, &regions);
   ebr.thread_init_ebr_meta(0, 0);
+  void *private_reuse = regions.AllocateOwnerPrivate(128, 5, 1);
+  regions.FreeOwnerPrivate(private_reuse, 128, 5, 1);
+  assert(regions.AllocateOwnerPrivate(128, 5, 1) == private_reuse);
   tigonkv::engine::KVPartition partition(regions, ebr, 5, 1, false);
   assert(regions.OwnerPrivateArenaOffset(5) ==
          regions.layout().partitions[5].private_arena);

@@ -28,17 +28,20 @@ class CXL_EBR {
         static constexpr uint64_t epoch_advance_threshold = 100;
 
         struct retired_object {
-                retired_object(void *ptr, uint64_t size, uint64_t category, uint32_t owner_shard)
+                retired_object(void *ptr, uint64_t size, uint64_t category, uint32_t owner_shard,
+                               uint32_t private_partition)
                         : ptr(ptr)
                         , size(size)
                         , category(category)
                         , owner_shard(owner_shard)
+                        , private_partition(private_partition)
                 {}
 
                 void *ptr;
                 uint64_t size;
                 uint64_t category;
                 uint32_t owner_shard;
+                uint32_t private_partition;
         };
 
         // per-thread EBR metadata in local DRAM
@@ -90,7 +93,8 @@ class CXL_EBR {
         }
 
         void add_retired_object(void *ptr, uint64_t size, uint64_t category,
-                                uint32_t owner_shard = 0)
+                                uint32_t owner_shard = 0,
+                                uint32_t private_partition = UINT32_MAX)
         {
                 EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
                 uint64_t coordinator_id = local_ebr_meta.coordinator_id;
@@ -101,7 +105,7 @@ class CXL_EBR {
 
                 // add the object to the list of the current local epoch
                 std::vector<retired_object> &cur_retired_object_list = local_ebr_meta.retired_objects[cur_local_epoch % max_epoch];
-                retired_object object(ptr, size, category, owner_shard);
+                retired_object object(ptr, size, category, owner_shard, private_partition);
                 cur_retired_object_list.push_back(object);
         }
 
@@ -165,9 +169,15 @@ class CXL_EBR {
                                 for (uint64_t i = 0; i < retired_object_list_to_reclaim.size(); i++) {
                                         const retired_object &object = retired_object_list_to_reclaim[i];
                                         CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
-                                        regions->Free(object.ptr, object.size,
-                                                      allocation_domain(object.category),
-                                                      object.owner_shard, coordinator_id);
+                                        if (object.private_partition != UINT32_MAX) {
+                                                regions->FreeOwnerPrivate(object.ptr, object.size,
+                                                                          object.private_partition,
+                                                                          object.owner_shard);
+                                        } else {
+                                                regions->Free(object.ptr, object.size,
+                                                              allocation_domain(object.category),
+                                                              object.owner_shard, coordinator_id);
+                                        }
                                         gc_size += retired_object_list_to_reclaim[i].size;
                                 }
 
@@ -197,9 +207,15 @@ class CXL_EBR {
                         auto &objects = local_ebr_meta.retired_objects[epoch];
                         for (const auto &object : objects) {
                                 CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
-                                regions->Free(object.ptr, object.size,
-                                              allocation_domain(object.category),
-                                              object.owner_shard, local_ebr_meta.coordinator_id);
+                                if (object.private_partition != UINT32_MAX) {
+                                        regions->FreeOwnerPrivate(object.ptr, object.size,
+                                                                  object.private_partition,
+                                                                  object.owner_shard);
+                                } else {
+                                        regions->Free(object.ptr, object.size,
+                                                      allocation_domain(object.category),
+                                                      object.owner_shard, local_ebr_meta.coordinator_id);
+                                }
                                 reclaimed += object.size;
                         }
                         objects.clear();

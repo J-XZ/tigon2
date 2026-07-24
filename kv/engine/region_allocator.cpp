@@ -384,22 +384,82 @@ void *DualRegionAllocator::AllocateOwnerPrivate(uint64_t bytes, uint32_t partiti
   }
   const uint64_t aligned = (bytes + RegionAllocator::kAlignment - 1) &
                            ~(RegionAllocator::kAlignment - 1);
-  const uint64_t begin = (arena->bump + RegionAllocator::kAlignment - 1) &
-                         ~(RegionAllocator::kAlignment - 1);
-  if (begin > arena->end || aligned > arena->end - begin) {
+  const uint64_t requested = aligned + RegionAllocator::kAlignment;
+  if (requested > UINT32_MAX) {
     arena->lock.store(0, std::memory_order_release);
     throw std::bad_alloc();
   }
-  arena->bump = begin + aligned;
-  arena->allocated_bytes.fetch_add(aligned, std::memory_order_relaxed);
+  RegionOffset previous = kNullOffset;
+  RegionOffset current = arena->free_head.load(std::memory_order_relaxed);
+  while (current != kNullOffset) {
+    auto *block = static_cast<RegionFreeBlock *>(swcc_.FromOffset(current));
+    if (block->size_class >= requested) {
+      const RegionOffset next = block->next.load(std::memory_order_relaxed);
+      if (previous == kNullOffset)
+        arena->free_head.store(next, std::memory_order_relaxed);
+      else
+        static_cast<RegionFreeBlock *>(swcc_.FromOffset(previous))->next.store(
+            next, std::memory_order_relaxed);
+      block->owner_shard = owner_shard;
+      arena->lock.store(0, std::memory_order_release);
+      arena->allocated_bytes.fetch_add(block->size_class, std::memory_order_relaxed);
+      auto &counter = header_->layout.domains[
+          static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc)];
+      const uint64_t used = counter.used_bytes.fetch_add(block->size_class, std::memory_order_relaxed) +
+                            block->size_class;
+      uint64_t peak = counter.peak_bytes.load(std::memory_order_relaxed);
+      while (peak < used && !counter.peak_bytes.compare_exchange_weak(
+                                 peak, used, std::memory_order_relaxed)) {}
+      return static_cast<std::byte *>(static_cast<void *>(block)) + RegionAllocator::kAlignment;
+    }
+    previous = current;
+    current = block->next.load(std::memory_order_relaxed);
+  }
+  const uint64_t begin = (arena->bump + RegionAllocator::kAlignment - 1) &
+                         ~(RegionAllocator::kAlignment - 1);
+  if (begin > arena->end || requested > arena->end - begin) {
+    arena->lock.store(0, std::memory_order_release);
+    throw std::bad_alloc();
+  }
+  arena->bump = begin + requested;
+  auto *block = new (swcc_.FromOffset(begin)) RegionFreeBlock;
+  block->size_class = static_cast<uint32_t>(requested);
+  block->owner_shard = owner_shard;
+  arena->allocated_bytes.fetch_add(requested, std::memory_order_relaxed);
   arena->lock.store(0, std::memory_order_release);
   auto &counter = header_->layout.domains[
       static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc)];
-  const uint64_t used = counter.used_bytes.fetch_add(aligned, std::memory_order_relaxed) + aligned;
+  const uint64_t used = counter.used_bytes.fetch_add(requested, std::memory_order_relaxed) + requested;
   uint64_t peak = counter.peak_bytes.load(std::memory_order_relaxed);
   while (peak < used && !counter.peak_bytes.compare_exchange_weak(
                              peak, used, std::memory_order_relaxed)) {}
-  return swcc_.FromOffset(begin);
+  return static_cast<std::byte *>(swcc_.FromOffset(begin)) + RegionAllocator::kAlignment;
+}
+
+void DualRegionAllocator::FreeOwnerPrivate(void *pointer, uint64_t bytes,
+                                           uint32_t partition_id,
+                                           uint32_t owner_shard) {
+  if (pointer == nullptr || bytes == 0) throw std::invalid_argument("invalid private free");
+  auto *arena = Arena(partition_id);
+  if (arena->owner_shard != owner_shard || !IsInOwnerPrivateArena(pointer, partition_id))
+    throw std::runtime_error("private arena free from non-owner or wrong arena");
+  auto *block = reinterpret_cast<RegionFreeBlock *>(
+      static_cast<std::byte *>(pointer) - RegionAllocator::kAlignment);
+  const uint64_t requested = ((bytes + RegionAllocator::kAlignment - 1) &
+                              ~(RegionAllocator::kAlignment - 1)) + RegionAllocator::kAlignment;
+  if (block->owner_shard != owner_shard || block->size_class < requested)
+    throw std::runtime_error("private arena free size or owner mismatch");
+  uint32_t expected = 0;
+  while (!arena->lock.compare_exchange_weak(expected, 1, std::memory_order_acquire,
+                                             std::memory_order_relaxed)) expected = 0;
+  block->next.store(arena->free_head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  arena->free_head.store(swcc_.ToOffset(block), std::memory_order_release);
+  arena->lock.store(0, std::memory_order_release);
+  arena->allocated_bytes.fetch_sub(block->size_class, std::memory_order_relaxed);
+  auto &counter = header_->layout.domains[
+      static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc)];
+  const uint64_t before = counter.used_bytes.fetch_sub(block->size_class, std::memory_order_relaxed);
+  if (before < block->size_class) throw std::runtime_error("private arena accounting underflow");
 }
 
 void DualRegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain domain,

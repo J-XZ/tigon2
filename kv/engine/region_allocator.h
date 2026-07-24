@@ -129,6 +129,7 @@ struct alignas(64) OwnerPrivateArenaHeader {
   uint64_t bump = 0;
   std::atomic<uint32_t> lock{0};
   std::atomic<uint64_t> allocated_bytes{0};
+  std::atomic<RegionOffset> free_head{kNullOffset};
 };
 
 struct alignas(64) DualRegionPersistentHeader {
@@ -150,6 +151,8 @@ class DualRegionAllocator {
   void *Allocate(uint64_t bytes, AllocationDomain domain, uint32_t owner_shard);
   void *AllocateOwnerPrivate(uint64_t bytes, uint32_t partition_id,
                              uint32_t owner_shard);
+  void FreeOwnerPrivate(void *pointer, uint64_t bytes, uint32_t partition_id,
+                        uint32_t owner_shard);
   void Free(void *pointer, uint64_t bytes, AllocationDomain domain,
             uint32_t owner_shard, uint32_t current_shard);
   bool IsHwccAddress(const void *pointer) const;

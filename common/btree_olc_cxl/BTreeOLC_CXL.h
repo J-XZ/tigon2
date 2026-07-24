@@ -64,7 +64,8 @@ struct TreeNodeAllocation {
 
 	void Retire(void *pointer, uint64_t bytes) const {
 		if (ebr == nullptr) throw std::runtime_error("BPlusTree requires an EBR binding for node retirement");
-		ebr->add_retired_object(pointer, bytes, star::CXLMemory::INDEX_FREE, owner_shard);
+		ebr->add_retired_object(pointer, bytes, star::CXLMemory::INDEX_FREE, owner_shard,
+		                        private_partition);
 	}
 };
 
