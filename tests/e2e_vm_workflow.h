@@ -125,13 +125,14 @@ PhaseResult RunWorkers(const Config &base, uint64_t total, Operation operation) 
   Config worker_config = base;
   worker_config.checkpoint_on_clean_exit = false;
 
-  // Each foreground worker owns a KVStore instance. This keeps RuntimeStats
-  // thread-local while all instances still exercise the shared BAR lock.
-  std::vector<std::unique_ptr<KVStore>> stores;
-  stores.reserve(static_cast<size_t>(threads));
-  for (uint64_t worker = 0; worker < threads; ++worker) {
-    stores.push_back(KVStore::Create(worker_config, false));
-  }
+  // A node owns one MPSC receive ring, so exactly one KVStore instance may
+  // consume its transport messages.  Foreground workers retain independent
+  // ranges and threads, but serialize a synchronous store operation through
+  // this node-local transport dispatcher.  Creating one KVStore per worker
+  // lets a response be consumed by a different instance and lost from the
+  // requester's response map.
+  auto store = KVStore::Create(worker_config, false);
+  std::mutex store_mutex;
 
   std::atomic<bool> start{false};
   std::mutex error_mutex;
@@ -145,9 +146,10 @@ PhaseResult RunWorkers(const Config &base, uint64_t total, Operation operation) 
         while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
         const uint64_t worker_start = StartForPart(node_count, threads, worker);
         const uint64_t worker_count = CountForPart(node_count, threads, worker);
-        for (uint64_t i = 0; i < worker_count; ++i)
-          operation(*stores[static_cast<size_t>(worker)], worker,
-                    node_start + worker_start + i, i);
+        for (uint64_t i = 0; i < worker_count; ++i) {
+          std::lock_guard<std::mutex> lock(store_mutex);
+          operation(*store, worker, node_start + worker_start + i, i);
+        }
       } catch (...) {
         std::lock_guard<std::mutex> guard(error_mutex);
         if (!error) error = std::current_exception();
