@@ -324,6 +324,55 @@ class TwoPLPashaHelper {
         {
         }
 
+        // tigonkv: KV path uses the original shared metadata word and SCC
+        // sequence without transaction Context/Table objects.  The read pin
+        // spans prepare_read/do_read so move-out can wait on reader_count.
+        static bool kv_shared_read(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
+                                   void *dest, std::size_t size)
+        {
+                if (smeta == nullptr || scc_manager == nullptr) return false;
+                smeta->lock();
+                if (smeta->is_write_locked() ||
+                    smeta->get_reader_count() == smeta->get_reader_count_max()) {
+                        smeta->unlock();
+                        return false;
+                }
+                smeta->increase_reader_count();
+                auto *scc_data = smeta->get_scc_data();
+                smeta->unlock();
+                scc_manager->prepare_read(smeta, host_id, scc_data,
+                                          sizeof(TwoPLPashaSharedDataSCC) + size);
+                const bool valid = scc_data->get_flag(TwoPLPashaSharedDataSCC::valid_flag_index);
+                if (valid)
+                        scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
+                smeta->lock();
+                smeta->decrease_reader_count();
+                smeta->unlock();
+                return valid;
+        }
+
+        static bool kv_shared_write(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
+                                    const void *src, std::size_t size)
+        {
+                if (smeta == nullptr || scc_manager == nullptr) return false;
+                smeta->lock();
+                if (smeta->is_write_locked() || smeta->get_reader_count() != 0) {
+                        smeta->unlock();
+                        return false;
+                }
+                smeta->set_write_locked();
+                auto *scc_data = smeta->get_scc_data();
+                smeta->unlock();
+                scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
+                scc_data->set_flag(TwoPLPashaSharedDataSCC::valid_flag_index);
+                scc_manager->finish_write(smeta, host_id, scc_data,
+                                          sizeof(TwoPLPashaSharedDataSCC) + size);
+                smeta->lock();
+                smeta->clear_write_locked();
+                smeta->unlock();
+                return true;
+        }
+
 	uint64_t read(const std::tuple<MetaDataType *, void *> &row, void *dest, std::size_t size, std::atomic<uint64_t> &local_cxl_access)
 	{
                 MetaDataType &meta = *std::get<0>(row);

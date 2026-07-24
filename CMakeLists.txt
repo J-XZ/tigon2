@@ -32,7 +32,7 @@ include_directories(${CMAKE_SOURCE_DIR})
 
 add_library(tigonkv STATIC kv/kv_store.cpp kv/latency_simulator.cpp
   kv/engine/kv_partition.cpp kv/engine/region_allocator.cpp
-  common/btree_olc_cxl/BTreeOLC_CXL.cpp)
+  common/btree_olc_cxl/BTreeOLC_CXL.cpp protocol/Pasha/SCCManager.cpp)
 target_link_libraries(tigonkv PUBLIC pthread)
 
 # tigonkv: legacy transaction benchmarks retain source-only reference status.
@@ -74,6 +74,8 @@ target_link_libraries(btree_binding_test PRIVATE tigonkv glog)
 add_executable(kv_partition_test tests/kv_partition_test.cpp)
 target_link_libraries(kv_partition_test PRIVATE tigonkv glog)
 add_executable(scc_protocol_test tests/scc_protocol_test.cpp tests/scc_test_backend.cpp)
+add_executable(kv_shared_protocol_test tests/kv_shared_protocol_test.cpp)
+target_link_libraries(kv_shared_protocol_test PRIVATE tigonkv glog)
 add_executable(region_allocator_test tests/region_allocator_test.cpp)
 target_link_libraries(region_allocator_test PRIVATE tigonkv)
 add_executable(numa_placement_probe tools/numa_placement_probe.cpp)
@@ -102,6 +104,7 @@ add_test(NAME kv_layout_test COMMAND kv_layout_test)
 add_test(NAME btree_binding_test COMMAND btree_binding_test)
 add_test(NAME kv_partition_test COMMAND kv_partition_test)
 add_test(NAME scc_protocol_test COMMAND scc_protocol_test)
+add_test(NAME kv_shared_protocol_test COMMAND kv_shared_protocol_test)
 add_test(NAME region_allocator_test COMMAND region_allocator_test)
 set_tests_properties(e2e_trace_test PROPERTIES
   ENVIRONMENT
