@@ -9,4 +9,4 @@ grep '^numactl ' <<<"$output" > "$tmp/qemu_cmdlines"
 cmp -s "$tmp/qemu_cmdlines" "$root/tests/fixtures/golden_qemu_cmdline_4vm.txt"
 [[ $(wc -l < "$tmp/qemu_cmdlines") -eq 4 ]]
 grep -q 'ivshmem-plain' <<<"$output"
-grep -q 'mem-path=/mnt/xz_shared_mem/ivshmem_shared_mem' <<<"$output"
+grep -q 'mem-path=/dev/shm/tigonkv' <<<"$output"

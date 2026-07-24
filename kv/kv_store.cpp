@@ -180,6 +180,11 @@ Config Config::FromJsonc(const std::string &path) {
   JsonNumber(text, "cache_hit_extra_ns", &c.latency_cache_hit_extra_ns);
   if (c.shared_memory_path == "/mnt/xz_shared_mem" || c.shared_memory_path == "/mnt/xz_shared_mem/")
     c.shared_memory_path = "/mnt/xz_shared_mem/ivshmem_shared_mem";
+  struct stat device_stat {};
+  if (!c.device_path.empty() && ::stat(c.device_path.c_str(), &device_stat) == 0 &&
+      S_ISCHR(device_stat.st_mode)) {
+    c.shared_memory_path = c.device_path;
+  }
   c.Validate();
   return c;
 }

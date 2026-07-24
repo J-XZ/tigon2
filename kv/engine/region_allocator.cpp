@@ -552,14 +552,17 @@ DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,
   const int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0660);
   if (fd < 0) throw std::runtime_error("open dual-region backing file failed");
   try {
-    if (flock(fd, LOCK_EX) != 0) throw std::runtime_error("lock dual-region backing file failed");
     struct stat st {};
     if (fstat(fd, &st) != 0) throw std::runtime_error("stat dual-region backing file failed");
-    if (reset) {
-      if (ftruncate(fd, static_cast<off_t>(config.total_pool_bytes)) != 0)
-        throw std::runtime_error("resize dual-region backing file failed");
-    } else if (st.st_size != static_cast<off_t>(config.total_pool_bytes)) {
-      throw std::runtime_error("dual-region backing file size mismatch");
+    const bool is_character_device = S_ISCHR(st.st_mode);
+    if (!is_character_device) {
+      if (flock(fd, LOCK_EX) != 0) throw std::runtime_error("lock dual-region backing file failed");
+      if (reset) {
+        if (ftruncate(fd, static_cast<off_t>(config.total_pool_bytes)) != 0)
+          throw std::runtime_error("resize dual-region backing file failed");
+      } else if (st.st_size != static_cast<off_t>(config.total_pool_bytes)) {
+        throw std::runtime_error("dual-region backing file size mismatch");
+      }
     }
     void *base = mmap(nullptr, config.total_pool_bytes, PROT_READ | PROT_WRITE,
                       MAP_SHARED, fd, 0);
@@ -578,7 +581,7 @@ DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,
       munmap(base, config.total_pool_bytes);
       throw;
     }
-    flock(fd, LOCK_UN);
+    if (!is_character_device) flock(fd, LOCK_UN);
     return DualRegionMappedPool(fd, base, config.total_pool_bytes, std::move(allocator));
   } catch (...) {
     flock(fd, LOCK_UN);
