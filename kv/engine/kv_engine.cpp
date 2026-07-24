@@ -1,10 +1,13 @@
 #include "kv/engine/kv_engine.h"
 
 #include "common/CXL_EBR.h"
+#include "common/MPSCRingBuffer.h"
 #include "kv/engine/kv_partition.h"
+#include "kv/engine/kv_messages.h"
 #include "protocol/TwoPLPasha/TwoPLPashaSCCWriteThrough.h"
 
 #include <stdexcept>
+#include <thread>
 
 namespace tigonkv::engine {
 namespace {
@@ -48,6 +51,26 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   config.Validate();
   auto pool = std::make_unique<DualRegionMappedPool>(
       DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
+  star::CXLMemory::bind_dual_region_allocator(&pool->allocator(), config.node_id);
+  star::MPSCRingBuffer *rings = nullptr;
+  if (reset) {
+    rings = static_cast<star::MPSCRingBuffer *>(star::cxl_memory.cxlalloc_malloc_wrapper(
+        sizeof(star::MPSCRingBuffer) * config.vm_count,
+        star::CXLMemory::TRANSPORT_ALLOCATION));
+    // 2048-byte records with the fixed message payload above; transport is a
+    // global HWCC allocation published before any remote node attaches.
+    const uint64_t entries = std::max<uint64_t>(1,
+        (config.transport_ring_total_mb * 1024ULL * 1024ULL / config.vm_count) / 2048ULL);
+    for (uint32_t node = 0; node < config.vm_count; ++node)
+      new (&rings[node]) star::MPSCRingBuffer(2048, entries);
+    star::CXLMemory::commit_shared_data_initialization(
+        star::CXLMemory::cxl_transport_root_index, rings);
+  } else {
+    void *root = nullptr;
+    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+        star::CXLMemory::cxl_transport_root_index, &root);
+    rings = static_cast<star::MPSCRingBuffer *>(root);
+  }
   auto ebr = std::make_unique<star::CXL_EBR>(config.vm_count,
                                              config.foreground_worker_count_per_vm,
                                              &pool->allocator());
@@ -56,9 +79,15 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   star::scc_manager = scc.get();
   auto engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool),
                                                         std::move(ebr), std::move(scc)));
-  const bool attach = !reset;
+  engine->rings_ = rings;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     if (engine->OwnerForPartition(partition) != config.node_id) continue;
+    const auto &directory = engine->pool_->allocator().layout().partitions[partition];
+    // A node may be the first owner to attach after node 0 created the shared
+    // layout. It alone creates its owner-private roots; later attaches recover
+    // them by offsets.
+    const bool attach = directory.private_root != kNullOffset &&
+                        directory.shared_root != kNullOffset;
     engine->partitions_.emplace_back(std::make_unique<KVPartition>(
         engine->pool_->allocator(), *engine->ebr_, partition, config.node_id, attach));
   }
@@ -88,7 +117,7 @@ KVPartition *KVEngine::OwnedPartition(std::string_view key) const {
 
 Status KVEngine::Put(std::string_view key, std::string_view value) {
   auto *partition = OwnedPartition(key);
-  if (partition == nullptr) return Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding");
+  if (partition == nullptr) return Forward(KvMessageType::kPut, key, value, nullptr);
   try { partition->PutPrivate(key, value); return Status::Ok(); }
   catch (const std::bad_alloc &) { return Status::Error(StatusCode::kOutOfMemory, "private arena exhausted"); }
   catch (const std::exception &e) { return Status::Error(StatusCode::kCorruption, e.what()); }
@@ -96,7 +125,11 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
 
 GetResult KVEngine::Get(std::string_view key) {
   auto *partition = OwnedPartition(key);
-  if (partition == nullptr) return {Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding"), {}};
+  if (partition == nullptr) {
+    std::string value;
+    auto status = Forward(KvMessageType::kGet, key, {}, &value);
+    return {std::move(status), std::move(value)};
+  }
   std::string value;
   return partition->GetPrivate(key, &value) ? GetResult{Status::Ok(), std::move(value)}
                                             : GetResult{Status::Error(StatusCode::kNotFound, "key not found"), {}};
@@ -104,9 +137,109 @@ GetResult KVEngine::Get(std::string_view key) {
 
 Status KVEngine::Delete(std::string_view key) {
   auto *partition = OwnedPartition(key);
-  if (partition == nullptr) return Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding");
+  if (partition == nullptr) return Forward(KvMessageType::kDelete, key, {}, nullptr);
   return partition->DeletePrivate(key) ? Status::Ok()
                                        : Status::Error(StatusCode::kNotFound, "key not found");
+}
+
+void KVEngine::SendTransportMessage(const KvMessage &message) {
+  while (!rings_[message.destination_node].enqueue(
+      const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
+    PollTransport();
+    std::this_thread::yield();
+  }
+}
+
+Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_view value,
+                         std::string *response_value) {
+  const uint32_t owner = OwnerForKey(key);
+  const uint64_t request_id = (static_cast<uint64_t>(config_.node_id) << 56) | next_request_id_++;
+  SendTransportMessage(MakeRequest(type, config_.node_id, owner, request_id, key, value));
+  for (;;) {
+    PollTransport();
+    std::lock_guard<std::mutex> lock(response_mutex_);
+    auto it = responses_.find(request_id);
+    if (it == responses_.end()) {
+      std::this_thread::yield();
+      continue;
+    }
+    KvMessage response = it->second;
+    responses_.erase(it);
+    if (response_value != nullptr)
+      response_value->assign(response.value.data(), response.value_size);
+    return {static_cast<StatusCode>(response.status),
+            static_cast<StatusCode>(response.status) == StatusCode::kOk ? "" : "forwarded owner operation failed"};
+  }
+}
+
+void KVEngine::PollTransport() {
+  if (rings_ == nullptr) return;
+  alignas(64) char bytes[sizeof(KvMessage)];
+  const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
+  if (received == 0) return;
+  if (received != sizeof(KvMessage)) throw std::runtime_error("malformed KV transport entry");
+  KvMessage message{};
+  std::memcpy(&message, bytes, sizeof(message));
+  HandleTransportMessage(message);
+}
+
+void KVEngine::HandleTransportMessage(const KvMessage &message) {
+  if (message.destination_node != config_.node_id ||
+      message.key_size > message.key.size() || message.value_size > message.value.size())
+    throw std::runtime_error("invalid KV transport message");
+  if (message.type == KvMessageType::kResponse) {
+    std::lock_guard<std::mutex> lock(response_mutex_);
+    responses_.emplace(message.request_id, message);
+    return;
+  }
+  const std::string_view key(message.key.data(), message.key_size);
+  const std::string_view value(message.value.data(), message.value_size);
+  KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
+                                   message.source_node, message.request_id, key);
+  auto *partition = OwnedPartition(key);
+  if (partition == nullptr) {
+    response.status = static_cast<uint32_t>(StatusCode::kCorruption);
+  } else if (message.type == KvMessageType::kPut) {
+    try {
+      partition->PutPrivate(key, value);
+      response.status = static_cast<uint32_t>(StatusCode::kOk);
+    } catch (const std::bad_alloc &) {
+      response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
+    } catch (...) {
+      response.status = static_cast<uint32_t>(StatusCode::kCorruption);
+    }
+  } else if (message.type == KvMessageType::kDelete) {
+    response.status = static_cast<uint32_t>(partition->DeletePrivate(key)
+        ? StatusCode::kOk : StatusCode::kNotFound);
+  } else if (message.type == KvMessageType::kGet) {
+    std::string result;
+    if (!partition->GetPrivate(key, &result)) {
+      response.status = static_cast<uint32_t>(StatusCode::kNotFound);
+    } else {
+      // A remote touch is the move-in trigger; a failed promotion means this
+      // row was already shared, which is equally valid for the response.
+      partition->PromotePrivate(key, config_.node_id);
+      response.status = static_cast<uint32_t>(StatusCode::kOk);
+      response.value_size = static_cast<uint32_t>(result.size());
+      std::memcpy(response.value.data(), result.data(), result.size());
+      EnforceMigrationBudget(*partition);
+    }
+  } else {
+    response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
+  }
+  SendTransportMessage(response);
+}
+
+void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
+  const uint64_t hw_budget = (config_.hw_cc_budget_mb * 1024ULL * 1024ULL -
+      star::CXL_EBR::max_ebr_retiring_memory) / config_.vm_count;
+  const bool payload_high = partition.shared_payload_used_bytes() * 10 >=
+      partition.shared_payload_capacity_bytes() * 9;
+  if (partition.hwcc_used_bytes() < hw_budget && !payload_high) return;
+  for (uint32_t attempt = 0; attempt < 16; ++attempt) {
+    if (partition.MoveOutClockVictim(config_.node_id)) return;
+  }
+  throw std::runtime_error("migration budget exceeded with no quiescent Clock victim");
 }
 
 Status KVEngine::MoveOut(std::string_view key) {

@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdio>
 #include <string>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace {
@@ -26,6 +27,7 @@ tigonkv::Config ConfigFor(const std::string &path, uint32_t vm_count = 1,
   config.fixed_key_size = 32;
   config.fixed_value_size = 128;
   config.foreground_worker_count_per_vm = 1;
+  config.transport_ring_total_mb = 1;
   return config;
 }
 
@@ -68,11 +70,34 @@ int main() {
       const std::string key = "route-" + std::to_string(i);
       const uint32_t partition = engine->PartitionForKey(key);
       assert(engine->OwnerForKey(key) == partition % node_zero.vm_count);
-      if (engine->OwnerForKey(key) == 1) {
-        assert(engine->Put(key, "remote").code == tigonkv::StatusCode::kOwnerViolation);
-        break;
-      }
+      if (engine->OwnerForKey(key) == 1) break;
     }
+
+    std::string owner_zero_key;
+    for (uint32_t i = 0; i < 100; ++i) {
+      const std::string key = "cross-node-" + std::to_string(i);
+      if (engine->OwnerForKey(key) == 0) { owner_zero_key = key; break; }
+    }
+    assert(!owner_zero_key.empty());
+    const pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+      auto node_one = tigonkv::engine::KVEngine::Open(ConfigFor(routed_path, 2, 1), false);
+      if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(1);
+      const auto read = node_one->Get(owner_zero_key);
+      if (!read.status.ok() || read.value != "forwarded") _exit(2);
+      if (!node_one->Delete(owner_zero_key).ok()) _exit(3);
+      if (node_one->Get(owner_zero_key).status.code != tigonkv::StatusCode::kNotFound) _exit(4);
+      _exit(0);
+    }
+    int status = 0;
+    for (;;) {
+      engine->PollTransport();
+      const pid_t done = waitpid(child, &status, WNOHANG);
+      if (done == child) break;
+      assert(done == 0);
+    }
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
   unlink(routed_path.c_str());
   return 0;

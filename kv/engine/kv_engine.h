@@ -1,9 +1,12 @@
 #pragma once
 
 #include "kv/engine/region_allocator.h"
+#include "kv/engine/kv_messages.h"
 #include "kv/kv_store.h"
 
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <string_view>
 #include <vector>
 
@@ -15,6 +18,11 @@ class SCCManager;
 namespace tigonkv::engine {
 
 class KVPartition;
+}
+
+namespace star { class MPSCRingBuffer; }
+
+namespace tigonkv::engine {
 
 // Process-local assembly over persistent dual-region state.  Only partitions
 // owned by config.node_id are materialized locally; remote transport is added
@@ -28,6 +36,9 @@ class KVEngine {
   GetResult Get(std::string_view key);
   Status Delete(std::string_view key);
   Status MoveOut(std::string_view key);
+  // Foreground workers call this between operations; synchronous forwarding
+  // also polls it while waiting so no dedicated service core is required.
+  void PollTransport();
   uint32_t PartitionForKey(std::string_view key) const;
   uint32_t OwnerForKey(std::string_view key) const;
 
@@ -37,12 +48,21 @@ class KVEngine {
            std::unique_ptr<star::SCCManager> scc);
   KVPartition *OwnedPartition(std::string_view key) const;
   uint32_t OwnerForPartition(uint32_t partition) const;
+  Status Forward(KvMessageType type, std::string_view key, std::string_view value,
+                 std::string *response_value);
+  void HandleTransportMessage(const KvMessage &message);
+  void SendTransportMessage(const KvMessage &message);
+  void EnforceMigrationBudget(KVPartition &partition);
 
   Config config_;
   std::unique_ptr<DualRegionMappedPool> pool_;
   std::unique_ptr<star::CXL_EBR> ebr_;
   std::unique_ptr<star::SCCManager> scc_;
   std::vector<std::unique_ptr<KVPartition>> partitions_;
+  star::MPSCRingBuffer *rings_ = nullptr;
+  std::mutex response_mutex_;
+  std::unordered_map<uint64_t, KvMessage> responses_;
+  uint64_t next_request_id_ = 1;
 };
 
 }  // namespace tigonkv::engine
