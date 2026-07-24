@@ -110,6 +110,7 @@ add_test(NAME kv_engine_test COMMAND kv_engine_test)
 add_test(NAME scc_protocol_test COMMAND scc_protocol_test)
 add_test(NAME kv_shared_protocol_test COMMAND kv_shared_protocol_test)
 add_test(NAME region_allocator_test COMMAND region_allocator_test)
+add_test(NAME vm_scripts_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/vm_scripts_test.sh)
 set_tests_properties(e2e_trace_test PROPERTIES
   ENVIRONMENT
     "TIGONKV_EXPERIMENT_CONFIG_JSONC=${CMAKE_SOURCE_DIR}/tests/fixtures/experiment_config.jsonc;TIGONKV_E2E_TRACE_FILE=${CMAKE_SOURCE_DIR}/tests/fixtures/trace.txt;TIGONKV_E2E_RESET=1;TIGONKV_E2E_TRACE_PHASE=fixture")
