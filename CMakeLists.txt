@@ -55,7 +55,7 @@ set(ALLOCATOR_TEST_TARGETS
   allocator_reclaim_test allocator_accounting_test allocator_domain_budget_test
   allocator_local_dram_test)
 foreach(test_target IN LISTS ALLOCATOR_TEST_TARGETS)
-  add_executable(${test_target} tests/tigonkv_tests.cpp)
+  add_executable(${test_target} tests/region_allocator_test.cpp)
   target_link_libraries(${test_target} PRIVATE tigonkv)
 endforeach()
 add_executable(e2e_tests tests/tigonkv_tests.cpp)
