@@ -177,10 +177,7 @@ CasResult KVEngine::CompareExchange(std::string_view key,
                                     std::string_view expected,
                                     std::string_view desired) {
   auto *partition = OwnedPartition(key);
-  if (partition == nullptr) {
-    return {Status::Error(StatusCode::kOwnerViolation,
-                          "remote CAS forwarding is not installed"), false};
-  }
+  if (partition == nullptr) return ForwardCompareExchange(key, expected, desired);
   try {
     bool exchanged = false;
     if (!partition->CompareExchangePrivate(key, expected, desired, &exchanged))
@@ -233,6 +230,10 @@ Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_v
   const uint32_t owner = OwnerForKey(key);
   const uint64_t request_id = (static_cast<uint64_t>(config_.node_id) << 56) | next_request_id_++;
   SendTransportMessage(MakeRequest(type, config_.node_id, owner, request_id, key, value));
+  return AwaitResponse(request_id, response_value);
+}
+
+Status KVEngine::AwaitResponse(uint64_t request_id, std::string *response_value) {
   const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::seconds(config_.sync_timeout_sec);
   for (;;) {
@@ -252,6 +253,21 @@ Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_v
     return {static_cast<StatusCode>(response.status),
             static_cast<StatusCode>(response.status) == StatusCode::kOk ? "" : "forwarded owner operation failed"};
   }
+}
+
+CasResult KVEngine::ForwardCompareExchange(std::string_view key,
+                                           std::string_view expected,
+                                           std::string_view desired) {
+  const uint32_t owner = OwnerForKey(key);
+  const uint64_t request_id = (static_cast<uint64_t>(config_.node_id) << 56) | next_request_id_++;
+  SendTransportMessage(MakeRequest(KvMessageType::kCasPrepare, config_.node_id, owner,
+                                   request_id, key, expected));
+  Status status = AwaitResponse(request_id, nullptr);
+  if (!status.ok()) return {std::move(status), false};
+  SendTransportMessage(MakeRequest(KvMessageType::kCasCommit, config_.node_id, owner,
+                                   request_id, key, desired));
+  status = AwaitResponse(request_id, nullptr);
+  return {status, status.ok()};
 }
 
 void KVEngine::PollTransport() {
@@ -322,6 +338,38 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
           response.value_size = static_cast<uint32_t>(encoded.size());
           std::memcpy(response.value.data(), encoded.data(), encoded.size());
         }
+      } catch (const std::invalid_argument &) {
+        response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
+      } catch (...) {
+        response.status = static_cast<uint32_t>(StatusCode::kCorruption);
+      }
+    }
+  } else if (message.type == KvMessageType::kCasPrepare) {
+    std::lock_guard<std::mutex> lock(pending_cas_mutex_);
+    pending_cas_[message.request_id] = {message.source_node, std::string(key), std::string(value)};
+    response.status = static_cast<uint32_t>(StatusCode::kOk);
+  } else if (message.type == KvMessageType::kCasCommit) {
+    PendingCas pending;
+    bool found = false;
+    {
+      std::lock_guard<std::mutex> lock(pending_cas_mutex_);
+      auto it = pending_cas_.find(message.request_id);
+      if (it != pending_cas_.end()) {
+        pending = std::move(it->second);
+        pending_cas_.erase(it);
+        found = pending.source_node == message.source_node && pending.key == key;
+      }
+    }
+    if (!found) {
+      response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
+    } else {
+      try {
+        bool exchanged = false;
+        if (!partition->CompareExchangePrivate(key, pending.expected, value, &exchanged))
+          response.status = static_cast<uint32_t>(StatusCode::kNotFound);
+        else
+          response.status = static_cast<uint32_t>(exchanged ? StatusCode::kOk
+                                                            : StatusCode::kCompareFailed);
       } catch (const std::invalid_argument &) {
         response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
       } catch (...) {

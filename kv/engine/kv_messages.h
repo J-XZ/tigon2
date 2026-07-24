@@ -17,7 +17,9 @@ enum class KvMessageType : uint8_t {
   kGet = 2,
   kDelete = 3,
   kIncrement = 4,
-  kResponse = 5,
+  kCasPrepare = 5,
+  kCasCommit = 6,
+  kResponse = 7,
 };
 
 struct KvMessage {
