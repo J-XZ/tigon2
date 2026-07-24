@@ -216,8 +216,11 @@ void Config::Validate() const {
 namespace {
 class ForegroundLatencyScope {
  public:
-  ForegroundLatencyScope() { GlobalLatencySimulator().BeginScope(); }
-  ~ForegroundLatencyScope() { GlobalLatencySimulator().EndScopeAndDelay(); }
+  ForegroundLatencyScope() {
+    latency_sim::GlobalLatencySimulator().BeginScope(
+        latency_sim::ScopeKind::kForeground);
+  }
+  ~ForegroundLatencyScope() { latency_sim::GlobalLatencySimulator().EndScopeAndDelay(); }
 };
 }  // namespace
 
@@ -229,11 +232,27 @@ std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
 
 KVStore::KVStore(const Config &config) : impl_(new Impl()), config_(config) {
   config_.Validate();
-  GlobalLatencySimulator().ConfigureDetailed(
-      config_.latency_enabled, config_.hwcc_read_ns, config_.hwcc_write_ns,
-      config_.hwcc_atomic_ns, config_.swcc_read_ns, config_.swcc_write_ns,
-      config_.swcc_flush_ns, config_.latency_cache_model.c_str(),
-      config_.latency_cache_fixed_hit_rate, config_.latency_cache_capacity_lines);
+  latency_sim::Config latency;
+  latency.enabled = config_.latency_enabled;
+  latency.foreground_enabled = config_.latency_foreground_enabled;
+  latency.merge_enabled = config_.latency_merge_enabled;
+  latency.stats_enabled = config_.latency_stats_enabled;
+  latency.cache_line_bytes = config_.latency_cache_line_bytes;
+  latency.swcc_read_ns_per_line = config_.swcc_read_ns;
+  latency.swcc_write_ns_per_line = config_.swcc_write_ns;
+  latency.swcc_flush_ns_per_line = config_.swcc_flush_ns;
+  latency.hwcc_read_ns_per_line = config_.hwcc_read_ns;
+  latency.hwcc_write_ns_per_line = config_.hwcc_write_ns;
+  latency.hwcc_atomic_load_ns = config_.hwcc_atomic_load_ns;
+  latency.hwcc_atomic_store_ns = config_.hwcc_atomic_store_ns;
+  latency.hwcc_atomic_rmw_ns = config_.hwcc_atomic_rmw_ns;
+  latency.cache_model = latency_sim::ParseCacheModel(config_.latency_cache_model);
+  latency.cache_hits_enabled = config_.latency_cache_hits_enabled;
+  latency.cache_capacity_lines = config_.latency_cache_capacity_lines;
+  latency.cache_associativity = config_.latency_cache_associativity;
+  latency.cache_fixed_hit_rate = config_.latency_cache_fixed_hit_rate;
+  latency.cache_hit_extra_ns = config_.latency_cache_hit_extra_ns;
+  latency_sim::GlobalLatencySimulator().Configure(latency);
 }
 
 KVStore::~KVStore() { Close(); }
@@ -410,16 +429,25 @@ std::string KVStore::DumpStats() const {
   out += "migration_out=" + std::to_string(runtime.migration_out) + "\n";
   out += "network_tx_bytes=" + std::to_string(runtime.network_tx_bytes) + "\n";
   out += "network_rx_bytes=" + std::to_string(runtime.network_rx_bytes) + "\n";
-  const LatencyStats latency = GlobalLatencySimulator().Snapshot();
-  out += "TIGONKV_LATENCY_STATS\nhwcc_reads=" + std::to_string(latency.hwcc_reads) +
-      "\nhwcc_writes=" + std::to_string(latency.hwcc_writes) +
-      "\nhwcc_atomics=" + std::to_string(latency.hwcc_atomics) +
-      "\nswcc_reads=" + std::to_string(latency.swcc_reads) +
-      "\nswcc_writes=" + std::to_string(latency.swcc_writes) +
-      "\nswcc_flushes=" + std::to_string(latency.swcc_flushes) +
-      "\ncache_hits=" + std::to_string(latency.cache_hits) +
-      "\ncache_misses=" + std::to_string(latency.cache_misses) +
-      "\ndelayed_ns=" + std::to_string(latency.delayed_ns) + "\n";
+  const latency_sim::Stats latency = latency_sim::GlobalLatencySimulator().SnapshotStats();
+  const auto ratio = [](uint64_t hits, uint64_t misses) {
+    const uint64_t total = hits + misses;
+    return total == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(total);
+  };
+  out += "TIGONKV_LATENCY_STATS\nswcc_raw=" +
+      std::to_string(latency.swcc_raw_line_accesses) +
+      "\nhwcc_raw=" + std::to_string(latency.hwcc_raw_line_accesses) +
+      "\nswcc_hits=" + std::to_string(latency.swcc_cache_hits) +
+      "\nhwcc_hits=" + std::to_string(latency.hwcc_cache_hits) +
+      "\nswcc_misses=" + std::to_string(latency.swcc_cache_misses) +
+      "\nhwcc_misses=" + std::to_string(latency.hwcc_cache_misses) +
+      "\nswcc_hit_ratio=" + std::to_string(ratio(latency.swcc_cache_hits, latency.swcc_cache_misses)) +
+      "\nhwcc_hit_ratio=" + std::to_string(ratio(latency.hwcc_cache_hits, latency.hwcc_cache_misses)) +
+      "\nswcc_delayed_ns=" + std::to_string(latency.swcc_delayed_ns) +
+      "\nhwcc_delayed_ns=" + std::to_string(latency.hwcc_delayed_ns) +
+      "\ndelayed_ns=" + std::to_string(latency.TotalDelayedNs()) +
+      "\ncache_model=" + latency_sim::CacheModelName(latency_sim::GlobalLatencySimulator().config().cache_model) +
+      "\ncache_hits_enabled=" + std::to_string(latency_sim::GlobalLatencySimulator().config().cache_hits_enabled) + "\n";
   return out;
 }
 

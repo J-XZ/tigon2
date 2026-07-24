@@ -1,82 +1,122 @@
 #pragma once
 
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
-#include <vector>
+#include <string>
 
-namespace tigonkv {
-enum class PoolKind { kHwcc, kSwcc };
-enum class AccessKind { kRead, kWrite, kAtomicLoad, kAtomicStore, kAtomicRmw, kFlush };
+namespace latency_sim {
 
-struct LatencyStats {
-  uint64_t hwcc_reads = 0, hwcc_writes = 0, hwcc_atomics = 0;
-  uint64_t swcc_reads = 0, swcc_writes = 0, swcc_flushes = 0;
-  uint64_t delayed_ns = 0;
-  uint64_t cache_hits = 0, cache_misses = 0;
+enum class PoolKind : uint8_t { kSwcc = 0, kHwcc = 1 };
+enum class AccessKind : uint8_t {
+  kRead = 0,
+  kWrite = 1,
+  kAtomicLoad = 2,
+  kAtomicStore = 3,
+  kAtomicRmw = 4,
+  kFlush = 5,
+};
+enum class CacheModel : uint8_t {
+  kNone = 0,
+  kFixedHitRate = 1,
+  kPerThreadLru = 2,
+};
+enum class ScopeKind : uint8_t {
+  kForeground = 0,
+  kMerge = 1,
+  kOther = 2,
+};
+class LatencySimulator;
+
+struct Config {
+  bool enabled = false;
+  bool foreground_enabled = true;
+  bool merge_enabled = true;
+  bool stats_enabled = false;
+  uint64_t cache_line_bytes = 64;
+
+  double swcc_read_ns_per_line = 0.0;
+  double swcc_write_ns_per_line = 0.0;
+  double swcc_flush_ns_per_line = 0.0;
+  double hwcc_read_ns_per_line = 0.0;
+  double hwcc_write_ns_per_line = 0.0;
+  double hwcc_atomic_load_ns = 0.0;
+  double hwcc_atomic_store_ns = 0.0;
+  double hwcc_atomic_rmw_ns = 0.0;
+
+  CacheModel cache_model = CacheModel::kNone;
+  bool cache_hits_enabled = true;
+  uint64_t cache_capacity_lines = 4096;
+  uint64_t cache_associativity = 8;
+  double cache_fixed_hit_rate = 0.0;
+  double cache_hit_extra_ns = 0.0;
 };
 
-class LatencySimulator {
- public:
-  void Configure(bool enabled, uint64_t hwcc_ns, uint64_t swcc_read_ns,
-                 uint64_t swcc_write_ns, uint64_t swcc_flush_ns);
-  void ConfigureDetailed(bool enabled, uint64_t hwcc_read_ns,
-                         uint64_t hwcc_write_ns, uint64_t hwcc_atomic_ns,
-                         uint64_t swcc_read_ns, uint64_t swcc_write_ns,
-                         uint64_t swcc_flush_ns,
-                         const char *cache_model = "none",
-                         double fixed_hit_rate = 0.0,
-                         uint64_t cache_capacity_lines = 0);
-  // cache_line_id is optional so existing instrumentation remains source
-  // compatible.  A non-zero token identifies the first cache line touched by
-  // this access; subsequent lines use consecutive tokens.
-  void Record(PoolKind pool, AccessKind kind, uint64_t bytes,
-              uint64_t cache_line_id = 0);
-  void BeginScope();
-  void EndScopeAndDelay();
-  // Sleep for latency accumulated by the current operation. Call only after
-  // releasing protocol locks.
-  void DrainPending();
-  LatencyStats Snapshot() const;
-  void Reset();
+struct Stats {
+  uint64_t swcc_raw_line_accesses = 0;
+  uint64_t hwcc_raw_line_accesses = 0;
+  uint64_t swcc_cache_hits = 0;
+  uint64_t hwcc_cache_hits = 0;
+  uint64_t swcc_cache_misses = 0;
+  uint64_t hwcc_cache_misses = 0;
+  uint64_t swcc_delayed_ns = 0;
+  uint64_t hwcc_delayed_ns = 0;
 
- private:
-  std::atomic<bool> enabled_{false};
-  std::atomic<uint64_t> hwcc_reads_{0}, hwcc_writes_{0}, hwcc_atomics_{0};
-  std::atomic<uint64_t> swcc_reads_{0}, swcc_writes_{0}, swcc_flushes_{0};
-  std::atomic<uint64_t> delayed_ns_{0};
-  std::atomic<uint64_t> cache_hits_{0}, cache_misses_{0}, cache_sequence_{0};
-  uint64_t hwcc_read_ns_ = 0, hwcc_write_ns_ = 0, hwcc_atomic_ns_ = 0;
-  uint64_t swcc_read_ns_ = 0, swcc_write_ns_ = 0, swcc_flush_ns_ = 0;
-  const char *cache_model_ = "none";
-  double fixed_hit_rate_ = 0.0;
-  uint64_t cache_capacity_lines_ = 0;
+  uint64_t RawLineAccesses(PoolKind pool) const {
+    return pool == PoolKind::kSwcc ? swcc_raw_line_accesses
+                                   : hwcc_raw_line_accesses;
+  }
+
+  uint64_t CacheHits(PoolKind pool) const {
+    return pool == PoolKind::kSwcc ? swcc_cache_hits : hwcc_cache_hits;
+  }
+
+  uint64_t CacheMisses(PoolKind pool) const {
+    return pool == PoolKind::kSwcc ? swcc_cache_misses : hwcc_cache_misses;
+  }
+
+  uint64_t TotalLineAccesses(PoolKind pool) const {
+    return CacheHits(pool) + CacheMisses(pool);
+  }
+
+  uint64_t DelayedNs(PoolKind pool) const {
+    return pool == PoolKind::kSwcc ? swcc_delayed_ns : hwcc_delayed_ns;
+  }
+
+  uint64_t TotalDelayedNs() const {
+    return swcc_delayed_ns + hwcc_delayed_ns;
+  }
 };
 
-// Process-wide simulator used by the engine's inline access wrappers.  The
-// relaxed gate lets disabled instrumentation return before touching TLS state.
+CacheModel ParseCacheModel(const std::string &value);
+const char *CacheModelName(CacheModel model);
 LatencySimulator &GlobalLatencySimulator();
+
+// Process-wide relaxed fast gate. Set by LatencySimulator::Configure().
+// All hot-path recorders should check this before touching thread-local state.
 bool InstrumentationEnabledFast();
 
-class NonCoherentSwccTestBackend {
- public:
-  explicit NonCoherentSwccTestBackend(size_t bytes = 4096);
-  void Write(uint32_t host, size_t offset, const void *data, size_t bytes);
-  void WriteBack(uint32_t host, size_t offset, size_t bytes);
-  void Invalidate(uint32_t host, size_t offset, size_t bytes);
-  // Publication is deliberately rejected while the publishing host still
-  // has dirty bytes. This is a deterministic fault-injection hook for the
-  // shared-index publication ordering rule.
-  bool Publish(uint32_t host, size_t offset, size_t bytes);
-  bool IsPublished(size_t offset) const;
-  void Read(uint32_t host, size_t offset, void *data, size_t bytes) const;
-  const uint8_t *Visible() const;
+class LatencySimulator {
+public:
+  explicit LatencySimulator(Config config = {});
 
- private:
-  size_t bytes_;
-  std::vector<uint8_t> visible_;
-  std::vector<uint8_t> published_;
-  std::vector<std::vector<uint8_t>> cache_;
-  std::vector<std::vector<uint8_t>> dirty_;
+  void Configure(Config config);
+  const Config &config() const { return config_; }
+
+  void BeginScope(ScopeKind scope);
+  void EndScopeAndDelay();
+
+  void RecordRange(PoolKind pool, AccessKind kind, const void *addr,
+                   uint64_t bytes);
+  void RecordLine(PoolKind pool, AccessKind kind, const void *addr);
+
+  Stats SnapshotStats() const;
+  Stats TakeStatsAndReset();
+  uint64_t PendingDelayNsForTest() const;
+
+private:
+  Config config_;
+  uint64_t generation_ = 0;
+  mutable Stats stats_;
 };
-}  // namespace tigonkv
+
+} // namespace latency_sim

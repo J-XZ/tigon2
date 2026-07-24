@@ -46,6 +46,8 @@ int main() {
   config.fixed_value_size = 128;
   config.transport_ring_total_mb = 1;
   config.latency_enabled = true;
+  config.latency_foreground_enabled = true;
+  config.latency_stats_enabled = true;
   config.swcc_read_ns = 1;
   config.swcc_write_ns = 1;
   auto store = KVStore::Create(config, true);
@@ -62,9 +64,8 @@ int main() {
   assert(stats.find("allocator_shared_overhead_bytes=") != std::string::npos);
   assert(stats.find("reclaimed_total_bytes=") != std::string::npos);
   assert(stats.find("network_tx_bytes=") != std::string::npos);
-  assert(stats.find("\nswcc_reads=0\n") == std::string::npos);
-  assert(stats.find("\nswcc_writes=0\n") == std::string::npos);
-  assert(stats.find("\nswcc_flushes=0\n") == std::string::npos);
+  assert(stats.find("\nswcc_raw=0\n") == std::string::npos);
+  assert(stats.find("\nswcc_misses=0\n") == std::string::npos);
   store.reset();
   auto attached = KVStore::Create(config, false);
   assert(attached->Get("alpha").value == "three");
