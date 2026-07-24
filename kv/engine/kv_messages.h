@@ -12,7 +12,13 @@ namespace tigonkv::engine {
 
 // A single MPSCRingBuffer entry is 2048 bytes.  This fixed wire record stays
 // below its usable payload and carries no process virtual addresses.
-enum class KvMessageType : uint8_t { kPut = 1, kGet = 2, kDelete = 3, kResponse = 4 };
+enum class KvMessageType : uint8_t {
+  kPut = 1,
+  kGet = 2,
+  kDelete = 3,
+  kIncrement = 4,
+  kResponse = 5,
+};
 
 struct KvMessage {
   KvMessageType type = KvMessageType::kGet;

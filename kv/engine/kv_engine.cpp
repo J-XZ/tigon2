@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <thread>
 #include <chrono>
+#include <charconv>
 #include <map>
 
 namespace tigonkv::engine {
@@ -197,8 +198,15 @@ CasResult KVEngine::CompareExchange(std::string_view key,
 IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
-    return {Status::Error(StatusCode::kOwnerViolation,
-                          "remote increment forwarding is not installed"), 0};
+    std::string value;
+    const auto status = Forward(KvMessageType::kIncrement, key,
+                                std::to_string(delta), &value);
+    if (!status.ok()) return {status, 0};
+    int64_t result = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
+      return {Status::Error(StatusCode::kCorruption, "malformed forwarded increment response"), 0};
+    return {Status::Ok(), result};
   }
   try {
     int64_t value = 0;
@@ -297,6 +305,28 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
       response.value_size = static_cast<uint32_t>(result.size());
       std::memcpy(response.value.data(), result.data(), result.size());
       EnforceMigrationBudget(*partition);
+    }
+  } else if (message.type == KvMessageType::kIncrement) {
+    int64_t delta = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), delta);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) {
+      response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
+    } else {
+      try {
+        int64_t result = 0;
+        if (!partition->IncrementPrivate(key, delta, &result)) {
+          response.status = static_cast<uint32_t>(StatusCode::kNotFound);
+        } else {
+          const std::string encoded = std::to_string(result);
+          response.status = static_cast<uint32_t>(StatusCode::kOk);
+          response.value_size = static_cast<uint32_t>(encoded.size());
+          std::memcpy(response.value.data(), encoded.data(), encoded.size());
+        }
+      } catch (const std::invalid_argument &) {
+        response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
+      } catch (...) {
+        response.status = static_cast<uint32_t>(StatusCode::kCorruption);
+      }
     }
   } else {
     response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);

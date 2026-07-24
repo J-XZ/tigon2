@@ -97,8 +97,16 @@ int main() {
       if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(1);
       const auto read = node_one->Get(owner_zero_key);
       if (!read.status.ok() || read.value != "forwarded") _exit(2);
-      if (!node_one->Delete(owner_zero_key).ok()) _exit(3);
-      if (node_one->Get(owner_zero_key).status.code != tigonkv::StatusCode::kNotFound) _exit(4);
+      std::string counter_key;
+      for (uint32_t i = 0; i < 100; ++i) {
+        const std::string candidate = "cross-counter-" + std::to_string(i);
+        if (node_one->OwnerForKey(candidate) == 0) { counter_key = candidate; break; }
+      }
+      if (counter_key.empty() || !node_one->Put(counter_key, "1").ok()) _exit(3);
+      const auto increment = node_one->Increment(counter_key, 2);
+      if (!increment.status.ok() || increment.value != 3) _exit(4);
+      if (!node_one->Delete(owner_zero_key).ok()) _exit(5);
+      if (node_one->Get(owner_zero_key).status.code != tigonkv::StatusCode::kNotFound) _exit(6);
       _exit(0);
     }
     int status = 0;
