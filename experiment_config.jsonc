@@ -2,7 +2,7 @@
   // NUMA-based CXL shared-memory emulation: the backing file is ordinary host DRAM.
   "shared_memory": {
     "size_mb": 32768,
-    "path": "/mnt/xz_shared_mem",
+    "path": "/dev/shm/tigonkv",
     "device_path": "/dev/ivpci0",
     "numa_node": 1,
     "hwcc": { "offset_mb": 0, "size_mb": 1024 },
