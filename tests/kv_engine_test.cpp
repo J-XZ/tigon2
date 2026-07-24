@@ -155,6 +155,9 @@ int main() {
     }
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     assert(engine->NetworkTxBytes() > 0 && engine->NetworkRxBytes() > 0);
+    const auto engine_runtime = engine->EngineRuntime();
+    assert(engine_runtime.migration_in > 0);
+    assert(engine_runtime.shared_swcc_flushes >= engine_runtime.migration_in);
   }
   unlink(routed_path.c_str());
   return 0;

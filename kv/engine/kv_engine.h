@@ -50,6 +50,7 @@ class KVEngine {
   uint32_t OwnerForKey(std::string_view key) const;
   uint64_t NetworkTxBytes() const { return network_tx_bytes_.load(std::memory_order_relaxed); }
   uint64_t NetworkRxBytes() const { return network_rx_bytes_.load(std::memory_order_relaxed); }
+  RuntimeStats EngineRuntime() const;
 
  private:
   KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> pool,
@@ -94,6 +95,12 @@ class KVEngine {
   uint64_t next_request_id_ = 1;
   std::atomic<uint64_t> network_tx_bytes_{0};
   std::atomic<uint64_t> network_rx_bytes_{0};
+  std::atomic<uint64_t> shared_gets_{0};
+  std::atomic<uint64_t> shared_puts_{0};
+  std::atomic<uint64_t> shared_deletes_{0};
+  std::atomic<uint64_t> shared_swcc_flushes_{0};
+  std::atomic<uint64_t> migration_in_{0};
+  std::atomic<uint64_t> migration_out_{0};
 };
 
 }  // namespace tigonkv::engine

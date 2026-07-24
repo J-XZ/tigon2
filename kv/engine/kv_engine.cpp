@@ -153,7 +153,11 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
     auto *visible = VisiblePartition(key);
-    if (visible != nullptr && visible->PutShared(key, config_.node_id, value)) return Status::Ok();
+    if (visible != nullptr && visible->PutShared(key, config_.node_id, value)) {
+      shared_puts_.fetch_add(1, std::memory_order_relaxed);
+      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      return Status::Ok();
+    }
     return Forward(KvMessageType::kPut, key, value, nullptr);
   }
   try { partition->PutPrivate(key, value); return Status::Ok(); }
@@ -166,8 +170,10 @@ GetResult KVEngine::Get(std::string_view key) {
   if (partition == nullptr) {
     std::string shared;
     auto *visible = VisiblePartition(key);
-    if (visible != nullptr && visible->GetShared(key, config_.node_id, &shared))
+    if (visible != nullptr && visible->GetShared(key, config_.node_id, &shared)) {
+      shared_gets_.fetch_add(1, std::memory_order_relaxed);
       return {Status::Ok(), std::move(shared)};
+    }
     std::string value;
     auto status = Forward(KvMessageType::kGet, key, {}, &value);
     return {std::move(status), std::move(value)};
@@ -270,10 +276,15 @@ CasResult KVEngine::CompareExchange(std::string_view key,
     bool exchanged = false;
     auto *visible = VisiblePartition(key);
     if (visible != nullptr && visible->CompareExchangeShared(
-            key, config_.node_id, expected, desired, &exchanged))
+            key, config_.node_id, expected, desired, &exchanged)) {
+      if (exchanged) {
+        shared_puts_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      }
       return {exchanged ? Status::Ok()
                          : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
               exchanged};
+    }
     return ForwardCompareExchange(key, expected, desired);
   }
   try {
@@ -295,8 +306,11 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   if (partition == nullptr) {
     int64_t shared = 0;
     auto *visible = VisiblePartition(key);
-    if (visible != nullptr && visible->IncrementShared(key, config_.node_id, delta, &shared))
+    if (visible != nullptr && visible->IncrementShared(key, config_.node_id, delta, &shared)) {
+      shared_puts_.fetch_add(1, std::memory_order_relaxed);
+      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
       return {Status::Ok(), shared};
+    }
     std::string value;
     const auto status = Forward(KvMessageType::kIncrement, key,
                                 std::to_string(delta), &value);
@@ -340,6 +354,19 @@ MemoryStats KVEngine::Memory() const {
   for (const auto &partition : partitions_)
     stats.active_shared_rows += partition->migrated_key_count();
   stats.rss_kb = CurrentRssKb();
+  return stats;
+}
+
+RuntimeStats KVEngine::EngineRuntime() const {
+  RuntimeStats stats;
+  stats.shared_gets = shared_gets_.load(std::memory_order_relaxed);
+  stats.shared_puts = shared_puts_.load(std::memory_order_relaxed);
+  stats.shared_deletes = shared_deletes_.load(std::memory_order_relaxed);
+  stats.shared_swcc_flushes = shared_swcc_flushes_.load(std::memory_order_relaxed);
+  stats.migration_in = migration_in_.load(std::memory_order_relaxed);
+  stats.migration_out = migration_out_.load(std::memory_order_relaxed);
+  stats.network_tx_bytes = NetworkTxBytes();
+  stats.network_rx_bytes = NetworkRxBytes();
   return stats;
 }
 
@@ -517,7 +544,12 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
     } else {
       // A remote touch is the move-in trigger; a failed promotion means this
       // row was already shared, which is equally valid for the response.
-      partition->PromotePrivate(key, config_.node_id);
+      // A failed promotion means that another request already published the
+      // shared authority, so count only the successful transition.
+      if (partition->PromotePrivate(key, config_.node_id)) {
+        migration_in_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      }
       response.status = static_cast<uint32_t>(StatusCode::kOk);
       response.value_size = static_cast<uint32_t>(result.size());
       std::memcpy(response.value.data(), result.data(), result.size());
@@ -590,7 +622,10 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
       partition.shared_payload_capacity_bytes() * 9;
   if (partition.hwcc_used_bytes() < hw_budget && !payload_high) return;
   for (uint32_t attempt = 0; attempt < 16; ++attempt) {
-    if (partition.MoveOutClockVictim(config_.node_id)) return;
+    if (partition.MoveOutClockVictim(config_.node_id)) {
+      migration_out_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
   }
   throw std::runtime_error("migration budget exceeded with no quiescent Clock victim");
 }
@@ -598,8 +633,11 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
 Status KVEngine::MoveOut(std::string_view key) {
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) return Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding");
-  return partition->MoveOutPrivate(key, config_.node_id) ? Status::Ok()
-                                                        : Status::Error(StatusCode::kNotFound, "shared key not found or busy");
+  if (partition->MoveOutPrivate(key, config_.node_id)) {
+    migration_out_.fetch_add(1, std::memory_order_relaxed);
+    return Status::Ok();
+  }
+  return Status::Error(StatusCode::kNotFound, "shared key not found or busy");
 }
 
 }  // namespace tigonkv::engine

@@ -1283,8 +1283,15 @@ MemoryStats KVStore::Memory() const { return impl_->engine->Memory(); }
 RuntimeStats KVStore::Runtime() const {
   RuntimeStats stats = runtime_;
   if (impl_ != nullptr && impl_->engine != nullptr) {
-    stats.network_tx_bytes = impl_->engine->NetworkTxBytes();
-    stats.network_rx_bytes = impl_->engine->NetworkRxBytes();
+    const RuntimeStats engine = impl_->engine->EngineRuntime();
+    stats.shared_gets += engine.shared_gets;
+    stats.shared_puts += engine.shared_puts;
+    stats.shared_deletes += engine.shared_deletes;
+    stats.shared_swcc_flushes += engine.shared_swcc_flushes;
+    stats.migration_in += engine.migration_in;
+    stats.migration_out += engine.migration_out;
+    stats.network_tx_bytes = engine.network_tx_bytes;
+    stats.network_rx_bytes = engine.network_rx_bytes;
   }
   return stats;
 }
