@@ -93,9 +93,18 @@ int main() {
   assert(partition.PromotePrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   assert(regions.layout().partitions[5].migration_in_seq.load() == 1);
+  const auto hwcc_before_moveout = regions.layout().domains[
+      static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load();
+  const auto swcc_before_moveout = regions.layout().domains[
+      static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load();
   assert(partition.MoveOutPrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   assert(regions.layout().partitions[5].migration_out_seq.load() == 1);
+  assert(ebr.drain_quiescent() > 0);
+  assert(regions.layout().domains[
+      static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load() < hwcc_before_moveout);
+  assert(regions.layout().domains[
+      static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load() < swcc_before_moveout);
   star::scc_manager = nullptr;
   assert(partition.DeletePrivate("beta"));
   assert(!partition.GetPrivate("beta", &value));

@@ -186,6 +186,27 @@ class CXL_EBR {
                 CHECK(0);       // not used
         }
 
+        // Checkpoint/move-out callers invoke this only after their quiescence
+        // predicate holds.  It makes bounded deterministic reclamation
+        // possible without treating msync as an SCC or epoch substitute.
+        uint64_t drain_quiescent()
+        {
+                EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
+                uint64_t reclaimed = 0;
+                for (uint64_t epoch = 0; epoch < max_epoch; ++epoch) {
+                        auto &objects = local_ebr_meta.retired_objects[epoch];
+                        for (const auto &object : objects) {
+                                CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
+                                regions->Free(object.ptr, object.size,
+                                              allocation_domain(object.category),
+                                              object.owner_shard, local_ebr_meta.coordinator_id);
+                                reclaimed += object.size;
+                        }
+                        objects.clear();
+                }
+                return reclaimed;
+        }
+
         void print_statistics()
         {
                 EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
