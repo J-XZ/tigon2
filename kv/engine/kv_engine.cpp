@@ -563,6 +563,7 @@ CasResult KVEngine::ForwardCompareExchange(std::string_view key,
 }
 
 void KVEngine::PollTransport() {
+  std::lock_guard<std::recursive_mutex> poll_lock(transport_poll_mutex_);
   if (rings_ == nullptr) return;
   alignas(64) char bytes[sizeof(KvMessage)];
   const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));

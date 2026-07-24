@@ -148,16 +148,11 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   std::vector<ReplayResult> results(workers);
   std::vector<std::thread> threads;
   std::mutex error_mutex;
-  std::mutex store_mutex;
   std::exception_ptr error;
   const auto start = std::chrono::steady_clock::now();
   for (uint64_t worker = 0; worker < workers; ++worker) {
     threads.emplace_back([&, worker] {
       try {
-        // MPSCRingBuffer permits one consumer per node.  Keep all transport
-        // polling and its associated request/response state under one VM
-        // dispatcher lock while retaining the per-worker trace contract.
-        std::lock_guard<std::mutex> lock(store_mutex);
         results[worker] = ReplayTrace(*stores.front(), traces[worker]);
       }
       catch (...) { std::lock_guard<std::mutex> lock(error_mutex); if (!error) error = std::current_exception(); }
@@ -168,9 +163,7 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   log_stage("replay_done");
   const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - start).count();
-  threads.clear();
-  for (auto &store : stores) threads.emplace_back([&store] { DrainTransport(*store); });
-  for (auto &thread : threads) thread.join();
+  DrainTransport(*stores.front());
   log_stage("drain_done");
   Barrier(phase, config.node_id, true, stores.front().get());
   log_stage("barrier_done");

@@ -123,13 +123,9 @@ PhaseResult RunWorkers(KVStore &store, const Config &base, uint64_t total, Opera
   const uint64_t node_count = CountForPart(total, base.vm_count, base.node_id);
   const uint64_t node_start = StartForPart(total, base.vm_count, base.node_id);
 
-  // A node owns one MPSC receive ring, so exactly one KVStore instance may
-  // consume its transport messages.  Foreground workers retain independent
-  // ranges and threads, but serialize a synchronous store operation through
-  // this node-local transport dispatcher.  Creating one KVStore per worker
-  // lets a response be consumed by a different instance and lost from the
-  // requester's response map.
-  std::mutex store_mutex;
+  // A node owns one KVStore/transport dispatcher.  Its inbound MPSC dequeue
+  // is serialized inside KVEngine, while foreground operations remain
+  // concurrent and retain independent worker ranges.
 
   std::atomic<bool> start{false};
   std::mutex error_mutex;
@@ -143,10 +139,8 @@ PhaseResult RunWorkers(KVStore &store, const Config &base, uint64_t total, Opera
         while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
         const uint64_t worker_start = StartForPart(node_count, threads, worker);
         const uint64_t worker_count = CountForPart(node_count, threads, worker);
-        for (uint64_t i = 0; i < worker_count; ++i) {
-          std::lock_guard<std::mutex> lock(store_mutex);
+        for (uint64_t i = 0; i < worker_count; ++i)
           operation(store, worker, node_start + worker_start + i, i);
-        }
       } catch (...) {
         std::lock_guard<std::mutex> guard(error_mutex);
         if (!error) error = std::current_exception();

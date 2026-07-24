@@ -76,6 +76,10 @@ class KVEngine {
   std::unique_ptr<star::SCCManager> scc_;
   std::vector<std::unique_ptr<KVPartition>> partitions_;
   star::MPSCRingBuffer *rings_ = nullptr;
+  // The node inbound transport is MPSC: producers are concurrent but exactly
+  // one thread may dequeue.  This lock protects only dequeue/dispatch, not
+  // the public KV operation path or row/index concurrency.
+  std::recursive_mutex transport_poll_mutex_;
   std::mutex response_mutex_;
   std::unordered_map<uint64_t, KvMessage> responses_;
   struct PendingScan {
