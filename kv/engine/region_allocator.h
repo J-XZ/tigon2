@@ -35,10 +35,11 @@ struct alignas(64) RegionAllocatorShard {
 // different mapping address because all links are offsets from base_.
 struct alignas(64) RegionAllocatorHeader {
   uint64_t magic = 0x5449474f4e414c4cULL;  // TIGONALL
-  uint32_t version = 2;
+  uint32_t version = 3;
   uint32_t shard_count = 0;
   uint64_t region_bytes = 0;
   uint64_t metadata_bytes = 0;
+  uint64_t reserved_prefix_bytes = 0;
   std::atomic<uint64_t> allocated_bytes{0};
   std::atomic<uint64_t> allocation_count{0};
   std::atomic<uint64_t> free_count{0};
@@ -50,7 +51,8 @@ class RegionAllocator {
   static constexpr uint64_t kAlignment = 64;
 
   static RegionAllocator Initialize(void *region, uint64_t region_bytes,
-                                    uint32_t shard_count);
+                                    uint32_t shard_count,
+                                    uint64_t reserved_prefix_bytes = 0);
   static RegionAllocator Attach(void *region, uint64_t region_bytes);
 
   // owner_shard identifies the VM which owns this allocation. current_shard
@@ -110,6 +112,23 @@ struct DualRegionConfig {
   uint32_t partition_count = 0;
   uint32_t fixed_key_size = 0;
   uint32_t fixed_value_size = 0;
+  double owner_private_swcc_fraction = 0.35;
+};
+
+// A fixed SWCC subrange assigned to one partition.  It is persistent and
+// intentionally carries no process virtual address.  Owner-only allocation is
+// a lock-protected bump path; reclamation is added through EBR in M4.
+struct alignas(64) OwnerPrivateArenaHeader {
+  uint64_t magic = 0x5449474f4e41524eULL;  // TIGONARN
+  uint32_t version = 1;
+  uint32_t partition_id = 0;
+  uint32_t owner_shard = 0;
+  uint32_t reserved = 0;
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  uint64_t bump = 0;
+  std::atomic<uint32_t> lock{0};
+  std::atomic<uint64_t> allocated_bytes{0};
 };
 
 struct alignas(64) DualRegionPersistentHeader {
@@ -118,6 +137,9 @@ struct alignas(64) DualRegionPersistentHeader {
   uint64_t hwcc_allocator_bytes = 0;
   uint64_t swcc_allocator_offset = 0;
   uint64_t swcc_allocator_bytes = 0;
+  uint64_t owner_private_arenas_offset = 0;
+  uint64_t owner_private_arenas_bytes = 0;
+  uint64_t owner_private_arena_stride = 0;
 };
 
 class DualRegionAllocator {
@@ -126,10 +148,14 @@ class DualRegionAllocator {
   static DualRegionAllocator Attach(void *pool, const DualRegionConfig &config);
 
   void *Allocate(uint64_t bytes, AllocationDomain domain, uint32_t owner_shard);
+  void *AllocateOwnerPrivate(uint64_t bytes, uint32_t partition_id,
+                             uint32_t owner_shard);
   void Free(void *pointer, uint64_t bytes, AllocationDomain domain,
             uint32_t owner_shard, uint32_t current_shard);
   bool IsHwccAddress(const void *pointer) const;
   bool IsSwccAddress(const void *pointer) const;
+  bool IsInOwnerPrivateArena(const void *pointer, uint32_t partition_id) const;
+  RegionOffset OwnerPrivateArenaOffset(uint32_t partition_id) const;
   const SharedLayoutHeader &layout() const { return header_->layout; }
   SharedLayoutHeader &layout() { return header_->layout; }
   const RegionAllocator &hwcc() const { return hwcc_; }
@@ -141,6 +167,7 @@ class DualRegionAllocator {
                       RegionAllocator swcc)
       : pool_(pool), config_(config), header_(header), hwcc_(hwcc), swcc_(swcc) {}
   static bool IsHwccDomain(AllocationDomain domain);
+  OwnerPrivateArenaHeader *Arena(uint32_t partition_id) const;
   std::byte *pool_;
   DualRegionConfig config_;
   DualRegionPersistentHeader *header_;

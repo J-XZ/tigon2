@@ -37,10 +37,21 @@ int main() {
   auto &regions = pool.allocator();
   star::CXL_EBR ebr(2, 1, &regions);
   ebr.thread_init_ebr_meta(0, 0);
-  tigonkv::engine::KVPartition partition(regions, ebr, 3, 1, false);
+  tigonkv::engine::KVPartition partition(regions, ebr, 5, 1, false);
+  assert(regions.OwnerPrivateArenaOffset(5) ==
+         regions.layout().partitions[5].private_arena);
+  bool wrong_owner_rejected = false;
+  try {
+    (void)regions.AllocateOwnerPrivate(64, 5, 0);
+  } catch (const std::runtime_error &) {
+    wrong_owner_rejected = true;
+  }
+  assert(wrong_owner_rejected);
   assert(partition.PutPrivate("alpha", "one"));
   assert(partition.PutPrivate("beta", "two"));
   assert(!partition.PutPrivate("alpha", "updated"));
+  assert(regions.IsInOwnerPrivateArena(
+      regions.swcc().FromOffset(regions.layout().partitions[5].private_root), 5));
   std::string value;
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   assert(partition.DeletePrivate("beta"));
@@ -53,7 +64,7 @@ int main() {
     auto &attached_regions = attached_pool.allocator();
     star::CXL_EBR attached_ebr(2, 1, &attached_regions);
     attached_ebr.thread_init_ebr_meta(0, 0);
-    tigonkv::engine::KVPartition attached(attached_regions, attached_ebr, 3, 1, true);
+    tigonkv::engine::KVPartition attached(attached_regions, attached_ebr, 5, 1, true);
     std::string child_value;
     if (!attached.GetPrivate("alpha", &child_value) || child_value != "updated") _exit(1);
     if (attached.GetPrivate("beta", &child_value)) _exit(1);

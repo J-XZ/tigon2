@@ -11,7 +11,8 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
                          bool attach)
     : regions_(regions), ebr_(ebr), partition_id_(partition_id),
       owner_shard_(owner_shard), directory_(regions.layout().partitions.at(partition_id)),
-      private_binding_{&regions, AllocationDomain::kOwnerPrivateSwcc, owner_shard, &ebr},
+      private_binding_{&regions, AllocationDomain::kOwnerPrivateSwcc, owner_shard, &ebr,
+                       partition_id},
       shared_binding_{&regions, AllocationDomain::kHwccIndex, owner_shard, &ebr} {
   if (partition_id >= regions.layout().partition_count)
     throw std::invalid_argument("partition id outside persistent layout");
@@ -42,8 +43,8 @@ PrivateRow *KVPartition::RowFromOffset(RegionOffset offset) const {
 PrivateRow *KVPartition::AllocateRow(const FixedKey &key, std::string_view value) {
   const uint64_t bytes = sizeof(PrivateRow) + regions_.layout().fixed_key_size +
                          regions_.layout().fixed_value_size;
-  auto *row = new (regions_.Allocate(bytes, AllocationDomain::kOwnerPrivateSwcc,
-                                     owner_shard_)) PrivateRow;
+  auto *row = new (regions_.AllocateOwnerPrivate(bytes, partition_id_, owner_shard_))
+      PrivateRow;
   row->key_len = regions_.layout().fixed_key_size;
   row->value_len = static_cast<uint32_t>(value.size());
   std::memcpy(row->kv, key.bytes, row->key_len);

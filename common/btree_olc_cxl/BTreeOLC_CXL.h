@@ -52,10 +52,14 @@ struct TreeNodeAllocation {
 	tigonkv::engine::AllocationDomain domain = tigonkv::engine::AllocationDomain::kHwccIndex;
 	uint32_t owner_shard = 0;
 	star::CXL_EBR *ebr = nullptr;
+	uint32_t private_partition = UINT32_MAX;
 
 	void *Allocate(uint64_t bytes) const {
 		if (regions == nullptr) throw std::invalid_argument("BPlusTree requires a region allocation binding");
-		return regions->Allocate(bytes, domain, owner_shard);
+		return domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc &&
+		               private_partition != UINT32_MAX
+		           ? regions->AllocateOwnerPrivate(bytes, private_partition, owner_shard)
+		           : regions->Allocate(bytes, domain, owner_shard);
 	}
 
 	void Retire(void *pointer, uint64_t bytes) const {
