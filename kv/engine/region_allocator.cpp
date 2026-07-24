@@ -220,4 +220,113 @@ bool RegionAllocator::Contains(const void *pointer) const {
   return p != nullptr && p >= base_ + header_->metadata_bytes && p < base_ + bytes_;
 }
 
+bool DualRegionAllocator::IsHwccDomain(AllocationDomain domain) {
+  switch (domain) {
+    case AllocationDomain::kHwccIndex:
+    case AllocationDomain::kHwccMetadata:
+    case AllocationDomain::kHwccEbr:
+    case AllocationDomain::kHwccLayout:
+    case AllocationDomain::kTransport:
+      return true;
+    case AllocationDomain::kOwnerPrivateSwcc:
+    case AllocationDomain::kSharedPayloadSwcc:
+    case AllocationDomain::kAllocatorMetadata:
+    case AllocationDomain::kCount:
+      return false;
+  }
+  throw std::invalid_argument("invalid allocation domain");
+}
+
+DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
+                                                    const DualRegionConfig &config) {
+  if (pool == nullptr || config.total_pool_bytes == 0 || config.vm_count == 0 ||
+      config.partition_count == 0 || config.partition_count % config.vm_count != 0 ||
+      config.hwcc_size_bytes <= sizeof(DualRegionPersistentHeader) ||
+      config.swcc_size_bytes <= sizeof(RegionAllocatorHeader) ||
+      config.hwcc_offset_bytes + config.hwcc_size_bytes > config.total_pool_bytes ||
+      config.swcc_offset_bytes + config.swcc_size_bytes > config.total_pool_bytes ||
+      (config.hwcc_offset_bytes < config.swcc_offset_bytes + config.swcc_size_bytes &&
+       config.swcc_offset_bytes < config.hwcc_offset_bytes + config.hwcc_size_bytes))
+    throw std::invalid_argument("invalid dual-region configuration");
+  auto *base = static_cast<std::byte *>(pool);
+  if (reinterpret_cast<uintptr_t>(base) % RegionAllocator::kAlignment != 0)
+    throw std::invalid_argument("dual-region pool is not cacheline aligned");
+  auto *header = new (base + config.hwcc_offset_bytes) DualRegionPersistentHeader;
+  header->layout.config_hash = config.config_hash;
+  header->layout.total_pool_bytes = config.total_pool_bytes;
+  header->layout.hwcc_offset_bytes = config.hwcc_offset_bytes;
+  header->layout.hwcc_size_bytes = config.hwcc_size_bytes;
+  header->layout.swcc_offset_bytes = config.swcc_offset_bytes;
+  header->layout.swcc_size_bytes = config.swcc_size_bytes;
+  header->layout.vm_count = config.vm_count;
+  header->layout.partition_count = config.partition_count;
+  header->layout.fixed_key_size = config.fixed_key_size;
+  header->layout.fixed_value_size = config.fixed_value_size;
+  const uint64_t dual_header_bytes =
+      (sizeof(*header) + RegionAllocator::kAlignment - 1) &
+      ~(RegionAllocator::kAlignment - 1);
+  header->hwcc_allocator_offset = config.hwcc_offset_bytes + dual_header_bytes;
+  header->hwcc_allocator_bytes = config.hwcc_size_bytes -
+                                  (header->hwcc_allocator_offset - config.hwcc_offset_bytes);
+  header->swcc_allocator_offset = config.swcc_offset_bytes;
+  header->swcc_allocator_bytes = config.swcc_size_bytes;
+  auto hwcc = RegionAllocator::Initialize(base + header->hwcc_allocator_offset,
+                                          header->hwcc_allocator_bytes, config.vm_count);
+  auto swcc = RegionAllocator::Initialize(base + header->swcc_allocator_offset,
+                                          header->swcc_allocator_bytes, config.vm_count);
+  header->layout.state.store(static_cast<uint32_t>(LayoutState::kClean),
+                             std::memory_order_release);
+  FlushForRemoteVisibility(header, sizeof(*header));
+  return DualRegionAllocator(base, config, header, hwcc, swcc);
+}
+
+DualRegionAllocator DualRegionAllocator::Attach(void *pool,
+                                                const DualRegionConfig &config) {
+  if (pool == nullptr) throw std::invalid_argument("null dual-region pool");
+  auto *base = static_cast<std::byte *>(pool);
+  auto *header = reinterpret_cast<DualRegionPersistentHeader *>(base + config.hwcc_offset_bytes);
+  if (!header->layout.IsCompatible(config.config_hash, config.total_pool_bytes,
+                                   config.vm_count, config.partition_count) ||
+      header->layout.hwcc_offset_bytes != config.hwcc_offset_bytes ||
+      header->layout.hwcc_size_bytes != config.hwcc_size_bytes ||
+      header->layout.swcc_offset_bytes != config.swcc_offset_bytes ||
+      header->layout.swcc_size_bytes != config.swcc_size_bytes ||
+      header->layout.fixed_key_size != config.fixed_key_size ||
+      header->layout.fixed_value_size != config.fixed_value_size)
+    throw std::runtime_error("dual-region layout attachment validation failed");
+  auto hwcc = RegionAllocator::Attach(base + header->hwcc_allocator_offset,
+                                      header->hwcc_allocator_bytes);
+  auto swcc = RegionAllocator::Attach(base + header->swcc_allocator_offset,
+                                      header->swcc_allocator_bytes);
+  return DualRegionAllocator(base, config, header, hwcc, swcc);
+}
+
+void *DualRegionAllocator::Allocate(uint64_t bytes, AllocationDomain domain,
+                                    uint32_t owner_shard) {
+  DomainCounter &counter = header_->layout.domains[static_cast<size_t>(domain)];
+  return IsHwccDomain(domain)
+             ? hwcc_.Allocate(bytes, domain, &counter, owner_shard)
+             : swcc_.Allocate(bytes, domain, &counter, owner_shard);
+}
+
+void DualRegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain domain,
+                               uint32_t owner_shard, uint32_t current_shard) {
+  DomainCounter &counter = header_->layout.domains[static_cast<size_t>(domain)];
+  if (IsHwccDomain(domain)) {
+    if (!hwcc_.Contains(pointer)) throw std::runtime_error("HWCC free outside HWCC region");
+    hwcc_.Free(pointer, bytes, domain, &counter, owner_shard, current_shard);
+  } else {
+    if (!swcc_.Contains(pointer)) throw std::runtime_error("SWCC free outside SWCC region");
+    swcc_.Free(pointer, bytes, domain, &counter, owner_shard, current_shard);
+  }
+}
+
+bool DualRegionAllocator::IsHwccAddress(const void *pointer) const {
+  return hwcc_.Contains(pointer);
+}
+
+bool DualRegionAllocator::IsSwccAddress(const void *pointer) const {
+  return swcc_.Contains(pointer);
+}
+
 }  // namespace tigonkv::engine

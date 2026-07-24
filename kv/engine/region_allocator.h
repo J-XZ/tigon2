@@ -93,4 +93,57 @@ class RegionAllocator {
   RegionAllocatorHeader *header_;
 };
 
+// The pool is mapped once, but allocations are physically constrained to one
+// of the two configured intervals.  This is deliberately a concrete routing
+// object, not a callback layer: hot callers select a domain and use an inline
+// switch to reach the correct RegionAllocator.
+struct DualRegionConfig {
+  uint64_t total_pool_bytes = 0;
+  uint64_t hwcc_offset_bytes = 0;
+  uint64_t hwcc_size_bytes = 0;
+  uint64_t swcc_offset_bytes = 0;
+  uint64_t swcc_size_bytes = 0;
+  uint64_t config_hash = 0;
+  uint32_t vm_count = 0;
+  uint32_t partition_count = 0;
+  uint32_t fixed_key_size = 0;
+  uint32_t fixed_value_size = 0;
+};
+
+struct alignas(64) DualRegionPersistentHeader {
+  SharedLayoutHeader layout{};
+  uint64_t hwcc_allocator_offset = 0;
+  uint64_t hwcc_allocator_bytes = 0;
+  uint64_t swcc_allocator_offset = 0;
+  uint64_t swcc_allocator_bytes = 0;
+};
+
+class DualRegionAllocator {
+ public:
+  static DualRegionAllocator Initialize(void *pool, const DualRegionConfig &config);
+  static DualRegionAllocator Attach(void *pool, const DualRegionConfig &config);
+
+  void *Allocate(uint64_t bytes, AllocationDomain domain, uint32_t owner_shard);
+  void Free(void *pointer, uint64_t bytes, AllocationDomain domain,
+            uint32_t owner_shard, uint32_t current_shard);
+  bool IsHwccAddress(const void *pointer) const;
+  bool IsSwccAddress(const void *pointer) const;
+  const SharedLayoutHeader &layout() const { return header_->layout; }
+  SharedLayoutHeader &layout() { return header_->layout; }
+  const RegionAllocator &hwcc() const { return hwcc_; }
+  const RegionAllocator &swcc() const { return swcc_; }
+
+ private:
+  DualRegionAllocator(std::byte *pool, const DualRegionConfig &config,
+                      DualRegionPersistentHeader *header, RegionAllocator hwcc,
+                      RegionAllocator swcc)
+      : pool_(pool), config_(config), header_(header), hwcc_(hwcc), swcc_(swcc) {}
+  static bool IsHwccDomain(AllocationDomain domain);
+  std::byte *pool_;
+  DualRegionConfig config_;
+  DualRegionPersistentHeader *header_;
+  RegionAllocator hwcc_;
+  RegionAllocator swcc_;
+};
+
 }  // namespace tigonkv::engine

@@ -144,6 +144,39 @@ void TestInvalidAttachment() {
   assert(rejected);
 }
 
+void TestDualPhysicalRegions() {
+  Mapping mapping(true);
+  DualRegionConfig config;
+  config.total_pool_bytes = kBytes;
+  config.hwcc_offset_bytes = 0;
+  config.hwcc_size_bytes = 1024 * 1024;
+  config.swcc_offset_bytes = 1024 * 1024;
+  config.swcc_size_bytes = kBytes - config.swcc_offset_bytes;
+  config.config_hash = 0x1234;
+  config.vm_count = 2;
+  config.partition_count = 8;
+  config.fixed_key_size = 32;
+  config.fixed_value_size = 128;
+  auto dual = DualRegionAllocator::Initialize(mapping.base, config);
+  void *index = dual.Allocate(100, AllocationDomain::kHwccIndex, 0);
+  void *metadata = dual.Allocate(64, AllocationDomain::kHwccMetadata, 1);
+  void *owner = dual.Allocate(80, AllocationDomain::kOwnerPrivateSwcc, 0);
+  void *payload = dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 1);
+  assert(dual.IsHwccAddress(index) && dual.IsHwccAddress(metadata));
+  assert(dual.IsSwccAddress(owner) && dual.IsSwccAddress(payload));
+  assert(!dual.IsHwccAddress(owner) && !dual.IsSwccAddress(index));
+  assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
+             .used_bytes.load() > 0);
+  auto attached = DualRegionAllocator::Attach(mapping.base, config);
+  assert(attached.IsHwccAddress(index) && attached.IsSwccAddress(payload));
+  dual.Free(index, 100, AllocationDomain::kHwccIndex, 0, 0);
+  dual.Free(metadata, 64, AllocationDomain::kHwccMetadata, 1, 1);
+  dual.Free(owner, 80, AllocationDomain::kOwnerPrivateSwcc, 0, 0);
+  dual.Free(payload, 100, AllocationDomain::kSharedPayloadSwcc, 1, 1);
+  assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
+             .used_bytes.load() == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -151,5 +184,6 @@ int main() {
   TestCrossProcessRemoteFree();
   TestConcurrencyAndBounds();
   TestInvalidAttachment();
+  TestDualPhysicalRegions();
   return 0;
 }
