@@ -150,6 +150,7 @@ int main() {
       assert(done == 0);
     }
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(engine->NetworkTxBytes() > 0 && engine->NetworkRxBytes() > 0);
   }
   unlink(routed_path.c_str());
   return 0;

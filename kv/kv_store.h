@@ -171,7 +171,7 @@ class KVStore {
   // ingest. Normal PUTs maintain this index online.
   Status RebuildSortedIndex();
   MemoryStats Memory() const;
-  RuntimeStats Runtime() const { return runtime_; }
+  RuntimeStats Runtime() const;
   uint32_t StablePartitionForKey(std::string_view key) const;
   uint32_t OwnerForKey(std::string_view key) const;
   std::string DumpStats() const;

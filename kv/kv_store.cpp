@@ -1280,8 +1280,18 @@ Status KVStore::RebuildSortedIndex() { return Status::Ok(); }
 
 MemoryStats KVStore::Memory() const { return impl_->engine->Memory(); }
 
+RuntimeStats KVStore::Runtime() const {
+  RuntimeStats stats = runtime_;
+  if (impl_ != nullptr && impl_->engine != nullptr) {
+    stats.network_tx_bytes = impl_->engine->NetworkTxBytes();
+    stats.network_rx_bytes = impl_->engine->NetworkRxBytes();
+  }
+  return stats;
+}
+
 std::string KVStore::DumpStats() const {
   const MemoryStats memory = Memory();
+  const RuntimeStats runtime = Runtime();
   std::string out = "TIGONKV_MEMORY_STATS\n";
   out += "allocator_mode=" + memory.allocator_mode + "\n";
   out += "physical_region_split=" + std::to_string(memory.physical_region_split) + "\n";
@@ -1299,23 +1309,23 @@ std::string KVStore::DumpStats() const {
   out += "active_shared_rows=" + std::to_string(memory.active_shared_rows) + "\n";
   out += "rss_kb=" + std::to_string(memory.rss_kb) + "\n";
   out += "TIGONKV_RUNTIME_STATS\nnode=" + std::to_string(config_.node_id) + "\n";
-  out += "logical_ops=" + std::to_string(runtime_.logical_ops) + "\n";
-  out += "commits=" + std::to_string(runtime_.commits) + "\n";
-  out += "aborts=" + std::to_string(runtime_.aborts) + "\n";
-  out += "retries=" + std::to_string(runtime_.retries) + "\n";
-  out += "private_gets=" + std::to_string(runtime_.private_gets) + "\n";
-  out += "private_puts=" + std::to_string(runtime_.private_puts) + "\n";
-  out += "private_deletes=" + std::to_string(runtime_.private_deletes) + "\n";
-  out += "checkpoint_swcc_flushes=" + std::to_string(runtime_.checkpoint_swcc_flushes) + "\n";
-  out += "private_swcc_flushes=" + std::to_string(runtime_.private_swcc_flushes) + "\n";
-  out += "shared_gets=" + std::to_string(runtime_.shared_gets) + "\n";
-  out += "shared_puts=" + std::to_string(runtime_.shared_puts) + "\n";
-  out += "shared_deletes=" + std::to_string(runtime_.shared_deletes) + "\n";
-  out += "shared_swcc_flushes=" + std::to_string(runtime_.shared_swcc_flushes) + "\n";
-  out += "migration_in=" + std::to_string(runtime_.migration_in) + "\n";
-  out += "migration_out=" + std::to_string(runtime_.migration_out) + "\n";
-  out += "network_tx_bytes=" + std::to_string(runtime_.network_tx_bytes) + "\n";
-  out += "network_rx_bytes=" + std::to_string(runtime_.network_rx_bytes) + "\n";
+  out += "logical_ops=" + std::to_string(runtime.logical_ops) + "\n";
+  out += "commits=" + std::to_string(runtime.commits) + "\n";
+  out += "aborts=" + std::to_string(runtime.aborts) + "\n";
+  out += "retries=" + std::to_string(runtime.retries) + "\n";
+  out += "private_gets=" + std::to_string(runtime.private_gets) + "\n";
+  out += "private_puts=" + std::to_string(runtime.private_puts) + "\n";
+  out += "private_deletes=" + std::to_string(runtime.private_deletes) + "\n";
+  out += "checkpoint_swcc_flushes=" + std::to_string(runtime.checkpoint_swcc_flushes) + "\n";
+  out += "private_swcc_flushes=" + std::to_string(runtime.private_swcc_flushes) + "\n";
+  out += "shared_gets=" + std::to_string(runtime.shared_gets) + "\n";
+  out += "shared_puts=" + std::to_string(runtime.shared_puts) + "\n";
+  out += "shared_deletes=" + std::to_string(runtime.shared_deletes) + "\n";
+  out += "shared_swcc_flushes=" + std::to_string(runtime.shared_swcc_flushes) + "\n";
+  out += "migration_in=" + std::to_string(runtime.migration_in) + "\n";
+  out += "migration_out=" + std::to_string(runtime.migration_out) + "\n";
+  out += "network_tx_bytes=" + std::to_string(runtime.network_tx_bytes) + "\n";
+  out += "network_rx_bytes=" + std::to_string(runtime.network_rx_bytes) + "\n";
   const LatencyStats latency = GlobalLatencySimulator().Snapshot();
   out += "TIGONKV_LATENCY_STATS\nhwcc_reads=" + std::to_string(latency.hwcc_reads) +
       "\nhwcc_writes=" + std::to_string(latency.hwcc_writes) +

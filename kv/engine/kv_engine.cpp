@@ -311,6 +311,7 @@ Status KVEngine::Checkpoint() {
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {
+  network_tx_bytes_.fetch_add(sizeof(message), std::memory_order_relaxed);
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
     PollTransport();
@@ -395,6 +396,7 @@ void KVEngine::PollTransport() {
   if (received != sizeof(KvMessage)) throw std::runtime_error("malformed KV transport entry");
   KvMessage message{};
   std::memcpy(&message, bytes, sizeof(message));
+  network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
   HandleTransportMessage(message);
 }
 

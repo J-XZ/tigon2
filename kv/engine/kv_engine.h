@@ -5,6 +5,7 @@
 #include "kv/kv_store.h"
 
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <string_view>
@@ -47,6 +48,8 @@ class KVEngine {
   void PollTransport();
   uint32_t PartitionForKey(std::string_view key) const;
   uint32_t OwnerForKey(std::string_view key) const;
+  uint64_t NetworkTxBytes() const { return network_tx_bytes_.load(std::memory_order_relaxed); }
+  uint64_t NetworkRxBytes() const { return network_rx_bytes_.load(std::memory_order_relaxed); }
 
  private:
   KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> pool,
@@ -88,6 +91,8 @@ class KVEngine {
   std::mutex pending_cas_mutex_;
   std::unordered_map<uint64_t, PendingCas> pending_cas_;
   uint64_t next_request_id_ = 1;
+  std::atomic<uint64_t> network_tx_bytes_{0};
+  std::atomic<uint64_t> network_rx_bytes_{0};
 };
 
 }  // namespace tigonkv::engine
