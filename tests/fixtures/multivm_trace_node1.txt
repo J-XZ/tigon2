@@ -1,0 +1,3 @@
+# node1 belongs to node 0; node 1 must forward both PUT and first GET.
+PUT 5 3node1
+GET 5 0node1

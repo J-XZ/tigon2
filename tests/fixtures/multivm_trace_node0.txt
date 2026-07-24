@@ -1,0 +1,3 @@
+# alpha belongs to node 1; node 0 must forward both PUT and first GET.
+PUT 5 3alpha
+GET 5 0alpha
