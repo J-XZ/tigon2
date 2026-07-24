@@ -71,7 +71,7 @@ echo "deb http://security.ubuntu.com/ubuntu jammy-security main restricted unive
 #     mv ./MLNX_OFED_LINUX-23.04-0.5.3.3-ubuntu22.04-x86_64.tgz ${BUILD_DIR}/mkosi.extra/root/
 # fi
 
-if echo ${network_device} | grep -i "Ethernet Controller E810-C" >/dev/null 2>/dev/null; then
+if echo "${network_device:-}" | grep -i "Ethernet Controller E810-C" >/dev/null 2>/dev/null; then
     wget https://sourceforge.net/projects/e1000/files/iavf%20stable/4.8.2/iavf-4.8.2.tar.gz -O ${BUILD_DIR}/mkosi.extra/root/iavf-4.8.2.tar.gz
 fi
 
@@ -80,6 +80,18 @@ enable_systemd_service sshd
 enable_systemd_service systemd-networkd
 enable_systemd_service systemd-resolved
 enable_systemd_service chrony
+
+# QEMU's user-mode NIC is discovered as an Ethernet device.  Explicitly let
+# systemd-networkd request an address from its built-in DHCP server so the
+# host-forwarded SSH checks work on a fresh, independent image.
+mkdir -p mkosi.extra/etc/systemd/network
+cat > mkosi.extra/etc/systemd/network/20-wired-dhcp.network <<'EOF'
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes
+EOF
 
 mkdir -p mkosi.extra/etc/sysctl.d/
 tee mkosi.extra/etc/sysctl.d/99-kubernetes-cri.conf <<EOF
