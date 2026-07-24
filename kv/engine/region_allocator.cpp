@@ -132,6 +132,16 @@ void RegionAllocator::ReapRemote(uint32_t owner_shard, DomainCounter *counter) {
   }
 }
 
+void RegionAllocator::FlushAllocatedRanges() const {
+  FlushForRemoteVisibility(header_, MetadataBytes());
+  for (uint32_t shard = 0; shard < header_->shard_count; ++shard) {
+    const auto &entry = header_->shards[shard];
+    const uint64_t bump = entry.bump;
+    if (bump > entry.begin)
+      FlushForRemoteVisibility(base_ + entry.begin, bump - entry.begin);
+  }
+}
+
 void *RegionAllocator::AllocateFromShard(uint64_t bytes, uint32_t size_class,
                                          uint32_t owner_shard) {
   auto &shard = header_->shards[owner_shard];
@@ -515,6 +525,21 @@ RegionOffset DualRegionAllocator::OwnerPrivateArenaOffset(uint32_t partition_id)
 
 uint64_t DualRegionAllocator::SharedPayloadCapacityBytes() const {
   return header_->swcc_allocator_bytes - header_->owner_private_arenas_bytes;
+}
+
+void DualRegionAllocator::FlushCheckpointRanges() {
+  hwcc_.FlushAllocatedRanges();
+  swcc_.FlushAllocatedRanges();
+  for (uint32_t partition = 0; partition < header_->layout.partition_count; ++partition) {
+    auto *arena = Arena(partition);
+    const RegionOffset arena_offset = swcc_.ToOffset(arena);
+    if (arena->bump > arena_offset)
+      FlushForRemoteVisibility(arena, arena->bump - arena_offset);
+  }
+  header_->layout.clean_epoch.fetch_add(1, std::memory_order_release);
+  header_->layout.state.store(static_cast<uint32_t>(LayoutState::kClean),
+                              std::memory_order_release);
+  FlushForRemoteVisibility(header_, sizeof(*header_));
 }
 
 DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,

@@ -73,6 +73,9 @@ class RegionAllocator {
     return header_->allocated_bytes.load(std::memory_order_acquire);
   }
   uint32_t shard_count() const { return header_->shard_count; }
+  // Flush allocator metadata plus each shard's allocated high-water range.
+  // This deliberately never sweeps an entire region.
+  void FlushAllocatedRanges() const;
 
  private:
   RegionAllocator(void *base, uint64_t bytes, RegionAllocatorHeader *header)
@@ -162,6 +165,9 @@ class DualRegionAllocator {
   bool IsInOwnerPrivateArena(const void *pointer, uint32_t partition_id) const;
   RegionOffset OwnerPrivateArenaOffset(uint32_t partition_id) const;
   uint64_t SharedPayloadCapacityBytes() const;
+  // Checkpoint persistence is cacheline writeback/fence only. It is not an
+  // SCC substitute and intentionally does not use page-level msync.
+  void FlushCheckpointRanges();
   const SharedLayoutHeader &layout() const { return header_->layout; }
   SharedLayoutHeader &layout() { return header_->layout; }
   const RegionAllocator &hwcc() const { return hwcc_; }

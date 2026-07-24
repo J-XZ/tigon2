@@ -61,6 +61,7 @@ int main() {
     assert(engine->Delete("alpha").ok());
     assert(engine->Get("alpha").status.code == tigonkv::StatusCode::kNotFound);
     assert(engine->Put("persist", "value").ok());
+    assert(engine->Checkpoint().ok());
   }
   {
     auto attached = tigonkv::engine::KVEngine::Open(single_owner, false);

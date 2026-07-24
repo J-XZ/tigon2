@@ -252,6 +252,19 @@ MemoryStats KVEngine::Memory() const {
   return stats;
 }
 
+Status KVEngine::Checkpoint() {
+  try {
+    // Poll a bounded batch before reclamation. Synchronous forwarders also
+    // poll, so this only drains requests already visible to this VM.
+    for (uint32_t i = 0; i < 1024; ++i) PollTransport();
+    ebr_->drain_quiescent();
+    pool_->allocator().FlushCheckpointRanges();
+    return Status::Ok();
+  } catch (const std::exception &e) {
+    return Status::Error(StatusCode::kCorruption, e.what());
+  }
+}
+
 void KVEngine::SendTransportMessage(const KvMessage &message) {
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {

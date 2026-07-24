@@ -41,6 +41,7 @@ class KVEngine {
                             std::string_view desired);
   IncrementResult Increment(std::string_view key, int64_t delta);
   MemoryStats Memory() const;
+  Status Checkpoint();
   // Foreground workers call this between operations; synchronous forwarding
   // also polls it while waiting so no dedicated service core is required.
   void PollTransport();
