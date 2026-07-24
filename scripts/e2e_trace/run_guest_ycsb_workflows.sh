@@ -85,9 +85,17 @@ for ((round = 1; round <= rounds; round++)); do
       phase_reset=0
       [[ "$phase" == load ]] && phase_reset=1
       pids=()
-      for ((vm = 0; vm < vm_count; vm++)); do
+      first_vm=0
+      if [[ "$phase" == load ]]; then
+        run_one "$round" "$workload" "$phase" 0 1 "$phase_log/vm0.log" &
+        pids+=("$!")
+        # VM0 publishes the shared layout before peers attach. It remains
+        # running to service forwarded operations while the other VMs start.
+        sleep "${TIGONKV_YCSB_LAYOUT_READY_DELAY_SEC:-1}"
+        first_vm=1
+      fi
+      for ((vm = first_vm; vm < vm_count; vm++)); do
         reset=0
-        [[ "$vm" == 0 ]] && reset="$phase_reset"
         run_one "$round" "$workload" "$phase" "$vm" "$reset" "$phase_log/vm$vm.log" &
         pids+=("$!")
       done
