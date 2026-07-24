@@ -98,6 +98,14 @@ int main() {
     }
     assert(!owner_one_key.empty());
     assert(engine->Put(owner_zero_key, "owner-zero").ok());
+    constexpr uint32_t kRemoteScanRows = 1024;
+    uint32_t remote_scan_rows = 0;
+    for (uint32_t i = 0; remote_scan_rows < kRemoteScanRows; ++i) {
+      const std::string key = "scan-bulk-" + std::to_string(i);
+      if (engine->OwnerForKey(key) != 0) continue;
+      assert(engine->Put(key, "bulk").ok());
+      ++remote_scan_rows;
+    }
     const pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
@@ -110,7 +118,11 @@ int main() {
         saw_owner_zero = saw_owner_zero || (item.key == owner_zero_key && item.value == "owner-zero");
         saw_owner_one = saw_owner_one || (item.key == owner_one_key && item.value == "owner-one");
       }
-      if (!distributed_scan.status.ok() || !saw_owner_zero || !saw_owner_one) _exit(2);
+      uint32_t bulk_seen = 0;
+      for (const auto &item : distributed_scan.items)
+        bulk_seen += item.value == "bulk";
+      if (!distributed_scan.status.ok() || !saw_owner_zero || !saw_owner_one ||
+          bulk_seen != kRemoteScanRows) _exit(2);
       if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(3);
       const auto read = node_one->Get(owner_zero_key);
       if (!read.status.ok() || read.value != "forwarded") _exit(4);
