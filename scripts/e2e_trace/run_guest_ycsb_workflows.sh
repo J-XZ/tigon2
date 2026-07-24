@@ -10,6 +10,7 @@ log_root=${2:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 rounds=${3:-${TIGONKV_E2E_ROUNDS:-5}}
 workloads=${4:-${TIGONKV_YCSB_WORKLOADS:-"A B C D E"}}
 vm_count=${TIGONKV_VM_COUNT:-4}
+threads_per_vm=${TIGONKV_YCSB_THREADS_PER_VM:-${TIGONKV_E2E_THREADS:-4}}
 base_port=${TIGONKV_VM_SSH_BASE_PORT:-10022}
 ssh_key=${TIGONKV_VM_SSH_KEY:-/root/.ssh/id_rsa}
 remote_root=${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}
@@ -41,7 +42,8 @@ sync_guest_runtime() {
   local vm
   for ((vm = 0; vm < vm_count; vm++)); do
     remote "$vm" "mkdir -p '$remote_root/build'"
-    scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$runner" "root@127.0.0.1:$remote_runner" >/dev/null
+    scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$runner" "root@127.0.0.1:$remote_runner.next" >/dev/null
+    remote "$vm" "mv -f '$remote_runner.next' '$remote_runner'"
     scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$config" "root@127.0.0.1:$remote_config" >/dev/null
   done
 }
@@ -49,13 +51,15 @@ sync_guest_runtime() {
 sync_guest_runtime
 
 sync_traces() {
-  local round=$1 workload=$2 phase=$3 vm trace remote_dir
+  local round=$1 workload=$2 phase=$3 vm worker trace remote_dir
   for ((vm = 0; vm < vm_count; vm++)); do
-    trace="$trace_root/workload$workload/$phase/worker$vm.txt"
-    [[ -f "$trace" ]] || { echo "missing trace: $trace" >&2; exit 2; }
     remote_dir="$remote_root/ycsb-guest-traces/round$round/workload$workload/$phase"
     remote "$vm" "mkdir -p '$remote_dir'"
-    scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$trace" "root@127.0.0.1:$remote_dir/worker$vm.txt" >/dev/null
+    for ((worker = 0; worker < threads_per_vm; worker++)); do
+      trace="$trace_root/workload$workload/$phase/worker$((vm * threads_per_vm + worker)).txt"
+      [[ -f "$trace" ]] || { echo "missing trace: $trace" >&2; exit 2; }
+      scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$trace" "root@127.0.0.1:$remote_dir/worker$worker.txt" >/dev/null
+    done
   done
 }
 
@@ -64,14 +68,12 @@ pool_reset() {
     "$pool_init" "$backing" "$shared_size_mb" >/dev/null
 }
 
-run_one() {
+run_fixed() {
   local round=$1 workload=$2 phase=$3 vm=$4 reset=$5 log=$6
-  local trace="$remote_root/ycsb-guest-traces/round$round/workload$workload/$phase/worker$vm.txt"
+  local trace_dir="$remote_root/ycsb-guest-traces/round$round/workload$workload/$phase"
   local zeroed=""
-  if [[ "$reset" == 1 ]]; then
-    zeroed="TIGONKV_DEVICE_BACKING_ZEROED=1"
-  fi
-  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_FILE='$trace' TIGONKV_E2E_RESET=$reset $zeroed '$remote_runner'"
+  [[ "$reset" == 1 ]] && zeroed="TIGONKV_DEVICE_BACKING_ZEROED=1"
+  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_VERBOSE=${TIGONKV_E2E_VERBOSE:-0} TIGONKV_E2E_RESET=$reset $zeroed '$remote_runner'"
   timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$command" >"$log" 2>&1
 }
 
@@ -87,21 +89,27 @@ for ((round = 1; round <= rounds; round++)); do
       pids=()
       first_vm=0
       if [[ "$phase" == load ]]; then
-        run_one "$round" "$workload" "$phase" 0 1 "$phase_log/vm0.log" &
+        run_fixed "$round" "$workload" "$phase" 0 1 "$phase_log/vm0.log" &
         pids+=("$!")
-        # VM0 publishes the shared layout before peers attach. It remains
-        # running to service forwarded operations while the other VMs start.
-        sleep "${TIGONKV_YCSB_LAYOUT_READY_DELAY_SEC:-1}"
+        # VM0 must finish constructing all in-process worker stores before
+        # peers attach.  A fixed sleep races with a cold guest; use the
+        # runner's explicit verbose stage marker instead.
+        deadline=$((SECONDS + ${TIGONKV_E2E_TIMEOUT_SEC:-600}))
+        while ! rg -q 'E2E_TRACE_STAGE .*stage=opened' "$phase_log/vm0.log"; do
+          kill -0 "${pids[0]}" 2>/dev/null || { wait "${pids[0]}" || true; exit 1; }
+          (( SECONDS < deadline )) || { echo "timeout waiting for VM0 layout publication" >&2; exit 1; }
+          sleep 0.05
+        done
         first_vm=1
       fi
       for ((vm = first_vm; vm < vm_count; vm++)); do
         reset=0
-        run_one "$round" "$workload" "$phase" "$vm" "$reset" "$phase_log/vm$vm.log" &
+        run_fixed "$round" "$workload" "$phase" "$vm" "$reset" "$phase_log/vm$vm.log" &
         pids+=("$!")
       done
       for pid in "${pids[@]}"; do wait "$pid"; done
       for ((vm = 0; vm < vm_count; vm++)); do
-        rg -q "e2e_trace_runner\[node${vm}\]: passed\." "$phase_log/vm${vm}.log" || {
+        rg -q "e2e_trace_runner\\[node${vm}\\]: passed\\." "$phase_log/vm${vm}.log" || {
           echo "guest trace failed: round=$round workload=$workload phase=$phase vm=$vm" >&2
           exit 1
         }

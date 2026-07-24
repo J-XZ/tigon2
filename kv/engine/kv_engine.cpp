@@ -23,6 +23,17 @@ uint64_t Hash(std::string_view key) {
   return h;
 }
 
+// Multiple foreground KVEngine instances can coexist in one VM. Transport
+// responses are delivered through a node-wide ring, so their request IDs must
+// be unique across the process rather than merely per engine instance.
+std::atomic<uint64_t> ProcessRequestSequence{1};
+
+uint64_t NextRequestId(uint32_t node_id) {
+  constexpr uint64_t kSequenceMask = (1ULL << 56) - 1;
+  const uint64_t sequence = ProcessRequestSequence.fetch_add(1, std::memory_order_relaxed);
+  return (static_cast<uint64_t>(node_id) << 56) | (sequence & kSequenceMask);
+}
+
 uint64_t CurrentRssKb() {
   std::ifstream statm("/proc/self/statm");
   uint64_t pages = 0;
@@ -206,7 +217,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   remote_request_ids.reserve(config_.vm_count > 0 ? config_.vm_count - 1 : 0);
   for (uint32_t node = 0; node < config_.vm_count; ++node) {
     if (node == config_.node_id) continue;
-    const uint64_t request_id = (static_cast<uint64_t>(config_.node_id) << 56) | next_request_id_++;
+    const uint64_t request_id = NextRequestId(config_.node_id);
     {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       pending_scans_.emplace(request_id, PendingScan{});
@@ -395,7 +406,7 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
 Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_view value,
                          std::string *response_value) {
   const uint32_t owner = OwnerForKey(key);
-  const uint64_t request_id = (static_cast<uint64_t>(config_.node_id) << 56) | next_request_id_++;
+  const uint64_t request_id = NextRequestId(config_.node_id);
   SendTransportMessage(MakeRequest(type, config_.node_id, owner, request_id, key, value));
   return AwaitResponse(request_id, response_value);
 }
@@ -417,8 +428,14 @@ Status KVEngine::AwaitResponse(uint64_t request_id, std::string *response_value)
     responses_.erase(it);
     if (response_value != nullptr)
       response_value->assign(response.value.data(), response.value_size);
-    return {static_cast<StatusCode>(response.status),
-            static_cast<StatusCode>(response.status) == StatusCode::kOk ? "" : "forwarded owner operation failed"};
+    const StatusCode code = static_cast<StatusCode>(response.status);
+    std::string message;
+    if (code != StatusCode::kOk) {
+      message = "forwarded owner operation failed";
+      if (response.value_size != 0)
+        message += ": " + std::string(response.value.data(), response.value_size);
+    }
+    return {code, std::move(message)};
   }
 }
 
@@ -450,7 +467,7 @@ CasResult KVEngine::ForwardCompareExchange(std::string_view key,
                                            std::string_view expected,
                                            std::string_view desired) {
   const uint32_t owner = OwnerForKey(key);
-  const uint64_t request_id = (static_cast<uint64_t>(config_.node_id) << 56) | next_request_id_++;
+  const uint64_t request_id = NextRequestId(config_.node_id);
   SendTransportMessage(MakeRequest(KvMessageType::kCasPrepare, config_.node_id, owner,
                                    request_id, key, expected));
   Status status = AwaitResponse(request_id, nullptr);
@@ -531,6 +548,11 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
       response.status = static_cast<uint32_t>(StatusCode::kOk);
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
+    } catch (const std::exception &error) {
+      response.status = static_cast<uint32_t>(StatusCode::kCorruption);
+      const size_t count = std::min(response.value.size(), std::strlen(error.what()));
+      std::memcpy(response.value.data(), error.what(), count);
+      response.value_size = static_cast<uint32_t>(count);
     } catch (...) {
       response.status = static_cast<uint32_t>(StatusCode::kCorruption);
     }

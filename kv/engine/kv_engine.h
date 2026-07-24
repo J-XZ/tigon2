@@ -92,7 +92,6 @@ class KVEngine {
   };
   std::mutex pending_cas_mutex_;
   std::unordered_map<uint64_t, PendingCas> pending_cas_;
-  uint64_t next_request_id_ = 1;
   std::atomic<uint64_t> network_tx_bytes_{0};
   std::atomic<uint64_t> network_rx_bytes_{0};
   std::atomic<uint64_t> shared_gets_{0};
