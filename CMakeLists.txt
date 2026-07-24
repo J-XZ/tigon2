@@ -76,6 +76,8 @@ add_executable(latency_modes_test tests/latency_modes_test.cpp)
 target_link_libraries(latency_modes_test PRIVATE tigonkv)
 add_executable(kv_layout_test tests/kv_layout_test.cpp)
 target_link_libraries(kv_layout_test PRIVATE tigonkv)
+add_executable(region_allocator_test tests/region_allocator_test.cpp)
+target_link_libraries(region_allocator_test PRIVATE tigonkv)
 add_executable(numa_placement_probe tools/numa_placement_probe.cpp)
 add_executable(cxl_pool_initer tools/cxl_pool_initer.cpp)
 
@@ -99,6 +101,7 @@ add_test(NAME e2e_09_test COMMAND e2e_09)
 add_test(NAME e2e_trace_test COMMAND e2e_trace)
 add_test(NAME latency_modes_test COMMAND latency_modes_test)
 add_test(NAME kv_layout_test COMMAND kv_layout_test)
+add_test(NAME region_allocator_test COMMAND region_allocator_test)
 set_tests_properties(e2e_trace_test PROPERTIES
   ENVIRONMENT
     "TIGONKV_EXPERIMENT_CONFIG_JSONC=${CMAKE_SOURCE_DIR}/tests/fixtures/experiment_config.jsonc;TIGONKV_E2E_TRACE_FILE=${CMAKE_SOURCE_DIR}/tests/fixtures/trace.txt;TIGONKV_E2E_RESET=1;TIGONKV_E2E_TRACE_PHASE=fixture")
