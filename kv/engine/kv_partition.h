@@ -37,6 +37,16 @@ class KVPartition {
   bool CompareExchangePrivate(std::string_view key, std::string_view expected,
                               std::string_view desired, bool *exchanged);
   bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value);
+  // Non-owner fast paths.  The persistent private row supplies the row latch
+  // and authoritative migration state; only a live migrated row is accessed
+  // through its HWCC metadata and SWCC payload.
+  bool GetShared(std::string_view key, uint32_t host_id, std::string *value) const;
+  bool PutShared(std::string_view key, uint32_t host_id, std::string_view value);
+  bool CompareExchangeShared(std::string_view key, uint32_t host_id,
+                             std::string_view expected, std::string_view desired,
+                             bool *exchanged);
+  bool IncrementShared(std::string_view key, uint32_t host_id, int64_t delta,
+                       int64_t *value);
   bool PromotePrivate(std::string_view key, uint32_t host_id);
   bool MoveOutPrivate(std::string_view key, uint32_t host_id);
   bool ScanOwned(std::string_view start_key, uint64_t limit,

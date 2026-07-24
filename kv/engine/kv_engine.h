@@ -56,6 +56,7 @@ class KVEngine {
            std::unique_ptr<star::CXL_EBR> ebr,
            std::unique_ptr<star::SCCManager> scc);
   KVPartition *OwnedPartition(std::string_view key) const;
+  KVPartition *VisiblePartition(std::string_view key) const;
   uint32_t OwnerForPartition(uint32_t partition) const;
   Status Forward(KvMessageType type, std::string_view key, std::string_view value,
                  std::string *response_value);

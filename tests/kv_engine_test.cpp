@@ -126,10 +126,14 @@ int main() {
       if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(3);
       const auto read = node_one->Get(owner_zero_key);
       if (!read.status.ok() || read.value != "forwarded") _exit(4);
+      const uint64_t tx_after_promotion = node_one->NetworkTxBytes();
       const auto cas = node_one->CompareExchange(owner_zero_key, "forwarded", "cas-forwarded");
       if (!cas.status.ok() || !cas.exchanged) _exit(5);
       const auto cas_miss = node_one->CompareExchange(owner_zero_key, "forwarded", "ignored");
       if (cas_miss.status.code != tigonkv::StatusCode::kCompareFailed || cas_miss.exchanged) _exit(6);
+      // The GET above promoted this row.  Both CAS operations must use the
+      // non-owner shared fast path rather than send another fixed transport frame.
+      if (node_one->NetworkTxBytes() != tx_after_promotion) _exit(11);
       std::string counter_key;
       for (uint32_t i = 0; i < 100; ++i) {
         const std::string candidate = "cross-counter-" + std::to_string(i);

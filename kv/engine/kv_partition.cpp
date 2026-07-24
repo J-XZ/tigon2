@@ -166,6 +166,164 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   return true;
 }
 
+bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
+                            std::string *value) const {
+  if (value == nullptr) throw std::invalid_argument("null shared GET output");
+  RegionOffset row_offset = kNullOffset;
+  const FixedKey fixed_key = MakeKey(key);
+  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  const RegionOffset smeta_offset = row->migrated_smeta_off;
+  RegionOffset indexed_offset = kNullOffset;
+  if (row->is_tombstone || !row->is_migrated || smeta_offset == kNullOffset ||
+      !shared_tree_->lookup(fixed_key, indexed_offset) || indexed_offset != smeta_offset) {
+    UnlockRow(row);
+    return false;
+  }
+  const uint32_t value_len = row->value_len;
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  std::string shared(value_len, '\0');
+  mem_access::SharedPayloadRead(smeta, value_len);
+  const bool read = star::TwoPLPashaHelper::kv_shared_read(
+      smeta, host_id, shared.data(), value_len);
+  if (read) {
+    smeta->lock();
+    smeta->set_bit(37);
+    smeta->unlock();
+  }
+  UnlockRow(row);
+  if (!read) return false;
+  *value = std::move(shared);
+  return true;
+}
+
+bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
+                            std::string_view value) {
+  if (value.size() > regions_.layout().fixed_value_size)
+    throw std::invalid_argument("shared value exceeds fixed value size");
+  RegionOffset row_offset = kNullOffset;
+  const FixedKey fixed_key = MakeKey(key);
+  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  const RegionOffset smeta_offset = row->migrated_smeta_off;
+  RegionOffset indexed_offset = kNullOffset;
+  if (row->is_tombstone || !row->is_migrated || smeta_offset == kNullOffset ||
+      !shared_tree_->lookup(fixed_key, indexed_offset) || indexed_offset != smeta_offset) {
+    UnlockRow(row);
+    return false;
+  }
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  mem_access::SharedPayloadWrite(smeta, value.size());
+  const bool written = star::TwoPLPashaHelper::kv_shared_write(
+      smeta, host_id, value.data(), value.size());
+  if (written) {
+    row->value_len = static_cast<uint32_t>(value.size());
+    ++row->version;
+    smeta->lock();
+    smeta->set_bit(37);
+    smeta->unlock();
+  }
+  UnlockRow(row);
+  return written;
+}
+
+bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
+                                        std::string_view expected,
+                                        std::string_view desired, bool *exchanged) {
+  if (exchanged == nullptr) throw std::invalid_argument("null shared CAS result");
+  if (desired.size() > regions_.layout().fixed_value_size)
+    throw std::invalid_argument("shared CAS desired value exceeds fixed value size");
+  *exchanged = false;
+  RegionOffset row_offset = kNullOffset;
+  const FixedKey fixed_key = MakeKey(key);
+  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  const RegionOffset smeta_offset = row->migrated_smeta_off;
+  RegionOffset indexed_offset = kNullOffset;
+  if (row->is_tombstone || !row->is_migrated || smeta_offset == kNullOffset ||
+      !shared_tree_->lookup(fixed_key, indexed_offset) || indexed_offset != smeta_offset) {
+    UnlockRow(row);
+    return false;
+  }
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  std::string current(row->value_len, '\0');
+  mem_access::SharedPayloadRead(smeta, current.size());
+  const bool read = star::TwoPLPashaHelper::kv_shared_read(
+      smeta, host_id, current.data(), current.size());
+  if (read && current == expected) {
+    mem_access::SharedPayloadWrite(smeta, desired.size());
+    if (!star::TwoPLPashaHelper::kv_shared_write(
+            smeta, host_id, desired.data(), desired.size())) {
+      UnlockRow(row);
+      return false;
+    }
+    row->value_len = static_cast<uint32_t>(desired.size());
+    ++row->version;
+    smeta->lock();
+    smeta->set_bit(37);
+    smeta->unlock();
+    *exchanged = true;
+  }
+  UnlockRow(row);
+  return read;
+}
+
+bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
+                                  int64_t delta, int64_t *value) {
+  if (value == nullptr) throw std::invalid_argument("null shared increment output");
+  RegionOffset row_offset = kNullOffset;
+  const FixedKey fixed_key = MakeKey(key);
+  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  const RegionOffset smeta_offset = row->migrated_smeta_off;
+  RegionOffset indexed_offset = kNullOffset;
+  if (row->is_tombstone || !row->is_migrated || smeta_offset == kNullOffset ||
+      !shared_tree_->lookup(fixed_key, indexed_offset) || indexed_offset != smeta_offset) {
+    UnlockRow(row);
+    return false;
+  }
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  std::string current(row->value_len, '\0');
+  mem_access::SharedPayloadRead(smeta, current.size());
+  if (!star::TwoPLPashaHelper::kv_shared_read(
+          smeta, host_id, current.data(), current.size())) {
+    UnlockRow(row);
+    return false;
+  }
+  int64_t previous = 0;
+  const auto parsed = std::from_chars(current.data(), current.data() + current.size(), previous);
+  if (parsed.ec != std::errc{} || parsed.ptr != current.data() + current.size() ||
+      (delta > 0 && previous > std::numeric_limits<int64_t>::max() - delta) ||
+      (delta < 0 && previous < std::numeric_limits<int64_t>::min() - delta)) {
+    UnlockRow(row);
+    throw std::invalid_argument("increment requires a non-overflowing int64 value");
+  }
+  const int64_t next = previous + delta;
+  const std::string encoded = std::to_string(next);
+  mem_access::SharedPayloadWrite(smeta, encoded.size());
+  if (!star::TwoPLPashaHelper::kv_shared_write(
+          smeta, host_id, encoded.data(), encoded.size())) {
+    UnlockRow(row);
+    return false;
+  }
+  row->value_len = static_cast<uint32_t>(encoded.size());
+  ++row->version;
+  smeta->lock();
+  smeta->set_bit(37);
+  smeta->unlock();
+  *value = next;
+  UnlockRow(row);
+  return true;
+}
+
 bool KVPartition::CompareExchangePrivate(std::string_view key,
                                          std::string_view expected,
                                          std::string_view desired,

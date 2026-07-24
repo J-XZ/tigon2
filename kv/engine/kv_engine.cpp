@@ -110,15 +110,16 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
                                                         std::move(ebr), std::move(scc)));
   engine->rings_ = rings;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
-    if (engine->OwnerForPartition(partition) != config.node_id) continue;
     const auto &directory = engine->pool_->allocator().layout().partitions[partition];
-    // A node may be the first owner to attach after node 0 created the shared
-    // layout. It alone creates its owner-private roots; later attaches recover
-    // them by offsets.
+    // All VMs reconstruct the persistent roots so a non-owner can use the
+    // shared-tree fast path after promotion.  Only the owner is allowed to
+    // invoke private-row operations; binding the partition to its stable owner
+    // keeps its private arena and tree nodes in the correct allocation shard.
     const bool attach = directory.private_root != kNullOffset &&
                         directory.shared_root != kNullOffset;
     engine->partitions_.emplace_back(std::make_unique<KVPartition>(
-        engine->pool_->allocator(), *engine->ebr_, partition, config.node_id, attach));
+        engine->pool_->allocator(), *engine->ebr_, partition,
+        engine->OwnerForPartition(partition), attach));
   }
   return engine;
 }
@@ -138,6 +139,10 @@ uint32_t KVEngine::OwnerForPartition(uint32_t partition) const {
 KVPartition *KVEngine::OwnedPartition(std::string_view key) const {
   const uint32_t owner = OwnerForKey(key);
   if (owner != config_.node_id) return nullptr;
+  return VisiblePartition(key);
+}
+
+KVPartition *KVEngine::VisiblePartition(std::string_view key) const {
   const uint32_t partition = PartitionForKey(key);
   for (const auto &entry : partitions_)
     if (entry->partition_id() == partition) return entry.get();
@@ -146,7 +151,11 @@ KVPartition *KVEngine::OwnedPartition(std::string_view key) const {
 
 Status KVEngine::Put(std::string_view key, std::string_view value) {
   auto *partition = OwnedPartition(key);
-  if (partition == nullptr) return Forward(KvMessageType::kPut, key, value, nullptr);
+  if (partition == nullptr) {
+    auto *visible = VisiblePartition(key);
+    if (visible != nullptr && visible->PutShared(key, config_.node_id, value)) return Status::Ok();
+    return Forward(KvMessageType::kPut, key, value, nullptr);
+  }
   try { partition->PutPrivate(key, value); return Status::Ok(); }
   catch (const std::bad_alloc &) { return Status::Error(StatusCode::kOutOfMemory, "private arena exhausted"); }
   catch (const std::exception &e) { return Status::Error(StatusCode::kCorruption, e.what()); }
@@ -155,6 +164,10 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
 GetResult KVEngine::Get(std::string_view key) {
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
+    std::string shared;
+    auto *visible = VisiblePartition(key);
+    if (visible != nullptr && visible->GetShared(key, config_.node_id, &shared))
+      return {Status::Ok(), std::move(shared)};
     std::string value;
     auto status = Forward(KvMessageType::kGet, key, {}, &value);
     return {std::move(status), std::move(value)};
@@ -252,7 +265,16 @@ CasResult KVEngine::CompareExchange(std::string_view key,
                                     std::string_view expected,
                                     std::string_view desired) {
   auto *partition = OwnedPartition(key);
-  if (partition == nullptr) return ForwardCompareExchange(key, expected, desired);
+  if (partition == nullptr) {
+    bool exchanged = false;
+    auto *visible = VisiblePartition(key);
+    if (visible != nullptr && visible->CompareExchangeShared(
+            key, config_.node_id, expected, desired, &exchanged))
+      return {exchanged ? Status::Ok()
+                         : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
+              exchanged};
+    return ForwardCompareExchange(key, expected, desired);
+  }
   try {
     bool exchanged = false;
     if (!partition->CompareExchangePrivate(key, expected, desired, &exchanged))
@@ -270,6 +292,10 @@ CasResult KVEngine::CompareExchange(std::string_view key,
 IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
+    int64_t shared = 0;
+    auto *visible = VisiblePartition(key);
+    if (visible != nullptr && visible->IncrementShared(key, config_.node_id, delta, &shared))
+      return {Status::Ok(), shared};
     std::string value;
     const auto status = Forward(KvMessageType::kIncrement, key,
                                 std::to_string(delta), &value);
