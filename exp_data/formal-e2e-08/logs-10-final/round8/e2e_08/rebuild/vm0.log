@@ -1,0 +1,4 @@
+Warning: Permanently added '[127.0.0.1]:10022' (ED25519) to the list of known hosts.
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I0724 08:58:58.876670  7517 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 0 thread_id = 0
+TIGONKV_MULTI_VM_REBUILD node=0 passed.

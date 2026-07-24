@@ -1,0 +1,12 @@
+Warning: Permanently added '[127.0.0.1]:10022' (ED25519) to the list of known hosts.
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I0724 08:23:45.498212  1505 MPSCRingBuffer.h:36] entry_struct_size: 2048 entry_num: 2048
+I0724 08:23:45.498746  1505 MPSCRingBuffer.h:36] entry_struct_size: 2048 entry_num: 2048
+I0724 08:23:45.499178  1505 MPSCRingBuffer.h:36] entry_struct_size: 2048 entry_num: 2048
+I0724 08:23:45.499579  1505 MPSCRingBuffer.h:36] entry_struct_size: 2048 entry_num: 2048
+I0724 08:23:45.499994  1505 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 0 thread_id = 0
+I0724 08:23:45.547477  1505 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 0 thread_id = 0
+I0724 08:23:45.595149  1505 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 0 thread_id = 0
+I0724 08:23:45.643013  1505 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 0 thread_id = 0
+E2E_TRACE_STAGE node=0 phase=load stage=opened
+E2E_TRACE_STAGE node=0 phase=load stage=barrier_ready

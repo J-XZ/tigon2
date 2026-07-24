@@ -1,0 +1,8 @@
+Warning: Permanently added '[127.0.0.1]:10022' (ED25519) to the list of known hosts.
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I0724 08:57:04.427049  7208 MPSCRingBuffer.h:36] entry_struct_size: 2048 entry_num: 2048
+I0724 08:57:04.427732  7208 MPSCRingBuffer.h:36] entry_struct_size: 2048 entry_num: 2048
+I0724 08:57:04.428292  7208 MPSCRingBuffer.h:36] entry_struct_size: 2048 entry_num: 2048
+I0724 08:57:04.428851  7208 MPSCRingBuffer.h:36] entry_struct_size: 2048 entry_num: 2048
+I0724 08:57:04.429430  7208 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 0 thread_id = 0
+TIGONKV_E2E_MULTI_VM_INIT node=0 passed.

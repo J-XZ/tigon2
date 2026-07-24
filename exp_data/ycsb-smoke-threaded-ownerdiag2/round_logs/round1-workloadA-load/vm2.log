@@ -1,0 +1,8 @@
+Warning: Permanently added '[127.0.0.1]:10024' (ED25519) to the list of known hosts.
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I0724 08:23:45.977949  1464 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 2 thread_id = 0
+I0724 08:23:46.026069  1464 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 2 thread_id = 0
+I0724 08:23:46.074127  1464 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 2 thread_id = 0
+I0724 08:23:46.122095  1464 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 2 thread_id = 0
+E2E_TRACE_STAGE node=2 phase=load stage=opened
+E2E_TRACE_STAGE node=2 phase=load stage=barrier_ready

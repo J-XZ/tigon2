@@ -1,0 +1,3 @@
+TIGONKV_E2E_YCSB_ROUND round=6
+TIGONKV_GUEST_YCSB round=1 workload=A phase=load pass
+TIGONKV_GUEST_YCSB round=1 workload=A phase=run pass

@@ -1,0 +1,13 @@
+Warning: Permanently added '[127.0.0.1]:10022' (ED25519) to the list of known hosts.
+bash: line 12:  3210 Killed                  env TIGONKV_NODE_ID="$node" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" TIGONKV_E2E_TRACE_PHASE="$phase" TIGONKV_E2E_TRACE_FILE="$trace_dir/worker$worker.txt" TIGONKV_E2E_RESET="$reset_worker" $zeroed_worker "$runner"
+bash: line 12:  3211 Killed                  env TIGONKV_NODE_ID="$node" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" TIGONKV_E2E_TRACE_PHASE="$phase" TIGONKV_E2E_TRACE_FILE="$trace_dir/worker$worker.txt" TIGONKV_E2E_RESET="$reset_worker" $zeroed_worker "$runner"
+bash: line 12:  3212 Killed                  env TIGONKV_NODE_ID="$node" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" TIGONKV_E2E_TRACE_PHASE="$phase" TIGONKV_E2E_TRACE_FILE="$trace_dir/worker$worker.txt" TIGONKV_E2E_RESET="$reset_worker" $zeroed_worker "$runner"
+e2e_trace_runner: hard failure: dual-region layout attachment validation failed
+E2E_TRACE_FAILURE
+node=0
+trace=/root/tigon2/ycsb-guest-traces/round1/workloadA/load/worker3.txt
+phase=
+line=0
+op=
+key=
+ops_completed=0

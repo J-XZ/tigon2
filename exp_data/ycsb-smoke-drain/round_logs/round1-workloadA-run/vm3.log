@@ -1,0 +1,5 @@
+Warning: Permanently added '[127.0.0.1]:10025' (ED25519) to the list of known hosts.
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I0724 07:56:02.897411  2171 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 3 thread_id = 0
+F0724 07:56:02.906970  2171 TwoPLPashaSCCWriteThrough.h:65] Check failed: smeta->is_bit_set(cur_host_bit_index) == true 
+*** Check failure stack trace: ***

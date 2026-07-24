@@ -1,0 +1,12 @@
+{
+  "base_config": "/root/code/tigon2/experiment_config.jsonc",
+  "generated_config": "/root/code/tigon2/exp_data/ycsb-smoke-concurrent/configs/experiment_config_ycsb_4vm.jsonc",
+  "operation_count": 200,
+  "record_count": 200,
+  "rounds": 1,
+  "threads_per_node": 1,
+  "workloads": [
+    "a"
+  ],
+  "ycsb_e": "unsupported"
+}

@@ -1,0 +1,112 @@
+{
+  "e2e": {
+    "foreground_worker_count_per_vm": 1
+  },
+  "host_cpu": {
+    "ivshmem_server_cores": [
+      32,
+      33
+    ],
+    "reserved_cores": [
+      34
+    ],
+    "vm_cores": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ]
+  },
+  "network": {
+    "base_ssh_port": 10022
+  },
+  "shared_memory": {
+    "device_path": "/dev/ivpci0",
+    "hwcc": {
+      "offset_mb": 0,
+      "size_mb": 1024
+    },
+    "numa_node": 1,
+    "path": "/dev/shm/tigonkv",
+    "size_mb": 32768,
+    "swcc": {
+      "offset_mb": 1024,
+      "size_mb": 31744
+    }
+  },
+  "sync": {
+    "timeout_sec": 60
+  },
+  "tigon_kv": {
+    "fixed_key_size": 32,
+    "fixed_value_size": 1000,
+    "hw_cc_budget_mb": 1024,
+    "latency_inject": {
+      "cache_associativity": 1,
+      "cache_capacity_lines": 0,
+      "cache_fixed_hit_rate": 0.0,
+      "cache_hit_extra_ns": 0,
+      "cache_hits_enabled": false,
+      "cache_line_bytes": 64,
+      "cache_model": "none",
+      "enabled": false,
+      "foreground_enabled": false,
+      "hwcc_atomic_load_ns": 0,
+      "hwcc_atomic_rmw_ns": 0,
+      "hwcc_atomic_store_ns": 0,
+      "hwcc_read_ns_per_line": 0,
+      "hwcc_write_ns_per_line": 0,
+      "merge_enabled": false,
+      "stats_enabled": false,
+      "swcc_flush_ns_per_line": 0,
+      "swcc_read_ns_per_line": 0,
+      "swcc_write_ns_per_line": 0
+    },
+    "migration_policy": "Clock",
+    "owner_private_swcc_fraction": 0.35,
+    "partition_count": 16,
+    "scc_mechanism": "WriteThrough",
+    "transport_ring_total_mb": 16,
+    "when_to_move_out": "OnDemand"
+  },
+  "vm": {
+    "bridge_tap_ip": "192.168.100.1",
+    "copy_root_img": true,
+    "core_count_per_vm": 8,
+    "count": 4,
+    "first_ip": "192.168.100.2",
+    "local_ssh_pub_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCSOBOyFCWpVmMz0nJLY6wQ6mIBCTRhda0nVSlalZJSl8mfI7E37BlATXN5yiXf6ZP1oweV1tmrxG9B3Aa+1DZloW0GFqI1DZyJWNZg25P9MOHVfJSBzk8aBOiyTAeWZqrQysb2sf3DiIJwVyzOGlAFpEAvYZcgtw4Usm1qgY2RFutbOcmhcwLowYaDRg+QV/3jhRHnhB8a973rT5F87oFLoJnVQnU4eHDXkwxMWUBnkgLUtQO3FJxfVF15ATEvzAN44k8dZJB3DB4k4BXcVhEFGWkJdRJDfmrTNJs+tBY9wrbFpbh5zGP3OErbcLQgWT4VM9uU0yKr14SfnkKSBr+TtaS2/3sBZlbicSiHn3WfcdeKZSdH2w4sGx2Ddr7qKQA16keIcNFFYksIcmB2D1EWiUC9HbF0TPY8J3Ukk5Op8a9DotIaSphHLAQXYY9SWoemYyy+AA1NA6sO4dPqr58h2gvVAEPaxiQZSuAQghZ1+St5YoqlbR261OLiHCed5Ss= root@node0.cxl1.dpmfs-pg0.clemson.cloudlab.us",
+    "mem_size_mb_per_vm": 2048,
+    "numa_node": 0,
+    "storage_path": "/mnt/xz_vm_storage",
+    "use_ivshmem_doorbell": false
+  }
+}

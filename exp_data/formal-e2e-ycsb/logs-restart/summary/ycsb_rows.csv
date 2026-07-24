@@ -1,0 +1,9 @@
+file,phase,node,ops,elapsed_us
+/root/code/tigon2/exp_data/formal-e2e-ycsb/logs-restart/round01/round1-workloadA-load/vm0.log,load,0,25000,678112
+/root/code/tigon2/exp_data/formal-e2e-ycsb/logs-restart/round01/round1-workloadA-load/vm1.log,load,1,25000,389334
+/root/code/tigon2/exp_data/formal-e2e-ycsb/logs-restart/round01/round1-workloadA-load/vm2.log,load,2,25000,378561
+/root/code/tigon2/exp_data/formal-e2e-ycsb/logs-restart/round01/round1-workloadA-load/vm3.log,load,3,25000,381655
+/root/code/tigon2/exp_data/formal-e2e-ycsb/logs-restart/round01/round1-workloadA-run/vm0.log,run,0,25000,380951
+/root/code/tigon2/exp_data/formal-e2e-ycsb/logs-restart/round01/round1-workloadA-run/vm1.log,run,1,25000,392467
+/root/code/tigon2/exp_data/formal-e2e-ycsb/logs-restart/round01/round1-workloadA-run/vm2.log,run,2,25000,404267
+/root/code/tigon2/exp_data/formal-e2e-ycsb/logs-restart/round01/round1-workloadA-run/vm3.log,run,3,25000,399041

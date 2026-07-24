@@ -1,0 +1,55 @@
+Warning: Permanently added '[127.0.0.1]:10022' (ED25519) to the list of known hosts.
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I0724 09:58:25.636034 15412 CXL_EBR.h:100] init local EBR metadata, coordinator_id = 0 thread_id = 0
+E2E_09_PHASE_TIME_US node=0 phase=mixed duration_us=60000531 op_count=143659205
+E2E_09_THREADS node=0 threads=4
+TIGONKV_MEMORY_STATS
+allocator_mode=dual_region
+physical_region_split=1
+total_pool_capacity_bytes=34359738368
+logical_hwcc_capacity_bytes=1073741824
+logical_swcc_capacity_bytes=33285996544
+logical_hwcc_used_bytes=16855360
+owner_private_swcc_used_bytes=78720
+shared_payload_swcc_used_bytes=7296
+allocator_shared_overhead_bytes=0
+allocator_local_dram_bytes=0
+unclassified_shared_bytes=0
+retired_pending_bytes=0
+reclaimed_total_bytes=0
+active_shared_rows=0
+rss_kb=5168
+TIGONKV_RUNTIME_STATS
+node=0
+logical_ops=135143016
+commits=131473231
+aborts=0
+retries=0
+private_gets=54002753
+private_puts=78583691
+private_deletes=4
+checkpoint_swcc_flushes=1
+private_swcc_flushes=0
+shared_gets=36900069
+shared_puts=55350105
+shared_deletes=0
+shared_swcc_flushes=55350108
+migration_in=3
+migration_out=0
+network_tx_bytes=26304
+network_rx_bytes=26304
+TIGONKV_LATENCY_STATS
+swcc_raw=0
+hwcc_raw=0
+swcc_hits=0
+hwcc_hits=0
+swcc_misses=0
+hwcc_misses=0
+swcc_hit_ratio=0.000000
+hwcc_hit_ratio=0.000000
+swcc_delayed_ns=0
+hwcc_delayed_ns=0
+delayed_ns=0
+cache_model=none
+cache_hits_enabled=0
+e2e_09_vm[node0]: passed.

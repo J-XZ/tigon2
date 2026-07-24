@@ -1,0 +1,9 @@
+file,phase,node,ops,elapsed_us
+/root/code/tigon2/exp_data/ycsb-smoke-threaded-serialized/round_logs/round1-workloadA-load/vm0.log,load,0,14,319338
+/root/code/tigon2/exp_data/ycsb-smoke-threaded-serialized/round_logs/round1-workloadA-load/vm1.log,load,1,12,8476
+/root/code/tigon2/exp_data/ycsb-smoke-threaded-serialized/round_logs/round1-workloadA-load/vm2.log,load,2,12,1338
+/root/code/tigon2/exp_data/ycsb-smoke-threaded-serialized/round_logs/round1-workloadA-load/vm3.log,load,3,12,8998
+/root/code/tigon2/exp_data/ycsb-smoke-threaded-serialized/round_logs/round1-workloadA-run/vm0.log,run,0,19,4628
+/root/code/tigon2/exp_data/ycsb-smoke-threaded-serialized/round_logs/round1-workloadA-run/vm1.log,run,1,18,22840
+/root/code/tigon2/exp_data/ycsb-smoke-threaded-serialized/round_logs/round1-workloadA-run/vm2.log,run,2,16,1468
+/root/code/tigon2/exp_data/ycsb-smoke-threaded-serialized/round_logs/round1-workloadA-run/vm3.log,run,3,16,3007

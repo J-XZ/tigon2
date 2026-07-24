@@ -1,0 +1,15 @@
+nodes=4
+threads_per_node=4
+total_workers=16
+record_count=50
+operation_count=50
+field_count=10
+field_length=32
+request_distribution=zipfian
+key_prefix=user
+zero_padding=16
+workload_file=/root/code/tigon2/thirdparty_libs/YCSB-cpp/workloads/workloada
+run_name=run
+load_dir=/root/code/tigon2/exp_data/ycsb-smoke-threaded-clean/traces/workloadA/load
+run_dir=/root/code/tigon2/exp_data/ycsb-smoke-threaded-clean/traces/workloadA/run
+update_reads_before_write=true

@@ -1,0 +1,10 @@
+Warning: Permanently added '[127.0.0.1]:10023' (ED25519) to the list of known hosts.
+e2e_trace_runner: hard failure: dual-region layout attachment validation failed
+E2E_TRACE_FAILURE
+node=1
+trace=/root/tigon2/ycsb-guest-traces/round1/workloadA/load/worker1.txt
+phase=
+line=0
+op=
+key=
+ops_completed=0
