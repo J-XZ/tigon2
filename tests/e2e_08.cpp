@@ -55,11 +55,14 @@ int main() {
   std::remove(path.c_str());
   auto owner = KVStore::Create(ConfigFor(path, 0), true);
   int stop_pipe[2];
+  int ack_pipe[2];
   assert(pipe(stop_pipe) == 0);
+  assert(pipe(ack_pipe) == 0);
   const pid_t service = fork();
   assert(service >= 0);
   if (service == 0) {
     close(stop_pipe[1]);
+    close(ack_pipe[0]);
     const int flags = fcntl(stop_pipe[0], F_GETFL);
     if (flags < 0 || fcntl(stop_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) _exit(20);
     try {
@@ -67,13 +70,21 @@ int main() {
       char stop = 0;
       for (;;) {
         const ssize_t read_bytes = read(stop_pipe[0], &stop, 1);
-        if (read_bytes == 1) _exit(stop == 'q' ? 0 : 21);
+        if (read_bytes == 1 && stop == 'd') {
+          if (!remote_owner->Checkpoint().ok()) _exit(24);
+          const char ack = 'd';
+          if (write(ack_pipe[1], &ack, 1) != 1) _exit(25);
+        }
+        if (read_bytes == 1 && stop == 'q') _exit(0);
+        if (read_bytes == 1 && stop != 'd') _exit(21);
+        if (read_bytes == 0) _exit(0);
         if (read_bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) _exit(22);
         remote_owner->PollTransport();
       }
     } catch (...) { _exit(23); }
   }
   close(stop_pipe[0]);
+  close(ack_pipe[1]);
   constexpr uint32_t kKeys = 100000;
   const auto fill_begin = std::chrono::steady_clock::now();
   for (uint32_t i = 0; i < kKeys; ++i) {
@@ -104,7 +115,13 @@ int main() {
     auto status = owner->Delete(Key8(i));
     assert(status.ok());
   }
+  assert(owner->Checkpoint().ok());
+  const char drain = 'd';
+  assert(write(stop_pipe[1], &drain, 1) == 1);
+  char drain_ack = 0;
+  assert(read(ack_pipe[0], &drain_ack, 1) == 1 && drain_ack == 'd');
   assert(owner->Memory().active_shared_rows == 0);
+  assert(owner->Memory().shared_payload_swcc_used_bytes == 0);
   assert(owner->Runtime().private_swcc_flushes == 0);
   assert(owner->Memory().unclassified_shared_bytes == 0);
   assert(owner->Memory().logical_hwcc_used_bytes <= owner->Memory().logical_hwcc_capacity_bytes);
@@ -125,6 +142,7 @@ int main() {
   const char quit = 'q';
   assert(write(stop_pipe[1], &quit, 1) == 1);
   close(stop_pipe[1]);
+  close(ack_pipe[0]);
   int service_status = 0;
   assert(waitpid(service, &service_status, 0) == service);
   assert(WIFEXITED(service_status) && WEXITSTATUS(service_status) == 0);
