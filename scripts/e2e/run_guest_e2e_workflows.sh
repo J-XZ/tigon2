@@ -115,7 +115,12 @@ run_phase() {
 for suite in $suites; do
   case "$suite" in
     08) phases=(fill read) ;;
-    09) phases=(fill update read) ;;
+    09)
+      phases=(fill update read)
+      if [[ "${TIGONKV_E2E09_INCLUDE_MIXED:-0}" == 1 ]]; then
+        phases+=(mixed)
+      fi
+      ;;
     *) echo "unsupported suite: $suite" >&2; exit 2 ;;
   esac
   [[ -x "$binary_dir/e2e_${suite}" ]] || { echo "missing $binary_dir/e2e_${suite}" >&2; exit 2; }

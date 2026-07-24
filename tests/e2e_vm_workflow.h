@@ -154,6 +154,52 @@ PhaseResult RunWorkers(KVStore &store, const Config &base, uint64_t total, Opera
   return {phase_end - phase_start, node_count};
 }
 
+inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
+  const uint64_t threads = PositiveEnv("TIGONKV_E2E_THREADS",
+                                       base.foreground_worker_count_per_vm);
+  const uint64_t seconds = PositiveEnv("TIGONKV_E2E_MIXED_SECONDS", 60);
+  std::atomic<bool> start{false};
+  std::mutex error_mutex;
+  std::exception_ptr error;
+  std::atomic<uint64_t> operations{0};
+  std::vector<std::thread> workers;
+  workers.reserve(static_cast<size_t>(threads));
+  const uint64_t begin = NowUs();
+  for (uint64_t worker = 0; worker < threads; ++worker) {
+    workers.emplace_back([&, worker] {
+      try {
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        const std::string key = Key09((static_cast<uint64_t>(base.node_id) << 32U) | worker);
+        while (std::chrono::steady_clock::now() < deadline) {
+          if (!store.Put(key, "0").ok()) throw std::runtime_error("mixed PUT failed");
+          const GetResult promoted = store.Get(key);
+          if (!promoted.status.ok() || promoted.value != "0")
+            throw std::runtime_error("mixed GET promotion verification failed");
+          const IncrementResult increment = store.Increment(key, 1);
+          if (!increment.status.ok() || increment.value != 1)
+            throw std::runtime_error("mixed INCR verification failed");
+          const CasResult cas = store.CompareExchange(key, "1", "2");
+          if (!cas.status.ok() || !cas.exchanged)
+            throw std::runtime_error("mixed CAS verification failed");
+          const GetResult verified = store.Get(key);
+          if (!verified.status.ok() || verified.value != "2")
+            throw std::runtime_error("mixed GET after CAS verification failed");
+          if (!store.Delete(key).ok()) throw std::runtime_error("mixed DELETE failed");
+          operations.fetch_add(6, std::memory_order_relaxed);
+        }
+      } catch (...) {
+        std::lock_guard<std::mutex> guard(error_mutex);
+        if (!error) error = std::current_exception();
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto &worker : workers) worker.join();
+  if (error) std::rethrow_exception(error);
+  return {NowUs() - begin, operations.load(std::memory_order_relaxed)};
+}
+
 inline void CheckpointOrThrow(KVStore &store) {
   const Status status = store.Checkpoint();
   if (!status.ok()) throw std::runtime_error("phase checkpoint failed: " + status.message);
@@ -243,8 +289,10 @@ inline int RunE2E09MultiVm() {
       if (!got.status.ok() || got.value != Value09(index, 1))
         throw std::runtime_error("e2e09 read verification failed for index " + std::to_string(index));
     });
+  } else if (phase == "mixed") {
+    result = RunMixedWorkers(*main_store, config);
   } else {
-    throw std::invalid_argument("e2e09 phase must be fill, update, or read");
+    throw std::invalid_argument("e2e09 phase must be fill, update, read, or mixed");
   }
   DrainTransport(*main_store);
   std::cout << "E2E_09_PHASE_TIME_US node=" << config.node_id << " phase=" << phase
