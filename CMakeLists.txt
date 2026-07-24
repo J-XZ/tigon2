@@ -36,7 +36,8 @@ file(GLOB_RECURSE MISC_CPP_FILES CONFIGURE_DEPENDS
   protocol/TwoPLPasha/*.cpp core/*.cpp)
 add_library(misc_cpp STATIC ${MISC_CPP_FILES})
 
-add_library(tigonkv STATIC kv/kv_store.cpp kv/latency_simulator.cpp)
+add_library(tigonkv STATIC kv/kv_store.cpp kv/latency_simulator.cpp
+  kv/engine/region_allocator.cpp)
 target_link_libraries(tigonkv PUBLIC pthread)
 
 add_executable(bench_tpcc bench_tpcc.cpp)
