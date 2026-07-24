@@ -52,7 +52,7 @@ for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
     -P "$port" "$module" root@127.0.0.1:/root/cxl_ivpci.ko >/dev/null
   ssh -i "$ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -p "$port" root@127.0.0.1 \
-    'rmmod cxl_ivpci 2>/dev/null || true; insmod /root/cxl_ivpci.ko; test -c /dev/ivpci0'
+    'rmmod cxl_ivpci 2>/dev/null || true; insmod /root/cxl_ivpci.ko; ln -sfn /dev/cxl_ivpci0 /dev/ivpci0; test -c /dev/ivpci0'
   echo "TIGONKV_VM_INIT_GUEST vm=$i port=$port ivpci=ok"
 done
 echo "VMs launched and prepared; run tigonkv_check_vms.sh --config '$config'"
