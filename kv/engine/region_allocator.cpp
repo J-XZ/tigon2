@@ -312,7 +312,9 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
                        partition * header->owner_private_arena_stride)
         OwnerPrivateArenaHeader;
     arena->partition_id = partition;
-    arena->owner_shard = partition / (config.partition_count / config.vm_count);
+    // The persistent layout follows the public routing contract: partitions
+    // are striped across owners, rather than stored in contiguous owner runs.
+    arena->owner_shard = partition % config.vm_count;
     arena->begin = header->owner_private_arenas_offset +
                    partition * header->owner_private_arena_stride +
                    ((sizeof(OwnerPrivateArenaHeader) + RegionAllocator::kAlignment - 1) &

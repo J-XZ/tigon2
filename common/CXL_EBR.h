@@ -22,7 +22,10 @@ class CXL_EBR {
         static constexpr uint64_t max_epoch = 3;
 
         static constexpr uint64_t max_coordinator_num = 8;
-        static constexpr uint64_t max_thread_num = 5;
+        // The old benchmark-only limit of five workers was smaller than the
+        // configured foreground-worker contract.  This is process-local
+        // metadata, so keep it bounded but sized for the KV experiment.
+        static constexpr uint64_t max_thread_num = 64;
 
         // try to advance global epoch when we have more than this number of garbage
         static constexpr uint64_t epoch_advance_threshold = 100;
@@ -69,6 +72,8 @@ class CXL_EBR {
                 , thread_num(thread_num)
                 , regions(regions)
         {
+                CHECK(coordinator_num <= max_coordinator_num);
+                CHECK(thread_num <= max_thread_num);
         }
 
         void thread_init_ebr_meta(uint64_t coordinator_id, uint64_t thread_id)

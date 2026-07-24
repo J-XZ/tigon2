@@ -31,7 +31,7 @@ endif()
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_library(tigonkv STATIC kv/kv_store.cpp kv/latency_simulator.cpp
-  kv/engine/kv_partition.cpp kv/engine/region_allocator.cpp
+  kv/engine/kv_engine.cpp kv/engine/kv_partition.cpp kv/engine/region_allocator.cpp
   common/CXLMemory.cpp common/btree_olc_cxl/BTreeOLC_CXL.cpp
   protocol/Pasha/SCCManager.cpp)
 target_link_libraries(tigonkv PUBLIC pthread)
@@ -74,6 +74,8 @@ add_executable(btree_binding_test tests/btree_binding_test.cpp)
 target_link_libraries(btree_binding_test PRIVATE tigonkv glog)
 add_executable(kv_partition_test tests/kv_partition_test.cpp)
 target_link_libraries(kv_partition_test PRIVATE tigonkv glog)
+add_executable(kv_engine_test tests/kv_engine_test.cpp)
+target_link_libraries(kv_engine_test PRIVATE tigonkv glog)
 add_executable(scc_protocol_test tests/scc_protocol_test.cpp tests/scc_test_backend.cpp)
 add_executable(kv_shared_protocol_test tests/kv_shared_protocol_test.cpp)
 target_link_libraries(kv_shared_protocol_test PRIVATE tigonkv glog)
@@ -104,6 +106,7 @@ add_test(NAME latency_modes_test COMMAND latency_modes_test)
 add_test(NAME kv_layout_test COMMAND kv_layout_test)
 add_test(NAME btree_binding_test COMMAND btree_binding_test)
 add_test(NAME kv_partition_test COMMAND kv_partition_test)
+add_test(NAME kv_engine_test COMMAND kv_engine_test)
 add_test(NAME scc_protocol_test COMMAND scc_protocol_test)
 add_test(NAME kv_shared_protocol_test COMMAND kv_shared_protocol_test)
 add_test(NAME region_allocator_test COMMAND region_allocator_test)

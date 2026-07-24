@@ -522,7 +522,8 @@ void Config::Validate() const {
     throw std::invalid_argument("invalid shared-memory capacity or HWCC budget");
   if (vm_count == 0 || partition_count == 0 || fixed_key_size == 0 || fixed_key_size > kMaxKey ||
       fixed_value_size > kMaxValue || shared_memory_numa_node < -1 || vm_numa_node < -1 ||
-      network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0)
+      network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0 ||
+      foreground_worker_count_per_vm > 64 || vm_count > 8)
     throw std::invalid_argument("invalid KV configuration");
   if (hw_cc_budget_mb == 0 || hw_cc_budget_mb > hwcc_size_mb ||
       owner_private_swcc_fraction <= 0.0 || owner_private_swcc_fraction >= 1.0 ||
