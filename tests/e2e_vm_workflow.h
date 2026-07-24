@@ -117,13 +117,11 @@ struct PhaseResult {
 };
 
 template <typename Operation>
-PhaseResult RunWorkers(const Config &base, uint64_t total, Operation operation) {
+PhaseResult RunWorkers(KVStore &store, const Config &base, uint64_t total, Operation operation) {
   const uint64_t threads = PositiveEnv("TIGONKV_E2E_THREADS",
                                        base.foreground_worker_count_per_vm);
   const uint64_t node_count = CountForPart(total, base.vm_count, base.node_id);
   const uint64_t node_start = StartForPart(total, base.vm_count, base.node_id);
-  Config worker_config = base;
-  worker_config.checkpoint_on_clean_exit = false;
 
   // A node owns one MPSC receive ring, so exactly one KVStore instance may
   // consume its transport messages.  Foreground workers retain independent
@@ -131,7 +129,6 @@ PhaseResult RunWorkers(const Config &base, uint64_t total, Operation operation) 
   // this node-local transport dispatcher.  Creating one KVStore per worker
   // lets a response be consumed by a different instance and lost from the
   // requester's response map.
-  auto store = KVStore::Create(worker_config, false);
   std::mutex store_mutex;
 
   std::atomic<bool> start{false};
@@ -148,7 +145,7 @@ PhaseResult RunWorkers(const Config &base, uint64_t total, Operation operation) 
         const uint64_t worker_count = CountForPart(node_count, threads, worker);
         for (uint64_t i = 0; i < worker_count; ++i) {
           std::lock_guard<std::mutex> lock(store_mutex);
-          operation(*store, worker, node_start + worker_start + i, i);
+          operation(store, worker, node_start + worker_start + i, i);
         }
       } catch (...) {
         std::lock_guard<std::mutex> guard(error_mutex);
@@ -200,20 +197,23 @@ inline int RunE2E08MultiVm() {
   const uint64_t total = PositiveEnv("TIGONKV_E2E08_TOTAL_KEYS", 100000);
   PhaseResult result;
   if (phase == "fill") {
-    result = RunWorkers(config, total, [](KVStore &store, uint64_t, uint64_t index, uint64_t) {
+    result = RunWorkers(*main_store, config, total, [](KVStore &store, uint64_t, uint64_t index, uint64_t) {
       const std::string key = Key08(index);
       const Status status = store.Put(key, key);
       if (!status.ok()) throw std::runtime_error("e2e08 fill PUT failed: " + status.message);
     });
   } else if (phase == "read") {
-    result = RunWorkers(config, total, [&](KVStore &store, uint64_t worker, uint64_t, uint64_t i) {
+    result = RunWorkers(*main_store, config, total, [&](KVStore &store, uint64_t worker, uint64_t, uint64_t i) {
       const uint64_t index = SplitMix64(0xe2080000ULL ^
           (static_cast<uint64_t>(config.node_id) << 32U) ^
           ((worker + 1) << 16U) ^ i) % total;
       const std::string key = Key08(index);
       const GetResult got = store.Get(key);
       if (!got.status.ok() || got.value != key)
-        throw std::runtime_error("e2e08 read verification failed for index " + std::to_string(index));
+        throw std::runtime_error("e2e08 read verification failed for index " + std::to_string(index) +
+                                 " status=" + std::to_string(static_cast<uint32_t>(got.status.code)) +
+                                 " message=" + got.status.message +
+                                 " value_size=" + std::to_string(got.value.size()));
     });
   } else {
     throw std::invalid_argument("e2e08 phase must be fill or read");
@@ -252,12 +252,12 @@ inline int RunE2E09MultiVm() {
   PhaseResult result;
   if (phase == "fill" || phase == "update") {
     const uint64_t generation = phase == "update" ? 1 : 0;
-    result = RunWorkers(config, total, [generation](KVStore &store, uint64_t, uint64_t index, uint64_t) {
+    result = RunWorkers(*main_store, config, total, [generation](KVStore &store, uint64_t, uint64_t index, uint64_t) {
       const Status status = store.Put(Key09(index), Value09(index, generation));
       if (!status.ok()) throw std::runtime_error("e2e09 PUT failed: " + status.message);
     });
   } else if (phase == "read") {
-    result = RunWorkers(config, total, [&](KVStore &store, uint64_t worker, uint64_t, uint64_t i) {
+    result = RunWorkers(*main_store, config, total, [&](KVStore &store, uint64_t worker, uint64_t, uint64_t i) {
       const uint64_t index = SplitMix64(0xe2090000ULL ^
           (static_cast<uint64_t>(config.node_id) << 32U) ^
           ((worker + 1) << 16U) ^ i) % total;
