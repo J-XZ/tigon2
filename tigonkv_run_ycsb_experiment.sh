@@ -49,7 +49,7 @@ if shared['swcc']['size_mb'] <= 0: raise SystemExit('shared size must exceed fix
 if numa: shared['numa_node']=[int(x) for x in numa.split(',')]
 lat=d['tigon_kv']['latency_inject']; lat['cache_model']='none'; lat['cache_hits_enabled']=False
 if no_latency == 'true': lat['enabled']=lat['foreground_enabled']=lat['merge_enabled']=False
-json.dump(d, open(dst, 'w', encoding='utf-8'), indent=2, sort_keys=True)
+json.dump(d, open(dst, 'w', encoding='utf-8'), indent=2)
 meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'threads_per_node':int(threads),'workloads':workloads.split(','),'base_config':src,'generated_config':dst,'ycsb_e':'unsupported'}
 json.dump(meta, open(dst.rsplit('/',1)[0] + '/../run_meta.json', 'w', encoding='utf-8'), indent=2, sort_keys=True)
 PY
