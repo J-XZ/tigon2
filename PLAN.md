@@ -1,2420 +1,1002 @@
-你正在一台用于多 VM 共享内存数据库实验的服务器上工作。
+# TigonKV 公平对比改造计划
 
-这不是一台部署真实 CXL 硬件的服务器。实验使用：
-
-    宿主机另一个 NUMA node 上的普通 DRAM
-        +
-    QEMU/ivshmem 多 VM 共享映射
-        +
-    软件缓存一致性协议
-        +
-    软件访问延迟注入
-
-来模拟 CXL 共享内存、HWCC 和 non-HWCC/SWCC 的行为。
-
-主项目已经存在：
-
-    /root/code/tigon2
-    GitHub: https://github.com/J-XZ/tigon2.git
-
-参考项目已经存在：
-
-    /root/code/cxlkv
-    GitHub: https://github.com/J-XZ/cxlkv.git
-    branch: my-work
-
-禁止重新 clone 这两个仓库。直接使用现有目录。
-
-你的任务是实际修改 /root/code/tigon2，配置、构建并执行必要的单元测试和多 VM
-集成测试。不能只提供设计、接口、伪代码或 TODO。
+本文档是唯一有效的完整改造计划。核心立场：**不追求与原实现隔离的独立
+TigonKV 分支，允许直接修改原始 Tigon 源码；最终只要求扩展后的系统可以
+运行，不保证旧 bench 等原有入口仍可运行**。不采用"可选钩子 + 默认旧行为
+兼容"的双路径设计，热路径集成一律为零间接开销的就地替换。
 
 ============================================================
-一、最高优先级目标
+零、改造起点决策与源码拷贝政策（必读）
 ============================================================
 
-将 Tigon2 改造成一个可以与 /root/code/cxlkv 公平比较的、独立完整的分布式
-共享内存 KV 数据库。
+## 0.1 起点决策
 
-核心架构要求：
+**结论：以当前 HEAD（`8ab9294`）为工作树起点继续修改；核心 KV 引擎以
+`ccd567a50116b7bada06df71a3bf0a07c424572e`（原始 Tigon 基准）中的组件为唯一
+代码基准重建；HEAD 上独立实现的 `kv/kv_store.cpp` 引擎核心整体废弃重写。**
 
-1. 保留 Tigon 的内部 partition 和 owner 概念。
-2. 对外只提供一个统一 KV namespace。
-3. 对外不暴露 table_id。
-4. 对外不暴露 partition_id。
-5. 任意 VM 可以接收任意 key 的请求。
-6. 每个 owner partition 的完整基础数据不再放在节点本地 DRAM，而是存放在该
-   partition 独占的 owner-private SWCC/non-HWCC 内存中。
-7. owner-private SWCC 只允许 partition owner VM 访问。
-8. owner-private SWCC 不需要跨 VM 软件缓存一致性，不应为普通访问创建共享
-   HWCC row metadata，也不应在每次普通 GET/PUT 时执行跨节点 flush/invalidate。
-9. 跨节点访问的活跃行继续按 Tigon/Pasha 的机制提升为：
-   - 逻辑 HWCC 中的共享索引和并发控制元数据；
-   - shared SWCC 中的共享 value payload。
-10. 只有真正被多个节点访问的 shared SWCC payload 才需要 SCC。
-11. HWCC 只保存少量共享索引、共享锁、跨节点状态、目录和回收元数据。
-12. HWCC 配置容量和实际逻辑使用预算都不得超过 1 GiB。
-13. SWCC 可以假设容量相对充裕，但所有内存必须有明确的分配、所有权、退休和
-    回收规则。
-14. 系统必须支持并发和安全内存回收，不得发生随运行轮数持续增长的内存泄漏。
-15. 只要求强一致的单次 KV 操作，不实现通用多 key 原子事务。
-16. 必须支持：
-    - PUT/upsert；
-    - GET；
-    - DELETE；
-    - SCAN；
-    - 用于测试的 CAS；
-    - 用于测试的原子 INCR。
-17. YCSB load、A、B、C、D 工作流必须全部实现并通过。
-18. YCSB-E 应认真尝试实现；只有在 SCAN 确实无法保证正确时，才允许明确标记为
-    不支持。
-19. 必须提供与 cxlkv/my-work 尽量一致的：
-    - experiment_config.jsonc；
-    - 多 VM 运行模型；
-    - trace 文件格式；
-    - e2e_trace_runner 可执行目标；
-    - YCSB trace 生成机制；
-    - 软件延迟模拟；
-    - 机器可读统计；
-    - e2e_08/e2e_09 风格测试；
-    - 多轮测试工作流。
+判断依据（均已用 `git diff --stat ccd567a..HEAD` 逐目录验证）：
 
-最终目标不是将 Tigon2 改成 cxlkv 的 DeltaIndex 或 merge-tree 算法，而是使：
+1. HEAD 相对 ccd567a 对原始 Tigon 的全部核心目录 **零改动**：
+   `protocol/`、`common/`、`core/`、`benchmark/`、`dependencies/` 逐字节一致。
+   因此"基于 HEAD 修改"与"从 ccd567a 重新实现"在核心代码上完全等价——
+   两种起点看到的原始 Tigon 代码是同一份。
+2. HEAD 新增的约 6200 行中，可保留或改造复用的实验 harness 约 5000 行：
+   `experiment_config.jsonc` 及解析、`tools/e2e_trace_runner.cpp`、
+   `tools/cxl_pool_initer.cpp`、`tools/numa_placement_probe.cpp`、
+   `scripts/vm/*`、`scripts/e2e_trace/*`、`tests/e2e/*`、`tests/e2e_08|09/*`、
+   YCSB-cpp submodule、文档骨架。若从 ccd567a 裸起点重做，这些全部要重新
+   搬运，纯增工作量。
+3. 必须废弃重写的是 HEAD 的引擎核心 `kv/kv_store.cpp`（约 1114 行）与
+   `kv/latency_simulator.*`（协议偏离 cxlkv，见 4.9）：前者与原始 Tigon 零
+   代码复用（hash+sorted 数组索引、全局一把锁、msync 伪 WriteThrough、同
+   slot 状态翻转），正是六个问题的根源。
 
-    Tigon/Pasha 的 partition + owner + row promotion 方案
+## 0.2 源码修改与拷贝政策（重要）
 
-能在相同 VM、相同 NUMA 布局、相同共享内存总容量、相同逻辑 HWCC/SWCC 容量、
-相同 trace、相同线程数、相同固定 key/value 大小、相同延迟注入和相同计时边界
-下，与 cxlkv 公平比较。
+**最终产物是单一系统：直接在原始 Tigon 代码上扩展改造。不维护双路径、不做
+向后兼容；只要求扩展后的系统可以运行。**
+
+1. **允许直接修改原始 Tigon 源码（ccd567a 内容）**。尊重原始实现的优先序：
+   直接调用原代码 > 在原文件上做就地最小修改（保留原有算法、锁位布局与
+   调用序列，改动处注释标注 `// tigonkv: <改动点>`）> 拷贝改编。禁止凭记忆
+   重写语义等价但细节走样的"仿制品"；就地修改的 diff 必须小而可审查。
+2. **不引入兼容层**：不做"可选钩子 + 默认旧行为"式双路径。热路径集成一律
+   选零间接开销方式——直接替换实现、构造期绑定、内联函数；禁止为兜底旧
+   行为引入函数指针/虚调用。这是"新增代码不拖慢系统"的硬要求。
+3. 原始文件**只改不删**：不再参与构建的原始组件（如 `protocol/SundialPasha`、
+   `bench_*`）源文件保留在仓库作原实现参考；若因本次修改导致其编译失败，
+   直接从 CMake 移除该 target，不花精力维持其可编译运行。
+4. **新增代码保持克制**：能就地改造原组件解决的，不新建平行组件；新文件
+   仅限原实现完全没有的职责（双区域分配器、KV 门面/消息编码、延迟模拟
+   移植、实验脚本）。
+5. **cxlkv 源码允许照搬**（延迟模拟器、QEMU 启动流程、YCSB 封装脚本、汇总
+   脚本等），但本仓库产物必须独立完备：**不得在构建或运行时引用
+   `/root/code/cxlkv` 本地目录**（不 include 其头文件、不调用其脚本、不链接
+   其构建产物）。每次照搬记入 `搬运清单.md` 与 `THIRD_PARTY_NOTICES.md`
+   （来源路径、cxlkv SHA、改写方式、license）。
+6. `kv/kv_store.h` 的对外 API、`Config`、`RuntimeStats`/`MemoryStats` 结构和
+   `DumpStats` 行协议**保留**（harness 依赖它们），仅重写实现；
+   `Config` 的延迟字段按 4.9 对齐 cxlkv `latency_inject` schema。
 
 ============================================================
-二、公平性要求
+一、目标与不变约束
 ============================================================
 
-不要把“公平”错误理解为强制两个数据库采用完全相同的内部 allocator 或完全相同
-的数据结构。
+## 1.1 目标
 
-公平性要求是：
+把 Tigon 改造成可与 `/root/code/cxlkv`（branch my-work）公平对比的分布式共享
+内存 KV 数据库：
 
-1. Tigon2 和 cxlkv 使用同一个共享 backing 文件配置。
-2. 使用相同的 shared_memory.size_mb。
-3. 使用相同的逻辑 HWCC 容量上限。
-4. 使用相同的逻辑 SWCC 容量上限。
-5. 使用相同的 VM 本地内存配置。
-6. 使用相同的 VM 数量。
-7. 使用相同的 foreground worker 数量。
-8. 使用相同的固定 key/value 大小。
-9. 使用同一份 YCSB trace 文件。
-10. 使用相同的软件延迟参数。
-11. 使用相同的 NUMA 计算节点和共享内存节点。
-12. Tigon2 不得创建隐藏的第二个共享内存池。
-13. Tigon2 不得在节点 DRAM 中保存一份未计入统计的完整数据副本。
-14. Tigon2 的所有共享内存分配必须被分类为：
-    - 逻辑 HWCC；
-    - owner-private SWCC；
-    - shared-payload SWCC；
-    - allocator/layout/EBR/transport 等明确类别。
-15. unclassified shared bytes 必须为 0。
-16. 不要求两个数据库的实际使用字节数相等，因为算法本身的空间开销不同。
-17. 必须准确报告各自的实际使用量，不得人为填充到相同值。
-18. Tigon2 的逻辑 HWCC 使用不得超过与 cxlkv 相同的 HWCC 容量。
-19. Tigon2 的逻辑 SWCC 使用不得超过与 cxlkv 相同的 SWCC 容量。
-20. allocator 自身占用的共享内存元数据也必须计入统计。
-21. allocator 在本地 DRAM 中的控制元数据必须测量，并且不得随 KV 数量线性增长。
-22. 吞吐计时只能覆盖 workload replay，不包含初始化、checkpoint、reset、同步和
-    barrier 等工作。
+- 共享内存分为两个**物理上固定划分、大小可配置**的区域：
+  HWCC（跨节点硬件缓存一致，典型 ≤ 1 GiB）与 non-HWCC/SWCC（无跨节点硬件
+  缓存一致）。
+- 单一 KV namespace，不暴露 table/partition；任意 VM 接受任意 key 的请求。
+- 只要求强一致的单 KV 操作：PUT/GET/DELETE/SCAN + 测试用 CAS/INCR；
+  不做通用多 key 事务。
+- 权威基础数据在 partition owner 独占的 owner-private SWCC 区（不是节点本地
+  DRAM）；跨节点活跃行按 Tigon/Pasha 机制 move-in：索引与并发控制元数据进
+  HWCC，payload 进 shared SWCC，且**必须是真实拷贝**。
+- 与 cxlkv 一致的 trace 实验接口、多 VM 运行模型、软件延迟注入（含 TSC
+  校准忙等实现细节，见 4.9）、独立的镜像制作/VM 启动脚本（见 4.10）、
+  一键 YCSB 封装与指南（见 4.11）。
 
-============================================================
-三、实验模型必须准确描述
-============================================================
+方案取舍总原则：**凡 Tigon 原有机制覆盖的部分，最大程度复用原始实现
+（B+树、SCC 协议、行级锁、迁移策略、EBR、CXL transport）；Tigon 原实现
+缺失或闭源的部分（共享内存分配器、KV 门面、请求转发消息、实验接口、
+VM 编排），自由设计并选性能最优方案，能照搬 cxlkv 的直接照搬。**
 
-所有代码、README、测试输出和修改日志都必须使用准确术语。
+## 1.2 公平性硬约束
 
-不得宣称：
+1. 与 cxlkv 使用同一 backing 文件（`/mnt/xz_shared_mem/ivshmem_shared_mem`）、
+   同一 `/dev/ivpci0`、相同 `shared_memory.size_mb`（须为 2 的幂，PCI BAR
+   要求）、相同 HWCC/SWCC offset 与 size、相同 VM 数/核数/NUMA 绑定、相同
+   worker 数、相同固定 key/value 大小、同一份 YCSB trace、相同延迟注入参数。
+2. HWCC 逻辑与物理使用均不得超过配置容量（典型 1024 MB）；不得创建隐藏的
+   第二共享内存池；不得在节点 DRAM 保存未计入统计的完整数据副本。
+3. 所有共享内存分配必须归类为：HWCC（细分 index/metadata/EBR/layout/
+   transport/allocator）、owner-private SWCC、shared-payload SWCC；
+   `unclassified_shared_bytes` 恒为 0。
+4. 本地 DRAM 中的进程元数据必须有界，不得随 KV 数量线性增长。
+5. 吞吐计时只覆盖 workload replay，不含初始化/checkpoint/reset/barrier。
+6. 延迟注入开启仅允许 `RelWithDebInfo + verbose=false + extra_check=false`
+   （与 cxlkv 同约束），否则 hard fail。
 
-- 服务器具有真实 CXL 内存；
-- HWCC/SWCC 是真实硬件提供的两类 CXL DIMM；
-- 软件延迟注入结果等同于真实 CXL 硬件结果。
+## 1.3 实验模型术语
 
-应明确描述为：
+不得宣称拥有真实 CXL 硬件。准确描述为：多 VM 通过 QEMU/ivshmem 映射同一块
+宿主机远端 NUMA DRAM；HWCC/SWCC 是协议与实验统计中的逻辑/物理区域类别；
+底层 CPU coherence 可能掩盖 SWCC 协议错误，正确性由 NonCoherent 测试后端
+兜底；结果称为 "NUMA-based CXL shared-memory emulation / software
+latency-injected result"。
 
-1. 多个 VM 通过 ivshmem 映射同一块宿主机 DRAM。
-2. 共享 DRAM 应位于与 VM 计算核和 VM 本地 RAM 不同的 NUMA node。
-3. HWCC 和 SWCC 是数据库协议和实验模型中的逻辑内存类别。
-4. 如果使用 global allocator，HWCC/SWCC 对象的物理地址可以交错。
-5. 如果使用 dual-region allocator，HWCC/SWCC 对象位于不同 offset range。
-6. 两种模式的底层仍然是同一台服务器上的共享 DRAM。
-7. 底层物理 CPU coherence 可能掩盖 SWCC 协议错误。
-8. shared SWCC 的正确性不能依赖底层硬件 coherence。
-9. owner-private SWCC 只有一个 VM 访问，因此不需要跨 VM coherence 协议。
-10. 软件延迟模拟器添加的是可配置的软件访问延迟。
-11. 实验结果应称为：
-    - NUMA-based CXL shared-memory emulation；
-    - software latency-injected result。
-12. 不得直接称为真实 CXL 性能。
+## 1.4 安全约束（不可违反）
 
-必须分别报告：
-
-- 未启用软件延迟时的远端 NUMA 共享 DRAM结果；
-- 启用软件延迟时的模拟结果；
-- 延迟参数；
-- SWCC/HWCC raw access；
-- cache hit/miss；
-- delayed_ns。
+- 禁止 push 到任何远程；允许本地 commit；禁止 `git reset --hard`、
+  `git clean -fd`；禁止覆盖用户已有修改；禁止重新 clone。
+- 禁止重启服务器；**未经用户明确允许禁止重启/重建 VM**（新写的 VM 启动
+  脚本本身允许开发与静态验证，实际执行 VM 重建须先获用户允许）；
+  禁止 mkfs/fdisk/parted/wipefs、remount/umount；禁止修改网络（bridge/TAP/
+  iptables/路由/NIC/SR-IOV）——例外：新 VM 启动脚本在**获用户允许执行时**
+  可按 cxlkv 同款方式创建/复用其专属 tap 设备，且必须先检查现有拓扑并优先
+  复用；禁止改 SMT/turbo/governor/NUMA balancing/THP（cxlkv 的 host tuning
+  步骤在我们脚本中降级为"只检查并报告"，见 4.10）。
+- 禁止执行原始 `emulation/start_vms.sh`、`emulation/setup.sh`、
+  `emulation/host_setup/**`、cxlkv 的 host tuning / init_vm 脚本（只读参考；
+  唯一例外是 `emulation/image/make_vm_img.sh` 被我们的镜像脚本以受控方式
+  包装调用，见 4.10，且执行前须获用户允许）。
+- 禁止无差别 pkill；只能按 PID 文件或精确可执行路径终止本轮测试进程。
+- `/root/code/cxlkv` 只读。VM 运行时文件只用 `/mnt/xz_vm_storage`。
+- 协议错误、越界、allocator OOM、所有权违规必须 hard fail；禁止静默
+  fallback、假 pass、空实现。
 
 ============================================================
-四、服务器路径和运行时路径
+二、现状诊断：六个问题的代码定位
 ============================================================
 
-所有源码修改只在：
+| # | 问题 | 现状代码 | 原始 Tigon 对应物（改造目标） |
+|---|------|----------|------------------------------|
+| P1 | PRIVATE→SHARED 同 slot 翻状态、无区域拷贝 | `kv/kv_store.cpp` `TransitionPayload()`（约 350–356 行），全库单一 slot 数组，`physical_region_split=0` | `TwoPLPashaHelper::move_from_partition_to_shared_region`（`protocol/TwoPLPasha/TwoPLPashaHelper.h:1583`）：真实分配+memcpy 到共享区 |
+| P2 | SCC WriteThrough 不完整 | `SyncRangeOrThrow()` 用页对齐 `msync`；无 per-host bitmap，`kv/` 内零 clflush/clwb | `protocol/Pasha/SCCWriteThrough.h`、`TwoPLPashaSCCWriteThrough`（bitmap 位于 `TwoPLPashaMetadataShared::atomic_word` bits 47–62；miss→clflush+置位；写→清他机位+clwb） |
+| P3 | HWCC Move-out 不完整 | 仅 owner 手动 `KVStore::MoveOut`；`migration_policy="Clock"` 只解析不执行 | `protocol/Pasha/MigrationManager.h` + `PolicyClock/LRU/FIFO` + `move_from_shared_region_to_partition`（`TwoPLPashaHelper.h:1795`），由 `TOTAL_HW_CC_USAGE >= hw_cc_budget` 驱动 |
+| P4 | 并发锁粒度过粗 | `SharedHeader::lock_word` 全库一把跨 VM 自旋锁 | 行级：`TwoPLPashaMetadataShared` 单 atomic word（latch bit63、写锁 bit41、读者数 bits42–46）；索引级：B+树 OLC |
+| P5 | 索引不是 B+树 | open-addressed hash + 排序 slot 数组（O(n) memmove） | `common/btree_olc_cxl/BTreeOLC_CXL.h` `btreeolc_cxl::BPlusTree`（OLC、叶链表、支持 scan）+ `core/CXLTable.h` `CXLTableBTreeOLC` |
+| P6 | 自研分配器性能可疑 | 固定 4KB+ 内嵌 slot 的 next-fit 环扫（最坏 O(n)），全局锁下分配 | 原 cxlalloc 为闭源 Rust 静态库（`dependencies/cxlalloc/libcxlalloc_static.a`），不可审计不可分区域 → 自研高性能双区域分配器（见 4.1） |
 
-    /root/code/tigon2
+另有三处与 cxlkv 对比接口尚未对齐：
 
-进行。
-
-/root/code/cxlkv 是只读参考，不要修改。
-
-所有 VM 临时文件和运行时文件必须使用：
-
-    /mnt/xz_vm_storage
-
-包括：
-
-- VM 磁盘副本；
-- QEMU pid；
-- QEMU log；
-- serial log；
-- ivshmem socket；
-- VM runtime metadata；
-- 临时同步状态。
-
-plain ivshmem 的宿主机共享文件必须是：
-
-    /mnt/xz_shared_mem/ivshmem_shared_mem
-
-VM 内共享设备必须是：
-
-    /dev/ivpci0
-
-新 TigonKV 默认路径不得再使用：
-
-    /mnt/cxl_mem
-    /mnt/cxl_mem/mem_1
-    /root/code/tigon2/emulation/vms
+| # | 缺口 | 现状 | 目标 |
+|---|------|------|------|
+| P7 | VM 镜像制作/启动脚本 | 只有原始 `emulation/*`（与 cxlkv 启动方式不同、被安全约束禁用）；`scripts/vm/start_existing_topology.sh` 只校验不启动 | 项目根新增独立完备的 `tigonkv_*` 镜像/启动/停止脚本，流程照搬 cxlkv（见 4.10） |
+| P8 | 软件延迟模拟不忠实 | `kv/latency_simulator.cpp` 无 TSC 校准（`sleep_for` 兜底路径为主）、热路径对共享原子计数器 fetch_add、LRU 用 `std::deque` 线性查找、无 scope/generation 语义 | 照搬 cxlkv `src/utils` 的 LatencySimulator（TSC 校准忙等、线程本地 pending、组相联 LRU），见 4.9 |
+| P9 | 无一键 YCSB 封装与指南 | 只有低层 `scripts/e2e_trace/*` | 项目根新增 `tigonkv_run_ycsb_experiment.sh` + `YCSB指南.md`，对齐 cxlkv `scripts/run_ycsb_trace_experiment.sh` + `doc/YCSB指南.md`（见 4.11） |
 
 ============================================================
-五、绝对安全约束
+三、目标架构总览
 ============================================================
 
-以下规则不可违反：
+## 3.1 共享内存物理布局（dual-region，P1/P6 的地基）
 
-1. 禁止 push 到任何远程。
-2. 允许创建本地 git commit。
-3. 禁止 git reset --hard。
-4. 禁止 git clean -fd 或 git clean -fdx。
-5. 禁止覆盖或丢弃用户已有修改。
-6. 禁止重新 clone tigon2 或 cxlkv。
-7. 禁止重启服务器。
-8. 未经用户明确允许，禁止重启 VM。
-9. 禁止格式化任何硬盘或分区。
-10. 禁止执行 mkfs、fdisk、parted、wipefs。
-11. 禁止重新挂载或卸载宿主机磁盘、分区或数据目录。
-12. 禁止修改服务器网络配置：
-    - 不创建或删除 bridge；
-    - 不创建或删除 TAP；
-    - 不修改 iptables/nftables；
-    - 不修改默认路由；
-    - 不修改物理 NIC；
-    - 不配置 SR-IOV；
-    - 不修改 Mellanox 配置。
-13. 禁止改变当前 SMT/超线程状态。
-14. 禁止改变当前 turbo、boost、CPU governor、NUMA balancing、THP 等宿主机状态。
-15. 禁止执行 cxlkv 的 host tuning 脚本。
-16. 禁止直接执行 Tigon 官方 VM/host 脚本。
-17. 默认禁止执行：
-    - /root/code/tigon2/emulation/start_vms.sh
-    - /root/code/tigon2/emulation/setup.sh
-    - /root/code/tigon2/emulation/host_setup/**
-    - /root/code/tigon2/emulation/vm_lib/start_vm.py
-    - /root/code/cxlkv/xz_scripts/init_scripts_env_3_init_vm.fish
-    - /root/code/cxlkv/cloudlab/**/prepare_disk*
-18. 如需参考上述脚本，只能阅读。
-19. 若确实需要运行某个已有脚本，必须：
-    - 完整检查脚本；
-    - 检查所有 source/import/call 链；
-    - 确认不违反安全约束；
-    - 获得用户明确允许。
-20. 禁止无差别 pkill qemu、ivshmem-server 或其他数据库进程。
-21. 只能终止本轮 Tigon2 测试创建的、通过 PID 文件或精确 executable path
-    确认的进程。
-22. cxlkv 与 Tigon2 不需要同时运行，用户保证同一时刻只有一个数据库运行。
-23. 不需要实现专用 cxlkv-vs-Tigon2 自动对比脚本。
-24. 默认复用服务器上已经存在的 VM、网络和 ivshmem 设备。
-25. VM、网络或设备状态不正确时先报告，不能通过修改网络或重启服务器修复。
-26. 协议错误、指针越界、allocator OOM、所有权错误、状态机错误必须 hard fail。
-27. 禁止用静默 fallback、无限重试或虚假成功掩盖错误。
+一个 backing（宿主机 `/mnt/xz_shared_mem/ivshmem_shared_mem`，VM 内
+`/dev/ivpci0`）单次 mmap，按配置切成两个物理区域：
 
-============================================================
-六、开始工作前的本地审计
-============================================================
+```
+共享池 [0, size_mb)
+├── HWCC 区  [hwcc.offset_mb, +hwcc.size_mb)          典型 [0, 1024MB)
+│   ├── SharedLayoutHeader（magic/version/config_hash/clean_epoch/根偏移表）
+│   ├── HWCC 分配器元数据（per-node shard）
+│   ├── 每 partition 的 shared CXL B+树（index 节点，INDEX_ALLOCATION）
+│   ├── TwoPLPashaMetadataShared（每个 shared row 一个，METADATA）
+│   ├── CXL_EBR 元数据（root 4）
+│   └── CXLTransport MPSC ring buffers（root 0，TRANSPORT）
+└── SWCC 区  [swcc.offset_mb, +swcc.size_mb)          典型 [1024MB, end)
+    ├── SWCC 分配器元数据
+    ├── owner-private arenas × partition_count
+    │   ├── 该 partition 的 private B+树节点（仅 owner VM 访问）
+    │   └── PrivateRow（key+value+私有元数据，仅 owner VM 访问）
+    └── shared payload 池
+        └── TwoPLPashaSharedDataSCC + value（SCC 保护，所有 VM 访问）
+```
 
-进入：
+- 两区域大小来自 `experiment_config.jsonc` 的
+  `shared_memory.hwcc.{offset_mb,size_mb}` / `swcc.{offset_mb,size_mb}`，
+  与 cxlkv 完全同 schema；HWCC 默认 1024 MB。
+- 持久引用一律 64 位区域内 offset 或 `boost::interprocess::offset_ptr`
+  （自相对，映射基址变化安全）；禁止跨进程 raw pointer。
+- `MemoryStats.physical_region_split = 1`，`allocator_mode = "dual_region"`。
 
-    cd /root/code/tigon2
+注意一个与直觉相反但必须忠实于 Tigon 的点：Tigon 在 `enable_scc=true` 时，
+move-in 的 **value payload 位于 non-HWCC 共享区（SCC 软件保证一致性），只有
+索引节点和行元数据进 HWCC**（见 `common/CXLMemory.h` 记账：DATA 类别在
+enable_scc 时不计入 `TOTAL_HW_CC_USAGE`）。因此 P1 所说"non-hwcc → hwcc 的
+迁移拷贝"落实为：**owner-private SWCC → (HWCC 新建元数据+索引项) +
+(shared SWCC 新分配 payload 的 memcpy)**，两笔都是真实分配与拷贝，无任何
+同地址状态翻转。反向 move-out 同理是真实拷回。
 
-记录：
+## 3.2 组件复用矩阵
 
-    pwd
-    git status --short --branch
-    git rev-parse HEAD
-    git remote -v
-    git submodule status --recursive || true
+| 子系统 | 采用 | 来源 | 改动量 |
+|--------|------|------|--------|
+| 私有索引 | `btreeolc_cxl::BPlusTree`（每 partition 一棵，分配域=该 owner arena） | `common/btree_olc_cxl/BTreeOLC_CXL.h` | 就地修改：分配/回收绑定树实例的分配域，节点访问插入延迟记账（构造期绑定 + 门控内联，零间接开销） |
+| 共享索引 | `CXLTableBTreeOLC`（每 partition 一棵，分配域=HWCC） | `core/CXLTable.h` | 近零 |
+| 行级并发控制 | `TwoPLPashaMetadataShared` 原子字（latch/写锁/读者数/SCC bits/offset） | `protocol/TwoPLPasha/TwoPLPashaHelper.h` | 近零 |
+| SCC 协议 | `TwoPLPashaSCCWriteThrough`（默认）/`NoSharedRead`/`NonTemporal`/`NoOP` 经 `SCCManagerFactory` | `protocol/Pasha/SCC*.h` | 零 |
+| 迁移策略 | `MigrationManager` + `PolicyClock`（默认）/LRU/FIFO/NoMoveOut | `protocol/Pasha/*` | 近零 |
+| move-in/out 执行体 | `move_from_partition_to_shared_region` / `move_from_shared_region_to_partition` 就地改造为 KV 版（源/宿从 DRAM 行换成 PrivateRow） | `TwoPLPashaHelper.h` | 就地修改（保留分配/初始化/发布步骤与顺序） |
+| 安全回收 | `CXL_EBR` | `common/CXL_EBR.*` | 零 |
+| 跨 VM 消息 | `MPSCRingBuffer` + `CXLTransport` | `common/MPSCRingBuffer.h`、`common/CXLTransport.h` | 零（消息编码新写） |
+| 记账 | `CXLMemory` 类别记账 + `TOTAL_HW_CC_USAGE` | `common/CXLMemory.h` | 就地修改：malloc wrapper 直接路由双区域分配器（弃 cxlalloc，无兼容分支） |
+| 共享内存分配器 | **新写** dual-region 高性能分配器（cxlalloc 闭源弃用） | 新 `kv/engine/region_allocator.*` | 全新（自由设计区） |
+| KV 门面/路由/转发/SCAN 归并 | **新写** | 新 `kv/engine/*` | 全新（自由设计区） |
+| 软件延迟模拟 | **照搬 cxlkv** `latency_sim::LatencySimulator` | cxlkv `src/utils/{include,src}/latency_simulator.*` → `kv/latency_simulator.*` | 移植（见 4.9） |
+| VM 镜像/启动 | **照搬 cxlkv 流程**（镜像层复用 tigon 自带 mkosi 脚本） | cxlkv `xz_scripts/*` + rust `init_vm`；tigon `emulation/image/make_vm_img.sh` | 新脚本（见 4.10） |
+| YCSB 一键封装 | **照搬 cxlkv** | cxlkv `scripts/run_ycsb_trace_experiment.sh` + `doc/YCSB指南.md` | 新脚本+文档（见 4.11） |
+| 其余实验 harness | 保留 HEAD 现有实现 | `tools/ scripts/ tests/` | 小改 |
 
-在只读参考目录记录：
+## 3.3 行状态机与数据流
 
-    git -C /root/code/cxlkv status --short --branch
-    git -C /root/code/cxlkv rev-parse HEAD
-    git -C /root/code/cxlkv branch --show-current
-    git -C /root/code/cxlkv submodule status --recursive
-    git -C /root/code/cxlkv/thirdparty_libs/YCSB-cpp rev-parse HEAD
-    git -C /root/code/cxlkv/thirdparty_libs/YCSB-cpp branch --show-current
+每个 key 的权威副本位置由状态决定：
 
-要求：
+```
+EMPTY ── owner PUT ──▶ PRIVATE ── 远程访问触发 move-in ──▶ SHARED_ACTIVE
+                          ▲                                     │
+                          └──── move-out（预算驱动/Clock）◀──────┘
+                                       （经 RETIRING + EBR 回收）
+DELETE：PRIVATE 直接从私有树删除；SHARED_ACTIVE 置 tombstone 后经 EBR 回收。
+```
 
-1. 以服务器本地 /root/code/cxlkv 当前实际代码和 SHA 为兼容基线。
-2. 不假设本地代码等于远程最新版本。
-3. 不覆盖 /root/code/tigon2 的已有修改。
-4. 检查当前 VM 和数据库进程。
-5. 检查：
-   - /mnt/xz_vm_storage；
-   - /mnt/xz_shared_mem；
-   - /mnt/xz_shared_mem/ivshmem_shared_mem；
-   - backing 文件大小；
-   - backing 所在文件系统；
-   - backing mount options；
-   - /dev/ivpci0；
-   - 当前 VM 数；
-   - SSH 端口；
-   - QEMU pid 和 cmdline；
-   - NUMA 拓扑；
-   - SMT 状态；
-   - CPU online 状态。
-6. 这些步骤只检查，不修改。
-
-在项目根创建：
-
-    /root/code/tigon2/修改日志.md
-
-文档必须记录：
-
-- 开始时间；
-- Tigon2 SHA；
-- cxlkv SHA；
-- YCSB-cpp SHA；
-- 初始 git status；
-- 当前 VM 数；
-- 当前共享文件；
-- 当前 CPU/NUMA 布局；
-- 实际共享页 NUMA 分布；
-- 当前 SMT 状态；
-- allocator 能力测试；
-- allocator 最终决策；
-- 缓存一致性设计决策；
-- 每个模块修改摘要；
-- 构建命令；
-- 测试命令和轮数；
-- 测试结果；
-- 本地 commit SHA；
-- 最终已知限制。
-
-保持文档简洁明确。
+- **PRIVATE**：private 树有 key，PrivateRow（owner arena）是权威副本；
+  shared 树无该 key；无 shared metadata、无 SCC、普通读写无 flush。
+- **SHARED_ACTIVE**：shared 树有 entry → `TwoPLPashaMetadataShared`（HWCC）→
+  `TwoPLPashaSharedDataSCC+value`（shared SWCC）为权威副本；PrivateRow 保留
+  但 `is_migrated=1` 只作 owner 侧壳；所有节点持行锁 + SCC 访问 payload。
+- **move-in**（真实拷贝，owner 执行）：private latch → 确认 PRIVATE →
+  HWCC 分配 smeta + SWCC 分配 payload → memcpy value → `init_scc_metadata` →
+  `finish_write`（clwb 发布）→ shared 树 insert（可达性线性化点）→
+  private 元数据记 `migrated_offset` → 解锁 → 回复请求方。
+- **move-out**（真实拷回，owner 执行）：Clock 选中 victim → 拒绝新引用、
+  等 `ref_cnt==0` → 持行写锁按 SCC 读最新 payload → memcpy 回 PrivateRow →
+  shared 树 remove → smeta+payload 交 `CXL_EBR` retire → 安全 epoch 后
+  归还各自分配器。
 
 ============================================================
-七、必须阅读和比较的代码
+四、分项设计与改造步骤
 ============================================================
 
-Tigon2：
+## 4.1 双区域共享内存分配器（P6 + P1 地基；自由设计区，取性能最优）
 
-- CMakeLists.txt
-- dependencies/cxlalloc/**
-- common/CXLMemory.h
-- common/CXL_EBR.*
-- common/btree_olc/**
-- common/btree_olc_cxl/**
-- common/CCHashTable.*
-- core/Table.h
-- core/CXLTable.h
-- core/Context.h
-- core/Coordinator.h
-- core/Executor.h
-- core/Dispatcher.h
-- core/Partitioner.h
-- protocol/TwoPLPasha/**
-- protocol/Pasha/**
-- protocol/Pasha/SCCManager.h
-- protocol/Pasha/SCCWriteThrough.h
-- protocol/Pasha/SCCNonTemporal.h
-- protocol/Pasha/SCCNoOP.h
-- benchmark/ycsb/**
-- bench_ycsb.cpp
-- scripts/**
-- emulation/start_vms.sh
-- emulation/setup.sh
-- emulation/vm_lib/**
-- emulation/ivshmem/**
-- dependencies/kernel_module/**
+### 决策：弃用 cxlalloc，自研
 
-cxlkv/my-work：
+`allocator审计.md` 已确认 cxlalloc 只有闭源 Rust 静态库：无法双区域化、无法
+审计 local-DRAM 元数据增长、无法做 domain 记账，也无法证明 multi-VM attach
+语义。公平性要求所有共享字节可分类，因此重写不可避免。这是 Tigon 原实现中
+唯一被整体替换的组件，须在 `修改日志.md` 中明确记录理由。
 
-- AGENTS.md
-- experiment_config.jsonc
-- readme.md
-- .gitmodules
-- src/utils/include/latency_simulator.h
-- src/utils/src/latency_simulator.cc
-- src/cxl_basic/**
-- src/cxl_pool_initer/**
-- src/tree/impl/latency_integration.*
-- src/tree/impl/multi_node_memory_manager.*
-- src/tree/test/test_config.h
-- src/tree/test/vm_test_pool_common.*
-- src/tree/test/n_vm_ssh_e2e.sh
-- src/tree/test/n_vm_ssh_e2e_common.sh
-- src/tree/test/run_e2e_100_no_kill_on_fail.sh
-- src/tree/test/e2e_08/**
-- src/tree/test/e2e_09/**
-- src/tree/test/e2e_trace/**
-- src/tree/test/e2e_10/**
-- doc/trace/README.md
-- doc/延迟模拟/**
-- doc/测试/测试说明.md
-- doc/测试/N-VM测试建议.md
-- doc/实现说明中关于 HWCC/SWCC、flush、allocator 和恢复的章节
-- xz_scripts 中与配置解析、QEMU 参数、NUMA 和共享内存相关的代码
-- rust_utils/init_vm 中的 shared-memory 和 QEMU 启动代码
+### 设计（新文件 `kv/engine/region_allocator.h/.cpp`）
 
-YCSB-cpp：
+每个物理区域一个 `RegionAllocator` 实例（HWCC 一个、SWCC 一个），元数据
+驻留区域内（可 attach 恢复），结构照 tcmalloc/jemalloc 思路裁剪：
 
-- scripts/generate_cxlkv_trace.sh
-- trace DB binding
-- workloads/workloada
-- workloads/workloadb
-- workloads/workloadc
-- workloads/workloadd
-- workloads/workloade
-- UPDATE read-before-write 逻辑
-- worker trace 拆分逻辑
-- manifest 逻辑
+1. **区域切分**：区域头（元数据）+ per-node shard × vm_count（静态均分或按
+   配置权重）。每个 shard 只由其所属 VM 在快路径上分配，天然消除跨 VM 分配
+   竞争。SWCC 区域再细分：owner-private arena 段（初始化时按
+   `owner_private_swcc_fraction` 一次性划给各 partition）+ shared payload 段。
+2. **shard 内部**：
+   - size-class 隔离空闲链（64B 起，1.25× 递进到 64KB；更大走 4KB 对齐的
+     chunk 分配器）。所有块 64B 对齐（cacheline / clflush 粒度要求）。
+   - **每线程本地缓存（process-local DRAM）**：小对象按 batch 从 shard 取/还，
+     快路径零原子操作；缓存容量固定上限（每线程每 class ≤ 64 个对象），
+     满足"local DRAM 元数据不随 KV 数量增长"。
+   - shard 中央空闲链用单条 64B 对齐自旋锁保护（同 VM 线程间），批量进出。
+3. **跨 VM free（EBR 回收他机分配的对象）**：每 shard 一个 remote-free
+   Treiber 栈（头指针在 HWCC，CAS 推入）；owner VM 分配路径顺手批量收割。
+   free 必须带 owner-shard 提示；找不到 owner 时 hard fail（暴露 double-free
+   或路由错误，不做扫描 fallback）。
+4. **owner-private arena 分配器**：arena 头 + size-class 空闲链 + bump 指针，
+   仅 owner VM 访问 → 只需进程内轻量锁，无任何跨 VM 原子。私有 B+树节点和
+   PrivateRow 都从这里分配。
+5. **offset/指针**：对外 API 直接返回指针 + `to_offset/from_offset`
+   （区域内 64 位 offset）。B+树用的 `offset_ptr` 自相对，无需转换。
+6. **记账**：每次分配带 domain 标签（`kHwccIndex/kHwccMetadata/kHwccEbr/
+   kHwccLayout/kTransport/kOwnerPrivateSwcc/kSharedPayloadSwcc/kAllocatorMeta`），
+   区域头维护 per-domain used/peak 计数（原子）。HWCC 区域分配失败 = 触发
+   move-out（见 4.5），仍失败则 hard fail。
+7. **attach/restart**：区域头含 magic/version/config_hash/clean_epoch；
+   clean checkpoint 时置 clean 标记；attach 校验不符 hard fail。
 
-============================================================
-八、实现前必须建立“对象访问分类”
-============================================================
+### 与原始 Tigon 代码的对接（就地替换，零间接开销）
 
-不要对所有 SWCC 对象使用同一个缓存一致性规则。
+原始组件（BTreeOLC_CXL、CXL_EBR、MPSCRingBuffer、TwoPLPashaHelper）全部经
+`common/CXLMemory.h` 的 `cxlalloc_malloc_wrapper(size, category)` 分配。对接
+方式为**直接修改 wrapper 实现**，不做可选钩子/双路径：
 
-必须先创建：
+- `cxlalloc_malloc_wrapper`/`free_wrapper` 就地改为按 category 路由双区域
+  分配器（内联 switch）：`INDEX_ALLOCATION/METADATA/MISC/TRANSPORT` → HWCC
+  区域（分别打 kHwccIndex/kHwccMetadata/kHwccLayout/kTransport 标签），
+  `DATA_ALLOCATION` → SWCC shared payload 段。原 `cxlalloc_*` 调用路径删除，
+  全仓不再链接 `libcxlalloc_static.a`。
+- `cxlalloc_get_root/set_root` 语义由 SharedLayoutHeader 的根偏移表就地替换
+  （root 0=transport rings，3=global epoch，4=EBR meta，与原编号一致），
+  原调用点尽量不动、只改实现。
+- `CXLMemory` 的类别记账与 `TOTAL_HW_CC_USAGE` 逻辑保留原样（迁移预算依赖）。
 
-    缓存一致性设计.md
+### 分配器测试（能力测试矩阵）
 
-对数据库中的每一类对象逐项记录：
+`allocator_capability/multi_process/restart_attach/concurrency/reclaim/
+accounting/domain_budget/local_dram` 各 CTest target：多进程 attach、offset
+稳定、并发 alloc/free、remote-free 收割、64B 对齐、OOM 明确、per-domain
+记账、unclassified=0、本地 DRAM 有界、多轮无泄漏。Debug 与 RelWithDebInfo
+各 ≥10 轮。
 
-1. 对象名称。
-2. 所在逻辑内存类别。
-3. 在 global allocator 模式中的 allocation domain。
-4. 在 dual-region 模式中的物理 region。
-5. 哪些 VM 可以访问。
-6. 哪些线程可以访问。
-7. 是否可变。
-8. 谁是权威副本。
-9. 使用什么同步机制。
-10. 是否需要跨 VM缓存一致性。
-11. 普通访问是否需要 flush/invalidate。
-12. 何时必须 flush。
-13. 是否需要 HWCC metadata。
-14. 如何发布。
-15. 如何退休和回收。
-16. 延迟模拟按什么 PoolKind/AccessKind 计数。
-17. clean restart时如何恢复。
+## 4.2 索引：私有 B+树 + 共享 B+树（P5）
 
-至少分类以下对象：
+### Key 类型
 
-- process-local DRAM transaction buffer；
-- process-local message buffer；
-- owner-private B+Tree page；
-- owner-private key/value row；
-- owner-private local metadata；
-- owner-private allocator metadata；
-- shared HWCC B+Tree/index page；
-- shared row concurrency metadata；
-- shared row payload；
-- migration tracker；
-- EBR metadata；
-- EBR retired object；
-- global root/layout；
-- transport buffer；
-- checkpoint metadata；
-- trace/runtime statistics。
-
-任何对象没有进入此表，不得进入共享内存热路径。
-
-============================================================
-九、强制定义的访问类别
-============================================================
-
-建议显式定义：
-
-enum class AccessClass {
-    kProcessLocalDram,
-    kOwnerPrivateSwcc,
-    kSharedHwcc,
-    kSharedSwccPayload,
-    kPublishedImmutableSwcc
+```cpp
+// kv/engine/fixed_key.h
+struct FixedKey {                       // fixed_key_size ≤ 32，右侧 space 填充
+  char bytes[32];                       // 与 cxlkv runner 的 key padding 一致
 };
-
-其中：
-
-------------------------------------------------------------
-9.1 kProcessLocalDram
-------------------------------------------------------------
-
-典型对象：
-
-- transaction temporary buffer；
-- request/response buffer；
-- worker-local state；
-- socket buffer；
-- thread stack；
-- 少量 runtime descriptor。
-
-规则：
-
-1. 仅当前进程访问。
-2. 使用普通 DRAM同步。
-3. 不计入 HWCC/SWCC延迟。
-4. 不需要 CXL flush。
-5. 不得随数据库 KV 数量线性增长。
-
-------------------------------------------------------------
-9.2 kOwnerPrivateSwcc
-------------------------------------------------------------
-
-典型对象：
-
-- owner partition 的 private B+Tree；
-- private B+Tree page；
-- private key/value row；
-- private local metadata；
-- owner-only allocator state；
-- owner-only migration tracker。
-
-规则：
-
-1. 物理上位于模拟 CXL 的 SWCC共享映射。
-2. 软件上只有该 partition owner VM 可以解引用。
-3. 同一 owner VM内可以有多个 worker线程。
-4. 只需要同一 VM内的线程同步。
-5. 不需要跨 VM SCC。
-6. 不需要每行 shared HWCC metadata。
-7. 普通 GET/PUT/DELETE不需要 clflush/clwb。
-8. 普通 B+Tree page split不需要跨节点 publish。
-9. 可以在同一 owner VM内原地修改。
-10. 不需要 SCC readable bitmap。
-11. 不需要跨节点 dirty/clean lifecycle。
-12. 不需要在每次普通操作后 flush 到 backing。
-13. 仍然记录 SWCC read/write延迟，因为访问的是远端 NUMA共享 DRAM。
-14. 不应记录不存在的 SWCC flush。
-15. clean checkpoint时必须将需要跨进程恢复的 dirty range flush/write-back。
-16. 从 private 状态 promote 到 shared 状态时，private source本身不需要为了同一
-    owner进程内复制而先 flush。
-17. 任何其他 VM访问 private offset 都是 hard failure。
-18. private offset不得通过消息或 shared metadata发布。
-
-------------------------------------------------------------
-9.3 kSharedHwcc
-------------------------------------------------------------
-
-典型对象：
-
-- shared index；
-- shared index latch/version；
-- shared row lock；
-- reader count；
-- writer state；
-- SCC bitmap；
-- ref count；
-- payload offset；
-- shared lifecycle；
-- generation；
-- EBR epoch；
-- global root/layout；
-- 跨 VM allocator metadata。
-
-规则：
-
-1. 多个 VM可以访问。
-2. 可承担跨 VM原子同步。
-3. 计入逻辑 HWCC预算。
-4. 使用 HWCC延迟类别。
-5. 复合状态仍需锁或明确状态机。
-6. 不因为属于 HWCC就允许无锁修改多字段结构。
-7. 不需要使用 SWCC flush来实现缓存一致性。
-8. publication使用明确的 release/acquire或锁线性化。
-9. 如果 global allocator物理地址交错，仍按显式 domain识别为 HWCC。
-10. 如果 dual-region，额外验证地址位于 HWCC region。
-
-------------------------------------------------------------
-9.4 kSharedSwccPayload
-------------------------------------------------------------
-
-典型对象：
-
-- 已 promote 的共享 row value；
-- 只有在 shared-active 状态下由多个 VM访问的 payload。
-
-规则：
-
-1. 可以被多个 VM读取或写入。
-2. 不能依赖底层物理 coherence。
-3. 必须通过共享 HWCC lock/metadata和 Tigon SCC协议访问。
-4. 需要的 flush/invalidate由实际 SCC机制决定。
-5. 不机械采用 cxlkv 的 copy-on-write tree规则。
-6. Tigon 行级写锁允许 shared row payload原地更新。
-7. 是否需要额外 dirty/clean状态，必须根据现有锁和 SCC协议是否已经足够决定。
-8. 不得为了照搬 cxlkv而强制增加不必要的 lifecycle状态、version revalidation或
-   copy-on-write。
-9. 但必须证明其他 VM在后续读操作中不会看到旧值或部分值。
-10. 计入 SWCC read/write，以及实际发生的 SCC flush。
-11. 普通 owner-private访问不得走本类别。
-
-------------------------------------------------------------
-9.5 kPublishedImmutableSwcc
-------------------------------------------------------------
-
-只有确实采用“写一次后发布、发布后只读”的对象才使用，例如：
-
-- 某些不可变配置块；
-- 某些不可变 snapshot；
-- 某些初始化完成后不再修改的对象。
-
-规则：
-
-1. 发布前完成写入。
-2. 发布前按需要 flush。
-3. 通过 HWCC root或offset发布。
-4. 发布后不原地修改。
-5. 这一规则不得被错误套用到 Tigon 的共享可更新 row payload。
-6. 如果项目没有此类对象，不必为了形式而创建。
-
-============================================================
-十、缓存一致性设计原则
-============================================================
-
-必须参考 cxlkv AGENTS.md 对 HWCC/SWCC 特性的理解，但不能照搬 cxlkv 的树协议。
-
-判断是否需要缓存一致性时，依次回答：
-
-1. 这个对象是否可能被两个 VM同时或先后访问？
-2. 它是否可变？
-3. 写入者和读取者是否可能位于不同 VM？
-4. 是否存在明确的权威副本？
-5. 是否存在跨 VM可见性要求？
-6. 是否已经有共享 HWCC lock保证互斥？
-7. 是否已经有 SCC sharer bitmap或 non-temporal路径？
-8. 是否需要在另一个 VM能够获得该地址前完成 publish？
-9. 是否只需要 clean process restart，而不需要 crash recovery？
-10. 当前 flush是为：
-    - 跨 VM可见性；
-    - clean restart；
-    - 持久化；
-    - 延迟模拟；
-    中的哪一种？
-
-禁止使用以下错误推理：
-
-- “对象在 SWCC，所以每次访问必须 flush。”
-- “对象在共享 mmap 中，所以所有 VM都会访问。”
-- “对象可能被其他 VM映射，所以必须分配 HWCC metadata。”
-- “cxlkv 不允许原地修改 SWCC，所以 Tigon shared row也不能原地修改。”
-- “有底层硬件 coherence，所以 SCC可以删除。”
-- “有 write lock，所以 shared SWCC不需要任何缓存可见性处理。”
-- “调用了 RecordSwccFlush，所以已经完成真实 flush。”
-
-============================================================
-十一、owner-private SWCC 的正确协议
-============================================================
-
-owner-private SWCC 的目标是替代原本节点本地 DRAM中的完整 partition。
-
-普通运行时：
-
-1. 只有 owner VM访问。
-2. 同一 VM内通过 private latch或 B+Tree OLC同步。
-3. 普通读：
-   - 获取必要的同进程锁；
-   - 直接读取 private SWCC；
-   - 不调用 SCCManager；
-   - 不分配 SharedMetadata；
-   - 不执行跨节点 invalidate。
-4. 普通写：
-   - 获取必要的同进程锁；
-   - 直接原地更新 private SWCC；
-   - 不调用 SCCManager；
-   - 不清除 host bitmap；
-   - 不在每次写后 clwb。
-5. 普通 insert、delete、page split、root split：
-   - 允许在 private SWCC原地修改；
-   - 只需 owner进程内同步。
-6. 记录：
-   - SWCC read；
-   - SWCC write；
-   但不记录虚假的 flush。
-7. 不允许为每个 private row额外创建 HWCC metadata。
-8. 在全部 key均保持 private 的 workload中，动态 HWCC row metadata使用应接近 0。
-
-clean checkpoint：
-
-1. 停止新操作。
-2. 等待本节点 worker退出临界区。
-3. 确认 private locks全部释放。
-4. flush private arena中本阶段实际修改的 dirty range。
-5. 可以使用 dirty page/range tracking。
-6. 如果实现简单，允许在计时窗口之外 flush private arena used range。
-7. 执行 fence。
-8. 发布 clean checkpoint marker。
-9. 新进程 attach后从 offset恢复。
-
-不要求：
-
-- 每个 private PUT立即 flush；
-- 每个 private GET先 invalidate；
-- 为 private row维护 SCC bit；
-- private row使用 HWCC ref count；
-- private row使用跨 VM lifecycle state。
-
-============================================================
-十二、shared row 的协议必须以现有 Tigon SCC 为基础
-============================================================
-
-必须仔细阅读并测试：
-
-- SCCWriteThrough；
-- SCCNonTemporal；
-- SCCNoOP；
-- TwoPLPashaHelper::read/update；
-- remote read/update；
-- shared lock acquire/release；
-- move_row_in；
-- move_row_out。
-
-不要预设必须采用 cxlkv 的 dirty-entry/immutable-node协议。
-
-优先保留 Tigon 已有的行级共享协议：
-
-    HWCC row lock
-        +
-    SCC host readable bitmap
-        +
-    shared SWCC payload
-        +
-    write-back/invalidate
-
-但必须通过测试证明其正确性。
-
-建议基准默认使用：
-
-    SCCWriteThrough
-
-只有经过测试并且配置明确时再使用 NonTemporal。
-
-对于 shared SWCC payload，必须满足以下“结果约束”，但不强制某一固定步骤列表：
-
-1. 任意时刻只有符合锁语义的 reader/writer可以访问。
-2. writer持有 exclusive shared row lock。
-3. reader持有 shared row read lock或等价稳定保护。
-4. writer完成后，下一个位于任意 VM的 reader必须能看到完整新值。
-5. reader不得看到部分更新。
-6. reader不得永久读到自己的旧 cache line。
-7. writer不得覆盖仍被 reader使用的 payload。
-8. payload retirement前不存在引用。
-9. lock释放前必须满足所选 SCC机制的可见性要求。
-10. 现有 WriteThrough 的 bitmap、clflush、clwb若足够，不要额外增加无必要协议。
-11. 如果现有实现不够，做最小、可解释的修复。
-12. 不为追求形式统一而照搬 DeltaIndex state machine。
-
-============================================================
-十三、shared payload 首次发布的正确要求
-============================================================
-
-不要硬编码必须存在：
-
-    initializing
-    dirty
-    clean
-    valid
-
-四个独立状态。
-
-Codex必须先确定“shared row 的可达性线性化点”。
-
-可达性线性化点可以是：
-
-- shared HWCC index entry成功插入；
-- 一个明确的 HWCC valid bit发布；
-- 现有共享 B+Tree的受锁插入；
-- 其他经过证明的原子发布点。
-
-首次 promote 必须满足：
-
-1. owner持有 private row保护。
-2. 同一 key不能被两个线程重复 promote。
-3. shared payload在任何远程 reader可以获得其地址之前已经初始化完成。
-4. 共享 metadata在任何远程访问之前已经初始化完成。
-5. 如果所选 SCC要求 destination payload先 write-back，则在发布前完成。
-6. 在发布点之前，远程节点查不到可用 shared row。
-7. 在发布点之后，远程节点可以通过统一 shared metadata访问。
-8. shared index不得指向未构造完成的 metadata。
-9. failure路径不得留下可达但未初始化的对象。
-10. 如果 index insertion本身已提供互斥和发布顺序，不要再添加重复状态。
-11. 如果 index insertion会在对象未完成时暴露，则增加最小必要状态。
-12. publication ordering必须写入 缓存一致性设计.md。
-13. 必须有 fault-injection测试验证发布顺序。
-
-private source：
-
-- 由同一 owner VM读取；
-- 不需要为了复制到 shared payload而先执行跨节点 flush；
-- 如果不同 owner线程并发，依靠本地锁和同一 VM coherence。
-
-shared destination：
-
-- 因为之后会被其他 VM访问；
-- 必须按选定 SCC机制完成必要的 write-back或 non-temporal store；
-- 再执行 shared index/metadata发布。
-
-============================================================
-十四、shared payload 原地更新的正确要求
-============================================================
-
-不要强制每次更新都额外设置 dirty/clean state，除非现有共享锁和 SCC机制不足。
-
-对于 strict 2PL + WriteThrough，可以采用类似现有 Tigon 的最小协议：
-
-1. 获取 shared row exclusive write lock。
-2. 确认当前 writer拥有可安全写入的 payload视图。
-3. 更新 SCC sharer bitmap：
-   - 其他 VM的 cached copy变为不可读；
-   - 当前 writer的 copy保持可读。
-4. 写完整 payload。
-5. 对 payload执行现有 WriteThrough要求的 write-back。
-6. 必要时执行 fence。
-7. 更新必要的 version/TID。
-8. 释放 write lock。
-
-以下不是无条件要求：
-
-- 每次设置 lifecycle=updating；
-- 每次设置 dirty bit；
-- 每次在释放锁前设置 clean；
-- 每次执行两次 version validation；
-- 每次 copy-on-write；
-- 每次重新插入 shared index。
-
-只有在下列情况才增加额外状态：
-
-1. reader在没有持有 read lock时访问；
-2. payload更新可以和 reader重叠；
-3. write-back可能晚于 lock release；
-4. shared index可以看到中间状态；
-5. existing SCC bit协议无法防止 stale read；
-6. 测试证明当前最小协议不正确。
-
-必须证明：
-
-- lock release是明确的写完成线性化边界；
-- 其他 VM在之后获取 read lock时能看到新值；
-- stale cache被正确识别并失效。
-
-============================================================
-十五、shared payload 读取的正确要求
-============================================================
-
-不要强制 strict 2PL reader在持有 read lock时重复验证 version，除非实现采用乐观读取。
-
-对于 shared row read，可以保留类似现有 Tigon 的最小协议：
-
-1. 获取 shared row read lock。
-2. 定位 shared payload。
-3. 检查当前 VM在 SCC bitmap中的 readable状态。
-4. readable=true：
-   - 可以直接读取 cached/shared payload。
-5. readable=false：
-   - 按选定 SCC机制执行必要 invalidate/flush或 non-temporal read；
-   - 将当前 VM标记为 readable。
-6. 复制完整 value到事务临时 buffer。
-7. 释放 read lock。
-
-只有在以下情况下需要 version revalidation：
-
-- 未持有 read lock；
-- lock只保护 metadata而不保护 payload；
-- 使用 optimistic read；
-- payload可能在读期间被替换；
-- shared index发生无锁结构变化。
-
-禁止：
-
-- owner-private row也走这一 SCC路径；
-- 每次 shared read无条件 flush；
-- readable=true时仍强制 invalidate；
-- 将 latency cache hit模型当作 SCC readable bit；
-- 用 software latency cache替代真实缓存一致性状态。
-
-============================================================
-十六、move-in、move-out 与权威副本转换
-============================================================
-
-状态至少区分：
-
-PRIVATE
-SHARED_ACTIVE
-RETIRING
-
-可以增加 PROMOTING，但仅在实际并发发布需要时增加。
-
-不强制在每次普通更新中增加 UPDATING状态。
-
-------------------------------------------------------------
-16.1 PRIVATE
-------------------------------------------------------------
-
-- private index有 key；
-- private SWCC row是权威副本；
-- shared index无该 key的有效 entry；
-- 只有 owner VM访问 private row；
-- 不需要 SCC；
-- 不需要 shared HWCC row metadata。
-
-------------------------------------------------------------
-16.2 SHARED_ACTIVE
-------------------------------------------------------------
-
-- private index仍有 key；
-- shared HWCC index有 entry；
-- shared metadata可定位 shared SWCC payload；
-- shared SWCC payload是权威副本；
-- private row只是 owner-side cache；
-- 所有节点访问共享 payload时使用 shared lock + SCC。
-
-------------------------------------------------------------
-16.3 move-in
-------------------------------------------------------------
-
-要求：
-
-1. owner获取 private row保护。
-2. 确认当前仍为 PRIVATE。
-3. 为 shared payload分配 SWCC内存。
-4. 从 private row复制 value。
-5. 初始化 shared metadata。
-6. 按 SCC要求使 shared payload可供其他 VM读取。
-7. 将 shared row发布到 shared index。
-8. 更新 private metadata的 migrated offset/state。
-9. release private protection。
-10. 响应 requester。
-
-不要求：
-
-- flush private source；
-- 为 private row补一份 HWCC metadata；
-- 将 private B+Tree page变成 shared；
-- 复制整个 private index。
-
-------------------------------------------------------------
-16.4 move-out
-------------------------------------------------------------
-
-要求：
-
-1. 只有 owner执行。
-2. 阻止或拒绝新 remote reference。
-3. 等待 shared ref count为 0。
-4. 获取必要的 shared和private保护。
-5. owner按 shared SCC规则读取最新 shared payload。
-6. 将最新 value复制到 private SWCC row。
-7. private row重新成为权威副本。
-8. 删除或使 shared index entry不可访问。
-9. 清除 private metadata中的 shared offset。
-10. SharedMetadata和SharedPayload进入 EBR retire。
-11. 安全 epoch后回收。
-
-private destination普通运行时不一定需要立即 flush：
-
-- move-out完成后只有同一 owner VM访问 private row；
-- 同一进程生命周期内依靠本地 cache coherence即可；
-- clean checkpoint再统一 flush private dirty range。
-
-只有在实现要求 move-out后立即支持进程崩溃恢复时，才需要更强的 private destination
-flush ordering。本实验不要求 crash recovery，只要求 clean checkpoint/restart。
-
-默认：
-
-    reuse_shared_payload_after_moveout = false
-
-禁止长期保留没有 shared index entry的 shared payload cache。
-
-============================================================
-十七、跨节点可变 metadata 的放置
-============================================================
-
-不要简单规定 `TwoPLPashaSharedDataSCC` 中所有非 value字段都必须搬到 HWCC，也不要
-无条件保留。
-
-逐字段判断：
-
-1. ref_cnt：
-   - 被多个 VM修改；
-   - 必须属于逻辑 HWCC或有等价跨节点原子保护；
-   - 建议迁入 SharedMetadata；
-   - 至少使用 32 bit。
-
-2. shared lock/reader count：
-   - 必须属于逻辑 HWCC。
-
-3. SCC sharer bitmap：
-   - 必须属于逻辑 HWCC。
-
-4. payload offset：
-   - 必须通过逻辑 HWCC metadata发布。
-
-5. migration lifecycle：
-   - 多节点可观察时属于逻辑 HWCC。
-
-6. valid/tombstone：
-   - 如果多个 VM需要在不读取 payload时判断，放 HWCC。
-   - 如果只在持有 shared lock并通过 SCC读取 payload时使用，可以保留在 shared
-     payload，但必须证明可见性。
-   - 优先选择更简单、可解释的方案。
-
-7. version/TID：
-   - 如果用于跨节点冲突检测或无锁读，放 HWCC。
-   - 如果只在持有 shared lock时使用，也可以和 payload一起由 SCC保护。
-   - 必须有测试证据。
-
-8. migration policy metadata：
-   - 如果只有 owner访问，可以放 owner-private SWCC。
-   - 如果多个 VM更新，放 HWCC。
-   - 不要因为原实现放在哪里就继续保留错误位置。
-
-最终字段布局写入：
-
-    缓存一致性设计.md
-    内存布局.md
-
-============================================================
-十八、非硬件一致性测试模型
-============================================================
-
-因为底层宿主机的物理 cache coherence可能掩盖 shared SWCC协议错误，必须提供一个
-确定性的测试后端，例如：
-
-    NonCoherentSwccTestBackend
-
-模型：
-
-1. 每个模拟 host拥有独立的 cached copy。
-2. shared backing维护 visible copy。
-3. 普通 shared SWCC write只修改当前 host cache。
-4. write-back后才更新 visible copy。
-5. reader invalidate后才从 visible copy刷新。
-6. HWCC状态始终全局共享。
-7. owner-private SWCC只绑定到一个模拟 host。
-8. owner-private普通读写不要求 write-back/invalidate。
-9. owner-private checkpoint时才将 dirty data发布到可重连 backing。
-10. latency simulator与此 correctness backend独立。
-
-必须测试：
-
-1. owner-private普通 PUT后同 owner GET可见，无需 flush。
-2. owner-private普通 PUT不产生 shared SCC metadata。
-3. owner-private普通 PUT不产生 SCC flush。
-4. owner-private checkpoint后新 process attach可见。
-5. shared write缺少 write-back时另一个 host读不到新值。
-6. shared write完成 SCC后另一个 host读到新值。
-7. shared reader readable bit=false时必须刷新。
-8. shared reader readable bit=true时不应产生额外 flush。
-9. shared payload尚未发布时 remote lookup不可见。
-10. shared index过早发布时测试应稳定失败。
-11. retiring后禁止新 ref。
-12. move-out前 owner获得最新 shared value。
-13. move-out后的 private value由 owner可见。
-14. latency enabled/disabled不改变结果。
-
-============================================================
-十九、allocator 必须先测试，再决定保留或替换
-============================================================
-
-不要因为当前 allocator没有完整公开源码就自动重写。
-
-不要因为当前程序能够启动就直接保留。
-
-必须采用：
-
-    capability-test-driven allocator decision
-
-最终选择：
-
-A. 保留现有 global cxlalloc
-B. 实现模仿 cxlkv 的 dual-region allocator
-
-------------------------------------------------------------
-19.1 allocator 审计
-------------------------------------------------------------
-
-创建：
-
-    allocator审计.md
-
-检查：
-
-1. dependencies/cxlalloc是否包含完整源码。
-2. libcxlalloc_static.a格式和架构。
-3. 使用：
-   - ar；
-   - nm；
-   - readelf；
-   - strings；
-   检查符号和依赖。
-4. cxlalloc.h backend声明与实际使用是否一致。
-5. 是否依赖外部固定路径或环境变量。
-6. 静态库 SHA256。
-7. ABI和工具链兼容性。
-8. allocator本地 DRAM metadata。
-9. allocator metadata是否随对象数线性增长。
-10. root数量限制。
-11. offset位宽。
-12. 最大共享池。
-13. close/attach语义。
-14. free/reuse语义。
-
-------------------------------------------------------------
-19.2 allocator 能力测试
-------------------------------------------------------------
-
-新增：
-
-    allocator_capability_test
-    allocator_multi_process_test
-    allocator_multi_vm_test
-    allocator_restart_attach_test
-    allocator_global_pool_test
-    allocator_concurrency_test
-    allocator_reclaim_test
-    allocator_accounting_test
-    allocator_domain_budget_test
-    allocator_local_dram_test
-
-测试：
-
-1. 当前 /dev/ivpci0/backend。
-2. 整个 shared_memory.size_mb。
-3. 多进程共享。
-4. 多 VM共享。
-5. root publication。
-6. pointer ↔ offset。
-7. 虚拟地址变化。
-8. clean process restart。
-9. 多线程 allocate/free。
-10. 多 VM allocate/free。
-11. 64B alignment。
-12. free后复用。
-13. OOM。
-14. capacity accounting。
-15. reset后重建。
-16. dirty close行为。
-17. per-partition大 arena。
-18. 大量小对象。
-19. page-size对象。
-20. EBR后回收。
-21. local DRAM占用。
-22. logical HWCC预算。
-23. logical SWCC预算。
-24. domain分类。
-25. unclassified bytes=0。
-26. allocator shared overhead。
-27. 总使用不超过配置。
-28. 多轮使用稳定。
-
-运行：
-
-- Debug至少10轮；
-- multi-process至少10轮；
-- multi-VM至少5轮。
-
-------------------------------------------------------------
-19.3 保留 global allocator 的条件
-------------------------------------------------------------
-
-只有全部满足才保留：
-
-1. 管理完整共享池。
-2. multi-process attach。
-3. multi-VM attach。
-4. offset稳定。
-5. root正确。
-6. restart正确。
-7. 并发正确。
-8. free/reuse正确。
-9. OOM明确。
-10. EBR free正确。
-11. local DRAM不随对象数线性增长。
-12. wrapper可严格执行逻辑 HWCC/SWCC预算。
-13. domain统计准确。
-14. unclassified bytes=0。
-15. per-partition arena可用。
-16. 总物理共享使用不超过配置。
-17. 多轮无持续增长。
-
-保留时允许继续使用全局接口：
-
-    cxlalloc_malloc
-    cxlalloc_free
-    cxlalloc_get_root
-    cxlalloc_set_root
-    cxlalloc_pointer_to_offset
-    cxlalloc_offset_to_pointer
-
-不强求物理双区域。
-
-新增统一 wrapper：
-
-enum class PoolDomain {
-    kHwccIndex,
-    kHwccMetadata,
-    kHwccEbr,
-    kHwccLayout,
-    kOwnerPrivateSwcc,
-    kSharedPayloadSwcc,
-    kTransport
+struct FixedKeyComparator {             // memcmp 序
+  int operator()(const FixedKey &a, const FixedKey &b) const;
 };
+```
 
-global mode中：
+`BTreeOLC_CXL.h` 的 `BPlusTree<KeyType, ValueType, KeyComparator, ...>`
+已支持任意可比较定长 Key（模板见 175 行），直接实例化
+`BPlusTree<FixedKey, offset_ptr<void>, FixedKeyComparator, ...>`，无需改树。
+先写编译期/单测冒烟确认非整型 Key 全路径（insert/lookup/remove/scan/split）
+可用；发现整型假设即最小化修补并记录。
 
-1. HWCC/SWCC物理地址可以交错。
-2. 访问类别必须由对象/domain显式传递。
-3. 不通过地址判断缓存一致性协议。
-4. 不通过地址判断延迟类别。
-5. 逻辑 HWCC容量等于配置 HWCC size。
-6. 逻辑 SWCC容量等于配置 SWCC size。
-7. 总物理使用不得超过 total size。
-8. 输出：
+### 私有索引（每 partition 一棵）
 
-       allocator_mode=global
-       physical_region_split=0
+- 复用 `btreeolc_cxl::BPlusTree`（CXL 版而非 DRAM 版：offset_ptr、节点驻共享
+  映射，天然满足"私有数据在 SWCC 不在本地 DRAM"+ 可 attach 恢复）。
+- **就地修改（BTreeOLC_CXL.h）**：节点分配/回收处
+  `cxl_memory.cxlalloc_malloc_wrapper(..., INDEX_ALLOCATION)` 改为经树实例
+  构造时绑定的分配域（直接成员引用，调用内联，无函数指针/虚调用）。私有树
+  绑定 owner arena 分配器；共享树绑定 HWCC 区域分配器。除分配/回收与延迟
+  记账插入点外，树的算法、OLC 锁协议、节点布局一行不动。
+- 私有树节点锁（OLC word）只有 owner VM 的线程竞争，正确性充分。
+- 叶 value = `offset_ptr<PrivateRow>`。
 
-------------------------------------------------------------
-19.4 切换 dual-region 的条件
-------------------------------------------------------------
+### PrivateRow 与私有元数据（替代 DRAM 里的 TwoPLPashaMetadataLocal）
 
-以下任一关键能力失败，改为 dual-region：
+原 `TwoPLPashaMetadataLocal` 含 `pthread_spinlock_t` 和 raw pointer，驻 DRAM
+且不可恢复，违反本实验要求，重定义（owner arena 内，64B 头 + 变长）：
 
-- attach失败；
-- offset不稳定；
-- 并发不安全；
-- free/reuse不可靠；
-- 不能严格执行预算；
-- 不能准确分类；
-- local DRAM线性增长；
-- 不能支持 partition arena；
-- restart失败；
-- 行为存在无法解决的不确定性。
-
-dual-region参考 cxlkv：
-
-    common/cxl_pool/
-    common/cxl_pool/include/
-    tools/cxl_pool_initer/
-
-实现：
-
-- SharedRegionMapper；
-- HWCC allocator；
-- SWCC allocator；
-- per-partition arena；
-- offset/address；
-- attach；
-- reset；
-- stats；
-- EBR free。
-
-输出：
-
-    allocator_mode=dual_region
-    physical_region_split=1
-
-============================================================
-二十、构建系统
-============================================================
-
-支持：
-
-1. Debug。
-2. RelWithDebInfo。
-3. CTest。
-
-要求：
-
-- Debug：
-  - -O0；
-  - -g3；
-  - 保留断言。
-- RelWithDebInfo：
-  - -O3；
-  - -g3；
-  - -march=native；
-  - 与 cxlkv工具链尽量一致。
-- 不在全局 flags中硬编码所有配置。
-- 增加：
-      include(CTest)
-      enable_testing()
-- 聚合目标：
-  - tigonkv；
-  - unit_tests；
-  - allocator_tests；
-  - e2e_tests；
-  - e2e_08；
-  - e2e_09；
-  - e2e_trace。
-- 旧 bench_tpcc和bench_ycsb继续编译。
-- 不链接 /root/code/cxlkv build。
-- 不自动下载依赖。
-- 新 KV路径使用 C++17或更高。
-
-ASAN不是固定验收要求。
-
-仅在实际出现 use-after-free、越界、double free或难定位内存破坏时配置或运行
-ASAN。
-
-============================================================
-二十一、YCSB-cpp 使用相同子模块
-============================================================
-
-Tigon2必须引用与 cxlkv当前 gitlink相同的 YCSB-cpp子模块。
-
-路径：
-
-    /root/code/tigon2/thirdparty_libs/YCSB-cpp
-
-.gitmodules：
-
-    url = https://github.com/J-XZ/YCSB-cpp.git
-    branch = cxlkv_trace
-
-要求：
-
-1. 读取 cxlkv本地 YCSB SHA。
-2. Tigon2 gitlink固定到同一 commit。
-3. 可利用本地 git object避免重复下载。
-4. 必须是标准 submodule。
-5. 不使用 symlink指向 cxlkv。
-6. 不复制修改生成器。
-7. 直接调用同一生成脚本。
-8. 同一 trace两边都能读取。
-9. SHA写入修改日志。
-
-============================================================
-二十二、experiment_config
-============================================================
-
-根目录提供：
-
-    experiment_config.jsonc
-
-公共字段与 cxlkv保持一致：
-
-- shared_memory.size_mb
-- shared_memory.path
-- shared_memory.device_path
-- shared_memory.numa_node
-- shared_memory.hwcc.offset_mb
-- shared_memory.hwcc.size_mb
-- shared_memory.swcc.offset_mb
-- shared_memory.swcc.size_mb
-- host_cpu.*
-- vm.*
-- network.*
-- sync.*
-- e2e.foreground_worker_count_per_vm
-
-默认：
-
-    shared_memory.path = "/mnt/xz_shared_mem"
-    shared_memory.device_path = "/dev/ivpci0"
-    vm.storage_path = "/mnt/xz_vm_storage"
-    HWCC size_mb = 1024
-
-global allocator模式：
-
-- HWCC/SWCC size作为逻辑预算。
-- offset保留配置兼容，但不强求物理 placement。
-- 仍验证 region描述合法。
-
-dual-region模式：
-
-- offset和size用于物理 mmap。
-
-增加：
-
-"tigon_kv": {
-  "partition_count": ...,
-  "fixed_key_size": ...,
-  "fixed_value_size": ...,
-  "hwcc_budget_mb": ...,
-  "hwcc_reserved_mb": ...,
-  "owner_private_swcc_fraction": ...,
-  "shared_payload_swcc_fraction": ...,
-  "migration_policy": "Clock",
-  "reuse_shared_payload_after_moveout": false,
-  "checkpoint_on_clean_exit": true,
-  "enable_scan": true,
-  "strict_swcc_access": false,
-  "latency_inject": {...}
-}
-
-unknown field hard fail。
-
-============================================================
-二十三、NUMA 模拟环境严格验证
-============================================================
-
-必须同时验证：
-
-1. 配置声明。
-2. QEMU实际命令。
-3. QEMU实际 CPU affinity。
-4. QEMU实际 memory policy。
-5. ivshmem backing实际页位置。
-6. reset后的页位置。
-
-检查：
-
-    numactl --hardware
-    lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE
-    findmnt -T /mnt/xz_shared_mem/ivshmem_shared_mem
-    stat /mnt/xz_shared_mem/ivshmem_shared_mem
-    ps -eo pid,args | grep qemu-system
-    tr '\0' ' ' < /proc/<qemu-pid>/cmdline
-    taskset -pc <qemu-pid>
-    grep -E 'Cpus_allowed_list|Mems_allowed_list' /proc/<qemu-pid>/status
-    numastat -p <qemu-pid>
-    grep -E 'ivshmem|xz_shared_mem' /proc/<qemu-pid>/maps
-    grep -E 'ivshmem|xz_shared_mem' /proc/<qemu-pid>/numa_maps
-
-增加：
-
-    tools/numa_placement_probe
-
-功能：
-
-1. mmap backing。
-2. 只查询页面位置，不移动。
-3. 采样 allocator metadata、HWCC对象、private SWCC、shared SWCC。
-4. global mode按allocation sample，不按地址范围猜测domain。
-5. dual mode额外检查region。
-6. 输出各NUMA页数和misplaced pages。
-7. 不修改网络、mount或VM。
-
-性能模式：
-
-1. VM CPU/RAM与shared backing位于不同NUMA。
-2. host CPU角色正确。
-3. 实际页面位置正确。
-4. 不正确则hard fail。
-
-功能模式允许重叠，但输出：
-
-    TIGONKV_NUMA_MODE mode=functional overlap=1
-
-============================================================
-二十四、可重连共享布局
-============================================================
-
-SharedLayoutHeader由Tigon2源码定义，无论allocator模式。
-
-至少包含：
-
-struct SharedLayoutHeader {
-    uint64_t magic;
-    uint32_t layout_version;
-    uint32_t init_state;
-    uint32_t allocator_mode;
-    uint32_t reserved;
-    uint64_t config_hash;
-    uint64_t clean_epoch;
-    uint64_t dirty_epoch;
-    uint32_t vm_count;
-    uint32_t partition_count;
-    uint32_t fixed_key_size;
-    uint32_t fixed_value_size;
-    uint64_t total_pool_bytes;
-    uint64_t logical_hwcc_capacity_bytes;
-    uint64_t logical_swcc_capacity_bytes;
-    uint64_t partition_directory_offset;
+```cpp
+// kv/engine/private_row.h
+struct PrivateRow {
+  uint32_t latch;              // owner 进程内自旋（仅 owner VM 线程）
+  uint8_t  is_migrated;        // 1 = 权威副本在 shared 侧
+  uint8_t  is_tombstone;
+  uint16_t key_len;
+  uint32_t value_len;
+  uint64_t version;            // 单调版本（CAS/INCR 与调试用）
+  uint64_t migrated_smeta_off; // HWCC 内 TwoPLPashaMetadataShared 偏移
+  char     kv[];               // key 后接 value（定长配置，实际紧凑存放）
 };
+```
 
-partition entry至少保存：
+clean shutdown 时全部 latch 归零；attach 校验 dirty 标记，dirty hard fail。
 
-struct PartitionLayoutEntry {
-    uint32_t partition_id;
-    uint32_t owner_node_id;
+### 共享索引（每 partition 一棵）
 
-    PersistentPtr private_arena;
-    uint64_t private_arena_size;
-    PersistentPtr private_index_root;
-    PersistentPtr private_allocator;
+- 直接用 `core/CXLTable.h` 的 `CXLTableBTreeOLC`（或直接持
+  `btreeolc_cxl::BPlusTree`，视 ITable 接口适配成本取小者）。
+- 节点经 INDEX_ALLOCATION → HWCC 区域，自动计入 `TOTAL_HW_CC_USAGE`。
+- 叶 value = `offset_ptr<TwoPLPashaMetadataShared>`。
+- 树根 offset 记入 SharedLayoutHeader 的 partition 目录项。
+- 节点删除/合并经 `CXL_EBR` 回收（原实现已有）。
 
-    PersistentPtr shared_index_root;
-    PersistentPtr shared_metadata_allocator;
-    PersistentPtr shared_payload_allocator;
+### SharedLayoutHeader / partition 目录
 
-    PersistentPtr migration_tracker;
-    uint64_t flags;
-};
+结构包含：magic、layout_version、config_hash、clean/dirty epoch、
+vm_count、partition_count、fixed key/value size、容量、partition 目录 offset；
+每 partition 记 owner、private_arena、private_index_root、shared_index_root、
+migration_tracker 等 offset。node0 初始化，follower attach 校验。
 
-要求：
+## 4.3 SCC WriteThrough 接入（P2）
 
-1. 持久引用使用offset/PersistentPtr。
-2. 不保存跨进程raw pointer。
-3. global mode使用global offset。
-4. dual mode使用domain+offset。
-5. node0初始化。
-6. follower attach。
-7. config mismatch hard fail。
-8. dirty marker hard fail。
-9. clean process restart。
-10. load退出后workload attach。
+**零重写：直接使用原始实现。**
+
+- `KVStore::Create` 时按配置调
+  `SCCManagerFactory::create_scc_manager("TwoPLPasha", scc_mechanism)` 初始化
+  全局 `scc_manager`；默认 `WriteThrough`（即 `TwoPLPashaSCCWriteThrough`），
+  保留 `WriteThroughNoSharedRead` / `NonTemporal` / `NoOP` 可配。
+- per-host bitmap 就是 `TwoPLPashaMetadataShared::atomic_word` bits 47–62
+  （≤16 host；本实验 vm_count ≤ 8）；`scc_data` 的 37 位 offset（bits 0–36）
+  上限 128 GB，覆盖本实验 ≤64 GB 池，初始化时 static/runtime 检查。
+- 读路径（shared row）：行读锁 → `prepare_read(smeta, host_id, scc_data,
+  sizeof(SCC)+value_size)`（本机 bit 未置 → `clflush` + 置位；已置 → 零 flush）
+  → 校验 valid → `do_read` memcpy 出 value → 放读锁。
+- 写路径：行写锁 → `do_write` memcpy 入 → `finish_write`（清其它 host bits +
+  `clwb`）→ 放写锁。
+- move-in 发布末尾调 `finish_write` 保证新 payload 全网可见（原实现行为）。
+- **owner-private 普通读写绝不经过 scc_manager**（无 bitmap、无 flush）；
+  以统计断言（`private_swcc_flushes≈0`）+ 单测锁死。
+
+### NonCoherent 正确性后端
+
+底层宿主机 coherence 会掩盖 SCC 缺陷，必须有确定性测试：
+新 `kv/engine/scc_test_backend.*` 实现 `SCCManager` 的测试子类（组合真
+WriteThrough）：每个模拟 host 持独立 cached copy，`clflush/clwb` 才与
+visible copy 同步；用 14 条正反用例验证（含"缺 write-back 时另一
+host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正反两向）。
+该后端仅测试 target 链接，不进生产路径。HEAD 旧 `kv/latency_simulator.cpp`
+内嵌的 `NonCoherentSwccTestBackend`（字节级 visible/cache/dirty 模型）可作为
+起点迁入此文件——它属于一致性正确性层而非延迟层，随旧延迟模拟器删除时
+必须先完成迁移，不得丢失该测试能力。
+
+## 4.4 并发模型（P4）
+
+删除全库锁，恢复 Tigon 原生粒度：
+
+| 层 | 机制 | 来源 |
+|----|------|------|
+| 共享行 | `TwoPLPashaMetadataShared` 单原子字：latch(bit63)＋写锁(bit41)＋读者数(bits42–46)＋SCC bits＋offset；`TwoPLPashaHelper` 的 take/release 锁函数族 | 原实现；锁位与算法不变，函数签名就地适配（去掉事务上下文参数） |
+| 私有行 | `PrivateRow::latch`（owner 进程内自旋，多 worker 线程互斥） | 新写（等价原 lmeta->latch） |
+| 索引结构 | B+树 OLC（version 校验 + restart） | 原实现，零改 |
+| 分配器 | per-thread cache 无锁快路径 + shard 短自旋 | 4.1 |
+| 迁移策略元数据 | tracker 持锁（原 Policy* 内部锁），每 partition 独立 | 原实现 |
+| 统计 | per-thread 计数聚合或 relaxed 原子 | 新写 |
+
+单 KV 强一致的论证：每个操作是"单行 2PL 微事务"——持该行写(读)锁完成全部
+读写与 SCC 发布后释放，行锁 + SCC WriteThrough 给出跨 VM 线性一致；索引
+insert（move-in 发布）是可达性线性化点，OLC 保证结构安全。无多行操作，
+故无死锁（CAS/INCR 也是单行）。
+
+延迟注入安全点：操作释放行锁、退出 EBR/树 guard 之后才
+`EndScopeAndDelay`（见 4.9）。
+
+## 4.5 Move-in / Move-out（P3 + P1）
+
+**复用 `MigrationManager` 框架与 Policy 家族，回调换成 KV 适配版。**
+
+- 初始化：`MigrationManagerFactory::create_migration_manager(policy=Clock,
+  when_to_move_out=OnDemand)`；tracker 元数据放 HWCC（多 VM 可观察）。
+- **move-in 回调**（在 `TwoPLPashaHelper.h` 上就地改造
+  `move_from_partition_to_shared_region`：源从 DRAM 行换成 PrivateRow，去掉
+  ITable/事务上下文依赖；分配、初始化、发布步骤与顺序保持原样）：
+  流程见 3.3；HWCC 分配 smeta（METADATA）、SWCC 分配
+  `TwoPLPashaSharedDataSCC+value`（DATA）、两次真实 memcpy 与初始化、shared
+  树 insert、`finish_write` 发布、私有侧记 offset。挂入 Clock tracker。
+- **move-out 触发**（补全 P3 的缺口）：
+  1. `TOTAL_HW_CC_USAGE >= hw_cc_budget_per_host`（budget =
+     `(hwcc.size_mb − EBR 预留 − 静态开销) / vm_count`，与原
+     `TwoPLPashaExecutor` 公式同构）→ OnDemand：每次 move-in 后检查并
+     `move_row_out(partition)`；
+  2. shared payload 段水位 ≥ 高水位 → 同样触发（新增，因 payload 池有限）；
+  3. 无 victim（全部 ref_cnt>0）→ 重试有限次后 hard fail 并 dump 诊断。
+- **move-out 回调**（同一文件就地改造
+  `move_from_shared_region_to_partition`，宿换成 PrivateRow）：流程见 3.3；
+  smeta+payload 经 `CXL_EBR::add_retired_object`
+  retire，安全 epoch 后由分配器按 owner-shard 归还。
+- `reuse_shared_payload_after_moveout=false`（默认）：不留 payload 缓存。
+- owner 手动 `KVStore::MoveOut(key)` 保留（测试用），内部走同一回调。
+- 统计：`migration_in/out`、victim 扫描次数、HWCC 峰值。
+
+## 4.6 跨节点请求转发（自由设计区，选共享内存传输）
+
+复用原 CXL transport（性能最优且属原实现）：
+
+- `MPSCRingBuffer`（每 host 一个入环，内嵌 clwb/clflush 语义）+
+  `common/CXLTransport.h`；环驻 HWCC（TRANSPORT 记账），root 0 发布。
+  环总容量可配（默认每对 1 MB 级），计入 HWCC 预算。
+- 新消息编码 `kv/engine/kv_messages.h`（借用 `common/Message.h` 帧格式）：
+  `PUT_FWD / GET_MISS / DELETE_FWD / CAS_FWD / INCR_FWD / SCAN_REQ` 及响应、
+  `MOVEIN_DONE`。payload 定长 key + 可选 value。
+- 每 VM 的 worker 线程在自身操作间隙轮询本机入环并服务请求（与原
+  Executor 的 process_request 模式一致），避免专职线程抢核；worker 数 =
+  `foreground_worker_count_per_vm`。
+- 何时转发（对齐 Tigon 语义）：
+  - 请求方先查本 VM 可见路径：owner 分区 → 私有树直达；非 owner → 查
+    shared 树，命中 SHARED_ACTIVE 即就地按行锁+SCC 操作，**不转发**。
+  - shared 树 miss 且非 owner：发对应 `*_FWD/GET_MISS` 给 owner。owner 对
+    remote GET/UPDATE/DELETE 命中 private 行时执行 move-in 再回 `MOVEIN_DONE`
+    （请求方随后在 shared 树重试）；新 key 的 PUT/CAS/INCR 由 owner 直接在
+    私有侧 upsert 并回执；不存在的 key 回 NOT_FOUND。
+- 消息缓冲属 process-local DRAM，不计共享预算；tx/rx 字节计入
+  `network_tx/rx_bytes` 统计。
+
+## 4.7 KVStore 门面组装与操作语义
+
+`kv/kv_store.h` 对外 API 不变；`Impl` 重写为组装层（`kv/engine/kv_engine.*`）：
+
+- 路由：`partition = FNV1a(key) % partition_count`，
+  `owner = partition % vm_count`（沿用 HEAD 语义，harness/测试已按此写）。
+- **PUT**：见 4.6 分派。load 阶段 insert 语义（重复 key hard fail）；
+  run 阶段 upsert。私有路径 = PrivateRow latch + 原地更新；共享路径 =
+  行写锁 + `do_write` + `finish_write`。
+- **GET**：owner 私有直读（latch + memcpy，无 flush）；共享 = 读锁 +
+  `prepare_read`/`do_read`；均 miss → GET_MISS 转发。tombstone → NOT_FOUND。
+- **DELETE**：私有 = owner 从私有树摘除、行 tombstone、arena 回收；共享 =
+  写锁下置 tombstone + 从 shared 树摘除 + EBR retire。
+- **SCAN(start, limit)**：请求方向全部 partition owner 发 `SCAN_REQ(start,
+  limit)`；owner 在私有树（跳过 is_migrated/tombstone）与 shared 树上分别
+  scan 后本地归并去重（owner 两边都可见，去重最简单），回 ≤limit 条已序
+  结果；请求方做 k 路归并取前 limit。自家 partition 走本地同一函数。
+  正确性优先，通不过则 YCSB-E 明确标记不支持，不假成功。
+- **CAS/INCR**：单行写锁内 read-modify-write（共享行含 SCC 读+写穿），
+  多 VM 线性一致由行锁保证；非 owner 私有 miss 时转发 owner。
+- **Checkpoint（计时窗口外）**：drain 转发队列 → EBR drain → 私有 dirty
+  range 与 HWCC 元数据 flush/msync → header 置 clean_epoch。
+- **Attach/clean restart**：校验 header/config_hash/clean 标记 → 恢复两个
+  RegionAllocator → 由 partition 目录恢复各树根/arena/tracker →
+  transport 环经 root 0 重挂。dirty backing hard fail。
+- 统计：维持 `RuntimeStats/MemoryStats` 全部字段与 `DumpStats` 的
+  `TIGONKV_MEMORY_STATS / TIGONKV_RUNTIME_STATS / TIGONKV_LATENCY_STATS`
+  行协议（harness 兼容），新增字段只增不改。
+
+## 4.8 实验接口层（保留 + 小改清单）
+
+| 资产 | 处置 |
+|------|------|
+| `experiment_config.jsonc` + `Config::FromJsonc` | 保留；`tigon_kv` 段新增 `scc_mechanism`、`when_to_move_out`、`hw_cc_budget_mb`（默认=hwcc.size_mb）、transport 环大小，并将延迟字段整体替换为 cxlkv 同构的 `latency_inject` 对象（见 4.9）；unknown field 仍 hard fail |
+| `tools/e2e_trace_runner.cpp` | 保留框架；改为按 `foreground_worker_count_per_vm` 起 N 线程，线程 t 回放 `worker{node*N+t}.txt`（对齐 cxlkv）；PUT value 生成与 cxlkv `FixedTraceValue` 一致（`'!'..'~'` 字符集、定长 `fixed_value_size`）；心跳行 `E2E_TRACE_HEARTBEAT phase=<p> node=<n> ops=<delta> total=<cum> elapsed_s=<s>` 与最终行 `E2E_TRACE_TIME_US phase=<p> node=<n> ops=<ops> duration_us=<us> trace_first=<f> trace_workers=<w> batch_ops=<b>` 字段与 cxlkv 逐字段对齐 |
+| trace 格式 | 不变：`<OP> <KEY_LEN> <LEN><KEY>`，PUT/GET/DELETE/SCAN；key 右填空格至 fixed_key_size |
+| YCSB | 不变：同 SHA 的 `thirdparty_libs/YCSB-cpp` submodule + `generate_cxlkv_trace.sh`；`prepare_ycsb_traces.sh`/`run_ycsb_workflows.sh` 保留为低层入口，另加根级一键封装（4.11） |
+| `tools/cxl_pool_initer.cpp`、`tools/numa_placement_probe.cpp` | 保留；probe 采样点换成新布局的分配样本 |
+| `scripts/vm/*`、`tests/e2e/*`、`scripts/e2e_trace/*`、`scripts/e2e/run_guest_e2e_workflows.sh` | 保留（仅路径/target 名核对）；另加根级 VM 镜像/启动脚本（4.10） |
+| `tests/e2e_08|09.cpp`、`tests/e2e_vm_workflow.h` | 保留工作流骨架，断言按新架构更新（见 §6） |
+| `tests/tigonkv_tests.cpp` | 大部分场景语义保留，针对新引擎重写实现相关断言 |
+| CMake | `tigonkv` 库改为 `kv/engine/*` + 所需原始源（`protocol/TwoPLPasha/*.cpp` 中被引用的部分、`common/*.cpp`）；全仓不再链 cxlalloc；`bench_tpcc/bench_ycsb` 等旧入口不再维护，因原文件修改而编译失败时直接从构建移除（源文件保留） |
+
+## 4.9 软件延迟模拟：照搬 cxlkv 实现
+
+**决策：整体废弃 HEAD 的 `kv/latency_simulator.*`，逐文件移植 cxlkv 的
+`src/utils/include/latency_simulator.h` + `src/utils/src/latency_simulator.cc`
+（466+122 行）到本仓库 `kv/latency_simulator.{h,cpp}`，保留 `latency_sim`
+命名空间与全部实现细节。** 记入 搬运清单.md / THIRD_PARTY_NOTICES.md。
+
+废弃理由（现实现与 cxlkv 的具体差距，已核对源码）：现版无 TSC 校准（延迟
+兜底走 `sleep_for`，微秒级粒度不可用于百 ns 级注入）；`Record` 热路径对
+**共享** `std::atomic` 计数器 fetch_add（多线程伪共享，本身即扰动被测系统）；
+LRU 用 `std::deque` 线性查找（O(容量)）；无 BeginScope/generation/scope 语义；
+配置字段与 cxlkv `latency_inject` 不同构。
+
+移植后必须保持一致的实现细节（照抄，不重新发明）：
+
+1. **TSC 校准**（`CalibrateTscOnce`）：`std::call_once` + 4ms
+   `steady_clock` 窗口内 `_mm_pause` 自旋，用 `__rdtsc` 差值除以纳秒差得
+   `ticks_per_ns`（`std::atomic<double>`，release/acquire）；仅 x86 分支，
+   非 x86 或校准失败回退 `sleep_for`。
+2. **忙等补齐**（`DelaySpinNs`）：`target = rdtsc() + max(1, ticks_per_ns*ns)`，
+   循环 `while (ReadTsc() < target) _mm_pause();`。
+3. **线程本地状态**：`thread_local unordered_map<const LatencySimulator*,
+   ThreadState>`，含 `pending_delay_ns`、xorshift64 RNG、组相联 LRU
+   `CacheState`；`generation_` 在 Configure 时递增使旧线程状态失效。
+4. **作用域协议**：`BeginScope(kForeground/kMerge/kOther)` 允许嵌套计深度；
+   访问期间只累积 `pending_delay_ns`；`EndScopeAndDelay` 在最外层退出时一次
+   `DelaySpinNs` 补齐——即"安全点补延迟"，绝不在持行锁/EBR/树 guard 时忙等。
+5. **快路径闸门**：`InstrumentationEnabledFast()` 读进程级 relaxed 原子，
+   关闭时所有 Record* 一条分支即返回。
+6. **行粒度记账**（`RecordRange`）：按 `cache_line_bytes`（默认 64）把
+   `[addr, addr+bytes)` 折成行数；`LineDelayNs` 按 PoolKind×AccessKind 查
+   ns/line 配置；三种 cache 模型照抄：`none`（全 miss）、`fixed_hit_rate`
+   （xorshift64 均匀采样）、`per_thread_lru`（组相联 + 组内 MRU 前移）；
+   `cache_hits_enabled=false` 时命中仍按 miss 计延迟（隔离 filter 开销的
+   对照模式）；`MakeTag = (line<<1)|pool`。
+7. **统计**：`Stats` 字段（swcc/hwcc 的 raw/hits/misses/delayed_ns）+
+   `SnapshotStats/TakeStatsAndReset`；导出行 `LATENCY_SIM_STATS`（字段名与
+   cxlkv 相同：`swcc_raw/hwcc_raw/*_hits/*_misses/*_hit_ratio/*_delayed_ns/
+   delayed_ns/cache_model/cache_hits_enabled`）。
+
+配置：`experiment_config.jsonc` 的 `tigon_kv.latency_inject` 对象，字段与
+cxlkv `LatencyInjectPolicyConfig` **同名同全集且全部必填**：
+`enabled, foreground_enabled, merge_enabled, stats_enabled, cache_line_bytes,
+swcc_{read,write,flush}_ns_per_line, hwcc_{read,write}_ns_per_line,
+hwcc_atomic_{load,store,rmw}_ns, cache_model, cache_hits_enabled,
+cache_capacity_lines, cache_associativity, cache_fixed_hit_rate,
+cache_hit_extra_ns`。SWCC 与 HWCC 的额外延迟由此独立可配。
+`merge_enabled` 在本系统映射为"迁移/EBR 等后台维护路径"开关。
+
+插入点（"现有实现适当的位置"；记录调用统一使用 `kv/engine/mem_access.h`
+提供的内联函数——含直接插入在原文件内的点——禁止散落手写裸调用；每个
+内联函数先查 `InstrumentationEnabledFast()`，关闭时单分支返回）：
+
+| 访问 | PoolKind | AccessKind | 位置 |
+|------|----------|-----------|------|
+| PrivateRow 读/写（value memcpy 区间） | kSwcc | kRead/kWrite | kv_row_ops 私有路径 |
+| 私有 B+树节点访问 | kSwcc | kRead/kWrite | 直接插入 BTreeOLC_CXL 节点锁获取/键区扫描处（与 4.2 就地修改同批） |
+| shared payload `do_read`/`do_write` 区间 | kSwcc | kRead/kWrite | kv_row_ops 共享路径 |
+| SCC `clflush`/`clwb` 区间 | kSwcc | kFlush | 直接插入 `SCCManager::clflush/clwb` 内 |
+| `TwoPLPashaMetadataShared::atomic_word` 锁/位操作 | kHwcc | kAtomicLoad/Store/Rmw | 直接插入 TwoPLPashaHelper 行锁 take/release 函数内 |
+| 共享 B+树节点访问 | kHwcc | kRead/kWrite | 同私有树插入点，pool 由树实例绑定的分配域决定 |
+| MPSC ring enqueue/dequeue 数据区 | kHwcc | kRead/kWrite | 直接插入 MPSCRingBuffer enqueue/dequeue 内 |
+| checkpoint 批量 flush | kSwcc | kFlush | checkpoint 路径 |
+
+作用域接线：worker 处理一个 trace 操作 = `BeginScope(kForeground)` … 释放
+全部锁/guard … `EndScopeAndDelay()`；迁移与 EBR 后台步骤用 `kMerge`。
+
+验证：
+- 单测：TSC 校准后 `DelaySpinNs(1000ns)` 实测误差 < 20%（RelWithDebInfo）；
+  pending 累积在锁释放前不睡眠（`PendingDelayNsForTest`）；三种 cache 模型
+  命中率符合期望；`enabled=false` 时热路径无统计副作用。
+- 与 cxlkv 同参数下跑相同 trace，`LATENCY_SIM_STATS` 的 raw line 计数量级
+  可比（数据结构不同不要求相等，但需在报告中并列给出）。
+- Debug 构建或 verbose/extra_check 开启时 `enabled=true` 必须 hard fail。
+
+## 4.10 VM 镜像制作与启动脚本
+
+**背景与决策**：原始 Tigon 的 VM 启动（`emulation/start_vms.sh` +
+`vm_lib/start_vm.py`）与 cxlkv 的多 VM 拓扑（ivshmem-plain、NUMA 绑定、
+SSH 端口约定、`/mnt/xz_*` 路径）不兼容，且被安全约束禁用。cxlkv 的镜像
+制作本身就是包装 Tigon 自带的 mkosi 脚本（cxlkv
+`xz_scripts/init_scripts_env_2_make_vm_img.fish` → 其 tigon submodule 的
+`emulation/image/make_vm_img.sh`），因此镜像层我们**直接包装本仓库自己的
+`emulation/image/make_vm_img.sh`**（同时尊重 tigon 原实现、又与 cxlkv 流程
+一致）；启动层**照搬 cxlkv 的 fish 预检 + Rust `init_vm` 所构造的 QEMU
+命令行语义**，用 bash 重新实现为独立脚本（不引用 /root/code/cxlkv，不依赖
+fish/Rust 工具链）。
+
+**新脚本（全部放项目根目录，`tigonkv_` 前缀与原始 `emulation/*` 明确区分）**：
+
+1. `tigonkv_make_vm_img.sh`
+   - 语义照搬 cxlkv `init_scripts_env_2_make_vm_img.fish`：目标
+     `image/root.img`；已存在且非空则跳过（`--force` 重建）；
+     内部 `pushd emulation/image && ./make_vm_img.sh`（本仓库自带 mkosi 流程，
+     产物 mv 到 `image/root.img`）。
+   - 追加：把本项目构建依赖（clang、cmake、rsync 等）写入 guest（mkosi
+     postinst 已装的沿用，缺的在首次 sync 后于 guest 内安装并记录）；
+     注入 `~/.ssh` 公钥（对齐 cxlkv `vm.local_ssh_pub_key` 字段）。
+   - 执行前提：mkosi 环境可用；执行属于"重操作"，跑之前需用户明确允许。
+2. `tigonkv_init_vms.sh`（对应 cxlkv `init_scripts_env_3_init_vm.fish` +
+   rust `init_vm`，一体化 bash 实现）
+   - **配置读取**：内嵌 python3 片段解析根 `experiment_config.jsonc`
+     （剥注释后 json.load），导出 vm.count / core_count_per_vm /
+     mem_size_mb_per_vm / storage_path / ssh_base_port / numa_node、
+     shared_memory.{path,size_mb,numa_node}、host_cpu 三组核列表。
+   - **预检（照搬 cxlkv 逻辑）**：shared/vm NUMA 不重叠（重叠仅告警，
+     供单 NUMA 功能验证）；host_cpu 三组列表互斥、在线、落在正确 NUMA；
+     `vm_cores` 长度 ≥ count×core_count；MemAvailable（含可回收旧 QEMU RSS）
+     覆盖全部 VM RAM；共享池大小为 2 的幂。
+   - **host tuning 差异点（安全约束要求，与 cxlkv 不同）**：cxlkv 会直接改
+     NMI watchdog/ASLR/KSM/NUMA balancing/THP/SMT/turbo/governor；本脚本
+     默认**只检查并打印当前值与 cxlkv 推荐值的差异**，不做任何修改；
+     `--apply-host-tuning` 选项保留同款写入逻辑，但必须由用户显式传入
+     （即用户授权）。对比公平性只要求两系统在**同一**宿主机状态下运行，
+     不要求宿主机处于某个特定状态。
+   - **清旧 VM**：按 `$VM_STORAGE/vm_*/qemu.pid` 精确 kill，再按精确进程名
+     `qemu-system-x86_64`/`ivshmem-server` 兜底（与 cxlkv `kill_existing_vms`
+     同款；这一步会终止 VM，因此**整个脚本的实际执行需用户允许**）。
+   - **共享 backing 准备**：`numactl --membind=<shared_numa>` 下创建/校验
+     `/mnt/xz_shared_mem/ivshmem_shared_mem`（大小 = size_mb，prefault +
+     清零，等价 cxlkv prepare_shared_mem + 本仓库 `tools/cxl_pool_initer`）。
+   - **每 VM QEMU 启动（照搬 cxlkv rust init_vm 的参数集，逐项保留）**：
+
+     ```
+     numactl --cpunodebind=<vm_numa> --membind=<vm_numa> -- qemu-system-x86_64 \
+       -machine q35,accel=kvm,mem-merge=off -cpu <model> \
+       -m <mem>M,maxmem=<mem>M \
+       -object memory-backend-ram,id=vmram0,size=<mem>M,host-nodes=<vm_numa>,policy=bind,prealloc=on \
+       -numa node,nodeid=0,memdev=vmram0 [-numa cpu,... 每核一条] \
+       -smp <core>,maxcpus=<core>,sockets=1,cores=<core>,threads=1 \
+       -enable-kvm -display none -daemonize \
+       -chardev socket,id=serial0,path=<vmdir>/serial.sock,server=on,wait=off,logfile=<vmdir>/serial.log \
+       -serial chardev:serial0 -device virtio-rng-pci \
+       -pidfile <vmdir>/qemu.pid -D <vmdir>/qemu.log \
+       -device virtio-blk-pci,packed=on,num-queues=1,drive=drive0,id=virblk0 \
+       -drive if=none,file=<vmdir>/root.img,format=raw,media=disk,id=drive0,cache=none,aio=native \
+       -device virtio-net-pci,netdev=netssh<idx>,mac=<mac> \
+       -netdev user,id=netssh<idx>,hostfwd=tcp:127.0.0.1:<ssh_base+idx>-:22 \
+       -device ivshmem-plain,memdev=ivshmem \
+       -object memory-backend-file,size=<shared_mb>M,share=on,mem-path=<shared_path>/ivshmem_shared_mem,id=ivshmem
+     ```
+
+     其中 `<model>` 照搬 cxlkv `get_cpu_model` 逻辑：默认 `host`，AMD EPYC
+     宿主机用 `EPYC,topoext`。与 cxlkv 的差异仅两处并须注释说明：(a) tap
+     桥接网卡默认省略（本项目 e2e 只用 SSH hostfwd + 共享内存 barrier；若
+     确需 VM 间 IP 网络，复用已存在的 tap_xz_* 设备，绝不新建桥）；
+     (b) host tuning 见上。
+   - **收尾（照搬）**：等待全部 VM SSH 就绪（`ssh-keyscan` 循环）、
+     `taskset -apc` 把每个 QEMU 的线程钉到其 host_cpu.vm_cores 切片、
+     known_hosts 刷新、guest 内加载 ivshmem 内核模块（复用
+     `dependencies/kernel_module`，创建 `/dev/ivpci0`）、清 guest 侧残留
+     rsync。
+3. `tigonkv_kill_vms.sh`：按 pid 文件精确终止本项目启动的 QEMU（安全约束
+   合规版 kill_existing_vms，供单独调用）。
+4. `tigonkv_check_vms.sh`：只读检查（等价现有
+   `scripts/vm/check_environment.sh` 的加强版：QEMU cmdline、taskset、
+   numa_maps 中共享映射页位置、SSH 连通、/dev/ivpci0 存在），供 --skip-vm-init
+   路径与 CI 前置。
+
+**验证要求**：`bash -n` + shellcheck 全过；`--dry-run` 模式打印将执行的
+完整 QEMU 命令与预检结论（不落地任何修改，可无授权运行）；实际重建 VM 的
+首次执行须获用户允许，成功标准 = 4.10 check 脚本全绿 + `tests/e2e/`
+既有 SSH e2e 能在新拓扑上跑通。`搬运清单.md` 记录对 cxlkv
+`init_scripts_env_3_init_vm.fish` / `prepare_shared_mem.rs` 的照搬关系。
+
+## 4.11 一键 YCSB 封装与 YCSB指南.md
+
+**新脚本 `tigonkv_run_ycsb_experiment.sh`（项目根），逐节对齐 cxlkv
+`scripts/run_ycsb_trace_experiment.sh` 的选项、步骤和产物布局**（允许照搬其
+bash 源码后替换项目相关路径/环境变量；记入搬运清单）：
+
+- **选项集（与 cxlkv 同名同默认，差异注明）**：`--rounds`(1)、
+  `--record-count`(默认降为 100000，正式对比时显式传 5000000)、
+  `--operation-count`(同上)、`--threads-per-node`(4)、`--out-dir`
+  (`exp_data/ycsb_tigonkv_<timestamp>`，仓库相对路径强制)、
+  `--round-timeout`(7200)、`--base-config`(experiment_config.jsonc)、
+  `--shared-numa`、`--shared-reserve-mb`、`--shared-size-mb`(自动向上取 2 的
+  幂并校验空闲内存)、`--workloads`(a,b,c,d)、`--no-latency`、
+  `--cache-flush-mb`(512)、`--skip-build`、`--skip-vm-init`、
+  `--skip-trace-gen`、`--skip-standalone-load`、`--prepare-only`。
+  固定 4 VM，HWCC 固定 1024MB、其余给 SWCC（与 cxlkv 硬编码一致）。
+- **步骤序列（对齐 cxlkv 指南 §1 的 12 步）**：
+  1. 清理本项目旧 runner 进程（精确名单），报告目标 NUMA 空闲内存；
+  2. 基于 `--base-config` 生成本轮 `experiment_config_ycsb_4vm.jsonc`
+     （改写 shared_memory / vm / e2e.foreground_worker_count_per_vm，并按
+     `--no-latency` 开关 `tigon_kv.latency_inject.enabled`）；
+  3. 生成 trace config 与 `run_meta.json`（完整参数 + git SHA + 复现命令）；
+  4. 调 `thirdparty_libs/YCSB-cpp/scripts/generate_cxlkv_trace.sh` 生成
+     load + A/B/C/D trace（load 用 workloadc 参数、zipfian；A 的 UPDATE 拆
+     GET+PUT）——与 cxlkv 用同一生成器保证 trace 逐字节可比；
+  5. RelWithDebInfo 构建（`--skip-build` 可跳）；
+  6. VM 初始化：默认走 `tigonkv_check_vms.sh` 复用现有拓扑，仅当传
+     `--reinit-vms`（且用户已授权）时调 `tigonkv_init_vms.sh`；
+  7. `scripts/vm/sync_to_vms.sh` 同步代码并在 guest 内构建；
+  8. 独立 load 轮：每轮先各 VM 清 cache（drop_caches + thrash buffer，
+     与 cxlkv 同款）→ pool reset（`tools/cxl_pool_initer`）→ 4 VM 并行
+     `e2e_trace_runner` 回放 load；
+  9. 每 workload 轮：清 cache → reset+load → run（run 不 reset）；
+  10. 收集各 VM 日志到 `round_logs/`；
+  11. 调 `scripts/summarize_ycsb_experiment.py`（新写，逻辑对齐 cxlkv
+      `summarize_ycsb_trace_experiment.py`：只解析 `E2E_TRACE_TIME_US` 行，
+      吞吐 = Σops / max(duration_us)，附 `TIGONKV_MEMORY_STATS` 与
+      `LATENCY_SIM_STATS` 摘要）；
+  12. 产出 `YCSB实验报告.md` + `ycsb_summary.json` + rows/round/case 三张 CSV。
+- **产物目录布局**与 cxlkv 指南 §7 同构（run_meta.json / runner.log /
+  报告 / csv / json / configs/ / traces/ / logs/ / round_logs/）。
+
+**新文档 `YCSB指南.md`（项目根）**，章节对齐 cxlkv `doc/YCSB指南.md`：
+脚本概述与步骤、约束（固定 4 VM、RelWithDebInfo、2 的幂共享池、HWCC 固定
+1024MB、NUMA 不重叠、延迟注入构建约束、独立 benchmark 语义——每 workload
+先全新 load 再 run）、选项参考表、load 专项说明、按本机拓扑的快速命令、
+中断恢复（--skip-* 组合）、输出结构、手动汇总、失败处理（残留进程清理、
+关键日志位置、常见问题表）、与 e2e_08/09 冒烟测试的关系。所有命令必须是
+本项目可直接执行的真实命令（写文档前逐条跑通或 dry-run 验证）。
+
+**脚本正确性检查（计划内强制步骤）**：
+1. `bash -n` + shellcheck 零 error；
+2. `--prepare-only` 全流程（生成 config/trace/run_meta）并断言 worker 文件
+   数 = vm.count × threads-per-node、manifest 与 trace 行数一致；
+3. 小规模冒烟：`--record-count 10000 --operation-count 10000 --rounds 1
+   --workloads a`，在现有 VM 拓扑上端到端跑通，报告/CSV/JSON 三者数字互相
+   一致（汇总脚本单测：给定伪造日志断言产出）；
+4. `--skip-*` 各恢复路径至少各验证一次；
+5. 指南中每条命令与脚本实际行为对拍（文档即测试清单）。
 
 ============================================================
-二十五、local metadata 可恢复
+五、文件级任务清单
 ============================================================
 
-替换不可持久化字段：
+**新建（`kv/engine/`）**
 
-- pthread_spinlock_t；
-- migrated_row raw pointer；
-- scc_data raw pointer。
+| 文件 | 内容 | 估算 |
+|------|------|------|
+| `region_allocator.h/.cpp` | 双区域分配器 + per-thread cache + remote-free + 记账 | ~900 行 |
+| `shared_layout.h` | SharedLayoutHeader、partition 目录、根表、attach 校验 | ~200 |
+| `fixed_key.h` | FixedKey/Comparator/padding | ~80 |
+| `private_row.h` | PrivateRow 布局与 latch | ~120 |
+| `kv_partition.h/.cpp` | 每 partition：私有树+arena+shared 树+tracker 的聚合 | ~400 |
+| `kv_row_ops.h/.cpp` | 私有行读写删 + 对 TwoPLPashaHelper KV 版共享行/迁移函数的薄组装（共享行协议主体在原文件就地改造） | ~300 |
+| `kv_messages.h/.cpp` | KV 消息编码 + 转发/服务循环 | ~450 |
+| `kv_engine.h/.cpp` | 组装：路由、六个操作、SCAN 归并、checkpoint/attach、统计 | ~700 |
+| `mem_access.h` | 延迟模拟统一访问 wrapper（4.9 插入点） | ~150 |
+| `scc_test_backend.h/.cpp` | NonCoherent SCC 测试后端 | ~250 |
 
-改为：
+**移植/重写**
 
-1. owner-only fixed-size latch。
-2. latch属于owner-private SWCC。
-3. 只由owner进程线程使用。
-4. migrated shared metadata使用offset。
-5. shared payload使用offset。
-6. clean shutdown时unlocked。
-7. attach验证。
-8. dirty hard fail。
-9. 不使用每key DRAM lock map。
-10. local metadata不需要shared HWCC。
-11. local metadata普通访问不需要SCC。
+| 文件 | 处置 |
+|------|------|
+| `kv/kv_store.cpp` | 重写为薄门面（~200 行，委托 kv_engine） |
+| `kv/latency_simulator.h/.cpp` | 用 cxlkv `src/utils` 版整体替换（4.9） |
+| `tigonkv_make_vm_img.sh` | 新建（包装 `emulation/image/make_vm_img.sh`） |
+| `tigonkv_init_vms.sh` / `tigonkv_kill_vms.sh` / `tigonkv_check_vms.sh` | 新建（4.10） |
+| `tigonkv_run_ycsb_experiment.sh` + `scripts/summarize_ycsb_experiment.py` | 新建（4.11） |
+| `YCSB指南.md` | 新建（4.11） |
 
-============================================================
-二十六、private/shared index
-============================================================
+**原始代码就地修改清单（改动须小而可审查，逐处 `// tigonkv:` 标注）**
 
-优先参数化Tigon的BTreeOLC_CXL。
+1. `common/CXLMemory.h`：malloc/free wrapper 直接路由双区域分配器；
+   get_root/set_root 换 SharedLayoutHeader 根表实现；删除 cxlalloc 调用与链接。
+2. `common/btree_olc_cxl/BTreeOLC_CXL.h`：节点分配/回收绑定树实例的分配域
+   （构造期绑定、内联）+ 节点访问处插入延迟记账（门控内联）。
+3. `protocol/TwoPLPasha/TwoPLPashaHelper.h`：`move_from_*` 与行锁 take/release
+   函数族就地改造为以 PrivateRow 为源/宿、无事务上下文的 KV 版本（锁位布局、
+   SCC 调用序列、迁移步骤顺序保持与原实现一致）；不再被引用的事务路径函数
+   原样保留不删。
+4. `protocol/Pasha/SCCManager.h`：`clflush/clwb` 内插入延迟记账（门控内联）。
+5. `common/MPSCRingBuffer.h`：enqueue/dequeue 数据区插入延迟记账（门控内联）。
 
-private index：
+**删除/降级（仅限晚于 ccd567a 的内容，详见 §七）**：旧 `kv/kv_store.cpp`
+实现体、旧 `kv/latency_simulator.*`、`kv/memory_domains.h`（并入
+region_allocator）、`e2e_trace_runner_alias.cpp`（如无消费者）。
 
-1. 位于owner-private SWCC。
-2. 只有owner VM访问。
-3. page允许原地更新。
-4. node lock只需同进程同步。
-5. 普通page update不需要SCC或HWCC metadata。
-6. clean checkpoint统一flush dirty range。
-
-shared index：
-
-1. 位于逻辑HWCC。
-2. 多VM访问。
-3. 使用跨VM安全锁和原子状态。
-4. 只保存shared-active rows。
-5. insert是shared row的重要发布点之一。
-
-共同要求：
-
-1. allocator/domain注入。
-2. root/child/row使用offset。
-3. 不用new/new[]在DRAM保存page。
-4. row/local metadata不进DRAM。
-5. non-owner不创建private root。
-6. restart attach。
-7. insert/split/remove/scan使用注入allocator。
+**文档同步**：见 §七。
 
 ============================================================
-二十七、统一 KV API
+六、测试计划
 ============================================================
 
-提供：
+构建：Debug（-O0 -g3，断言开）与 RelWithDebInfo（-O3 -g3 -march=native）双
+配置，CTest 全接入。ASAN 仅在实际内存故障排查时启用。
 
-class KVStore {
-public:
-    Status Put(std::string_view key, std::string_view value);
-    GetResult Get(std::string_view key);
-    Status Delete(std::string_view key);
-    ScanResult Scan(std::string_view start_key, uint64_t limit);
-    CasResult CompareExchange(...);
-    IncrementResult Increment(...);
-};
+## 6.1 单元测试（Debug + RelWithDebInfo，各 ≥10 轮 `--repeat until-fail`）
 
-公开API禁止：
+1. **分配器**：4.1 末尾的能力矩阵（多进程 attach 用同一 mmap 文件模拟）。
+2. **FixedKey/B+树**：非整型 key 的 insert/lookup/remove/scan/split/merge；
+   私有树节点落 owner arena、共享树节点落 HWCC 的地址范围断言；attach 后
+   树根恢复可查。
+3. **行操作**：私有读写删无 SCC/无 shared metadata/无 flush（计数断言）；
+   共享 WriteThrough read-hit（零 flush）/read-miss（恰一次 clflush+置位）/
+   write（清他机位+恰一次 clwb）；publish ordering（发布前 remote 不可见）。
+4. **NonCoherentSwccTestBackend**：全部 14 条正反用例（缺 flush 读旧值、
+   过早发布稳定失败、retiring 拒新 ref、move-out 前 owner 读到最新值等）。
+5. **迁移**：move-in 拷贝字节级校验（源/宿地址分属两区域）、并发同 key
+   move-in 恰一次、预算触顶触发 Clock move-out、victim ref_cnt>0 跳过、
+   反复迁移无泄漏、EBR drain 后 used 回基线。
+6. **并发**：多线程单 VM 混合读写删 + 不变量校验；CAS/INCR 多线程线性一致；
+   两进程（同 mmap）跨"节点"行锁互斥与 SCC 可见性。
+7. **门面**：config 解析（含 latency_inject 全字段必填校验）、stable hash、
+   HWCC 预算 hard cap、unclassified=0、checkpoint→exit→attach→数据完整、
+   dirty attach 拒绝、trace 解析 golden（与 cxlkv 样例逐字节对齐）。
+8. **延迟模拟（4.9）**：TSC 校准精度（1µs 忙等误差 <20%）；安全点补齐
+   （持锁期间 pending 只累积不睡）；none/fixed_hit_rate/per_thread_lru 三
+   模型命中率；`cache_hits_enabled=false` 对照；enabled=false 零副作用；
+   Debug+enabled hard fail；四种模式结果不变性。
 
-- table_id；
-- partition_id；
-- ITable；
-- transaction internals。
+## 6.2 脚本与工具验证
 
-内部：
+1. 全部新脚本 `bash -n` + shellcheck 零 error。
+2. `tigonkv_init_vms.sh --dry-run`：预检结论与将执行的 QEMU 命令逐 VM 打印，
+   与 cxlkv rust init_vm 生成的参数逐项人工比对（记录在 修改日志.md）。
+3. `tigonkv_check_vms.sh` 在现有拓扑上全绿。
+4. `tigonkv_run_ycsb_experiment.sh --prepare-only` 产物断言（worker 文件数、
+   manifest、config 改写正确）；汇总脚本对伪造日志的单测。
+5. 小规模端到端冒烟（1e4 records，workload a，现有 VM）。
+6. 实际执行 `tigonkv_make_vm_img.sh` / `tigonkv_init_vms.sh` 重建拓扑前，
+   先向用户申请授权；授权后执行并以 check 脚本 + 既有 SSH e2e 验收。
 
-    partition_id = StablePartitionForKey(key)
-    owner = partition_id % vm_count
+## 6.3 多 VM 集成测试（复用现有 harness，默认每项 ≥5 轮）
 
-使用稳定hash。
+按现有 `tests/e2e/n_vm_ssh_e2e.sh` + `run_e2e_rounds.sh` 编排（不重启 VM、
+不改网络、node0 先起、pass marker + SHA 校验）：
 
-内部允许固定：
+- **A 基础 E2E**：任意节点 PUT/GET/DELETE → 远程访问触发 promotion →
+  共享更新 → owner 读 → move-out → checkpoint → attach。
+- **B private-only**：全部请求发 owner；断言 promotion=0、shared metadata
+  分配=0、SCC flush≈0。
+- **C remote-heavy**：大量非 owner 访问；断言 migration_in/out、SCC flush
+  非零且与操作数相关。
+- **D e2e_08**（1e5 key，8B/8B）与 **e2e_09**（1e5 key，32B/1000B）：各 ≥10
+  轮；输出 `E2E_08/09_PHASE_TIME_US / OP_LATENCY_US / MEMORY` 与既有断言
+  （checkpoint 后 active_shared_rows=0、EBR drained、HWCC 稳定、无泄漏）。
+- **E YCSB**：经 `tigonkv_run_ycsb_experiment.sh` 跑 load+A/B/C/D 各 ≥5 轮
+  （1e5 规模起步，正式对比换 5e6 并与 cxlkv 同一份 trace）；YCSB-E 在 SCAN
+  验证通过后 ≥5 轮，否则明确标记不支持。
+- **F HWCC 压力**：填充至接近 1 GiB 预算，高频迁移 ≥10 轮，断言不超预算、
+  无 hard fail 之外的降级。
+- **G 一致性故障注入**：人为跳过 write-back / 过早发布 / retiring 加 ref，
+  用 NonCoherent 后端或 strict 模式证明测试能抓住。
+- **H latency 模式**：disabled / none / LRU hits-off / LRU hits-on 各 ≥5 轮，
+  校验 `LATENCY_SIM_STATS` 行与结果不变性。
 
-    constexpr uint32_t kKVTableId = 0;
+NUMA 验证沿用 `tigonkv_check_vms.sh` + `numa_placement_probe`（页位置采样、
+performance 模式错位 hard fail）。
 
-============================================================
-二十八、操作语义
-============================================================
+## 6.4 验收清单（全部满足才算完成）
 
-PUT：
-
-load：
-- insert语义；
-- 重复key hard fail；
-- 路由owner；
-- 写private SWCC；
-- 不全量promote；
-- 不为每key分配HWCC shared metadata。
-
-run：
-- owner/private：private lock + private SWCC原地更新。
-- non-owner/shared：shared lock + SCC shared payload更新。
-- non-owner/private：请求owner move-in后更新。
-- 不存在：owner在private SWCC upsert。
-
-GET：
-
-- owner/private：private lock + direct private SWCC read。
-- shared：shared read lock + SCC。
-- non-owner/private：move-in后shared read。
-- tombstone：not found。
-
-DELETE：
-
-- tombstone；
-- private由owner修改；
-- shared在shared write lock下修改；
-- delete/reinsert不泄漏。
-
-SCAN：
-
-- >= start_key；
-- 最多limit；
-- 跳过tombstone；
-- 保序；
-- 跨partition不漏数据；
-- 无法正确实现时对SCAN hard fail，不假成功。
-
-CAS/INCR：
-
-- 单key write lock；
-- 多VM线性一致性测试。
-
-============================================================
-二十九、HWCC 预算和统计
-============================================================
-
-1. logical HWCC capacity与cxlkv相同。
-2. 不超过1GiB。
-3. 每次HWCC allocation检查。
-4. 分类统计：
-   - shared index；
-   - shared row metadata；
-   - EBR；
-   - layout；
-   - allocator；
-   - transport。
-5. private row不计入HWCC。
-6. private metadata不计入HWCC。
-7. shared value不计入HWCC。
-8. 仅private workload中dynamic shared-row HWCC使用应接近0。
-9. remote promotion才增加shared metadata。
-10. 超预算执行migration policy。
-11. 无victim hard fail。
-12. checkpoint后dynamic HWCC回到稳定基线。
-13. global allocator不能通过物理混合逃避逻辑预算。
+1. 物理 dual-region 生效（`physical_region_split=1`），两区间大小可配，
+   HWCC ≤ 1 GiB 且分配 hard cap。
+2. move-in/move-out 均为跨区域真实拷贝；预算驱动的自动 move-out 生效
+  （Clock 默认，OnDemand/Reactive 可配）。
+3. SCC = 原始 `TwoPLPashaSCCWriteThrough`（bitmap + clflush/clwb），
+   NonCoherent 后端正反用例全过；owner-private 普通操作零 SCC、零 flush。
+4. 并发 = 行级 2PL + OLC B+树，无任何全局锁；多 VM 下 CAS/INCR 线性一致。
+5. 私有/共享索引均为 `btreeolc_cxl::BPlusTree`；SCAN 正确（或 YCSB-E 明确
+   标记不支持）。
+6. 分配器通过全部能力测试，unclassified_shared_bytes=0，local DRAM 有界，
+   多轮容量稳定。
+7. 延迟模拟 = cxlkv 移植版（TSC 校准忙等、安全点补齐、三 cache 模型、
+   `latency_inject` 全字段同构），SWCC/HWCC 延迟独立可配，6.1-8 全绿。
+8. 根目录具备独立完备的 `tigonkv_make_vm_img.sh` / `tigonkv_init_vms.sh` /
+   `tigonkv_kill_vms.sh` / `tigonkv_check_vms.sh`，不引用 /root/code/cxlkv，
+   dry-run 与实机验证通过。
+9. 根目录具备 `tigonkv_run_ycsb_experiment.sh` + `YCSB指南.md`，指南命令
+   全部实测可用；YCSB load/A/B/C/D 多 VM 多轮通过；e2e_08/09 ≥10 轮通过；
+   trace/config/runner/统计与 cxlkv 逐项对齐（4.8 表）。
+10. §七 的文档更新与死代码清理全部完成。
 
 ============================================================
-三十、安全内存回收
+七、文档更新与死代码清理（收尾强制步骤）
 ============================================================
 
-1. shared metadata/payload使用EBR。
-2. shared index node删除使用EBR。
-3. ref count至少32bit。
-4. shared ref count属于逻辑HWCC。
-5. generation属于逻辑HWCC或等价安全状态。
-6. EBR队列有统计。
-7. shutdown drain。
-8. allocation有domain/partition/owner/size/state。
-9. 不允许unreachable allocation。
-10. delete/reinsert不持续分配。
-11. 多轮使用量稳定。
-12. allocator snapshot可诊断。
-13. private B+Tree中的tombstone仍属于reachable allocation。
-14. private arena的回收不需要跨VM EBR，除非其对象地址被异步本地线程引用。
-15. 不要对owner-private对象机械使用shared EBR。
+## 7.1 文档更新（实现完成后的下一步，逐项强制）
+
+| 文档 | 更新内容 |
+|------|----------|
+| `README.md` | 新架构综述、构建方法、根目录脚本入口（镜像/VM/YCSB）、术语声明（1.3）、与 cxlkv 对比实验的操作顺序 |
+| `内存布局.md` | 重写为 dual-region 物理布局（3.1 图 + 各对象归属 + offset 规则 + attach 语义），删除旧 slot 布局描述 |
+| `缓存一致性设计.md` | 重写对象访问分类表（逐对象记录所在区域、访问者、并发保护、SCC 参与、flush 行为等属性，覆盖全部 16 类共享内存对象），描述真实 SCC WriteThrough 协议与 NonCoherent 后端，删除 msync 伪协议描述 |
+| `allocator审计.md` | 追加：自研双区域分配器的设计决策、能力测试矩阵结果、cxlalloc 弃用终审 |
+| `搬运清单.md` + `THIRD_PARTY_NOTICES.md` | 追加：cxlkv latency_simulator 整体移植、QEMU 启动流程照搬（init_vm fish/rust → bash）、YCSB 一键脚本与汇总脚本照搬、各自的 cxlkv SHA 与改写说明 |
+| `YCSB指南.md` | 新建（4.11），发布前逐命令实测 |
+| `修改日志.md` | 每里程碑追加：commit SHA、测试结果、偏离决策（cxlalloc 弃用、host tuning 降级为检查、与 cxlkv QEMU 参数的两处差异等） |
+
+文档验收标准：文档描述与代码/统计输出**对拍**——每张表格里的字段/行为必须
+能指到具体代码或测试；不允许残留描述已删实现的段落。
+
+## 7.2 死代码与无效实现清理（**仅限晚于 ccd567a 的内容**）
+
+范围红线：**ccd567a 已存在的文件允许按本计划就地修改，但一律不删除文件**
+（包括不再参与构建的 `protocol/SundialPasha`、`bench_smallbank/tatp`、
+`emulation/*`、`dependencies/cxlalloc` 等——保留源文件即尊重原实现；从
+CMake 移除失效 target 不算删除）。**删除**仅限 ccd567a 之后引入、且被本次
+改造取代的内容：
+
+1. 旧 `kv/kv_store.cpp` 实现体中被新引擎取代后不再被引用的全部代码
+   （slot 布局、全局 lock_word、TransitionPayload、SyncRangeOrThrow、
+   open-addressed index、sorted index 等）。
+2. 旧 `kv/latency_simulator.*`（被 cxlkv 移植版替换）及其独有配置字段
+   （`Config` 中旧的扁平 latency_* 字段，替换为 `latency_inject` 对象后删除）。
+3. `kv/memory_domains.h`（并入 region_allocator 后删除）。
+4. `e2e_trace_runner_alias.cpp`（确认无消费者后删除，CMake 同步）。
+5. `tests/tigonkv_tests.cpp` / `tests/e2e_vm_workflow.h` 中针对旧 slot/全局
+   锁实现的断言、helper 与 env 开关（如 `TIGONKV_E2E_BATCH_SORTED_INDEX`）。
+6. `scripts/` 内引用已删符号/env/target 的行；`RebuildSortedIndex` 等失效
+   API 从 `kv/kv_store.h` 移除（此为 HEAD 新增 API，不属原始 Tigon）。
+7. 文档中描述旧实现的段落（随 7.1 重写自然清除，需最终 grep 复核）。
+8. CMake 中无源可编、无 test 引用的 target。
+
+清理方法与验证：
+- 每删一项先 `rg` 全仓引用扫描（含 scripts/tests/docs），零引用才删；
+- 删除后 Debug+RelWithDebInfo 全量重编 + CTest 全绿 + e2e 冒烟一轮；
+- 链接器 `--gc-sections` + `-Wunused` 报告作为辅助线索（不作为唯一依据）；
+- 清理以独立 commit 提交（不与功能改动混合），列表记入 修改日志.md。
 
 ============================================================
-三十一、e2e_trace_runner
+八、实施顺序与里程碑
 ============================================================
 
-提供CMake target：
+每阶段完成 = 对应测试绿 + 本地 commit（SHA 记入 修改日志.md）。禁止跨阶段
+堆未验证代码。
 
-    e2e_trace_runner
+| 阶段 | 内容 | 退出标准 |
+|------|------|----------|
+| M0 环境与基线 | 记录 tigon2/cxlkv/YCSB SHA、git status、VM/共享文件/NUMA 现状；建 `rework-v2` 分支；双配置构建通过 | 审计记录入修改日志 |
+| M1 分配器 | `region_allocator` + CXLMemory wrapper 就地路由 + shared_layout + cxl_pool_initer 对接 | 6.1-1 全绿（含多进程） |
+| M2 索引 | FixedKey + BTreeOLC_CXL 就地修改（分配域绑定/延迟记账）+ 私有/共享树 + PrivateRow + attach | 6.1-2 全绿 |
+| M3 行协议 | TwoPLPashaHelper 就地改造（KV 版行锁/行操作）+ kv_row_ops 组装 + SCC 接入 + NonCoherent 后端 | 6.1-3/4 全绿 |
+| M4 迁移 | MigrationManager 接入 + move-in/out 回调 + 预算驱动 + EBR 回收 | 6.1-5 全绿；两进程迁移测试过 |
+| M5 引擎组装 | kv_engine + kv_messages + 转发/SCAN + kv_store 门面 + checkpoint/attach + 统计 | 6.1-6/7 全绿；单机双进程 A/B/C 场景过 |
+| M6 延迟模拟移植 | cxlkv latency_simulator 移植 + mem_access wrapper 全插入点 + latency_inject 配置 | 6.1-8 全绿 |
+| M7 harness 接线 | trace runner 多 worker 化 + 统计行对齐 + CMake 收尾 | trace golden 过；本机模拟多进程 YCSB load+C 过 |
+| M8 VM 与 YCSB 脚本 | `tigonkv_make_vm_img/init_vms/kill_vms/check_vms` + `tigonkv_run_ycsb_experiment` + 汇总脚本 + `YCSB指南.md` 初稿 | 6.2 全过（实机重建需先获用户授权） |
+| M9 多 VM 验证 | 6.3 全矩阵（VM 内构建同步用现有 sync 脚本） | 6.3 A–H 通过，轮数达标 |
+| M10 收尾 | 性能自查（分配器/转发/延迟 wrapper 热点 perf 采样，必要微调）、§7.1 文档更新、§7.2 死代码清理、验收清单逐条核对 | 6.4 全满足 |
 
-正式环境变量：
-
-- TIGONKV_NODE_ID
-- TIGONKV_E2E_TRACE_PHASE
-- TIGONKV_E2E_TRACE_CONFIG_JSONC
-- TIGONKV_EXPERIMENT_CONFIG_JSONC
-- TIGONKV_POLICY_CONFIG_JSON
-- TIGONKV_E2E_TRACE_HEARTBEAT_SEC
-
-兼容CXLKV变量。
-
-优先级：
-
-    TIGONKV_* > CXLKV_* > JSONC
-
-行为：
-
-- 每worker一个trace；
-- init后barrier；
-- replay单独计时；
-- checkpoint不计时；
-- final barrier；
-- pass marker。
-
-输出：
-
-E2E_TRACE_HEARTBEAT ...
-E2E_TRACE_TIME_US ...
-E2E_TRACE_REMOTE_EXIT ...
-e2e_trace_runner[nodeN]: passed.
+预估核心新代码 ~3.5k 行、原文件就地修改 ~400 行、移植 ~0.6k 行、脚本
+~1.5k 行、测试改造 ~1.7k 行。
 
 ============================================================
-三十二、trace 格式和YCSB
+九、风险与备选方案
 ============================================================
 
-格式：
-
-    <OP> <KEY_LEN> <LEN><KEY>
-
-严格按KEY_LEN解析。
-
-支持PUT/GET/DELETE/SCAN。
-
-建立与cxlkv实际runner的golden test：
-
-- key padding；
-- value size；
-- RNG；
-- worker assignment；
-- UPDATE read-before-write。
-
-Tigon2引用相同YCSB-cpp子模块：
-
-    thirdparty_libs/YCSB-cpp
-
-提供：
-
-    scripts/e2e_trace/prepare_ycsb_traces.sh
-    scripts/e2e_trace/run_ycsb_workflows.sh
-
-每项独立执行：
-
-    reset
-    load
-    checkpoint
-    process exit
-    attach
-    workload
-    checkpoint
-    verify
-
-必须通过：
-
-- load + A；
-- load + B；
-- load + C；
-- load + D。
-
-默认：
-
-- 100000 records；
-- 100000 operations；
-- worker数取配置。
-
-============================================================
-三十三、软件延迟模拟
-============================================================
-
-搬运并适配cxlkv的：
-
-- latency_simulator；
-- wrapper；
-- tests；
-- audit思路。
-
-PoolKind：
-
-- HWCC；
-- SWCC。
-
-关键规则：
-
-1. owner-private SWCC普通访问记录SWCC read/write。
-2. owner-private普通访问不记录不存在的flush。
-3. owner-private checkpoint实际flush时记录SWCC flush。
-4. shared payload记录SWCC read/write。
-5. shared payload实际SCC flush/invalidate时记录SWCC flush。
-6. shared HWCC metadata记录HWCC read/write/atomic。
-7. global allocator模式中PoolKind来自显式domain，不来自地址。
-8. dual-region模式中额外验证地址范围。
-9. instrumentation不能代替correctness flush。
-10. latency cache model不能代替SCC bitmap。
-11. 报告明确是软件注入延迟。
-
-支持：
-
-- Read；
-- Write；
-- AtomicLoad；
-- AtomicStore；
-- AtomicRmw；
-- Flush；
-- none；
-- fixed_hit_rate；
-- per_thread_lru。
-
-============================================================
-三十四、延迟补齐安全点
-============================================================
-
-一次operation：
-
-1. BeginScope。
-2. 执行协议。
-3. commit/abort。
-4. 释放锁。
-5. ref count下降。
-6. 离开EBR。
-7. 离开B+Tree guard。
-8. EndScopeAndDelay。
-
-禁止持锁时补延迟。
-
-latency enabled只允许：
-
-- RelWithDebInfo；
-- verbose=false；
-- extra_check=false。
-
-============================================================
-三十五、e2e_08
-============================================================
-
-参考cxlkv e2e_08。
-
-提供：
-
-- vm0_e2e_08
-- vm1_e2e_08
-- e2e_08 target
-
-要求：
-
-1. 100000 key。
-2. 8B key/value。
-3. 多节点fill。
-4. 请求包含local和remote。
-5. deterministic random read。
-6. 完整value验证。
-7. 输出延迟百分位。
-8. 输出内存趋势。
-9. 额外验证：
-   - private local操作不产生SCC flush；
-   - private local操作不分配shared metadata；
-   - remote访问才发生promotion；
-   - checkpoint后active shared rows=0；
-   - EBR drained；
-   - HWCC稳定；
-   - SWCC无泄漏。
-
-输出：
-
-- E2E_08_PHASE_TIME_US
-- E2E_08_OP_LATENCY_US
-- E2E_08_MEMORY
-- E2E_08_STRESS_TIME_US
-
-============================================================
-三十六、e2e_09
-============================================================
-
-参考cxlkv e2e_09。
-
-提供：
-
-- vm0_e2e_09
-- vm1_e2e_09
-- e2e_09 target
-
-要求：
-
-1. 100000 key。
-2. 32B key。
-3. 1000B value。
-4. fill generation0。
-5. update generation1。
-6. random read。
-7. 完整1000B验证。
-8. 验证private大value访问不进行无意义flush。
-9. 验证remote shared大value使用SCC。
-10. 验证migration。
-11. 验证move-out。
-12. 验证reclaim。
-13. 无payload泄漏。
-
-============================================================
-三十七、多 VM runner
-============================================================
-
-提供：
-
-    tests/e2e/n_vm_ssh_e2e.sh
-    tests/e2e/n_vm_ssh_e2e_common.sh
-    tests/e2e/run_e2e_rounds.sh
-
-要求：
-
-- 使用现有VM；
-- 不修改网络；
-- 不重启VM；
-- node0短暂先启动；
-- 每节点日志；
-- timeout；
-- pass marker；
-- SHA校验；
-- 不终止QEMU；
-- 不无差别pkill；
-- 支持release、rounds、timeout、save logs。
-
-ASAN仅在debug需要时考虑。
-
-============================================================
-三十八、pool reset
-============================================================
-
-reset前确认：
-
-- 无Tigon2 runner；
-- 无cxlkv runner；
-- backing路径正确；
-- 大小正确；
-- NUMA placement可验证。
-
-hole punch只有在reset后页仍位于正确NUMA时允许用于性能测试。
-
-否则使用：
-
-    tools/cxl_pool_initer
-
-在正确NUMA policy下：
-
-- mmap；
-- zero；
-- prefault；
-- flush；
-- fence；
-- placement验证。
-
-禁止删除/recreate backing、remount、mkfs、VM reboot。
-
-============================================================
-三十九、VM辅助脚本
-============================================================
-
-提供：
-
-    scripts/vm/check_environment.sh
-    scripts/vm/sync_to_vms.sh
-    scripts/vm/start_existing_topology.sh
-    scripts/vm/stop_tigon_processes.sh
-
-要求：
-
-- 不创建网络；
-- 不修改SMT；
-- 不修改host tuning；
-- 不包含GPU/VFIO/Mellanox/SR-IOV/IB；
-- 不修改uncore；
-- 默认只复用现有拓扑；
-- 同步到/root/code/tigon2；
-- 不同步cxlkv；
-- 验证NUMA。
-
-============================================================
-四十、机器可读统计
-============================================================
-
-输出：
-
-TIGONKV_MEMORY_STATS
-allocator_mode=<global|dual_region>
-physical_region_split=<0|1>
-total_pool_capacity_bytes=<...>
-logical_hwcc_capacity_bytes=<...>
-logical_swcc_capacity_bytes=<...>
-logical_hwcc_used_bytes=<...>
-owner_private_swcc_used_bytes=<...>
-shared_payload_swcc_used_bytes=<...>
-allocator_shared_overhead_bytes=<...>
-allocator_local_dram_bytes=<...>
-unclassified_shared_bytes=<...>
-retired_pending_bytes=<...>
-reclaimed_total_bytes=<...>
-active_shared_rows=<...>
-rss_kb=<...>
-
-TIGONKV_RUNTIME_STATS
-node=<...>
-logical_ops=<...>
-commits=<...>
-aborts=<...>
-retries=<...>
-private_gets=<...>
-private_puts=<...>
-private_deletes=<...>
-private_swcc_flushes=<...>
-shared_gets=<...>
-shared_puts=<...>
-shared_swcc_flushes=<...>
-migration_in=<...>
-migration_out=<...>
-network_tx_bytes=<...>
-network_rx_bytes=<...>
-
-TIGONKV_NUMA_STATS
-node=<...>
-vm_numa=<...>
-shared_numa=<...>
-misplaced_pages=<...>
-mode=<functional|performance>
-
-强制检查：
-
-1. unclassified_shared_bytes=0。
-2. 普通private workload中的private_swcc_flushes接近0。
-3. shared_swcc_flushes应与实际SCC活动相关。
-4. 不能将checkpoint flush混入前台operation flush统计，二者分开报告。
-
-集群吞吐：
-
-    sum(node ops) / max(node duration)
-
-============================================================
-四十一、单元测试
-============================================================
-
-必须配置CTest。
-
-至少覆盖：
-
-1. config parser。
-2. region和逻辑预算。
-3. allocator能力测试。
-4. allocator最终模式。
-5. domain accounting。
-6. unclassified bytes。
-7. persistent offset。
-8. attach/restart。
-9. stable hash。
-10. private arena。
-11. HWCC预算。
-12. private index reopen。
-13. shared index。
-14. local metadata。
-15. shared metadata。
-16. object access-class mapping。
-17. owner-private普通read/write无SCC。
-18. owner-private普通read/write无shared metadata。
-19. owner-privatecheckpoint。
-20. shared WriteThrough read hit。
-21. shared WriteThrough read miss。
-22. shared WriteThrough write。
-23. publish ordering。
-24. NonCoherentSwccTestBackend。
-25. move-in。
-26. concurrent move-in same key。
-27. move-out。
-28. retiring禁止新ref。
-29. EBR。
-30. repeated migration。
-31. delete/reinsert。
-32. trace golden。
-33. latency models。
-34. strict access guard。
-35. source access audit。
-36. CAS/INCR线性一致。
-37. checkpoint。
-38. NUMA probe parser。
-39. memory stability。
-40. private flush统计和shared flush统计分离。
-
-运行：
-
-Debug：
-
-    ctest --test-dir <debug-build> --output-on-failure
-    ctest --test-dir <debug-build> --repeat until-fail:10 --output-on-failure
-
-RelWithDebInfo：
-
-    ctest --test-dir <release-build> --repeat until-fail:10 --output-on-failure
-
-ASAN只在实际debug需要时运行。
-
-============================================================
-四十二、多 VM集成测试
-============================================================
-
-A. allocator决策测试
-- 至少5轮multi-VM。
-- 决策后重新完整测试。
-
-B. 基础E2E
-- arbitrary-node Put；
-- private access；
-- remote promotion；
-- shared update；
-- owner read；
-- move-out；
-- checkpoint；
-- attach；
-- 至少5轮。
-
-C. private-only workload
-- 所有请求发送到owner；
-- 不发生promotion；
-- 不分配shared row metadata；
-- 不发生SCC flush；
-- 至少5轮。
-
-D. remote-heavy workload
-- 大量non-owner访问；
-- promotion和SCC统计非零；
-- 至少5轮。
-
-E. e2e_08
-- 完整规模；
-- 至少10轮。
-
-F. e2e_09
-- 完整规模；
-- 至少10轮。
-
-G. YCSB
-每项至少5轮：
-
-- load + A；
-- load + B；
-- load + C；
-- load + D。
-
-E在SCAN正确后至少5轮。
-
-H. HWCC压力
-- 接近但不超过1GiB；
-- 高频migration；
-- 至少10轮。
-
-I. 一致性故障注入
-- shared payload缺flush；
-- shared publication过早；
-- stale reader；
-- retiring新ref；
-- owner-private不必要flush检测；
-- latency disabled；
-- strict mode。
-
-J. latency模式
-- disabled；
-- none；
-- LRU hits disabled；
-- LRU hits enabled；
-- 每种至少5轮。
-
-============================================================
-四十三、测试失败处理
-============================================================
-
-失败时输出：
-
-- allocator_mode；
-- AccessClass；
-- key；
-- partition；
-- owner；
-- private/shared state；
-- domain；
-- offset；
-- version；
-- ref count；
-- SCC bits；
-- allocator snapshot；
-- EBR；
-- NUMA；
-- latency；
-- 实际flush计数；
-- 节点日志和线程栈。
-
-修复根因后重新多轮测试。
-
-禁止：
-
-- 降低断言；
-- 跳过suite；
-- 缩小默认规模后声称通过；
-- 静默fallback；
-- 只重跑到偶然成功；
-- 用物理coherence掩盖缺失SCC；
-- 为owner-private对象机械添加大量flush来让测试偶然通过；
-- 用cxlkv协议替代对Tigon协议的正确分析。
-
-============================================================
-四十四、git提交纪律
-============================================================
-
-允许模块完成后本地commit。
-
-建议顺序：
-
-1. 审计和构建。
-2. allocator能力测试。
-3. allocator决策。
-4. 缓存一致性对象分类和设计文档。
-5. layout和arena。
-6. private index/metadata。
-7. shared SCC wrapper。
-8. TwoPLPasha state transition。
-9. KV API。
-10. trace runner。
-11. YCSB。
-12. latency。
-13. e2e_08/e2e_09。
-14. VM/NUMA工具。
-15. 完整测试和文档。
-
-每次commit前：
-
-    git status
-    git diff --check
-    运行对应测试
-
-禁止push。
-
-commit SHA写入修改日志.md。
-
-============================================================
-四十五、禁止空实现
-============================================================
-
-除明确记录YCSB-E未支持外，其余要求均为强制。
-
-禁止：
-
-- TODO-only；
-- 空函数；
-- 固定返回success；
-- mock代替multi-VM；
-- 假统计；
-- 假pass marker；
-- 只编译不运行；
-- 通过硬件coherence绕过shared SCC；
-- latency wrapper代替flush；
-- DRAM shadow规避SWCC；
-- silent fallback；
-- 未测试就做allocator决策；
-- 给所有SWCC对象统一套用同一个flush协议；
-- 给owner-private对象无理由分配shared HWCC metadata；
-- 照搬cxlkv的immutable SWCC tree规则来禁止Tigon shared row原地更新。
-
-============================================================
-四十六、搬运与独立性
-============================================================
-
-创建：
-
-    THIRD_PARTY_NOTICES.md
-    搬运清单.md
-
-记录：
-
-- cxlkv SHA；
-- 原路径；
-- 新路径；
-- 复制/改写；
-- license。
-
-可搬运：
-
-- latency simulator；
-- trace parser；
-- runner结构；
-- config helper；
-- pool initer；
-- e2e helper；
-- e2e_08/e2e_09测试结构；
-- dual-region allocator相关代码，仅在最终选择dual-region时搬运。
-
-可以参考但不能直接照搬协议：
-
-- cxlkv AGENTS.md中的HWCC/SWCC特性；
-- publish-before-visible原则；
-- flush范围审计；
-- offset规则；
-- 延迟安全点。
-
-不要搬运：
-
-- CxlTree；
-- DeltaIndex；
-- merge算法；
-- merge gRPC；
-- cxlkv数据结构；
-- cxlkv专用SWCC immutable-node协议。
-
-独立性：
-
-- 构建不依赖/root/code/cxlkv；
-- runtime不依赖cxlkv；
-- YCSB是Tigon2自己的submodule；
-- 保留cxlalloc时记录静态库SHA和ABI。
-
-============================================================
-四十七、最终验收
-============================================================
-
-必须满足：
-
-1. allocator经过详细测试后做出决策。
-2. 保留global allocator时逻辑预算和统计正确。
-3. 使用dual-region时物理区域正确。
-4. private index/row/metadata位于owner-private SWCC。
-5. private普通操作不运行跨VM SCC。
-6. private普通操作不需要每次flush。
-7. private普通操作不分配shared HWCC row metadata。
-8. remote promotion后才创建shared metadata和shared payload。
-9. shared payload通过Tigon SCC保证跨VM可见性。
-10. Tigon shared row允许在write lock下原地更新。
-11. 没有机械照搬cxlkv immutable SWCC tree规则。
-12. HWCC容量不超过1GiB。
-13. unclassified bytes=0。
-14. private数据不大量占用DRAM。
-15. 任意VM处理任意key。
-16. GET/PUT/DELETE正确。
-17. CAS/INCR线性一致。
-18. YCSB load/A/B/C/D通过。
-19. e2e_trace_runner兼容。
-20. e2e_08/e2e_09多轮通过。
-21. latency四种模式通过。
-22. clean attach正确。
-23. 无持续内存泄漏。
-24. NonCoherentSwccTestBackend通过。
-25. strict shared SWCC测试通过。
-26. NUMA页位置正确。
-27. 没有宣称真实CXL。
-28. 没有修改网络。
-29. 没有格式化/remount。
-30. 没有重启服务器。
-31. 没有push。
-32. 修改日志完整。
-33. 缓存一致性设计.md完整。
-34. 最终git status明确。
-
-============================================================
-四十八、最终输出
-============================================================
-
-修改日志.md最后记录：
-
-1. 最终架构。
-2. allocator测试矩阵。
-3. allocator最终决策。
-4. global或dual-region选择证据。
-5. 对象AccessClass表。
-6. owner-private SWCC协议。
-7. shared row SCC协议。
-8. shared row publication线性化点。
-9. move-in/move-out权威副本转换。
-10. NUMA实际绑定。
-11. 修改文件。
-12. 搬运来源。
-13. YCSB SHA。
-14. KV API。
-15. trace runner接口。
-16. 单元测试结果。
-17. private-only E2E结果。
-18. remote-heavy E2E结果。
-19. e2e_08结果。
-20. e2e_09结果。
-21. YCSB A/B/C/D结果。
-22. YCSB-E状态。
-23. latency结果。
-24. HWCC峰值。
-25. owner-private SWCC使用。
-26. shared-payload SWCC使用。
-27. private普通操作flush计数。
-28. shared SCC flush计数。
-29. allocator overhead。
-30. RSS。
-31. migration/abort/retry。
-32. 一致性故障注入结果。
-33. 已知限制。
-34. 本地commit列表。
-35. 可复现命令。
-
-终端最终回复简洁列出：
-
-- 完成模块；
-- allocator_mode；
-- allocator测试依据；
-- 缓存一致性设计摘要；
-- private访问是否无SCC；
-- shared访问采用的SCC机制；
-- 构建结果；
-- 单元测试；
-- 多VM测试；
-- YCSB结果；
-- HWCC/SWCC容量和峰值；
-- private/shared flush统计；
-- unclassified bytes；
-- NUMA页位置；
-- latency数据；
-- 本地commit SHA；
-- 未提交文件。
-
-禁止push。
+1. **TwoPLPashaHelper 与 ITable/Context/消息层耦合过深**。
+   → 就地改造时直接去掉事务上下文依赖（§五 修改 3），无需维持事务路径
+   兼容；锁位布局、SCC 调用序列、迁移步骤必须与原实现一致，用单测对拍
+   （同一输入下 atomic_word 状态序列一致）。
+2. **BTreeOLC_CXL 对非整型 Key 有隐藏假设**（如某处按值哈希/算术）。
+   → M2 首日做全路径冒烟；若有，在原文件上最小修补并加回归测试；禁止
+   另起炉灶 fork 平行版本。
+3. **scc_data 37 位 offset 不够或语义为"cxlalloc 堆内偏移"**。
+   → 我们的 offset 基于映射基址，池 ≤64 GB 时 37 位足够；初始化断言
+   `swcc_offset+size < (1ull<<37)`；不满足则扩位（该字段打包在
+   atomic_word，需同步调整位段并全测）。
+4. **clflushopt/clwb 在 VM guest 对 ivshmem BAR 内存的效果**依赖映射属性。
+   → 正确性不依赖它（NonCoherent 后端验证协议本身）；真实环境用
+   e2e 一致性用例 + strict 模式验证；指令不可用时按原 SCCManager 编译
+   fallback（clflush）。
+5. **SCAN 跨 partition 归并延迟高**导致 YCSB-E 不达标。
+   → 语义正确优先；性能不足时仅优化实现（owner 侧批量、限深），仍不达标
+   则按规格明确标记 E 不支持，不降低正确性。
+6. **转发消息轮询与 worker 抢核**导致尾延迟。
+   → 轮询间隔自适应（忙时每 op 后查一次，闲时退避）；必要时允许配置一个
+   专职 service 线程（计入相同 worker 预算，保持与 cxlkv 公平）。
+7. **HWCC 1 GiB 内装不下大规模 shared 树 + smeta + 环**。
+   → 这正是 move-out 存在的意义：预算水位驱动收缩 shared 集合；e2e-F 压力
+   测试专门覆盖；不足即 hard fail 暴露而非静默扩张。
+8. **mkosi 镜像构建环境不可用**（`emulation/image/make_vm_img.sh` 依赖
+   mkosi/debootstrap）。
+   → `tigonkv_make_vm_img.sh` 提供 `--from-existing <path>` 从本机已有可用
+   root.img 复制（等价 cxlkv restore 脚本的本地复制行为），来源与 SHA 记入
+   修改日志；两条路径都不可行时明确 BLOCKED，不伪造镜像。
+9. **重建 VM 拓扑影响服务器上其他实验**。
+   → 所有会终止/重建 VM 的脚本执行前必须获用户明确允许；默认路径是
+   `tigonkv_check_vms.sh` 复用现有拓扑。
+10. **延迟注入本身扰动性能**（instrumentation 开销）。
+    → 照搬 cxlkv 的 relaxed 快路径闸门与线程本地状态；`stats_enabled=false`
+    时不碰互斥锁；报告同时给出 enabled=false 基线，扰动可量化。
