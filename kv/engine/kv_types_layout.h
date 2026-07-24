@@ -44,24 +44,30 @@ struct alignas(64) DomainCounter {
 
 // This key format is deliberately bytewise and does not assume integral keys.
 struct FixedKey {
-  std::array<char, kMaxFixedKeyBytes> bytes{};
+  char bytes[kMaxFixedKeyBytes];
 
   static FixedKey From(std::string_view key, uint32_t fixed_size) {
     if (fixed_size == 0 || fixed_size > kMaxFixedKeyBytes || key.size() > fixed_size)
       throw std::invalid_argument("invalid fixed key size");
-    FixedKey result;
-    std::memcpy(result.bytes.data(), key.data(), key.size());
+    FixedKey result{};
+    std::memcpy(result.bytes, key.data(), key.size());
     return result;
   }
 
   int Compare(const FixedKey &other) const {
-    return std::memcmp(bytes.data(), other.bytes.data(), bytes.size());
+    return std::memcmp(bytes, other.bytes, kMaxFixedKeyBytes);
   }
 };
 
 struct FixedKeyLess {
   bool operator()(const FixedKey &left, const FixedKey &right) const {
     return left.Compare(right) < 0;
+  }
+};
+
+struct FixedKeyComparator {
+  int operator()(const FixedKey &left, const FixedKey &right) const {
+    return left.Compare(right);
   }
 };
 

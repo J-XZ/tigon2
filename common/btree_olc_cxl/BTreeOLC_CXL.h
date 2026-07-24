@@ -25,6 +25,8 @@
 #include "common/CXLMemory.h"
 #include "common/CXL_EBR.h"
 
+#include "kv/engine/region_allocator.h"
+
 #include "common/atomic_offset_ptr.hpp"
 #include <boost/interprocess/offset_ptr.hpp>
 
@@ -41,6 +43,20 @@ constexpr uint64_t kLeafPageSize = 4096;
 constexpr uint64_t kLockMask = 1 << 10;
 constexpr uint64_t kReaderMask = kLockMask - 1;
 constexpr uint64_t kVersionMask = ~kReaderMask;
+
+// tigonkv: node placement is selected when a tree instance is constructed.
+// It is intentionally a concrete direct binding (no virtual dispatch or
+// callback) so a private tree can never silently fall back into HWCC.
+struct TreeNodeAllocation {
+	tigonkv::engine::DualRegionAllocator *regions = nullptr;
+	tigonkv::engine::AllocationDomain domain = tigonkv::engine::AllocationDomain::kHwccIndex;
+	uint32_t owner_shard = 0;
+
+	void *Allocate(uint64_t bytes) const {
+		if (regions == nullptr) throw std::invalid_argument("BPlusTree requires a region allocation binding");
+		return regions->Allocate(bytes, domain, owner_shard);
+	}
+};
 
 struct LatchBase {
 	std::atomic<uint64_t> word{ 0 };
@@ -568,7 +584,7 @@ class BPlusTree {
 	 */
 	class BTreeLeaf : public NodeBase {
 	    public:
-		static constexpr uint64_t maxEntries = (LeafPageSize - sizeof(NodeBase) - sizeof(boost::interprocess::offset_ptr<BTreeLeaf>) * 2) / (sizeof(KeyValuePair));
+		static constexpr uint64_t maxEntries = (LeafPageSize - sizeof(NodeBase) - sizeof(TreeNodeAllocation *) - sizeof(boost::interprocess::offset_ptr<BTreeLeaf>) * 2) / (sizeof(KeyValuePair));
 		static_assert(maxEntries >= 3, "maxEntries of BTreeLeaf must >= 3");
 
 		boost::interprocess::offset_ptr<BTreeLeaf> pre_;
@@ -577,12 +593,14 @@ class BPlusTree {
 		/** This is the array that we perform search on */
 		KeyType keys_[maxEntries];
 		ValueType values_[maxEntries];
+		const TreeNodeAllocation *allocation_;
 		// KeyValuePair data_[0];
 
-		BTreeLeaf()
+		BTreeLeaf(const TreeNodeAllocation *allocation)
 			: NodeBase(NodeType::BTreeLeaf)
 			, pre_(nullptr)
 			, next_(nullptr)
+			, allocation_(allocation)
 		{
 		}
 
@@ -862,8 +880,8 @@ class BPlusTree {
 		 */
 		BTreeLeaf *split(KeyType &sep)
 		{
-                        char *base = reinterpret_cast<char *>(star::cxl_memory.cxlalloc_malloc_wrapper(LeafPageSize, star::CXLMemory::INDEX_ALLOCATION));
-			BTreeLeaf *newLeaf = new (base) BTreeLeaf(); // Placement new
+			char *base = reinterpret_cast<char *>(allocation_->Allocate(LeafPageSize));
+			BTreeLeaf *newLeaf = new (base) BTreeLeaf(allocation_); // Placement new
 
 			newLeaf->setCount(this->getCount() - (this->getCount() / 2));
 			newLeaf->next_ = next_.get();
@@ -912,7 +930,7 @@ class BPlusTree {
 	 */
 	class BTreeInner : public NodeBase {
 	    public:
-		static constexpr uint64_t maxEntries = (InnerPageSize - sizeof(NodeBase)) / (sizeof(KeyType) + sizeof(boost::interprocess::offset_ptr<NodeBase>));
+		static constexpr uint64_t maxEntries = (InnerPageSize - sizeof(NodeBase) - sizeof(TreeNodeAllocation *)) / (sizeof(KeyType) + sizeof(boost::interprocess::offset_ptr<NodeBase>));
 		static_assert(maxEntries >= 3, "maxEntries of BTreeInner must >= 3");
 
 		static constexpr uint64_t childOffset = maxEntries * sizeof(KeyType);
@@ -923,10 +941,12 @@ class BPlusTree {
 		 *  | Key 0 | Key 1 | ... | Key N | Child 0 | Child 1 | ... | Child N |
 		 *  -------------------------------------------------------------------
 		 */
+		const TreeNodeAllocation *allocation_;
 		char data_[0];
 
-		BTreeInner()
+		BTreeInner(const TreeNodeAllocation *allocation)
 			: NodeBase(NodeType::BTreeInner)
+			, allocation_(allocation)
 		{
 		}
 
@@ -1108,8 +1128,8 @@ class BPlusTree {
 
 		BTreeInner *split(KeyType &sep)
 		{
-                        char *base = reinterpret_cast<char *>(star::cxl_memory.cxlalloc_malloc_wrapper(InnerPageSize, star::CXLMemory::INDEX_ALLOCATION));
-			BTreeInner *newInner = new (base) BTreeInner(); // Placement new
+			char *base = reinterpret_cast<char *>(allocation_->Allocate(InnerPageSize));
+			BTreeInner *newInner = new (base) BTreeInner(allocation_); // Placement new
 
 			newInner->setCount(this->getCount() - (this->getCount() / 2));
 			this->setCount(this->getCount() - newInner->getCount() - 1);
@@ -1426,13 +1446,14 @@ class BPlusTree {
 		std::cout << "------\n";
 	}
 
-	BPlusTree(bool isUnique = false, const KeyComparator &keyComp = KeyComparator{}, const ValueComparator &valueComp = ValueComparator{})
+	BPlusTree(const TreeNodeAllocation &allocation, bool isUnique = false, const KeyComparator &keyComp = KeyComparator{}, const ValueComparator &valueComp = ValueComparator{})
 		: keyComp_(keyComp)
 		, valueComp_(valueComp)
 		, keyUnique_(isUnique)
+		, allocation_(allocation)
 	{
-                char *base = reinterpret_cast<char *>(star::cxl_memory.cxlalloc_malloc_wrapper(LeafPageSize, star::CXLMemory::INDEX_ALLOCATION));
-		root_.store(new (base) BTreeLeaf()); // Placement new
+		char *base = reinterpret_cast<char *>(allocation_.Allocate(LeafPageSize));
+		root_.store(new (base) BTreeLeaf(&allocation_)); // Placement new
 		stats_.leaf_nodes++;
 		// std::cout << "BTreeLeaf::maxEntries = " << BTreeLeaf::maxEntries << ", "
 		//           << "BTreeInner::maxEntries = " << BTreeInner::maxEntries << ".\n";
@@ -1440,8 +1461,8 @@ class BPlusTree {
 
 	void makeRoot(const KeyType &k, NodeBase *leftChild, NodeBase *rightChild)
 	{
-                char *base = reinterpret_cast<char *>(star::cxl_memory.cxlalloc_malloc_wrapper(InnerPageSize, star::CXLMemory::INDEX_ALLOCATION));
-		auto inner = new (base) BTreeInner(); // Placement new
+		char *base = reinterpret_cast<char *>(allocation_.Allocate(InnerPageSize));
+		auto inner = new (base) BTreeInner(&allocation_); // Placement new
 
 		inner->setCount(1);
 		inner->newKey(0, k);
@@ -2733,6 +2754,7 @@ restart:
 
 	/** whether key is unique */
 	const int keyUnique_;
+	const TreeNodeAllocation allocation_;
 
         AtomicOffsetPtr<NodeBase> root_;
 

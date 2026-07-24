@@ -31,7 +31,7 @@ endif()
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_library(tigonkv STATIC kv/kv_store.cpp kv/latency_simulator.cpp
-  kv/engine/region_allocator.cpp)
+  kv/engine/region_allocator.cpp common/btree_olc_cxl/BTreeOLC_CXL.cpp)
 target_link_libraries(tigonkv PUBLIC pthread)
 
 # tigonkv: legacy transaction benchmarks retain source-only reference status.
@@ -68,6 +68,8 @@ add_executable(latency_modes_test tests/latency_modes_test.cpp)
 target_link_libraries(latency_modes_test PRIVATE tigonkv)
 add_executable(kv_layout_test tests/kv_layout_test.cpp)
 target_link_libraries(kv_layout_test PRIVATE tigonkv)
+add_executable(btree_binding_test tests/btree_binding_test.cpp)
+target_link_libraries(btree_binding_test PRIVATE tigonkv)
 add_executable(region_allocator_test tests/region_allocator_test.cpp)
 target_link_libraries(region_allocator_test PRIVATE tigonkv)
 add_executable(numa_placement_probe tools/numa_placement_probe.cpp)
@@ -93,6 +95,7 @@ add_test(NAME e2e_09_test COMMAND e2e_09)
 add_test(NAME e2e_trace_test COMMAND e2e_trace)
 add_test(NAME latency_modes_test COMMAND latency_modes_test)
 add_test(NAME kv_layout_test COMMAND kv_layout_test)
+add_test(NAME btree_binding_test COMMAND btree_binding_test)
 add_test(NAME region_allocator_test COMMAND region_allocator_test)
 set_tests_properties(e2e_trace_test PROPERTIES
   ENVIRONMENT

@@ -5,10 +5,10 @@
 #pragma once
 
 #include <atomic>
+#include <stdexcept>
 
 #include "core/Context.h"
 
-#include "cxlalloc.h"
 #include <glog/logging.h>
 
 namespace star
@@ -52,11 +52,8 @@ class CXLMemory {
 
         void init_cxlalloc_for_given_thread(uint64_t threads_num_per_host, uint64_t thread_id, uint64_t hosts_num, uint64_t host_id)
         {
-                cxlalloc_init_backend("ivshmem");
-                cxlalloc_init("SS", default_cxl_mem_size, thread_id + threads_num_per_host * host_id, threads_num_per_host * hosts_num, host_id, hosts_num);
-                LOG(INFO) << "cxlalloc initialized for thread " << thread_id 
-                        << " (global ID = " << thread_id + threads_num_per_host * host_id 
-                        << ") on host " << host_id;
+                (void)threads_num_per_host; (void)thread_id; (void)hosts_num; (void)host_id;
+                throw std::runtime_error("tigonkv: legacy cxlalloc initialization is unavailable");
         }
 
         // backward compatibility
@@ -84,7 +81,8 @@ class CXLMemory {
                         CHECK(0);
                 }
 
-                return cxlalloc_malloc(size);
+                (void)size;
+                throw std::runtime_error("tigonkv: legacy cxlalloc allocation is unavailable");
         }
 
         void cxlalloc_free_wrapper(void *ptr, uint64_t size, int category, uint64_t metadata_size, uint64_t data_size)
@@ -146,7 +144,8 @@ class CXLMemory {
                         CHECK(0);
                 }
 
-                return cxlalloc_malloc(size);
+                (void)size;
+                throw std::runtime_error("tigonkv: legacy cxlalloc allocation is unavailable");
         }
 
         void cxlalloc_free_wrapper(void *ptr, uint64_t size, int category)
@@ -185,19 +184,14 @@ class CXLMemory {
 
         static void commit_shared_data_initialization(uint64_t root_index, void *shared_data)
         {
-                cxlalloc_set_root(root_index, shared_data);
+                (void)root_index; (void)shared_data;
+                throw std::runtime_error("tigonkv: legacy cxlalloc root table is unavailable");
         }
 
         static void wait_and_retrieve_cxl_shared_data(uint64_t root_index, void **shared_data)
         {
-                void *addr = NULL;
-                while (true) {
-                        addr = cxlalloc_get_root(root_index);
-                        if (addr)
-                                break;
-                }
-
-                *shared_data = addr;
+                (void)root_index; (void)shared_data;
+                throw std::runtime_error("tigonkv: legacy cxlalloc root table is unavailable");
         }
 
         uint64_t get_stats(int category)

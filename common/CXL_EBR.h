@@ -9,6 +9,7 @@
 #include <boost/interprocess/offset_ptr.hpp>
 
 #include "common/CXLMemory.h"
+#include "kv/engine/region_allocator.h"
 
 namespace star
 {
@@ -27,15 +28,17 @@ class CXL_EBR {
         static constexpr uint64_t epoch_advance_threshold = 100;
 
         struct retired_object {
-                retired_object(void *ptr, uint64_t size, uint64_t category)
+                retired_object(void *ptr, uint64_t size, uint64_t category, uint32_t owner_shard)
                         : ptr(ptr)
                         , size(size)
                         , category(category)
+                        , owner_shard(owner_shard)
                 {}
 
                 void *ptr;
                 uint64_t size;
                 uint64_t category;
+                uint32_t owner_shard;
         };
 
         // per-thread EBR metadata in local DRAM
@@ -57,9 +60,11 @@ class CXL_EBR {
                 std::atomic<uint64_t> local_epoch{ 0 }; // local epoch always <= global epoch
         };
 
-        CXL_EBR(uint64_t coordinator_num, uint64_t thread_num)
+        CXL_EBR(uint64_t coordinator_num, uint64_t thread_num,
+                tigonkv::engine::DualRegionAllocator *regions = nullptr)
                 : coordinator_num(coordinator_num)
                 , thread_num(thread_num)
+                , regions(regions)
         {
         }
 
@@ -84,7 +89,8 @@ class CXL_EBR {
                 LOG(INFO) << "init local EBR metadata, coordinator_id = " << local_ebr_meta.coordinator_id << " thread_id = " << local_ebr_meta.thread_id;
         }
 
-        void add_retired_object(void *ptr, uint64_t size, uint64_t category)
+        void add_retired_object(void *ptr, uint64_t size, uint64_t category,
+                                uint32_t owner_shard = 0)
         {
                 EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
                 uint64_t coordinator_id = local_ebr_meta.coordinator_id;
@@ -95,7 +101,7 @@ class CXL_EBR {
 
                 // add the object to the list of the current local epoch
                 std::vector<retired_object> &cur_retired_object_list = local_ebr_meta.retired_objects[cur_local_epoch % max_epoch];
-                retired_object object(ptr, size, category);
+                retired_object object(ptr, size, category, owner_shard);
                 cur_retired_object_list.push_back(object);
         }
 
@@ -157,7 +163,11 @@ class CXL_EBR {
                                 std::vector<retired_object> &retired_object_list_to_reclaim = local_ebr_meta.retired_objects[epoch_to_reclaim % max_epoch];
 
                                 for (uint64_t i = 0; i < retired_object_list_to_reclaim.size(); i++) {
-                                        cxlalloc_free(retired_object_list_to_reclaim[i].ptr);
+                                        const retired_object &object = retired_object_list_to_reclaim[i];
+                                        CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
+                                        regions->Free(object.ptr, object.size,
+                                                      allocation_domain(object.category),
+                                                      object.owner_shard, coordinator_id);
                                         gc_size += retired_object_list_to_reclaim[i].size;
                                 }
 
@@ -197,6 +207,26 @@ class CXL_EBR {
 
         uint64_t coordinator_num{ 0 };
         uint64_t thread_num{ 0 };
+
+        static tigonkv::engine::AllocationDomain allocation_domain(uint64_t category)
+        {
+                switch (category) {
+                case CXLMemory::INDEX_FREE:
+                        return tigonkv::engine::AllocationDomain::kHwccIndex;
+                case CXLMemory::METADATA_FREE:
+                        return tigonkv::engine::AllocationDomain::kHwccMetadata;
+                case CXLMemory::DATA_FREE:
+                        return tigonkv::engine::AllocationDomain::kSharedPayloadSwcc;
+                case CXLMemory::TRANSPORT_FREE:
+                        return tigonkv::engine::AllocationDomain::kTransport;
+                case CXLMemory::MISC_FREE:
+                        return tigonkv::engine::AllocationDomain::kHwccLayout;
+                default:
+                        LOG(FATAL) << "tigonkv: unknown EBR allocation category " << category;
+                }
+        }
+
+        tigonkv::engine::DualRegionAllocator *regions{ nullptr };
 
         std::atomic<uint64_t> global_epoch{ 0 };
 
