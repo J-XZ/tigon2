@@ -186,14 +186,6 @@ inline int RunE2E08MultiVm() {
     return 0;
   }
   const std::string phase = Env("TIGONKV_E2E_PHASE", "fill");
-  if (phase == "rebuild") {
-    CheckpointOrThrow(*main_store);
-    const Status status = main_store->RebuildSortedIndex();
-    if (!status.ok()) throw std::runtime_error("e2e08 sorted index rebuild failed: " + status.message);
-    CheckpointOrThrow(*main_store);
-    std::cout << "TIGONKV_MULTI_VM_REBUILD node=" << config.node_id << " passed.\n";
-    return 0;
-  }
   const uint64_t total = PositiveEnv("TIGONKV_E2E08_TOTAL_KEYS", 100000);
   PhaseResult result;
   if (phase == "fill") {
@@ -240,14 +232,6 @@ inline int RunE2E09MultiVm() {
     return 0;
   }
   const std::string phase = Env("TIGONKV_E2E_PHASE", "fill");
-  if (phase == "rebuild") {
-    CheckpointOrThrow(*main_store);
-    const Status status = main_store->RebuildSortedIndex();
-    if (!status.ok()) throw std::runtime_error("e2e09 sorted index rebuild failed: " + status.message);
-    CheckpointOrThrow(*main_store);
-    std::cout << "TIGONKV_MULTI_VM_REBUILD node=" << config.node_id << " passed.\n";
-    return 0;
-  }
   const uint64_t total = PositiveEnv("TIGONKV_E2E09_TOTAL_KEYS", 100000);
   PhaseResult result;
   if (phase == "fill" || phase == "update") {

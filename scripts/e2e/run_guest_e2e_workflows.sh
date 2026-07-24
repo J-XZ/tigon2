@@ -67,7 +67,7 @@ run_remote() {
   if [[ "$phase" == init ]]; then
     extra="$extra TIGONKV_E2E_MULTI_VM_INIT_ONLY=1"
   fi
-  local command="env TIGONKV_E2E_MULTI_VM=1 TIGONKV_E2E_BATCH_SORTED_INDEX=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' $extra '$remote_root/build/e2e_${suite}'"
+  local command="env TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' $extra '$remote_root/build/e2e_${suite}'"
   timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" root@127.0.0.1 "$command" >"$log" 2>&1
 }
 
@@ -112,19 +112,6 @@ run_phase() {
   echo "TIGONKV_MULTI_VM_E2E suite=$suite round=$round phase=$phase pass"
 }
 
-run_rebuild() {
-  local suite=$1 round=$2
-  local log="$log_root/round${round}/e2e_${suite}/rebuild/vm0.log"
-  mkdir -p "$(dirname "$log")"
-  run_remote "$suite" rebuild 0 0 "$log"
-  rg -q "TIGONKV_MULTI_VM_REBUILD node=0 passed\." "$log" || {
-    echo "sorted index rebuild failed: suite=$suite round=$round" >&2
-    tail -n 80 "$log" >&2 || true
-    return 1
-  }
-  echo "TIGONKV_MULTI_VM_E2E suite=$suite round=$round phase=rebuild pass"
-}
-
 for suite in $suites; do
   case "$suite" in
     08) phases=(fill read) ;;
@@ -144,9 +131,6 @@ for suite in $suites; do
       exit 1
     }
     for phase in "${phases[@]}"; do
-      if [[ "$phase" == read ]]; then
-        run_rebuild "$suite" "$round"
-      fi
       run_phase "$suite" "$phase" "$round"
     done
     echo "TIGONKV_MULTI_VM_E2E suite=$suite round=$round pass"

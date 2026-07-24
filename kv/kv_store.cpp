@@ -398,8 +398,6 @@ Status KVStore::Checkpoint() {
   return status;
 }
 
-Status KVStore::RebuildSortedIndex() { return Status::Ok(); }
-
 MemoryStats KVStore::Memory() const { return impl_->engine->Memory(); }
 
 RuntimeStats KVStore::Runtime() const {

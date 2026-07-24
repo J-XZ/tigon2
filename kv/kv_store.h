@@ -169,9 +169,6 @@ class KVStore {
   Status PollTransport();
 
   Status Checkpoint();
-  // Rebuild the persistent sorted SCAN index after an explicitly batched
-  // ingest. Normal PUTs maintain this index online.
-  Status RebuildSortedIndex();
   MemoryStats Memory() const;
   RuntimeStats Runtime() const;
   uint32_t StablePartitionForKey(std::string_view key) const;
