@@ -10,6 +10,8 @@ RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
                                             uint32_t shard_count) {
   if (region == nullptr || region_bytes < Align(sizeof(RegionAllocatorHeader)) || shard_count == 0)
     throw std::invalid_argument("invalid allocator region");
+  if (reinterpret_cast<uintptr_t>(region) % kAlignment != 0)
+    throw std::invalid_argument("allocator region is not cacheline aligned");
   std::memset(region, 0, sizeof(RegionAllocatorHeader));
   auto *header = new (region) RegionAllocatorHeader;
   header->shard_count = shard_count;
@@ -21,6 +23,8 @@ RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
 RegionAllocator RegionAllocator::Attach(void *region, uint64_t region_bytes) {
   if (region == nullptr || region_bytes < sizeof(RegionAllocatorHeader))
     throw std::invalid_argument("invalid allocator attachment");
+  if (reinterpret_cast<uintptr_t>(region) % kAlignment != 0)
+    throw std::invalid_argument("allocator attachment is not cacheline aligned");
   auto *header = static_cast<RegionAllocatorHeader *>(region);
   if (header->magic != 0x5449474f4e414c4cULL || header->version != 1 ||
       header->region_bytes != region_bytes || header->shard_count == 0)
