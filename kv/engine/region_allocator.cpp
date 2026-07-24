@@ -2,8 +2,13 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fcntl.h>
 #include <immintrin.h>
 #include <new>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace tigonkv::engine {
 namespace {
@@ -152,16 +157,16 @@ void *RegionAllocator::Allocate(uint64_t bytes, AllocationDomain, DomainCounter 
   if (bytes == 0 || counter == nullptr || owner_shard >= header_->shard_count)
     throw std::invalid_argument("invalid allocation");
   ReapRemote(owner_shard, counter);
-  const uint64_t aligned = Align(std::max<uint64_t>(bytes, sizeof(RegionFreeBlock)));
-  const uint32_t size_class = SizeClass(aligned);
-  void *result = AllocateFromShard(aligned, size_class, owner_shard);
+  const uint64_t requested = Align(bytes + Align(sizeof(RegionFreeBlock)));
+  const uint32_t size_class = SizeClass(requested);
+  void *result = AllocateFromShard(requested, size_class, owner_shard);
   if (size_class < kAllocatorSizeClasses) {
     auto *block = new (result) RegionFreeBlock;
     block->size_class = size_class;
     block->owner_shard = owner_shard;
   }
-  AccountAllocate(size_class < kAllocatorSizeClasses ? ClassBytes(size_class) : aligned, counter);
-  return result;
+  AccountAllocate(size_class < kAllocatorSizeClasses ? ClassBytes(size_class) : requested, counter);
+  return static_cast<std::byte *>(result) + Align(sizeof(RegionFreeBlock));
 }
 
 void RegionAllocator::FreeLocal(RegionOffset offset, uint32_t size_class, uint32_t owner_shard) {
@@ -180,14 +185,15 @@ void RegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain,
   if (!Contains(pointer) || bytes == 0 || counter == nullptr ||
       owner_shard >= header_->shard_count || current_shard >= header_->shard_count)
     throw std::invalid_argument("invalid free");
-  const uint64_t aligned = Align(std::max<uint64_t>(bytes, sizeof(RegionFreeBlock)));
-  const uint32_t size_class = SizeClass(aligned);
+  const uint64_t requested = Align(bytes + Align(sizeof(RegionFreeBlock)));
+  const uint32_t size_class = SizeClass(requested);
   if (size_class == kAllocatorSizeClasses)
     throw std::invalid_argument("large allocations are not individually reusable");
-  auto *block = static_cast<RegionFreeBlock *>(pointer);
+  auto *block = reinterpret_cast<RegionFreeBlock *>(
+      static_cast<std::byte *>(pointer) - Align(sizeof(RegionFreeBlock)));
   if (block->owner_shard != owner_shard || block->size_class != size_class)
     throw std::runtime_error("allocator owner or size-class mismatch");
-  const RegionOffset offset = ToOffset(pointer);
+  const RegionOffset offset = ToOffset(block);
   if (owner_shard == current_shard) {
     FreeLocal(offset, size_class, owner_shard);
   } else {
@@ -217,7 +223,8 @@ void *RegionAllocator::FromOffset(RegionOffset offset) const {
 
 bool RegionAllocator::Contains(const void *pointer) const {
   const auto *p = static_cast<const std::byte *>(pointer);
-  return p != nullptr && p >= base_ + header_->metadata_bytes && p < base_ + bytes_;
+  return p != nullptr && p >= base_ + header_->metadata_bytes + Align(sizeof(RegionFreeBlock)) &&
+         p < base_ + bytes_;
 }
 
 bool DualRegionAllocator::IsHwccDomain(AllocationDomain domain) {
@@ -327,6 +334,81 @@ bool DualRegionAllocator::IsHwccAddress(const void *pointer) const {
 
 bool DualRegionAllocator::IsSwccAddress(const void *pointer) const {
   return swcc_.Contains(pointer);
+}
+
+DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,
+                                                const DualRegionConfig &config,
+                                                bool reset) {
+  if (path.empty() || config.total_pool_bytes == 0)
+    throw std::invalid_argument("invalid dual-region backing-file request");
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0660);
+  if (fd < 0) throw std::runtime_error("open dual-region backing file failed");
+  try {
+    if (flock(fd, LOCK_EX) != 0) throw std::runtime_error("lock dual-region backing file failed");
+    struct stat st {};
+    if (fstat(fd, &st) != 0) throw std::runtime_error("stat dual-region backing file failed");
+    if (reset) {
+      if (ftruncate(fd, static_cast<off_t>(config.total_pool_bytes)) != 0)
+        throw std::runtime_error("resize dual-region backing file failed");
+    } else if (st.st_size != static_cast<off_t>(config.total_pool_bytes)) {
+      throw std::runtime_error("dual-region backing file size mismatch");
+    }
+    void *base = mmap(nullptr, config.total_pool_bytes, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) throw std::runtime_error("map dual-region backing file failed");
+    std::unique_ptr<DualRegionAllocator> allocator;
+    try {
+      if (reset) {
+        std::memset(base, 0, config.total_pool_bytes);
+        allocator = std::make_unique<DualRegionAllocator>(
+            DualRegionAllocator::Initialize(base, config));
+      } else {
+        allocator = std::make_unique<DualRegionAllocator>(
+            DualRegionAllocator::Attach(base, config));
+      }
+    } catch (...) {
+      munmap(base, config.total_pool_bytes);
+      throw;
+    }
+    flock(fd, LOCK_UN);
+    return DualRegionMappedPool(fd, base, config.total_pool_bytes, std::move(allocator));
+  } catch (...) {
+    flock(fd, LOCK_UN);
+    ::close(fd);
+    throw;
+  }
+}
+
+DualRegionMappedPool::~DualRegionMappedPool() { Close(); }
+
+DualRegionMappedPool::DualRegionMappedPool(DualRegionMappedPool &&other) noexcept
+    : fd_(other.fd_), base_(other.base_), bytes_(other.bytes_),
+      allocator_(std::move(other.allocator_)) {
+  other.fd_ = -1;
+  other.base_ = nullptr;
+  other.bytes_ = 0;
+}
+
+DualRegionMappedPool &DualRegionMappedPool::operator=(DualRegionMappedPool &&other) noexcept {
+  if (this == &other) return *this;
+  Close();
+  fd_ = other.fd_;
+  base_ = other.base_;
+  bytes_ = other.bytes_;
+  allocator_ = std::move(other.allocator_);
+  other.fd_ = -1;
+  other.base_ = nullptr;
+  other.bytes_ = 0;
+  return *this;
+}
+
+void DualRegionMappedPool::Close() noexcept {
+  allocator_.reset();
+  if (base_ != nullptr) munmap(base_, bytes_);
+  if (fd_ >= 0) ::close(fd_);
+  fd_ = -1;
+  base_ = nullptr;
+  bytes_ = 0;
 }
 
 }  // namespace tigonkv::engine

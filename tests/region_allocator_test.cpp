@@ -53,8 +53,8 @@ void TestAttachReuseAndAccounting() {
   void *second = allocator.Allocate(80, AllocationDomain::kSharedPayloadSwcc, &payload, 1);
   assert(reinterpret_cast<uintptr_t>(first) % RegionAllocator::kAlignment == 0);
   assert(reinterpret_cast<uintptr_t>(second) % RegionAllocator::kAlignment == 0);
-  assert(index.used_bytes.load() == 64);
-  assert(payload.used_bytes.load() == 128);
+  assert(index.used_bytes.load() == 128);
+  assert(payload.used_bytes.load() == 192);
   const RegionOffset offset = allocator.ToOffset(second);
   auto attached = RegionAllocator::Attach(mapping.base, kBytes);
   assert(attached.FromOffset(offset) == second);
@@ -65,7 +65,7 @@ void TestAttachReuseAndAccounting() {
   allocator.Free(reused, 1, AllocationDomain::kHwccIndex, &index, 0, 0);
   allocator.Free(second, 80, AllocationDomain::kSharedPayloadSwcc, &payload, 1, 1);
   assert(index.used_bytes.load() == 0 && payload.used_bytes.load() == 0);
-  assert(index.peak_bytes.load() == 64 && payload.peak_bytes.load() == 128);
+  assert(index.peak_bytes.load() == 128 && payload.peak_bytes.load() == 192);
 }
 
 void TestCrossProcessRemoteFree() {
@@ -177,6 +177,54 @@ void TestDualPhysicalRegions() {
              .used_bytes.load() == 0);
 }
 
+DualRegionConfig TestDualConfig() {
+  DualRegionConfig config;
+  config.total_pool_bytes = kBytes;
+  config.hwcc_offset_bytes = 0;
+  config.hwcc_size_bytes = 1024 * 1024;
+  config.swcc_offset_bytes = 1024 * 1024;
+  config.swcc_size_bytes = kBytes - config.swcc_offset_bytes;
+  config.config_hash = 0x9898;
+  config.vm_count = 2;
+  config.partition_count = 8;
+  config.fixed_key_size = 32;
+  config.fixed_value_size = 128;
+  return config;
+}
+
+void TestMappedPoolAttach() {
+  char path[] = "/tmp/tigonkv-dual-pool-XXXXXX";
+  const int seed_fd = mkstemp(path);
+  assert(seed_fd >= 0);
+  close(seed_fd);
+  const DualRegionConfig config = TestDualConfig();
+  auto parent = DualRegionMappedPool::Open(path, config, true);
+  auto *payload = static_cast<char *>(parent.allocator().Allocate(
+      64, AllocationDomain::kSharedPayloadSwcc, 0));
+  std::memcpy(payload, "mapped-payload", 15);
+  const RegionOffset payload_offset = parent.allocator().swcc().ToOffset(payload);
+  const pid_t child = fork();
+  assert(child >= 0);
+  if (child == 0) {
+    try {
+      auto attached = DualRegionMappedPool::Open(path, config, false);
+      auto *child_payload = static_cast<char *>(
+          attached.allocator().swcc().FromOffset(payload_offset));
+      if (std::strcmp(child_payload, "mapped-payload") != 0) _exit(2);
+      void *index = attached.allocator().Allocate(64, AllocationDomain::kHwccIndex, 1);
+      if (!attached.allocator().IsHwccAddress(index)) _exit(3);
+      _exit(0);
+    } catch (...) {
+      _exit(4);
+    }
+  }
+  int status = 0;
+  assert(waitpid(child, &status, 0) == child);
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  parent.allocator().Free(payload, 64, AllocationDomain::kSharedPayloadSwcc, 0, 0);
+  unlink(path);
+}
+
 }  // namespace
 
 int main() {
@@ -185,5 +233,6 @@ int main() {
   TestConcurrencyAndBounds();
   TestInvalidAttachment();
   TestDualPhysicalRegions();
+  TestMappedPoolAttach();
   return 0;
 }

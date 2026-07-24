@@ -5,7 +5,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
+#include <string>
 
 namespace tigonkv::engine {
 
@@ -144,6 +146,34 @@ class DualRegionAllocator {
   DualRegionPersistentHeader *header_;
   RegionAllocator hwcc_;
   RegionAllocator swcc_;
+};
+
+// Owns one MAP_SHARED backing-file mapping. Initialization is serialized with
+// the backing file lock; normal attach never rewrites allocator metadata.
+class DualRegionMappedPool {
+ public:
+  static DualRegionMappedPool Open(const std::string &path,
+                                   const DualRegionConfig &config, bool reset);
+  ~DualRegionMappedPool();
+  DualRegionMappedPool(DualRegionMappedPool &&other) noexcept;
+  DualRegionMappedPool &operator=(DualRegionMappedPool &&other) noexcept;
+  DualRegionMappedPool(const DualRegionMappedPool &) = delete;
+  DualRegionMappedPool &operator=(const DualRegionMappedPool &) = delete;
+
+  DualRegionAllocator &allocator() { return *allocator_; }
+  const DualRegionAllocator &allocator() const { return *allocator_; }
+  void *base() const { return base_; }
+  uint64_t bytes() const { return bytes_; }
+
+ private:
+  DualRegionMappedPool(int fd, void *base, uint64_t bytes,
+                       std::unique_ptr<DualRegionAllocator> allocator)
+      : fd_(fd), base_(base), bytes_(bytes), allocator_(std::move(allocator)) {}
+  void Close() noexcept;
+  int fd_ = -1;
+  void *base_ = nullptr;
+  uint64_t bytes_ = 0;
+  std::unique_ptr<DualRegionAllocator> allocator_;
 };
 
 }  // namespace tigonkv::engine
