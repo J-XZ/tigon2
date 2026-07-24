@@ -1,6 +1,8 @@
 #include "kv/engine/kv_types_layout.h"
 
 #include <cassert>
+#include <cstring>
+#include <new>
 
 int main() {
   using namespace tigonkv::engine;
@@ -20,5 +22,20 @@ int main() {
                      std::memory_order_release);
   assert(header.IsCompatible(7, 4096, 2, 16));
   assert(!header.IsCompatible(8, 4096, 2, 16));
+  assert(header.partitions[3].private_root == kNullOffset);
+  header.partitions[3].private_root = 64;
+  header.partitions[3].shared_root = 128;
+  header.partitions[3].migration_in_seq.store(1, std::memory_order_release);
+  assert(header.partitions[3].private_root == 64);
+  assert(header.partitions[3].migration_in_seq.load(std::memory_order_acquire) == 1);
+
+  alignas(PrivateRow) std::byte storage[sizeof(PrivateRow) + 16]{};
+  auto *row = new (storage) PrivateRow;
+  row->key_len = 3;
+  row->value_len = 5;
+  row->version = 9;
+  std::memcpy(row->kv, "keyvalue", 8);
+  assert(std::memcmp(row->kv, "keyvalue", 8) == 0);
+  assert(row->migrated_smeta_off == kNullOffset && row->is_migrated == 0);
   return 0;
 }

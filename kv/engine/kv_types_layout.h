@@ -18,6 +18,7 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5633ULL;  // TIGONKV3
 constexpr uint32_t kSharedLayoutVersion = 1;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
+constexpr size_t kMaxPartitions = 256;
 
 enum class AllocationDomain : uint32_t {
   kHwccIndex = 0,
@@ -64,6 +65,27 @@ struct FixedKeyLess {
   }
 };
 
+// Owner-private SWCC row header. The key bytes are followed by value bytes in
+// kv[]; no raw process pointer is persisted here.
+struct alignas(64) PrivateRow {
+  std::atomic<uint32_t> latch{0};
+  uint8_t is_migrated = 0;
+  uint8_t is_tombstone = 0;
+  uint16_t key_len = 0;
+  uint32_t value_len = 0;
+  uint64_t version = 0;
+  RegionOffset migrated_smeta_off = kNullOffset;
+  char kv[];
+};
+
+struct alignas(64) PartitionDirectoryEntry {
+  RegionOffset private_root = kNullOffset;
+  RegionOffset shared_root = kNullOffset;
+  RegionOffset private_arena = kNullOffset;
+  std::atomic<uint64_t> migration_in_seq{0};
+  std::atomic<uint64_t> migration_out_seq{0};
+};
+
 // The first object in the HWCC region. Fields are fixed-width so an attach in a
 // separately mapped process can validate the complete layout before dereference.
 struct alignas(64) SharedLayoutHeader {
@@ -82,6 +104,7 @@ struct alignas(64) SharedLayoutHeader {
   uint32_t fixed_value_size = 0;
   std::atomic<uint64_t> clean_epoch{0};
   std::array<std::atomic<RegionOffset>, kRootSlotCount> roots{};
+  std::array<PartitionDirectoryEntry, kMaxPartitions> partitions{};
   std::array<DomainCounter, kAllocationDomainCount> domains{};
 
   bool IsCompatible(uint64_t expected_hash, uint64_t expected_pool_bytes,
@@ -96,5 +119,7 @@ struct alignas(64) SharedLayoutHeader {
 
 static_assert(alignof(SharedLayoutHeader) == 64);
 static_assert(sizeof(FixedKey) == kMaxFixedKeyBytes);
+static_assert(alignof(PrivateRow) == 64);
+static_assert(alignof(PartitionDirectoryEntry) == 64);
 
 }  // namespace tigonkv::engine
