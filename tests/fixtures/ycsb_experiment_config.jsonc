@@ -16,7 +16,7 @@
     "migration_policy": "Clock",
     "when_to_move_out": "OnDemand",
     "scc_mechanism": "WriteThrough",
-    "transport_ring_total_mb": 16,
+    "transport_ring_total_mb": 1,
     "latency_inject": {
       "enabled": false, "foreground_enabled": false, "merge_enabled": false,
       "stats_enabled": false, "cache_line_bytes": 64,
