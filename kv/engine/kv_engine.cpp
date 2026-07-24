@@ -179,6 +179,12 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   if (!local.status.ok()) return local;
   std::map<std::string, std::string> merged;
   for (auto &item : local.items) merged.emplace(std::move(item.key), std::move(item.value));
+
+  // Register every request before sending any of them.  This gives all remote
+  // owners an opportunity to make progress concurrently while the caller
+  // polls its incoming ring below.
+  std::vector<uint64_t> remote_request_ids;
+  remote_request_ids.reserve(config_.vm_count > 0 ? config_.vm_count - 1 : 0);
   for (uint32_t node = 0; node < config_.vm_count; ++node) {
     if (node == config_.node_id) continue;
     const uint64_t request_id = (static_cast<uint64_t>(config_.node_id) << 56) | next_request_id_++;
@@ -192,11 +198,24 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     } catch (const std::exception &e) {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       pending_scans_.erase(request_id);
+      for (const uint64_t pending_id : remote_request_ids) pending_scans_.erase(pending_id);
       return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
     }
+    remote_request_ids.push_back(request_id);
+  }
+
+  // Awaiting the first owner continuously polls the local ring, so responses
+  // from every owner are received concurrently instead of serializing network
+  // request issuance behind each owner's full scan.
+  for (const uint64_t request_id : remote_request_ids) {
     std::vector<ScanItem> remote;
     const Status status = AwaitScan(request_id, &remote);
-    if (!status.ok()) return {status, {}};
+    if (!status.ok()) {
+      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+      for (const uint64_t pending_id : remote_request_ids)
+        pending_scans_.erase(pending_id);
+      return {status, {}};
+    }
     for (auto &item : remote) merged.emplace(std::move(item.key), std::move(item.value));
   }
   ScanResult result{Status::Ok(), {}};
@@ -311,12 +330,12 @@ Status KVEngine::Checkpoint() {
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {
-  network_tx_bytes_.fetch_add(sizeof(message), std::memory_order_relaxed);
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
     PollTransport();
     std::this_thread::yield();
   }
+  network_tx_bytes_.fetch_add(sizeof(message), std::memory_order_relaxed);
 }
 
 Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_view value,
