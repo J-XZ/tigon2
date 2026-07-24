@@ -41,7 +41,6 @@ cd ${BUILD_DIR}
 mkdir -p mkosi.extra/root/.ssh
 cp -L ~/.ssh/id_rsa.pub mkosi.extra/root/.ssh/authorized_keys
 cp ~/.ssh/id_rsa.pub mkosi.extra/root/.ssh
-cp ~/.ssh/id_rsa mkosi.extra/root/.ssh
 touch ${BUILD_DIR}/mkosi.extra/root/.ssh/config
 chmod +w ${BUILD_DIR}/mkosi.extra/root/.ssh/config || true
 echo -e "Host *\n    StrictHostKeyChecking no" >> ${BUILD_DIR}/mkosi.extra/root/.ssh/config
