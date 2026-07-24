@@ -28,22 +28,14 @@ elseif(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
-include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/dependencies/cxlalloc)
-find_library(jemalloc_lib jemalloc)
-
-file(GLOB_RECURSE MISC_CPP_FILES CONFIGURE_DEPENDS
-  common/*.cpp protocol/Pasha/*.cpp protocol/SundialPasha/*.cpp
-  protocol/TwoPLPasha/*.cpp core/*.cpp)
-add_library(misc_cpp STATIC ${MISC_CPP_FILES})
+include_directories(${CMAKE_SOURCE_DIR})
 
 add_library(tigonkv STATIC kv/kv_store.cpp kv/latency_simulator.cpp
   kv/engine/region_allocator.cpp)
 target_link_libraries(tigonkv PUBLIC pthread)
 
-add_executable(bench_tpcc bench_tpcc.cpp)
-target_link_libraries(bench_tpcc misc_cpp ${CMAKE_SOURCE_DIR}/dependencies/cxlalloc/libcxlalloc_static.a ${jemalloc_lib} glog gflags)
-add_executable(bench_ycsb bench_ycsb.cpp)
-target_link_libraries(bench_ycsb misc_cpp ${CMAKE_SOURCE_DIR}/dependencies/cxlalloc/libcxlalloc_static.a ${jemalloc_lib} glog gflags)
+# tigonkv: legacy transaction benchmarks retain source-only reference status.
+# The redesigned KV target must not link the obsolete cxlalloc implementation.
 
 add_executable(unit_tests tests/tigonkv_tests.cpp)
 target_link_libraries(unit_tests PRIVATE tigonkv)
