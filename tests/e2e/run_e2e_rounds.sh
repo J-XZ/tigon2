@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-rounds=${1:-5}
+rounds=${1:-10}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 for ((round=1; round<=rounds; ++round)); do
   echo "TIGONKV_E2E_ROUND round=$round"
