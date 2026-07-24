@@ -35,6 +35,9 @@ Config TestConfig(const std::string &path, uint32_t node = 0) {
   c.partition_count = 8;
   c.fixed_key_size = 32;
   c.fixed_value_size = 128;
+  c.hw_cc_budget_mb = 1;
+  c.owner_private_swcc_fraction = 0.35;
+  c.transport_ring_total_mb = 16;
   return c;
 }
 
@@ -366,29 +369,36 @@ void TestLatencyAndStrictAccess() {
 void TestConfig() {
   const std::string path = "/tmp/tigonkv-config-" + std::to_string(getpid()) + ".jsonc";
   std::ofstream out(path);
-  out << R"({"shared_memory":{"size_mb":16,"path":"/tmp/x","device_path":"/dev/ivpci0","hwcc":{"offset_mb":0,"size_mb":1},"swcc":{"offset_mb":1,"size_mb":15}},"vm":{"count":2},"tigon_kv":{"partition_count":8,"fixed_key_size":32,"fixed_value_size":128,"hwcc_budget_mb":1,"enable_scan":true,"latency_inject":{"cache_model":"fixed_hit_rate","cache_fixed_hit_rate":0.5,"cache_capacity_lines":4}}})";
+  out << R"({"shared_memory":{"size_mb":16,"path":"/tmp/x","device_path":"/dev/ivpci0","hwcc":{"offset_mb":0,"size_mb":1},"swcc":{"offset_mb":1,"size_mb":15}},"vm":{"count":2},"tigon_kv":{"partition_count":8,"fixed_key_size":32,"fixed_value_size":128,"hw_cc_budget_mb":1,"owner_private_swcc_fraction":0.35,"migration_policy":"Clock","when_to_move_out":"OnDemand","scc_mechanism":"WriteThrough","transport_ring_total_mb":16,"latency_inject":{"enabled":false,"foreground_enabled":false,"merge_enabled":false,"stats_enabled":false,"cache_line_bytes":64,"swcc_read_ns_per_line":0,"swcc_write_ns_per_line":0,"swcc_flush_ns_per_line":0,"hwcc_read_ns_per_line":0,"hwcc_write_ns_per_line":0,"hwcc_atomic_load_ns":0,"hwcc_atomic_store_ns":0,"hwcc_atomic_rmw_ns":0,"cache_model":"fixed_hit_rate","cache_hits_enabled":false,"cache_fixed_hit_rate":0.5,"cache_capacity_lines":4,"cache_associativity":1,"cache_hit_extra_ns":0}}})";
   out.close();
   Config c = Config::FromJsonc(path);
   assert(c.size_mb == 16 && c.vm_count == 2 && c.hwcc_size_mb == 1);
   assert(c.shared_memory_numa_node == 1 && c.vm_numa_node == 0);
   assert(c.vm_storage_path == "/mnt/xz_vm_storage" && c.network_base_ssh_port == 2200);
   assert(c.sync_timeout_sec == 60 && c.foreground_worker_count_per_vm == 1);
-  assert(c.owner_private_swcc_fraction == 0.0 && c.shared_payload_swcc_fraction == 0.0);
+  assert(c.owner_private_swcc_fraction == 0.35 && c.hw_cc_budget_mb == 1);
   assert(c.latency_cache_model == "fixed_hit_rate" && c.latency_cache_fixed_hit_rate == 0.5 && c.latency_cache_capacity_lines == 4);
   std::remove(path.c_str());
 
   Config experiment = Config::FromJsonc(std::string(TIGONKV_SOURCE_DIR) + "/experiment_config.jsonc");
   assert(experiment.shared_memory_numa_node == 1 && experiment.vm_numa_node == 0);
-  assert(experiment.hwcc_reserved_mb == 64);
-  assert(experiment.owner_private_swcc_fraction == 0.75);
-  assert(experiment.shared_payload_swcc_fraction == 0.25);
-  assert(experiment.migration_policy == "Clock" && !experiment.reuse_shared_payload_after_moveout);
+  assert(experiment.hw_cc_budget_mb == 1024);
+  assert(experiment.owner_private_swcc_fraction == 0.35);
+  assert(experiment.migration_policy == "Clock" &&
+         experiment.when_to_move_out == "OnDemand" &&
+         experiment.scc_mechanism == "WriteThrough");
   assert(experiment.vm_storage_path == "/mnt/xz_vm_storage");
 
   std::ofstream bad(path);
   bad << R"({"unknown_field": 1})";
   bad.close();
   bool rejected = false;
+  try { (void)Config::FromJsonc(path); } catch (const std::invalid_argument &) { rejected = true; }
+  assert(rejected);
+  std::ofstream legacy(path);
+  legacy << R"({"tigon_kv":{"hwcc_budget_mb":1}})";
+  legacy.close();
+  rejected = false;
   try { (void)Config::FromJsonc(path); } catch (const std::invalid_argument &) { rejected = true; }
   assert(rejected);
   std::remove(path.c_str());

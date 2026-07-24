@@ -46,10 +46,9 @@ uint64_t ConfigFingerprint(const Config &config) {
       static_cast<uint64_t>(config.shared_memory_numa_node + 1),
       config.vm_core_count_per_vm, static_cast<uint64_t>(config.vm_numa_node + 1),
       config.network_base_ssh_port, config.sync_timeout_sec,
-      config.foreground_worker_count_per_vm, config.hwcc_reserved_mb,
+      config.foreground_worker_count_per_vm, config.hw_cc_budget_mb,
       static_cast<uint64_t>(config.owner_private_swcc_fraction * 1000000000.0),
-      static_cast<uint64_t>(config.shared_payload_swcc_fraction * 1000000000.0),
-      config.reuse_shared_payload_after_moveout ? 1ULL : 0ULL};
+      config.transport_ring_total_mb};
   for (uint64_t field : fields) {
     h ^= field + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
   }
@@ -66,6 +65,8 @@ uint64_t ConfigFingerprint(const Config &config) {
   mix_core_list(config.ivshmem_server_cores);
   mix_core_list(config.vm_cores);
   h ^= HashBytes(config.migration_policy) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+  h ^= HashBytes(config.when_to_move_out) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+  h ^= HashBytes(config.scc_mechanism) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
   return h;
 }
 
@@ -152,14 +153,16 @@ void ValidateKnownKeys(const std::string &s) {
       "network", "base_ssh_port", "sync", "e2e",
       "foreground_worker_count_per_vm", "tigon_kv", "partition_count",
       "timeout_sec",
-      "fixed_key_size", "fixed_value_size", "hwcc_budget_mb", "hwcc_reserved_mb",
-      "owner_private_swcc_fraction", "shared_payload_swcc_fraction",
-      "migration_policy", "reuse_shared_payload_after_moveout",
-      "checkpoint_on_clean_exit", "enable_scan", "strict_swcc_access",
-      "latency_inject", "enabled", "swcc_read_ns", "swcc_write_ns",
-      "swcc_flush_ns", "hwcc_read_ns", "hwcc_write_ns", "hwcc_atomic_ns",
-      "cache_model", "cache_fixed_hit_rate", "cache_capacity_lines",
-      "cache_associativity", "foreground_enabled", "merge_enabled"};
+      "fixed_key_size", "fixed_value_size", "hw_cc_budget_mb",
+      "owner_private_swcc_fraction", "migration_policy", "when_to_move_out",
+      "scc_mechanism", "transport_ring_total_mb",
+      "latency_inject", "enabled", "foreground_enabled", "merge_enabled",
+      "stats_enabled", "cache_line_bytes", "swcc_read_ns_per_line",
+      "swcc_write_ns_per_line", "swcc_flush_ns_per_line", "hwcc_read_ns_per_line",
+      "hwcc_write_ns_per_line", "hwcc_atomic_load_ns", "hwcc_atomic_store_ns",
+      "hwcc_atomic_rmw_ns", "cache_model", "cache_hits_enabled",
+      "cache_capacity_lines", "cache_associativity", "cache_fixed_hit_rate",
+      "cache_hit_extra_ns"};
   std::regex key(R"KEY("([A-Za-z0-9_.-]+)"\s*:)KEY");
   for (auto it = std::sregex_iterator(s.begin(), s.end(), key); it != std::sregex_iterator(); ++it) {
     if (!known.count((*it)[1].str()))
@@ -473,29 +476,37 @@ Config Config::FromJsonc(const std::string &path) {
   JsonNumber(text, "partition_count", &c.partition_count);
   JsonNumber(text, "fixed_key_size", &c.fixed_key_size);
   JsonNumber(text, "fixed_value_size", &c.fixed_value_size);
-  JsonNumber(text, "hwcc_budget_mb", &c.hwcc_size_mb);
-  JsonNumber(text, "hwcc_reserved_mb", &c.hwcc_reserved_mb);
+  JsonNumber(text, "hw_cc_budget_mb", &c.hw_cc_budget_mb);
   JsonDouble(text, "owner_private_swcc_fraction", &c.owner_private_swcc_fraction);
-  JsonDouble(text, "shared_payload_swcc_fraction", &c.shared_payload_swcc_fraction);
   JsonString(text, "migration_policy", &c.migration_policy);
-  JsonBool(text, "reuse_shared_payload_after_moveout", &c.reuse_shared_payload_after_moveout);
+  JsonString(text, "when_to_move_out", &c.when_to_move_out);
+  JsonString(text, "scc_mechanism", &c.scc_mechanism);
+  JsonNumber(text, "transport_ring_total_mb", &c.transport_ring_total_mb);
   JsonNumberInObject(text, "hwcc", "offset_mb", &c.hwcc_offset_mb);
   JsonNumberInObject(text, "hwcc", "size_mb", &c.hwcc_size_mb);
   JsonNumberInObject(text, "swcc", "offset_mb", &c.swcc_offset_mb);
   JsonNumberInObject(text, "swcc", "size_mb", &c.swcc_size_mb);
-  JsonBool(text, "enable_scan", &c.enable_scan);
-  JsonBool(text, "strict_swcc_access", &c.strict_swcc_access);
-  JsonBool(text, "checkpoint_on_clean_exit", &c.checkpoint_on_clean_exit);
   JsonBool(text, "enabled", &c.latency_enabled);
-  JsonNumber(text, "swcc_read_ns", &c.swcc_read_ns);
-  JsonNumber(text, "swcc_write_ns", &c.swcc_write_ns);
-  JsonNumber(text, "swcc_flush_ns", &c.swcc_flush_ns);
-  JsonNumber(text, "hwcc_read_ns", &c.hwcc_read_ns);
-  JsonNumber(text, "hwcc_write_ns", &c.hwcc_write_ns);
-  JsonNumber(text, "hwcc_atomic_ns", &c.hwcc_atomic_ns);
+  JsonBool(text, "foreground_enabled", &c.latency_foreground_enabled);
+  JsonBool(text, "merge_enabled", &c.latency_merge_enabled);
+  JsonBool(text, "stats_enabled", &c.latency_stats_enabled);
+  JsonNumber(text, "cache_line_bytes", &c.latency_cache_line_bytes);
+  JsonNumber(text, "swcc_read_ns_per_line", &c.swcc_read_ns);
+  JsonNumber(text, "swcc_write_ns_per_line", &c.swcc_write_ns);
+  JsonNumber(text, "swcc_flush_ns_per_line", &c.swcc_flush_ns);
+  JsonNumber(text, "hwcc_read_ns_per_line", &c.hwcc_read_ns);
+  JsonNumber(text, "hwcc_write_ns_per_line", &c.hwcc_write_ns);
+  JsonNumber(text, "hwcc_atomic_load_ns", &c.hwcc_atomic_load_ns);
+  JsonNumber(text, "hwcc_atomic_store_ns", &c.hwcc_atomic_store_ns);
+  JsonNumber(text, "hwcc_atomic_rmw_ns", &c.hwcc_atomic_rmw_ns);
+  c.hwcc_atomic_ns = std::max({c.hwcc_atomic_load_ns, c.hwcc_atomic_store_ns,
+                                c.hwcc_atomic_rmw_ns});
   JsonString(text, "cache_model", &c.latency_cache_model);
+  JsonBool(text, "cache_hits_enabled", &c.latency_cache_hits_enabled);
   JsonDouble(text, "cache_fixed_hit_rate", &c.latency_cache_fixed_hit_rate);
   JsonNumber(text, "cache_capacity_lines", &c.latency_cache_capacity_lines);
+  JsonNumber(text, "cache_associativity", &c.latency_cache_associativity);
+  JsonNumber(text, "cache_hit_extra_ns", &c.latency_cache_hit_extra_ns);
   if (c.shared_memory_path == "/mnt/xz_shared_mem" || c.shared_memory_path == "/mnt/xz_shared_mem/")
     c.shared_memory_path = "/mnt/xz_shared_mem/ivshmem_shared_mem";
   c.Validate();
@@ -513,15 +524,19 @@ void Config::Validate() const {
       fixed_value_size > kMaxValue || shared_memory_numa_node < -1 || vm_numa_node < -1 ||
       network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0)
     throw std::invalid_argument("invalid KV configuration");
-  if (hwcc_reserved_mb > hwcc_size_mb || owner_private_swcc_fraction < 0.0 ||
-      shared_payload_swcc_fraction < 0.0 ||
-      owner_private_swcc_fraction + shared_payload_swcc_fraction > 1.0 + 1e-9)
+  if (hw_cc_budget_mb == 0 || hw_cc_budget_mb > hwcc_size_mb ||
+      owner_private_swcc_fraction <= 0.0 || owner_private_swcc_fraction >= 1.0 ||
+      partition_count % vm_count != 0 || transport_ring_total_mb == 0 ||
+      migration_policy != "Clock" || when_to_move_out != "OnDemand" ||
+      scc_mechanism != "WriteThrough")
     throw std::invalid_argument("invalid allocator budget fractions");
   if (latency_cache_model != "none" && latency_cache_model != "fixed_hit_rate" &&
       latency_cache_model != "per_thread_lru")
     throw std::invalid_argument("unknown latency cache model");
   if (latency_cache_fixed_hit_rate < 0.0 || latency_cache_fixed_hit_rate > 1.0)
     throw std::invalid_argument("latency cache hit rate must be in [0,1]");
+  if (latency_cache_line_bytes != 64 || latency_cache_associativity == 0)
+    throw std::invalid_argument("invalid latency cache geometry");
 }
 
 std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
