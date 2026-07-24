@@ -112,6 +112,7 @@ int main() {
       auto node_one = tigonkv::engine::KVEngine::Open(ConfigFor(routed_path, 2, 1), false);
       if (!node_one->Put(owner_one_key, "owner-one").ok()) _exit(1);
       const auto distributed_scan = node_one->Scan("", 0);
+      const auto limited_scan = node_one->Scan("", 17);
       bool saw_owner_zero = false;
       bool saw_owner_one = false;
       for (const auto &item : distributed_scan.items) {
@@ -123,6 +124,10 @@ int main() {
         bulk_seen += item.value == "bulk";
       if (!distributed_scan.status.ok() || !saw_owner_zero || !saw_owner_one ||
           bulk_seen != kRemoteScanRows) _exit(2);
+      if (!limited_scan.status.ok() || limited_scan.items.size() != 17) _exit(12);
+      for (size_t i = 1; i < limited_scan.items.size(); ++i) {
+        if (limited_scan.items[i - 1].key >= limited_scan.items[i].key) _exit(13);
+      }
       if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(3);
       const auto read = node_one->Get(owner_zero_key);
       if (!read.status.ok() || read.value != "forwarded") _exit(4);

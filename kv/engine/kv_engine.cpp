@@ -10,7 +10,9 @@
 #include <thread>
 #include <chrono>
 #include <charconv>
+#include <algorithm>
 #include <map>
+#include <queue>
 #include <fstream>
 #include <unistd.h>
 
@@ -205,16 +207,49 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
   if (limit > kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
-  ScanResult local = ScanOwnedPartitions(start_key, limit);
-  if (!local.status.ok()) return local;
-  std::map<std::string, std::string> merged;
-  for (auto &item : local.items) merged.emplace(std::move(item.key), std::move(item.value));
+  constexpr uint64_t kPageSize = 64;
+  const uint64_t target = limit == 0 ? kScanSafetyLimit : limit;
+  const uint64_t request_limit = kPageSize + 1;  // one cursor duplicate + one page
 
-  // Register every request before sending any of them.  This gives all remote
-  // owners an opportunity to make progress concurrently while the caller
-  // polls its incoming ring below.
+  struct Source {
+    uint32_t node = 0;
+    std::string cursor;
+    bool has_cursor = false;
+    bool more = false;
+    std::vector<ScanItem> items;
+    size_t next = 0;
+  };
+  std::vector<Source> sources;
+  sources.reserve(config_.vm_count);
+
+  auto load_page = [&](Source *source, std::vector<ScanItem> raw) -> Status {
+    source->items.clear();
+    source->next = 0;
+    for (auto &item : raw) {
+      if (source->has_cursor && item.key <= source->cursor) continue;
+      source->items.push_back(std::move(item));
+      if (source->items.size() == kPageSize) break;
+    }
+    // A full request can contain either a complete page or cursor + page.  A
+    // later cursor request disambiguates the boundary without materializing
+    // the remaining owner result.
+    source->more = raw.size() == request_limit;
+    return Status::Ok();
+  };
+
+  Source local;
+  local.node = config_.node_id;
+  ScanResult local_page = ScanOwnedPartitions(start_key, request_limit);
+  if (!local_page.status.ok()) return local_page;
+  load_page(&local, std::move(local_page.items));
+  sources.push_back(std::move(local));
+
+  // Register every first-page request before sending any of them so remote
+  // owners can progress concurrently.  Each response is bounded to 65 rows.
   std::vector<uint64_t> remote_request_ids;
+  std::vector<uint32_t> remote_nodes;
   remote_request_ids.reserve(config_.vm_count > 0 ? config_.vm_count - 1 : 0);
+  remote_nodes.reserve(config_.vm_count > 0 ? config_.vm_count - 1 : 0);
   for (uint32_t node = 0; node < config_.vm_count; ++node) {
     if (node == config_.node_id) continue;
     const uint64_t request_id = NextRequestId(config_.node_id);
@@ -224,7 +259,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     }
     try {
       SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id, node,
-                                       request_id, start_key, EncodeU64(limit)));
+                                       request_id, start_key, EncodeU64(request_limit)));
     } catch (const std::exception &e) {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       pending_scans_.erase(request_id);
@@ -232,12 +267,11 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
     }
     remote_request_ids.push_back(request_id);
+    remote_nodes.push_back(node);
   }
 
-  // Awaiting the first owner continuously polls the local ring, so responses
-  // from every owner are received concurrently instead of serializing network
-  // request issuance behind each owner's full scan.
-  for (const uint64_t request_id : remote_request_ids) {
+  for (size_t remote_index = 0; remote_index < remote_request_ids.size(); ++remote_index) {
+    const uint64_t request_id = remote_request_ids[remote_index];
     std::vector<ScanItem> remote;
     const Status status = AwaitScan(request_id, &remote);
     if (!status.ok()) {
@@ -246,13 +280,63 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
         pending_scans_.erase(pending_id);
       return {status, {}};
     }
-    for (auto &item : remote) merged.emplace(std::move(item.key), std::move(item.value));
+    Source source;
+    source.node = remote_nodes[remote_index];
+    load_page(&source, std::move(remote));
+    sources.push_back(std::move(source));
+  }
+
+  auto refill = [&](Source *source) -> Status {
+    if (!source->more) return Status::Ok();
+    const uint64_t request_id = NextRequestId(config_.node_id);
+    {
+      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+      pending_scans_.emplace(request_id, PendingScan{});
+    }
+    try {
+      SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id,
+                                       source->node, request_id, source->cursor,
+                                       EncodeU64(request_limit)));
+    } catch (const std::exception &e) {
+      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+      pending_scans_.erase(request_id);
+      return Status::Error(StatusCode::kInvalidArgument, e.what());
+    }
+    std::vector<ScanItem> raw;
+    const Status status = AwaitScan(request_id, &raw);
+    if (!status.ok()) return status;
+    return load_page(source, std::move(raw));
+  };
+
+  struct HeapItem { std::string_view key; size_t source; };
+  auto compare = [](const HeapItem &left, const HeapItem &right) {
+    return left.key > right.key;
+  };
+  std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(compare)> heap(compare);
+  for (size_t i = 0; i < sources.size(); ++i) {
+    if (!sources[i].items.empty()) heap.push({sources[i].items[0].key, i});
   }
   ScanResult result{Status::Ok(), {}};
-  for (auto &item : merged) {
-    if (limit != 0 && result.items.size() >= limit) break;
-    result.items.push_back({std::move(item.first), std::move(item.second)});
+  while (!heap.empty() && result.items.size() < target) {
+    const HeapItem item = heap.top();
+    heap.pop();
+    Source &source = sources[item.source];
+    ScanItem row = std::move(source.items[source.next++]);
+    source.cursor = row.key;
+    source.has_cursor = true;
+    if (result.items.empty() || result.items.back().key != row.key)
+      result.items.push_back(std::move(row));
+    if (source.next == source.items.size()) {
+      const Status status = refill(&source);
+      if (!status.ok()) return {status, {}};
+    }
+    if (source.next < source.items.size())
+      heap.push({source.items[source.next].key, item.source});
   }
+  if (limit == 0 && result.items.size() == kScanSafetyLimit &&
+      (!heap.empty() || std::any_of(sources.begin(), sources.end(),
+                                    [](const Source &source) { return source.more; })))
+    return {Status::Error(StatusCode::kInvalidArgument, "scan result exceeds safety cap"), {}};
   return result;
 }
 
