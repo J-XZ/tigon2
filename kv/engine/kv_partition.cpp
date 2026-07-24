@@ -1,4 +1,5 @@
 #include "kv/engine/kv_partition.h"
+#include "kv/engine/mem_access.h"
 
 #include <charconv>
 #include <cstring>
@@ -66,6 +67,7 @@ PrivateRow *KVPartition::AllocateRow(const FixedKey &key, std::string_view value
   row->value_len = static_cast<uint32_t>(value.size());
   std::memcpy(row->kv, key.bytes, row->key_len);
   std::memcpy(row->kv + row->key_len, value.data(), value.size());
+  mem_access::PrivateWrite(row->kv, row->key_len + value.size());
   return row;
 }
 
@@ -106,6 +108,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
     }
     row->value_len = static_cast<uint32_t>(value.size());
     std::memcpy(row->kv + row->key_len, value.data(), value.size());
+    mem_access::PrivateWrite(row->kv + row->key_len, value.size());
     ++row->version;
     UnlockRow(row);
     return false;
@@ -129,6 +132,7 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   }
   if (!row->is_migrated) {
     value->assign(row->kv + row->key_len, row->value_len);
+    mem_access::PrivateRead(row->kv + row->key_len, row->value_len);
     UnlockRow(row);
     return true;
   }
@@ -190,6 +194,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
     if (current == expected) {
       row->value_len = static_cast<uint32_t>(desired.size());
       std::memcpy(row->kv + row->key_len, desired.data(), desired.size());
+      mem_access::PrivateWrite(row->kv + row->key_len, desired.size());
       ++row->version;
       *exchanged = true;
     }
@@ -249,6 +254,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   if (!row->is_migrated) {
     current.assign(row->kv + row->key_len, row->value_len);
+    mem_access::PrivateRead(row->kv + row->key_len, row->value_len);
   } else {
     const RegionOffset smeta_offset = row->migrated_smeta_off;
     RegionOffset indexed_offset = kNullOffset;
@@ -287,6 +293,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
     smeta->unlock();
   } else {
     std::memcpy(row->kv + row->key_len, encoded.data(), encoded.size());
+    mem_access::PrivateWrite(row->kv + row->key_len, encoded.size());
   }
   row->value_len = static_cast<uint32_t>(encoded.size());
   ++row->version;

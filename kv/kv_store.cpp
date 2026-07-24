@@ -1136,6 +1136,14 @@ std::string KVStore::DumpStats() const {
 
 #endif
 
+namespace {
+class ForegroundLatencyScope {
+ public:
+  ForegroundLatencyScope() { GlobalLatencySimulator().BeginScope(); }
+  ~ForegroundLatencyScope() { GlobalLatencySimulator().EndScopeAndDelay(); }
+};
+}  // namespace
+
 std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
   auto store = std::unique_ptr<KVStore>(new KVStore(config));
   store->Open(reset);
@@ -1144,6 +1152,11 @@ std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
 
 KVStore::KVStore(const Config &config) : impl_(new Impl()), config_(config) {
   config_.Validate();
+  GlobalLatencySimulator().ConfigureDetailed(
+      config_.latency_enabled, config_.hwcc_read_ns, config_.hwcc_write_ns,
+      config_.hwcc_atomic_ns, config_.swcc_read_ns, config_.swcc_write_ns,
+      config_.swcc_flush_ns, config_.latency_cache_model.c_str(),
+      config_.latency_cache_fixed_hit_rate, config_.latency_cache_capacity_lines);
 }
 
 KVStore::~KVStore() { Close(); }
@@ -1175,6 +1188,7 @@ void KVStore::ValidateKeyValue(std::string_view key, std::string_view value) con
 }
 
 Status KVStore::Put(std::string_view key, std::string_view value) {
+  ForegroundLatencyScope latency_scope;
   impl_->engine->PollTransport();
   try { ValidateKeyValue(key, value); }
   catch (const std::exception &e) { return Status::Error(StatusCode::kInvalidArgument, e.what()); }
@@ -1186,6 +1200,7 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
 }
 
 GetResult KVStore::Get(std::string_view key) {
+  ForegroundLatencyScope latency_scope;
   impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
@@ -1197,6 +1212,7 @@ GetResult KVStore::Get(std::string_view key) {
 }
 
 Status KVStore::Delete(std::string_view key) {
+  ForegroundLatencyScope latency_scope;
   impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return Status::Error(StatusCode::kInvalidArgument, "invalid key");
@@ -1208,6 +1224,7 @@ Status KVStore::Delete(std::string_view key) {
 }
 
 Status KVStore::MoveOut(std::string_view key) {
+  ForegroundLatencyScope latency_scope;
   impl_->engine->PollTransport();
   ++runtime_.logical_ops;
   Status status = impl_->engine->MoveOut(key);
@@ -1216,6 +1233,7 @@ Status KVStore::MoveOut(std::string_view key) {
 }
 
 ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
+  ForegroundLatencyScope latency_scope;
   impl_->engine->PollTransport();
   if (!config_.enable_scan)
     return {Status::Error(StatusCode::kInvalidArgument, "SCAN disabled"), {}};
@@ -1228,6 +1246,7 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
 
 CasResult KVStore::CompareExchange(std::string_view key, std::string_view expected,
                                    std::string_view desired) {
+  ForegroundLatencyScope latency_scope;
   impl_->engine->PollTransport();
   try { ValidateKeyValue(key, desired); }
   catch (const std::exception &e) { return {Status::Error(StatusCode::kInvalidArgument, e.what()), false}; }
@@ -1239,6 +1258,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
 }
 
 IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
+  ForegroundLatencyScope latency_scope;
   impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), 0};
@@ -1250,6 +1270,7 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
 }
 
 Status KVStore::Checkpoint() {
+  ForegroundLatencyScope latency_scope;
   Status status = impl_->engine->Checkpoint();
   if (status.ok()) ++runtime_.checkpoint_swcc_flushes;
   return status;
@@ -1295,7 +1316,16 @@ std::string KVStore::DumpStats() const {
   out += "migration_out=" + std::to_string(runtime_.migration_out) + "\n";
   out += "network_tx_bytes=" + std::to_string(runtime_.network_tx_bytes) + "\n";
   out += "network_rx_bytes=" + std::to_string(runtime_.network_rx_bytes) + "\n";
-  out += "TIGONKV_LATENCY_STATS\nhwcc_reads=0\nhwcc_writes=0\nhwcc_atomics=0\nswcc_reads=0\nswcc_writes=0\nswcc_flushes=0\ncache_hits=0\ncache_misses=0\ndelayed_ns=0\n";
+  const LatencyStats latency = GlobalLatencySimulator().Snapshot();
+  out += "TIGONKV_LATENCY_STATS\nhwcc_reads=" + std::to_string(latency.hwcc_reads) +
+      "\nhwcc_writes=" + std::to_string(latency.hwcc_writes) +
+      "\nhwcc_atomics=" + std::to_string(latency.hwcc_atomics) +
+      "\nswcc_reads=" + std::to_string(latency.swcc_reads) +
+      "\nswcc_writes=" + std::to_string(latency.swcc_writes) +
+      "\nswcc_flushes=" + std::to_string(latency.swcc_flushes) +
+      "\ncache_hits=" + std::to_string(latency.cache_hits) +
+      "\ncache_misses=" + std::to_string(latency.cache_misses) +
+      "\ndelayed_ns=" + std::to_string(latency.delayed_ns) + "\n";
   return out;
 }
 

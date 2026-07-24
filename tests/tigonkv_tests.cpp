@@ -450,6 +450,9 @@ int main() {
   config.fixed_key_size = 32;
   config.fixed_value_size = 128;
   config.transport_ring_total_mb = 1;
+  config.latency_enabled = true;
+  config.swcc_read_ns = 1;
+  config.swcc_write_ns = 1;
   auto store = KVStore::Create(config, true);
   assert(store->Put("alpha", "one").ok());
   assert(store->Put("beta", "two").ok());
@@ -457,12 +460,15 @@ int main() {
   assert(scan.status.ok() && scan.items.size() == 2);
   assert(store->CompareExchange("alpha", "one", "three").exchanged);
   assert(store->Increment("counter", 3).value == 3);
+  assert(store->Get("alpha").value == "three");
   assert(store->Checkpoint().ok());
   assert(store->Memory().physical_region_split);
   const std::string stats = store->DumpStats();
   assert(stats.find("allocator_shared_overhead_bytes=") != std::string::npos);
   assert(stats.find("reclaimed_total_bytes=") != std::string::npos);
   assert(stats.find("network_tx_bytes=") != std::string::npos);
+  assert(stats.find("swcc_reads=0") == std::string::npos);
+  assert(stats.find("swcc_writes=0") == std::string::npos);
   store.reset();
   auto attached = KVStore::Create(config, false);
   assert(attached->Get("alpha").value == "three");

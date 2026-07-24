@@ -3,6 +3,7 @@
 #include "common/CXL_EBR.h"
 #include "common/MPSCRingBuffer.h"
 #include "kv/engine/kv_partition.h"
+#include "kv/engine/mem_access.h"
 #include "kv/engine/kv_messages.h"
 #include "protocol/TwoPLPasha/TwoPLPashaSCCWriteThrough.h"
 
@@ -311,6 +312,7 @@ Status KVEngine::Checkpoint() {
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {
+  mem_access::TransportWrite(&message, sizeof(message));
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
     PollTransport();
@@ -393,6 +395,7 @@ void KVEngine::PollTransport() {
   const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
   if (received == 0) return;
   if (received != sizeof(KvMessage)) throw std::runtime_error("malformed KV transport entry");
+  mem_access::TransportRead(bytes, received);
   KvMessage message{};
   std::memcpy(&message, bytes, sizeof(message));
   HandleTransportMessage(message);

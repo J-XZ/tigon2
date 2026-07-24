@@ -32,6 +32,8 @@ class LatencySimulator {
   // this access; subsequent lines use consecutive tokens.
   void Record(PoolKind pool, AccessKind kind, uint64_t bytes,
               uint64_t cache_line_id = 0);
+  void BeginScope();
+  void EndScopeAndDelay();
   // Sleep for latency accumulated by the current operation. Call only after
   // releasing protocol locks.
   void DrainPending();
@@ -50,6 +52,11 @@ class LatencySimulator {
   double fixed_hit_rate_ = 0.0;
   uint64_t cache_capacity_lines_ = 0;
 };
+
+// Process-wide simulator used by the engine's inline access wrappers.  The
+// relaxed gate lets disabled instrumentation return before touching TLS state.
+LatencySimulator &GlobalLatencySimulator();
+bool InstrumentationEnabledFast();
 
 class NonCoherentSwccTestBackend {
  public:

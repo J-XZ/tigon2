@@ -18,9 +18,11 @@ namespace tigonkv {
 
 namespace {
 thread_local std::unordered_map<const LatencySimulator *, uint64_t> pending_delay;
+thread_local std::unordered_map<const LatencySimulator *, uint32_t> scope_depth;
 thread_local std::unordered_map<const LatencySimulator *, std::deque<uint64_t>> lru_lines;
 std::once_flag tsc_calibration_once;
 std::atomic<double> tsc_ticks_per_ns{0.0};
+std::atomic<bool> instrumentation_enabled{false};
 
 void CpuRelax() {
 #if defined(__x86_64__) || defined(__i386__)
@@ -102,10 +104,13 @@ void LatencySimulator::ConfigureDetailed(bool enabled, uint64_t hwcc_read_ns,
   cache_model_ = cache_model;
   fixed_hit_rate_ = fixed_hit_rate;
   cache_capacity_lines_ = cache_capacity_lines;
+  instrumentation_enabled.store(enabled, std::memory_order_relaxed);
+  if (enabled) CalibrateTscOnce();
 }
 
 void LatencySimulator::Record(PoolKind pool, AccessKind kind, uint64_t bytes,
                               uint64_t cache_line_id) {
+  if (!InstrumentationEnabledFast()) return;
   const uint64_t lines = std::max<uint64_t>(1, (bytes + 63) / 64);
   if (pool == PoolKind::kHwcc) {
     if (kind == AccessKind::kRead) hwcc_reads_.fetch_add(lines);
@@ -118,7 +123,6 @@ void LatencySimulator::Record(PoolKind pool, AccessKind kind, uint64_t bytes,
   } else {
     swcc_writes_.fetch_add(lines);
   }
-  if (!enabled_.load(std::memory_order_acquire)) return;
   uint64_t cache_hits = 0;
   uint64_t cache_misses = 0;
   if (pool == PoolKind::kSwcc && kind == AccessKind::kRead) {
@@ -168,6 +172,20 @@ void LatencySimulator::Record(PoolKind pool, AccessKind kind, uint64_t bytes,
   pending_delay[this] += delay;
 }
 
+void LatencySimulator::BeginScope() {
+  if (!InstrumentationEnabledFast()) return;
+  ++scope_depth[this];
+}
+
+void LatencySimulator::EndScopeAndDelay() {
+  if (!InstrumentationEnabledFast()) return;
+  auto it = scope_depth.find(this);
+  if (it == scope_depth.end() || it->second == 0) return;
+  if (--it->second != 0) return;
+  scope_depth.erase(it);
+  DrainPending();
+}
+
 void LatencySimulator::DrainPending() {
   auto it = pending_delay.find(this);
   if (it == pending_delay.end()) return;
@@ -187,7 +205,17 @@ void LatencySimulator::Reset() {
   swcc_reads_ = swcc_writes_ = swcc_flushes_ = delayed_ns_ = 0;
   cache_hits_ = cache_misses_ = cache_sequence_ = 0;
   pending_delay.erase(this);
+  scope_depth.erase(this);
   lru_lines.erase(this);
+}
+
+LatencySimulator &GlobalLatencySimulator() {
+  static LatencySimulator simulator;
+  return simulator;
+}
+
+bool InstrumentationEnabledFast() {
+  return instrumentation_enabled.load(std::memory_order_relaxed);
 }
 
 NonCoherentSwccTestBackend::NonCoherentSwccTestBackend(size_t bytes)
