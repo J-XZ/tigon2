@@ -28,11 +28,12 @@ ivshmem; HWCC/SWCC are logical protocol and accounting categories. Results must 
 described as NUMA-based CXL shared-memory emulation and software latency-injected
 results, never as real CXL hardware performance.
 
-The default experiment paths are `/mnt/xz_shared_mem/ivshmem_shared_mem`,
-`/dev/ivpci0`, and `/mnt/xz_vm_storage`. `scripts/vm/*` only inspects or reuses an
-existing topology and deliberately refuses to start/reboot VMs, configure networking,
-or change host tuning. See [experiment_config.jsonc](experiment_config.jsonc),
-[缓存一致性设计.md](缓存一致性设计.md), and [内存布局.md](内存布局.md).
+The default experiment paths come from `experiment_config.jsonc`
+(`shared_memory.path` / `device_path`, `vm.storage_path`). `scripts/vm/*` only
+inspects or reuses an existing topology and deliberately refuses to start/reboot
+VMs, configure networking, or change host tuning. The authoritative redesign plan
+is [PLAN.md](PLAN.md); do not treat older slot-layout notes (if found in git
+history) as the current target architecture.
 
 Build and local verification:
 
