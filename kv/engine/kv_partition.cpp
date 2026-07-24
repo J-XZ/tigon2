@@ -14,6 +14,7 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
       private_binding_{&regions, AllocationDomain::kOwnerPrivateSwcc, owner_shard, &ebr,
                        partition_id},
       shared_binding_{&regions, AllocationDomain::kHwccIndex, owner_shard, &ebr} {
+  star::CXLMemory::bind_dual_region_allocator(&regions, owner_shard);
   if (partition_id >= regions.layout().partition_count)
     throw std::invalid_argument("partition id outside persistent layout");
   if (attach) {
@@ -38,6 +39,17 @@ FixedKey KVPartition::MakeKey(std::string_view key) const {
 PrivateRow *KVPartition::RowFromOffset(RegionOffset offset) const {
   if (offset == kNullOffset) return nullptr;
   return static_cast<PrivateRow *>(regions_.swcc().FromOffset(offset));
+}
+
+void KVPartition::LockRow(PrivateRow *row) {
+  uint32_t expected = 0;
+  while (!row->latch.compare_exchange_weak(expected, 1, std::memory_order_acquire,
+                                            std::memory_order_relaxed))
+    expected = 0;
+}
+
+void KVPartition::UnlockRow(PrivateRow *row) {
+  row->latch.store(0, std::memory_order_release);
 }
 
 PrivateRow *KVPartition::AllocateRow(const FixedKey &key, std::string_view value) {
@@ -76,9 +88,69 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
 bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   RegionOffset row_offset = kNullOffset;
   if (!private_tree_->lookup(MakeKey(key), row_offset)) return false;
-  const auto *row = RowFromOffset(row_offset);
-  if (row->is_tombstone || row->is_migrated) return false;
-  value->assign(row->kv + row->key_len, row->value_len);
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  if (row->is_tombstone) {
+    UnlockRow(row);
+    return false;
+  }
+  if (!row->is_migrated) {
+    value->assign(row->kv + row->key_len, row->value_len);
+    UnlockRow(row);
+    return true;
+  }
+  const RegionOffset smeta_offset = row->migrated_smeta_off;
+  const uint32_t value_len = row->value_len;
+  UnlockRow(row);
+  if (smeta_offset == kNullOffset) return false;
+  RegionOffset shared_value = kNullOffset;
+  if (!shared_tree_->lookup(MakeKey(key), shared_value) || shared_value != smeta_offset)
+    return false;
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  std::string shared(value_len, '\0');
+  if (!star::TwoPLPashaHelper::kv_shared_read(smeta, owner_shard_, shared.data(), value_len))
+    return false;
+  *value = std::move(shared);
+  return true;
+}
+
+bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id) {
+  if (star::scc_manager == nullptr) return false;
+  RegionOffset row_offset = kNullOffset;
+  const FixedKey fixed_key = MakeKey(key);
+  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  if (row->is_tombstone || row->is_migrated) {
+    UnlockRow(row);
+    return false;
+  }
+  const uint64_t payload_bytes = sizeof(star::TwoPLPashaSharedDataSCC) +
+                                 regions_.layout().fixed_value_size;
+  auto *payload = new (regions_.Allocate(payload_bytes,
+      AllocationDomain::kSharedPayloadSwcc, owner_shard_)) star::TwoPLPashaSharedDataSCC;
+  auto *smeta = new (regions_.Allocate(sizeof(star::TwoPLPashaMetadataShared),
+      AllocationDomain::kHwccMetadata, owner_shard_)) star::TwoPLPashaMetadataShared(payload);
+  star::scc_manager->init_scc_metadata(smeta, host_id);
+  smeta->lock();
+  star::scc_manager->do_write(smeta, host_id, payload->data, row->kv + row->key_len,
+                               row->value_len);
+  payload->set_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
+  const RegionOffset smeta_offset = regions_.hwcc().ToOffset(smeta);
+  if (!shared_tree_->insert(fixed_key, smeta_offset)) {
+    smeta->unlock();
+    UnlockRow(row);
+    return false;
+  }
+  row->migrated_smeta_off = smeta_offset;
+  row->is_migrated = 1;
+  star::scc_manager->finish_write(smeta, host_id, payload,
+                                  sizeof(star::TwoPLPashaSharedDataSCC) + row->value_len);
+  smeta->unlock();
+  UnlockRow(row);
+  PersistRoots();
+  directory_.migration_in_seq.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
