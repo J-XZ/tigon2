@@ -9,8 +9,7 @@ if [[ -s "$image" && "$force" != true ]]; then echo "VM image already exists: $i
 [[ -x "$root/emulation/image/make_vm_img.sh" ]] || { echo "missing repository image builder" >&2; exit 2; }
 echo "building independent tigonkv image via emulation/image/make_vm_img.sh"
 if [[ "$force" == true && -e "$image" ]]; then
-  echo "refusing to overwrite existing image without an explicit destination" >&2
-  exit 2
+  echo "rebuilding explicit image destination: $image"
 fi
 "$root/emulation/image/make_vm_img.sh"
 [[ -s "$builder_image" ]] || { echo "image builder did not produce $builder_image" >&2; exit 2; }
