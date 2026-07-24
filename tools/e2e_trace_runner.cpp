@@ -30,7 +30,7 @@ uint64_t ReadDecimal(const std::string &line, size_t *pos, const std::string &la
   return ParseUnsigned(line.substr(begin, *pos - begin), label);
 }
 
-void Barrier(const std::string &phase, uint32_t node, bool final) {
+void Barrier(const std::string &phase, uint32_t node, bool final, KVStore *store = nullptr) {
   const std::string dir = Env("TIGONKV_E2E_BARRIER_DIR", "CXLKV_E2E_BARRIER_DIR");
   if (dir.empty()) return;
   const uint64_t count = ParseUnsigned(Env("TIGONKV_E2E_WORKER_COUNT", "CXLKV_E2E_WORKER_COUNT", "1"), "worker count");
@@ -42,6 +42,14 @@ void Barrier(const std::string &phase, uint32_t node, bool final) {
   const uint64_t timeout = ParseUnsigned(Env("TIGONKV_E2E_BARRIER_TIMEOUT_SEC", "CXLKV_E2E_BARRIER_TIMEOUT_SEC", "600"), "barrier timeout");
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
   for (;;) {
+    // A node that has completed its local trace can still own requests issued
+    // by a peer that is finishing later.  Keep servicing the owner transport
+    // while waiting at the final barrier instead of leaving those requests to
+    // time out.
+    if (store != nullptr) {
+      const Status status = store->PollTransport();
+      if (!status.ok()) Fail("transport poll failed at barrier: " + status.message);
+    }
     uint64_t seen = 0;
     for (uint64_t i = 0; i < count; ++i)
       if (std::filesystem::exists(prefix + std::to_string(i))) ++seen;
@@ -127,8 +135,8 @@ int main() {
       ++ops;
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
-    if (!store->Checkpoint().ok()) Fail("checkpoint failed before final barrier");
-    Barrier(phase, config.node_id, true);
+    Barrier(phase, config.node_id, true, store.get());
+    if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
     const std::string heartbeat = Env("TIGONKV_E2E_TRACE_HEARTBEAT_SEC", "CXLKV_E2E_TRACE_HEARTBEAT_SEC", "0");
     if (heartbeat != "0") std::cout << "E2E_TRACE_HEARTBEAT phase=" << phase << " node=" << config.node_id << " ops=" << ops << "\n";
     std::cout << "E2E_TRACE_TIME_US phase=" << phase << " node=" << config.node_id << " ops=" << ops << " elapsed_us=" << elapsed << "\n";
