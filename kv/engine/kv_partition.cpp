@@ -3,6 +3,7 @@
 #include <cstring>
 #include <new>
 #include <stdexcept>
+#include <vector>
 
 namespace tigonkv::engine {
 
@@ -30,6 +31,7 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
     shared_tree_ = new SharedTree(shared_binding_);
     PersistRoots();
   }
+  RebuildClockTracker();
 }
 
 FixedKey KVPartition::MakeKey(std::string_view key) const {
@@ -91,6 +93,9 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       if (written) {
         row->value_len = static_cast<uint32_t>(value.size());
         ++row->version;
+        smeta->lock();
+        smeta->set_bit(37);
+        smeta->unlock();
       }
       UnlockRow(row);
       if (!written) throw std::runtime_error("migrated row shared write rejected");
@@ -140,6 +145,11 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   std::string shared(value_len, '\0');
   const bool read = star::TwoPLPashaHelper::kv_shared_read(
       smeta, owner_shard_, shared.data(), value_len);
+  if (read) {
+    smeta->lock();
+    smeta->set_bit(37);
+    smeta->unlock();
+  }
   UnlockRow(row);
   if (!read)
     return false;
@@ -177,12 +187,14 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id) {
   }
   row->migrated_smeta_off = smeta_offset;
   row->is_migrated = 1;
+  smeta->set_bit(37);
   star::scc_manager->finish_write(smeta, host_id, payload,
                                   sizeof(star::TwoPLPashaSharedDataSCC) + row->value_len);
   smeta->unlock();
   UnlockRow(row);
   PersistRoots();
   directory_.migration_in_seq.fetch_add(1, std::memory_order_relaxed);
+  TrackMigratedKey(fixed_key);
   return true;
 }
 
@@ -245,6 +257,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   UnlockRow(row);
   PersistRoots();
   directory_.migration_out_seq.fetch_add(1, std::memory_order_relaxed);
+  UntrackMigratedKey(fixed_key);
   return true;
 }
 
@@ -305,7 +318,83 @@ bool KVPartition::DeletePrivate(std::string_view key) {
                           owner_shard_, partition_id_);
   UnlockRow(row);
   PersistRoots();
+  UntrackMigratedKey(fixed_key);
   return true;
+}
+
+void KVPartition::TrackMigratedKey(const FixedKey &key) {
+  std::lock_guard<std::mutex> lock(clock_mutex_);
+  for (const auto &candidate : clock_keys_)
+    if (candidate.Compare(key) == 0) return;
+  clock_keys_.push_back(key);
+}
+
+void KVPartition::UntrackMigratedKey(const FixedKey &key) {
+  std::lock_guard<std::mutex> lock(clock_mutex_);
+  for (size_t i = 0; i < clock_keys_.size(); ++i) {
+    if (clock_keys_[i].Compare(key) != 0) continue;
+    clock_keys_.erase(clock_keys_.begin() + static_cast<std::ptrdiff_t>(i));
+    if (clock_keys_.empty()) clock_cursor_ = 0;
+    else if (clock_cursor_ >= clock_keys_.size()) clock_cursor_ = 0;
+    return;
+  }
+}
+
+void KVPartition::RebuildClockTracker() {
+  FixedKey low{};
+  FixedKey high{};
+  std::memset(high.bytes, 0xff, sizeof(high.bytes));
+  std::vector<SharedTree::KeyValuePair> entries;
+  shared_tree_->scan(low, high, true, true, 0, entries);
+  std::lock_guard<std::mutex> lock(clock_mutex_);
+  clock_keys_.clear();
+  clock_cursor_ = 0;
+  for (const auto &entry : entries) clock_keys_.push_back(entry.first);
+}
+
+bool KVPartition::MoveOutClockVictim(uint32_t host_id) {
+  FixedKey victim{};
+  bool selected = false;
+  {
+    std::lock_guard<std::mutex> lock(clock_mutex_);
+    if (clock_keys_.empty()) return false;
+    const size_t attempts = clock_keys_.size();
+    for (size_t attempt = 0; attempt < attempts; ++attempt) {
+      if (clock_cursor_ >= clock_keys_.size()) clock_cursor_ = 0;
+      const FixedKey key = clock_keys_[clock_cursor_++];
+      RegionOffset smeta_offset = kNullOffset;
+      if (!shared_tree_->lookup(key, smeta_offset) || smeta_offset == kNullOffset) continue;
+      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+          regions_.hwcc().FromOffset(smeta_offset));
+      smeta->lock();
+      const bool second_chance = smeta->is_bit_set(37);
+      if (second_chance) smeta->clear_bit(37);
+      smeta->unlock();
+      if (second_chance) continue;
+      victim = key;
+      selected = true;
+      break;
+    }
+  }
+  if (!selected) return false;
+  return MoveOutPrivate(std::string_view(victim.bytes, regions_.layout().fixed_key_size),
+                        host_id);
+}
+
+uint64_t KVPartition::shared_payload_used_bytes() const {
+  return regions_.layout().domains[static_cast<size_t>(
+      AllocationDomain::kSharedPayloadSwcc)].used_bytes.load(std::memory_order_relaxed);
+}
+
+uint64_t KVPartition::shared_payload_capacity_bytes() const {
+  return regions_.SharedPayloadCapacityBytes();
+}
+
+uint64_t KVPartition::hwcc_used_bytes() const {
+  uint64_t total = 0;
+  for (size_t i = 0; i < static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc); ++i)
+    total += regions_.layout().domains[i].used_bytes.load(std::memory_order_relaxed);
+  return total;
 }
 
 void KVPartition::PersistRoots() {

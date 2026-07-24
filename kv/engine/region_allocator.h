@@ -161,6 +161,7 @@ class DualRegionAllocator {
   void *FromPoolOffset(uint64_t offset) const;
   bool IsInOwnerPrivateArena(const void *pointer, uint32_t partition_id) const;
   RegionOffset OwnerPrivateArenaOffset(uint32_t partition_id) const;
+  uint64_t SharedPayloadCapacityBytes() const;
   const SharedLayoutHeader &layout() const { return header_->layout; }
   SharedLayoutHeader &layout() { return header_->layout; }
   const RegionAllocator &hwcc() const { return hwcc_; }

@@ -513,6 +513,10 @@ RegionOffset DualRegionAllocator::OwnerPrivateArenaOffset(uint32_t partition_id)
   return swcc_.ToOffset(Arena(partition_id));
 }
 
+uint64_t DualRegionAllocator::SharedPayloadCapacityBytes() const {
+  return header_->swcc_allocator_bytes - header_->owner_private_arenas_bytes;
+}
+
 DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,
                                                 const DualRegionConfig &config,
                                                 bool reset) {

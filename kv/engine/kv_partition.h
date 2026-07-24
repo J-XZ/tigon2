@@ -7,6 +7,7 @@
 #include "kv/engine/region_allocator.h"
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -33,6 +34,12 @@ class KVPartition {
   bool DeletePrivate(std::string_view key);
   bool PromotePrivate(std::string_view key, uint32_t host_id);
   bool MoveOutPrivate(std::string_view key, uint32_t host_id);
+  // Owner-local Clock tracker. Returns true only when a quiescent shared
+  // victim was copied back and retired.
+  bool MoveOutClockVictim(uint32_t host_id);
+  uint64_t shared_payload_used_bytes() const;
+  uint64_t shared_payload_capacity_bytes() const;
+  uint64_t hwcc_used_bytes() const;
 
   // Must be called after an operation which might split or collapse a root.
   // It writes only region-relative offsets into the persistent directory.
@@ -44,6 +51,9 @@ class KVPartition {
   PrivateRow *AllocateRow(const FixedKey &key, std::string_view value);
   static void LockRow(PrivateRow *row);
   static void UnlockRow(PrivateRow *row);
+  void TrackMigratedKey(const FixedKey &key);
+  void UntrackMigratedKey(const FixedKey &key);
+  void RebuildClockTracker();
 
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;
@@ -54,6 +64,9 @@ class KVPartition {
   btreeolc_cxl::TreeNodeAllocation shared_binding_;
   PrivateTree *private_tree_ = nullptr;
   SharedTree *shared_tree_ = nullptr;
+  mutable std::mutex clock_mutex_;
+  std::vector<FixedKey> clock_keys_;
+  size_t clock_cursor_ = 0;
 };
 
 }  // namespace tigonkv::engine

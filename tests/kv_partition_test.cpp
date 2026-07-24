@@ -126,6 +126,16 @@ int main() {
   assert(ebr.drain_quiescent() > 0);
   assert(partition.PutPrivate("gamma", "replacement"));
   assert(partition.GetPrivate("gamma", &value) && value == "replacement");
+
+  // PolicyClock's first pass consumes the shared metadata second-chance bit;
+  // the next pass selects the same quiescent key and performs real move-out.
+  assert(partition.PutPrivate("clock", "victim"));
+  assert(partition.PromotePrivate("clock", 1));
+  assert(!partition.MoveOutClockVictim(1));
+  assert(partition.MoveOutClockVictim(1));
+  assert(partition.GetPrivate("clock", &value) && value == "victim");
+  assert(partition.hwcc_used_bytes() > 0);
+  assert(partition.shared_payload_used_bytes() < partition.shared_payload_capacity_bytes());
   star::scc_manager = nullptr;
 
   const pid_t child = fork();
