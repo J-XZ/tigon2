@@ -26,6 +26,7 @@
 #include "common/CXL_EBR.h"
 
 #include "kv/engine/region_allocator.h"
+#include "kv/engine/mem_access.h"
 
 #include "common/atomic_offset_ptr.hpp"
 #include <boost/interprocess/offset_ptr.hpp>
@@ -68,6 +69,19 @@ struct TreeNodeAllocation {
 		                        private_partition);
 	}
 };
+
+// tigonkv: one tree operation touches at least its root page.  The tree's
+// concrete allocation binding determines whether that page belongs to the
+// owner-private SWCC arena or the shared HWCC index region.
+inline void RecordTreeAccess(const TreeNodeAllocation &allocation, bool write) {
+	if (allocation.domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc) {
+		if (write) tigonkv::engine::mem_access::PrivateWrite(nullptr, kPageSize);
+		else tigonkv::engine::mem_access::PrivateRead(nullptr, kPageSize);
+	} else {
+		if (write) tigonkv::engine::mem_access::TransportWrite(nullptr, kPageSize);
+		else tigonkv::engine::mem_access::TransportRead(nullptr, kPageSize);
+	}
+}
 
 struct LatchBase {
 	std::atomic<uint64_t> word{ 0 };
@@ -1710,6 +1724,7 @@ class BPlusTree {
 	 */
 	bool insert(const KeyType &k, const ValueType &v)
 	{
+		RecordTreeAccess(allocation_, true);
 		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
 		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
@@ -2222,6 +2237,7 @@ restart:
 	 */
 	bool remove(const KeyType &key)
 	{
+		RecordTreeAccess(allocation_, true);
 		return _remove(key);
 	}
 
@@ -2231,6 +2247,7 @@ restart:
 	 */
 	bool remove(const KeyType &key, ValueType value)
 	{
+		RecordTreeAccess(allocation_, true);
 		return _remove(key);
 	}
 
@@ -2248,6 +2265,7 @@ restart:
 	 */
 	void scan(const KeyType &lowKey, const KeyType &highKey, bool leftExist, bool rightExist, uint32_t limit, std::vector<KeyValuePair> &res)
 	{
+		RecordTreeAccess(allocation_, false);
 		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
 		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
@@ -2686,6 +2704,7 @@ restart:
 	 */
 	bool lookup(const KeyType &key, ValueType &result)
 	{
+		RecordTreeAccess(allocation_, false);
 		return _lookup(key, result);
 	}
 
