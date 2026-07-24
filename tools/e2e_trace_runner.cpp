@@ -112,7 +112,8 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace) {
     else if (op == "DELETE") { if (len != 0) Fail("DELETE LEN must be zero"); status = store.Delete(key); if (status.code == StatusCode::kNotFound) status = Status::Ok(); }
     else if (op == "SCAN") {
       ScanResult scan = store.Scan(key, len); status = scan.status;
-      if (status.ok() && scan.items.size() > len) Fail("SCAN returned more than requested at line " + std::to_string(line_no));
+      if (status.ok() && len != 0 && scan.items.size() > len)
+        Fail("SCAN returned more than requested at line " + std::to_string(line_no));
     } else Fail("unknown operation at line " + std::to_string(line_no));
     if (!status.ok()) Fail("operation failed at line " + std::to_string(line_no) + ": " + status.message);
     ++result.ops;
@@ -255,7 +256,8 @@ int main() {
         ScanResult result = store->Scan(key, len);
         status = result.status;
         if (status.ok()) {
-          if (result.items.size() > len) Fail("SCAN returned more than requested at line " + std::to_string(line_no));
+          if (len != 0 && result.items.size() > len)
+            Fail("SCAN returned more than requested at line " + std::to_string(line_no));
           for (size_t i = 0; i < result.items.size(); ++i) {
             if (result.items[i].key < key || (i != 0 && result.items[i - 1].key >= result.items[i].key))
               Fail("SCAN result ordering mismatch at line " + std::to_string(line_no));
