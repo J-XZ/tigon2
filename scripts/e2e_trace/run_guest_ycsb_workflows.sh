@@ -85,14 +85,10 @@ for ((round = 1; round <= rounds; round++)); do
       phase_reset=0
       [[ "$phase" == load ]] && phase_reset=1
       pids=()
-      if [[ "$phase" == load ]]; then
-        run_one "$round" "$workload" "$phase" 0 "$phase_reset" "$phase_log/vm0.log"
-        first_vm=1
-      else
-        first_vm=0
-      fi
-      for ((vm = first_vm; vm < vm_count; vm++)); do
-        run_one "$round" "$workload" "$phase" "$vm" 0 "$phase_log/vm$vm.log" &
+      for ((vm = 0; vm < vm_count; vm++)); do
+        reset=0
+        [[ "$vm" == 0 ]] && reset="$phase_reset"
+        run_one "$round" "$workload" "$phase" "$vm" "$reset" "$phase_log/vm$vm.log" &
         pids+=("$!")
       done
       for pid in "${pids[@]}"; do wait "$pid"; done
