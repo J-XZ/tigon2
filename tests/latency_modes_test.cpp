@@ -1,4 +1,4 @@
-#include "kv/latency_simulator.h"
+#include "kv/engine/latency_inject.h"
 
 #ifdef NDEBUG
 #undef NDEBUG

@@ -1,8 +1,7 @@
 #include "kv/kv_store.h"
 
 #include "kv/engine/kv_engine.h"
-#include "kv/latency_simulator.h"
-#include "kv/memory_domains.h"
+#include "kv/engine/latency_inject.h"
 
 #include <algorithm>
 #include <cerrno>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kv/latency_simulator.h"
+#include "kv/engine/latency_inject.h"
 
 #include <cstddef>
 
