@@ -2,6 +2,9 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+config=${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}
+source "$root/scripts/tigonkv_vm_common.sh"
+tigonkv_load_vm_config "$config"
 trace_root=${1:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 log_root=${2:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 rounds=${3:-${TIGONKV_E2E_ROUNDS:-5}}
@@ -12,13 +15,15 @@ ssh_key=${TIGONKV_VM_SSH_KEY:-/root/.ssh/id_rsa}
 remote_root=${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}
 remote_config=${TIGONKV_VM_REMOTE_CONFIG:-$remote_root/experiment_config.jsonc}
 remote_runner=${TIGONKV_VM_REMOTE_RUNNER:-$remote_root/build/e2e_trace_runner}
-backing=${TIGONKV_SHARED_MEMORY_PATH:-/mnt/xz_shared_mem/ivshmem_shared_mem}
+runner=${TIGONKV_E2E_TRACE_RUNNER:-$root/build-relwithdebinfo/e2e_trace_runner}
+backing=${TIGONKV_SHARED_MEMORY_PATH:-$TIGONKV_SHARED_BACKING}
 pool_init=${TIGONKV_POOL_INITER:-$root/build/cxl_pool_initer}
-shared_size_mb=${TIGONKV_SHARED_SIZE_MB:-32768}
-shared_numa=${TIGONKV_SHARED_NUMA_NODE:-1}
+shared_size_mb=${TIGONKV_SHARED_SIZE_MB:-$TIGONKV_SHARED_MB}
+shared_numa=${TIGONKV_SHARED_NUMA_NODE:-$TIGONKV_SHARED_NUMA}
 timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-600}
 
 [[ -d "$trace_root" ]] || { echo "missing trace root: $trace_root" >&2; exit 2; }
+[[ -x "$runner" ]] || { echo "missing trace runner: $runner" >&2; exit 2; }
 [[ -x "$pool_init" ]] || { echo "build cxl_pool_initer first: $pool_init" >&2; exit 2; }
 [[ -f "$ssh_key" ]] || { echo "missing SSH key: $ssh_key" >&2; exit 2; }
 [[ "$vm_count" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_VM_COUNT must be positive" >&2; exit 2; }
@@ -31,6 +36,17 @@ remote() {
   shift
   ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$@"
 }
+
+sync_guest_runtime() {
+  local vm
+  for ((vm = 0; vm < vm_count; vm++)); do
+    remote "$vm" "mkdir -p '$remote_root/build'"
+    scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$runner" "root@127.0.0.1:$remote_runner" >/dev/null
+    scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$config" "root@127.0.0.1:$remote_config" >/dev/null
+  done
+}
+
+sync_guest_runtime
 
 sync_traces() {
   local round=$1 workload=$2 phase=$3 vm trace remote_dir
