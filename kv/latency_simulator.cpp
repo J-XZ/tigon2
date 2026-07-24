@@ -4,16 +4,76 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
+#endif
 
 namespace tigonkv {
 
 namespace {
 thread_local std::unordered_map<const LatencySimulator *, uint64_t> pending_delay;
 thread_local std::unordered_map<const LatencySimulator *, std::deque<uint64_t>> lru_lines;
+std::once_flag tsc_calibration_once;
+std::atomic<double> tsc_ticks_per_ns{0.0};
+
+void CpuRelax() {
+#if defined(__x86_64__) || defined(__i386__)
+  _mm_pause();
+#else
+  std::this_thread::yield();
+#endif
+}
+
+uint64_t ReadTsc() {
+#if defined(__x86_64__) || defined(__i386__)
+  return __rdtsc();
+#else
+  return 0;
+#endif
+}
+
+void CalibrateTscOnce() {
+  std::call_once(tsc_calibration_once, [] {
+#if defined(__x86_64__) || defined(__i386__)
+    constexpr auto kCalibrationWindow = std::chrono::milliseconds(4);
+    const auto begin = std::chrono::steady_clock::now();
+    const uint64_t ticks_begin = ReadTsc();
+    auto end = begin;
+    do {
+      CpuRelax();
+      end = std::chrono::steady_clock::now();
+    } while (end - begin < kCalibrationWindow);
+    const uint64_t ticks_end = ReadTsc();
+    const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+    if (elapsed_ns > 0 && ticks_end > ticks_begin)
+      tsc_ticks_per_ns.store(static_cast<double>(ticks_end - ticks_begin) /
+                                 static_cast<double>(elapsed_ns),
+                             std::memory_order_release);
+#endif
+  });
+}
+
+void DelaySpinNs(uint64_t delay_ns) {
+  if (delay_ns == 0) return;
+  CalibrateTscOnce();
+  const double ticks_per_ns = tsc_ticks_per_ns.load(std::memory_order_acquire);
+#if defined(__x86_64__) || defined(__i386__)
+  if (ticks_per_ns > 0.0) {
+    const uint64_t start = ReadTsc();
+    const uint64_t target = start + std::max<uint64_t>(
+        1, static_cast<uint64_t>(ticks_per_ns * static_cast<double>(delay_ns)));
+    while (ReadTsc() < target) CpuRelax();
+    return;
+  }
+#endif
+  std::this_thread::sleep_for(std::chrono::nanoseconds(delay_ns));
+}
 }
 
 void LatencySimulator::Configure(bool enabled, uint64_t hwcc_ns,
@@ -113,7 +173,7 @@ void LatencySimulator::DrainPending() {
   if (it == pending_delay.end()) return;
   const uint64_t delay = it->second;
   pending_delay.erase(it);
-  if (delay != 0) std::this_thread::sleep_for(std::chrono::nanoseconds(delay));
+  DelaySpinNs(delay);
 }
 
 LatencyStats LatencySimulator::Snapshot() const {
