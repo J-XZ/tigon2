@@ -35,6 +35,20 @@ int main() {
   const std::string path(path_template);
   auto pool = tigonkv::engine::DualRegionMappedPool::Open(path, Config(), true);
   auto &regions = pool.allocator();
+  star::CXLMemory memory;
+  star::CXLMemory::bind_dual_region_allocator(&regions, 1);
+  void *index_object = memory.cxlalloc_malloc_wrapper(
+      128, star::CXLMemory::INDEX_ALLOCATION);
+  void *payload_object = memory.cxlalloc_malloc_wrapper(
+      128, star::CXLMemory::DATA_ALLOCATION);
+  assert(regions.IsHwccAddress(index_object));
+  assert(regions.IsSwccAddress(payload_object));
+  star::CXLMemory::commit_shared_data_initialization(
+      star::CXLMemory::cxl_global_epoch_root_index, index_object);
+  void *recovered_root = nullptr;
+  star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+      star::CXLMemory::cxl_global_epoch_root_index, &recovered_root);
+  assert(recovered_root == index_object);
   star::CXL_EBR ebr(2, 1, &regions);
   ebr.thread_init_ebr_meta(0, 0);
   tigonkv::engine::KVPartition partition(regions, ebr, 5, 1, false);

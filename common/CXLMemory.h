@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "core/Context.h"
+#include "kv/engine/region_allocator.h"
 
 #include <glog/logging.h>
 
@@ -50,10 +51,23 @@ class CXLMemory {
                 this->context = context;
         }
 
+        // tigonkv: the allocator is process-local state over a persistent
+        // mapped pool.  It is deliberately an explicit binding rather than a
+        // cxlalloc compatibility fallback.
+        static void bind_dual_region_allocator(tigonkv::engine::DualRegionAllocator *regions,
+                                                uint32_t owner_shard)
+        {
+                if (regions == nullptr) throw std::invalid_argument("null dual-region allocator");
+                dual_regions_ = regions;
+                owner_shard_ = owner_shard;
+        }
+
         void init_cxlalloc_for_given_thread(uint64_t threads_num_per_host, uint64_t thread_id, uint64_t hosts_num, uint64_t host_id)
         {
-                (void)threads_num_per_host; (void)thread_id; (void)hosts_num; (void)host_id;
-                throw std::runtime_error("tigonkv: legacy cxlalloc initialization is unavailable");
+                (void)threads_num_per_host; (void)thread_id; (void)hosts_num;
+                if (dual_regions_ == nullptr)
+                        throw std::runtime_error("tigonkv: dual-region allocator is not bound");
+                owner_shard_ = static_cast<uint32_t>(host_id);
         }
 
         // backward compatibility
@@ -81,8 +95,7 @@ class CXLMemory {
                         CHECK(0);
                 }
 
-                (void)size;
-                throw std::runtime_error("tigonkv: legacy cxlalloc allocation is unavailable");
+                return Allocate(size, category);
         }
 
         void cxlalloc_free_wrapper(void *ptr, uint64_t size, int category, uint64_t metadata_size, uint64_t data_size)
@@ -144,8 +157,7 @@ class CXLMemory {
                         CHECK(0);
                 }
 
-                (void)size;
-                throw std::runtime_error("tigonkv: legacy cxlalloc allocation is unavailable");
+                return Allocate(size, category);
         }
 
         void cxlalloc_free_wrapper(void *ptr, uint64_t size, int category)
@@ -184,14 +196,24 @@ class CXLMemory {
 
         static void commit_shared_data_initialization(uint64_t root_index, void *shared_data)
         {
-                (void)root_index; (void)shared_data;
-                throw std::runtime_error("tigonkv: legacy cxlalloc root table is unavailable");
+                if (dual_regions_ == nullptr || root_index >= tigonkv::engine::kRootSlotCount)
+                        throw std::runtime_error("tigonkv: dual-region root table is unavailable");
+                if (!dual_regions_->IsHwccAddress(shared_data))
+                        throw std::invalid_argument("tigonkv: root must be in HWCC");
+                dual_regions_->layout().roots[root_index].store(
+                        dual_regions_->hwcc().ToOffset(shared_data), std::memory_order_release);
         }
 
         static void wait_and_retrieve_cxl_shared_data(uint64_t root_index, void **shared_data)
         {
-                (void)root_index; (void)shared_data;
-                throw std::runtime_error("tigonkv: legacy cxlalloc root table is unavailable");
+                if (shared_data == nullptr || dual_regions_ == nullptr ||
+                    root_index >= tigonkv::engine::kRootSlotCount)
+                        throw std::runtime_error("tigonkv: dual-region root table is unavailable");
+                const auto offset = dual_regions_->layout().roots[root_index].load(
+                        std::memory_order_acquire);
+                if (offset == tigonkv::engine::kNullOffset)
+                        throw std::runtime_error("tigonkv: shared root is not initialized");
+                *shared_data = dual_regions_->hwcc().FromOffset(offset);
         }
 
         uint64_t get_stats(int category)
@@ -229,6 +251,27 @@ class CXLMemory {
         }
 
     private:
+        static tigonkv::engine::AllocationDomain DomainForAllocation(int category)
+        {
+                switch (category) {
+                case INDEX_ALLOCATION: return tigonkv::engine::AllocationDomain::kHwccIndex;
+                case METADATA_ALLOCATION: return tigonkv::engine::AllocationDomain::kHwccMetadata;
+                case DATA_ALLOCATION: return tigonkv::engine::AllocationDomain::kSharedPayloadSwcc;
+                case TRANSPORT_ALLOCATION: return tigonkv::engine::AllocationDomain::kTransport;
+                case MISC_ALLOCATION: return tigonkv::engine::AllocationDomain::kHwccLayout;
+                default: throw std::invalid_argument("invalid CXL allocation category");
+                }
+        }
+
+        static void *Allocate(uint64_t size, int category)
+        {
+                if (dual_regions_ == nullptr)
+                        throw std::runtime_error("tigonkv: dual-region allocator is not bound");
+                return dual_regions_->Allocate(size, DomainForAllocation(category), owner_shard_);
+        }
+
+        inline static tigonkv::engine::DualRegionAllocator *dual_regions_ = nullptr;
+        inline static uint32_t owner_shard_ = 0;
         Context context;
 
         std::atomic<uint64_t> size_index_usage{ 0 };

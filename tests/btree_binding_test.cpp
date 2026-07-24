@@ -80,6 +80,16 @@ int main() {
     assert(private_tree->lookup(Key(i), value) && value == i);
     assert(shared_tree->lookup(Key(i), value) && value == i + 1000);
   }
+  std::vector<Tree::KeyValuePair> private_scan;
+  std::vector<Tree::KeyValuePair> shared_scan;
+  private_tree->scan(Key(250), Key(260), true, true, 0, private_scan);
+  shared_tree->scan(Key(250), Key(260), true, true, 0, shared_scan);
+  assert(private_scan.size() == 11 && shared_scan.size() == 11);
+  for (uint32_t i = 0; i < private_scan.size(); ++i) {
+    assert(private_scan[i].first.Compare(Key(250 + i)) == 0);
+    assert(private_scan[i].second == 250 + i);
+    assert(shared_scan[i].second == 1250 + i);
+  }
   const auto &layout = regions.layout();
   assert(layout.domains[static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc)]
              .used_bytes.load() > 0);
