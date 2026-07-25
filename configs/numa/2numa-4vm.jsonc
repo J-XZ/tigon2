@@ -1,12 +1,13 @@
 {
-  // Portable two-NUMA example. Replace CPU lists and paths for the host.
+  // Portable two-NUMA example aligned with cxlkv root topology.
+  // Replace CPU lists and paths for the host as needed.
   "shared_memory": {
     "size_mb": 32768,
-    "path": "/dev/shm/tigonkv",
-    "device_path": "/dev/ivpci0",
-    "numa_node": 1,
     "hwcc": { "offset_mb": 0, "size_mb": 1024 },
-    "swcc": { "offset_mb": 1024, "size_mb": 31744 }
+    "swcc": { "offset_mb": 1024, "size_mb": 31744 },
+    "path": "/mnt/xz_shared_mem",
+    "device_path": "/dev/ivpci0",
+    "numa_node": [1]
   },
   "host_cpu": {
     "reserved_cores": [34],
@@ -19,10 +20,15 @@
     "core_count_per_vm": 8,
     "mem_size_mb_per_vm": 2048,
     "storage_path": "/mnt/xz_vm_storage",
-    "numa_node": 0,
-    "copy_root_img": true
+    "numa_node": [0],
+    "ssh_base_port": 10022,
+    "copy_root_img": true,
+    "use_ivshmem_doorbell": false
   },
-  "network": { "base_ssh_port": 10022 },
+  "network": {
+    "sriov_nic": "",
+    "outside_nic": ""
+  },
   "sync": { "timeout_sec": 60 },
   "e2e": { "foreground_worker_count_per_vm": 4 }
 }

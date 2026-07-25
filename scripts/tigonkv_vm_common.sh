@@ -31,16 +31,22 @@ while i < len(text):
 d=json.loads(''.join(out))
 def get(*keys, default=None):
     x=d
-    for key in keys: x=x[key]
+    for key in keys:
+        if not isinstance(x, dict) or key not in x:
+            return default
+        x=x[key]
     return x if x is not None else default
 def nodes(value): return value if isinstance(value, list) else [value]
+ssh_port = get('vm', 'ssh_base_port')
+if ssh_port is None:
+    ssh_port = get('network', 'base_ssh_port')
 values={
  'TIGONKV_VM_COUNT': get('vm','count'),
  'TIGONKV_VM_CORES_PER_VM': get('vm','core_count_per_vm'),
  'TIGONKV_VM_MEM_MB': get('vm','mem_size_mb_per_vm'),
  'TIGONKV_VM_STORAGE': get('vm','storage_path'),
  'TIGONKV_VM_NUMA': ','.join(map(str,nodes(get('vm','numa_node')))),
- 'TIGONKV_SSH_BASE_PORT': get('network','base_ssh_port'),
+ 'TIGONKV_SSH_BASE_PORT': ssh_port,
  'TIGONKV_SHARED_PATH': get('shared_memory','path'),
  'TIGONKV_SHARED_MB': get('shared_memory','size_mb'),
  'TIGONKV_SHARED_NUMA': ','.join(map(str,nodes(get('shared_memory','numa_node')))),
@@ -52,7 +58,7 @@ values={
 for key, value in values.items(): print(f'{key}={shlex.quote(str(value))}')
 PY
 )"
-  if [[ -d "$TIGONKV_SHARED_PATH" || "$TIGONKV_SHARED_PATH" == */ ]]; then
+  if [[ "$TIGONKV_SHARED_PATH" == "/mnt/xz_shared_mem" || "$TIGONKV_SHARED_PATH" == "/mnt/xz_shared_mem/" || -d "$TIGONKV_SHARED_PATH" || "$TIGONKV_SHARED_PATH" == */ ]]; then
     TIGONKV_SHARED_BACKING="${TIGONKV_SHARED_PATH%/}/ivshmem_shared_mem"
   else
     TIGONKV_SHARED_BACKING="$TIGONKV_SHARED_PATH"

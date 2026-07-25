@@ -85,12 +85,44 @@ bool JsonNumberArray(const std::string &s, const char *name, std::vector<T> *out
   return true;
 }
 
-template <typename T>
-bool JsonNumberInObject(const std::string &s, const char *object, const char *name, T *out) {
-  std::regex object_re(std::string("\\\"") + object + R"(\"\s*:\s*\{([^}]*)\})");
+bool ExtractObjectBody(const std::string &s, const char *object, std::string *body) {
+  std::regex object_re(std::string("\\\"") + object + R"(\"\s*:\s*\{)");
   std::smatch object_match;
   if (!std::regex_search(s, object_match, object_re)) return false;
-  return JsonNumber(object_match[1].str(), name, out);
+  const size_t start = static_cast<size_t>(object_match.position() + object_match.length());
+  int depth = 1;
+  for (size_t pos = start; pos < s.size(); ++pos) {
+    if (s[pos] == '{') {
+      ++depth;
+    } else if (s[pos] == '}') {
+      --depth;
+      if (depth == 0) {
+        *body = s.substr(start, pos - start);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+template <typename T>
+bool JsonNumberInObject(const std::string &s, const char *object, const char *name, T *out) {
+  std::string body;
+  if (!ExtractObjectBody(s, object, &body)) return false;
+  return JsonNumber(body, name, out);
+}
+
+// Accept either a scalar int or an int array; arrays use the first element.
+template <typename T>
+bool JsonNumberOrFirstArrayInObject(const std::string &s, const char *object, const char *name,
+                                    T *out) {
+  std::string body;
+  if (!ExtractObjectBody(s, object, &body)) return false;
+  if (JsonNumber(body, name, out)) return true;
+  std::vector<T> values;
+  if (!JsonNumberArray(body, name, &values) || values.empty()) return false;
+  *out = values.front();
+  return true;
 }
 
 void ValidateKnownKeys(const std::string &s) {
@@ -100,9 +132,11 @@ void ValidateKnownKeys(const std::string &s) {
       "ivshmem_server_cores", "vm_cores", "vm", "count", "core_count_per_vm",
       "storage_path", "mem_size_mb_per_vm", "first_ip", "bridge_tap_ip",
       "copy_root_img", "use_ivshmem_doorbell", "local_ssh_pub_key",
-      "network", "base_ssh_port", "sync", "e2e",
+      "ssh_base_port",
+      "network", "base_ssh_port", "sriov_nic", "outside_nic", "sync", "e2e",
       "foreground_worker_count_per_vm", "tigon_kv", "partition_count",
-      "timeout_sec",
+      "timeout_sec", "vm_ssh_user", "vm_direct_ssh_port", "host_rsync_dest",
+      "host_ssh_port", "host_ssh_extra", "project_root_on_targets", "vm_ssh_extra",
       "fixed_key_size", "fixed_value_size", "hw_cc_budget_mb",
       "owner_private_swcc_fraction", "migration_policy", "when_to_move_out",
       "scc_mechanism", "transport_ring_total_mb",
@@ -135,15 +169,16 @@ Config Config::FromJsonc(const std::string &path) {
   JsonString(text, "path", &c.shared_memory_path);
   JsonString(text, "device_path", &c.device_path);
   JsonNumber(text, "size_mb", &c.size_mb);
-  JsonNumberInObject(text, "shared_memory", "numa_node", &c.shared_memory_numa_node);
+  JsonNumberOrFirstArrayInObject(text, "shared_memory", "numa_node", &c.shared_memory_numa_node);
   JsonNumberArray(text, "reserved_cores", &c.host_reserved_cores);
   JsonNumberArray(text, "ivshmem_server_cores", &c.ivshmem_server_cores);
   JsonNumberArray(text, "vm_cores", &c.vm_cores);
   JsonNumber(text, "count", &c.vm_count);
   JsonNumberInObject(text, "vm", "core_count_per_vm", &c.vm_core_count_per_vm);
   JsonString(text, "storage_path", &c.vm_storage_path);
-  JsonNumberInObject(text, "vm", "numa_node", &c.vm_numa_node);
-  JsonNumber(text, "base_ssh_port", &c.network_base_ssh_port);
+  JsonNumberOrFirstArrayInObject(text, "vm", "numa_node", &c.vm_numa_node);
+  if (!JsonNumberInObject(text, "vm", "ssh_base_port", &c.network_base_ssh_port))
+    JsonNumber(text, "base_ssh_port", &c.network_base_ssh_port);
   JsonNumber(text, "timeout_sec", &c.sync_timeout_sec);
   JsonNumber(text, "foreground_worker_count_per_vm", &c.foreground_worker_count_per_vm);
   JsonNumber(text, "partition_count", &c.partition_count);
