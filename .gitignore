@@ -6,6 +6,8 @@ settings.json
 
 build
 build-*/
+# Historical experiment logs/traces/configs (do not commit)
+exp_data/
 results/ycsb_traces/
 tmp*
 __pycache__
