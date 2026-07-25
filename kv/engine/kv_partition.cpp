@@ -8,6 +8,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace tigonkv::engine {
@@ -98,8 +99,23 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       // Keep the private latch through the shared operation so move-out cannot
       // remove the shared authority between lookup and the SCC write.
       if (payload != nullptr) mem_access::SharedPayloadWrite(payload->data, value.size());
-      const bool written = star::TwoPLPashaHelper::kv_shared_write(
-          smeta, owner_shard_, value.data(), value.size());
+      bool written = false;
+      for (uint32_t spin = 0; spin < 100000u && smeta != nullptr; ++spin) {
+        written = star::TwoPLPashaHelper::kv_shared_write(
+            smeta, owner_shard_, value.data(), value.size());
+        if (written) break;
+        // Drop PrivateRow latch so concurrent GetShared readers / move-out
+        // checks can progress; re-validate after reacquire.
+        UnlockRow(row);
+        std::this_thread::yield();
+        LockRow(row);
+        if (row->is_tombstone || !row->is_migrated ||
+            row->migrated_smeta_off != smeta_offset) {
+          UnlockRow(row);
+          // Row left shared authority; retry as a fresh private put.
+          return PutPrivate(key, value);
+        }
+      }
       if (written) {
         row->value_len = static_cast<uint32_t>(value.size());
         ++row->version;
