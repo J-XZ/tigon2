@@ -48,9 +48,11 @@ uint64_t CurrentRssKb() {
 }
 
 // While serving a request (or walking owned trees for a local Scan), nested
-// PollTransport must only apply response/item/done traffic.  Handling Put/Get
-// or another ScanRequest here mutates the same B+trees under OLC and livelocks
+// PollTransport must not pop/serve deferred requests.  Handling Put/Get or
+// another ScanRequest here mutates the same B+trees under OLC and livelocks
 // scan() restart loops (GDB: yield counts > 10M on YCSB-E 4x4).
+// Response/item/done traffic is applied by the inbound demuxer thread, so
+// nested FG polls only need to skip ServeDeferred.
 thread_local uint32_t TlsRequestServeDepth = 0;
 
 struct RequestServeDepthGuard {
@@ -101,6 +103,7 @@ KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> p
     : config_(config), pool_(std::move(pool)), ebr_(std::move(ebr)), scc_(std::move(scc)) {}
 
 KVEngine::~KVEngine() {
+  StopInboundDemuxer();
   if (star::scc_manager == scc_.get()) star::scc_manager = nullptr;
   if (star::global_ebr_meta == ebr_.get()) star::global_ebr_meta = nullptr;
   KvMigrationRuntime::Instance().Reset();
@@ -130,8 +133,11 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
         star::CXLMemory::cxl_transport_root_index, &root);
     rings = static_cast<star::MPSCRingBuffer *>(root);
   }
+  // +1 EBR slot for the inbound demuxer (Tigon IncomingDispatcher analogue).
+  // This is a transport IO thread — it never serves Put/Get/Scan — so it does
+  // not steal foreground KV work from the cxlkv-comparable CPU budget.
   auto ebr = std::make_unique<star::CXL_EBR>(config.vm_count,
-                                             config.foreground_worker_count_per_vm,
+                                             config.foreground_worker_count_per_vm + 1,
                                              &pool->allocator());
   ebr->thread_init_ebr_meta(config.node_id, 0);
   star::global_ebr_meta = ebr.get();
@@ -164,6 +170,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     if (engine->OwnerForPartition(partition->partition_id()) == config.node_id)
       partition->RebuildClockTracker();
   }
+  engine->StartInboundDemuxer();
   return engine;
 }
 
@@ -526,9 +533,9 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
   unsigned spins = 0;
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
-    PollTransport();
-    // Brief backoff when the peer ring is full so other threads/VMs can drain
-    // without this core pegging at 400% in a yield-only spin.
+    // Do not steal the MPSC consumer role or nest ServeDeferred here.
+    // Peer/local inbound demuxers free ring slots; nested serve+Send is what
+    // previously produced multi-node full-ring circular waits.
     if ((++spins & 63u) == 0)
       std::this_thread::sleep_for(std::chrono::microseconds(50));
     else
@@ -549,6 +556,8 @@ Status KVEngine::AwaitResponse(uint64_t request_id, std::string *response_value)
   const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::seconds(config_.sync_timeout_sec);
   for (;;) {
+    // Help serve deferred requests so peers waiting on us make progress, while
+    // the demuxer independently publishes our response into responses_.
     PollTransport();
     std::lock_guard<std::mutex> lock(response_mutex_);
     auto it = responses_.find(request_id);
@@ -577,8 +586,6 @@ Status KVEngine::AwaitScan(uint64_t request_id, std::vector<ScanItem> *items) {
   const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::seconds(config_.sync_timeout_sec);
   for (;;) {
-    // Keep draining while traffic is present so ScanItem bursts from multiple
-    // owners do not stall behind a single poll per yield.
     for (int i = 0; i < 4; ++i) PollTransport();
     std::lock_guard<std::mutex> lock(pending_scan_mutex_);
     auto it = pending_scans_.find(request_id);
@@ -614,39 +621,88 @@ CasResult KVEngine::ForwardCompareExchange(std::string_view key,
   return {status, status.ok()};
 }
 
-void KVEngine::PollTransport() {
-  if (rings_ == nullptr) return;
-  // MPSC single-consumer: only the dequeue is serialized.  Handling must run
-  // without the poll lock so peer threads can keep draining this node's ring
-  // while a serve is blocked on a full remote ring.
-  for (int drained = 0; drained < 64; ++drained) {
-    KvMessage message{};
-    {
-      std::lock_guard<std::recursive_mutex> poll_lock(transport_poll_mutex_);
-      alignas(64) char bytes[sizeof(KvMessage)];
-      const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
-      if (received == 0) break;
-      if (received != sizeof(KvMessage))
-        throw std::runtime_error("malformed KV transport entry");
-      std::memcpy(&message, bytes, sizeof(message));
-      network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
-    }
-    HandleTransportMessage(message);
-  }
-  // Only the outermost poller drains deferred requests.  Nested polls (from
-  // Send/Await/Scan progress) must stay response-only.
-  if (TlsRequestServeDepth == 0) {
-    for (int i = 0; i < 8; ++i) {
-      KvMessage deferred;
-      {
-        std::lock_guard<std::mutex> lock(deferred_request_mutex_);
-        if (deferred_transport_requests_.empty()) break;
-        deferred = deferred_transport_requests_.front();
-        deferred_transport_requests_.pop_front();
+void KVEngine::StartInboundDemuxer() {
+  inbound_demuxer_worker_id_ = config_.foreground_worker_count_per_vm;
+  inbound_demuxer_stop_.store(false, std::memory_order_release);
+  inbound_demuxer_ = std::thread([this] { InboundDemuxerLoop(); });
+}
+
+void KVEngine::StopInboundDemuxer() {
+  inbound_demuxer_stop_.store(true, std::memory_order_release);
+  if (inbound_demuxer_.joinable()) inbound_demuxer_.join();
+}
+
+void KVEngine::InboundDemuxerLoop() {
+  ebr_->thread_init_ebr_meta(config_.node_id, inbound_demuxer_worker_id_);
+  star::global_ebr_meta = ebr_.get();
+  while (!inbound_demuxer_stop_.load(std::memory_order_acquire)) {
+    bool progressed = false;
+    try {
+      if (rings_ != nullptr) {
+        for (int drained = 0; drained < 64; ++drained) {
+          alignas(64) char bytes[sizeof(KvMessage)];
+          const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
+          if (received == 0) break;
+          if (received != sizeof(KvMessage))
+            throw std::runtime_error("malformed KV transport entry");
+          KvMessage message{};
+          std::memcpy(&message, bytes, sizeof(message));
+          network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
+          DemuxTransportMessage(message);
+          progressed = true;
+        }
       }
-      HandleTransportMessage(deferred);
+    } catch (...) {
+      // Keep demuxing; FG paths surface hard failures to callers.
     }
+    if (!progressed) std::this_thread::sleep_for(std::chrono::microseconds(20));
   }
+}
+
+void KVEngine::DemuxTransportMessage(const KvMessage &message) {
+  if (message.destination_node != config_.node_id ||
+      message.key_size > message.key.size() || message.value_size > message.value.size())
+    throw std::runtime_error("invalid KV transport message");
+  if (message.type == KvMessageType::kResponse) {
+    std::lock_guard<std::mutex> lock(response_mutex_);
+    responses_.emplace(message.request_id, message);
+    return;
+  }
+  if (message.type == KvMessageType::kScanItem || message.type == KvMessageType::kScanDone) {
+    std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+    auto it = pending_scans_.find(message.request_id);
+    if (it == pending_scans_.end()) return;
+    if (message.type == KvMessageType::kScanItem) {
+      it->second.items.push_back({std::string(message.key.data(), message.key_size),
+                                  std::string(message.value.data(), message.value_size)});
+    } else {
+      it->second.status = static_cast<StatusCode>(message.status);
+      it->second.done = true;
+    }
+    return;
+  }
+  // Request path: queue for FG workers (Tigon IncomingDispatcher → worker queue).
+  std::lock_guard<std::mutex> lock(deferred_request_mutex_);
+  deferred_transport_requests_.push_back(message);
+}
+
+void KVEngine::ServeDeferredRequests(int max_count) {
+  if (TlsRequestServeDepth != 0) return;
+  for (int i = 0; i < max_count; ++i) {
+    KvMessage deferred;
+    {
+      std::lock_guard<std::mutex> lock(deferred_request_mutex_);
+      if (deferred_transport_requests_.empty()) break;
+      deferred = deferred_transport_requests_.front();
+      deferred_transport_requests_.pop_front();
+    }
+    ServeTransportRequest(deferred);
+  }
+}
+
+void KVEngine::PollTransport() {
+  // FG cooperative serve only — no MPSC recv (demuxer owns that).
+  ServeDeferredRequests(8);
 }
 
 void KVEngine::BindWorker(uint32_t worker_id) {
@@ -676,8 +732,7 @@ void KVEngine::ServeScanRequest(const KvMessage &message) {
       SendTransportMessage(MakeRequest(KvMessageType::kScanItem, config_.node_id,
                                        message.source_node, message.request_id,
                                        items[i].key, items[i].value));
-      // Cooperative drain so peers blocked on a full ring into this node can
-      // make progress without waiting for the entire serve to finish.
+      // Cooperative deferred serve (not MPSC recv) between ScanItem bursts.
       if ((i + 1) % 8 == 0) PollTransport();
     }
   }
@@ -687,35 +742,15 @@ void KVEngine::ServeScanRequest(const KvMessage &message) {
   SendTransportMessage(done);
 }
 
-void KVEngine::HandleTransportMessage(const KvMessage &message) {
+void KVEngine::ServeTransportRequest(const KvMessage &message) {
   if (message.destination_node != config_.node_id ||
       message.key_size > message.key.size() || message.value_size > message.value.size())
     throw std::runtime_error("invalid KV transport message");
-  if (message.type == KvMessageType::kResponse) {
-    std::lock_guard<std::mutex> lock(response_mutex_);
-    responses_.emplace(message.request_id, message);
-    return;
-  }
-  if (message.type == KvMessageType::kScanItem || message.type == KvMessageType::kScanDone) {
-    std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-    auto it = pending_scans_.find(message.request_id);
-    if (it == pending_scans_.end()) return;
-    if (message.type == KvMessageType::kScanItem) {
-      it->second.items.push_back({std::string(message.key.data(), message.key_size),
-                                  std::string(message.value.data(), message.value_size)});
-    } else {
-      it->second.status = static_cast<StatusCode>(message.status);
-      it->second.done = true;
-    }
-    return;
-  }
-  // Nested poll (Scan walk / request serve / Send backoff): defer every request
-  // so we only apply response traffic and do not mutate trees under OLC readers.
-  if (TlsRequestServeDepth != 0) {
-    std::lock_guard<std::mutex> lock(deferred_request_mutex_);
-    deferred_transport_requests_.push_back(message);
-    return;
-  }
+  // Responses must never reach the serve path (demuxer applies them).
+  if (message.type == KvMessageType::kResponse ||
+      message.type == KvMessageType::kScanItem ||
+      message.type == KvMessageType::kScanDone)
+    throw std::runtime_error("response traffic must not enter ServeTransportRequest");
 
   RequestServeDepthGuard depth_guard;
   if (message.type == KvMessageType::kScanRequest) {
