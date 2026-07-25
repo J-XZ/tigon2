@@ -592,10 +592,9 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
   unsigned spins = 0;
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
-    // Help serve deferred requests when not already inside a serve (depth==0).
-    // Nested serve during Send is unsafe for OLC; empty-depth Send stalls can
-    // otherwise form a full-ring circular wait with peer Forwards.
-    if (TlsRequestServeDepth == 0) ServeDeferredRequests(4);
+    // Do not steal the MPSC consumer role or nest ServeDeferred here.
+    // Peer/local inbound demuxers free ring slots; nested serve+Send is what
+    // previously produced multi-node full-ring circular waits.
     if ((++spins & 63u) == 0)
       std::this_thread::sleep_for(std::chrono::microseconds(50));
     else
@@ -764,7 +763,7 @@ void KVEngine::ServeDeferredRequests(int max_count) {
 
 void KVEngine::PollTransport() {
   // FG cooperative serve only — no MPSC recv (demuxer owns that).
-  ServeDeferredRequests(64);
+  ServeDeferredRequests(8);
 }
 
 void KVEngine::BindWorker(uint32_t worker_id) {
