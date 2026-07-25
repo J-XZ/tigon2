@@ -6,7 +6,6 @@
 
 #include <memory>
 #include <atomic>
-#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -106,8 +105,12 @@ class KVEngine {
   // Kept well above worker count so Scans stay parallel after nested-poll fix.
   static constexpr uint32_t kMaxInflightScanRpcs = 8;
   std::mutex scan_rpc_mutex_;
-  std::condition_variable scan_rpc_cv_;
   uint32_t inflight_scan_rpcs_ = 0;
+  // OLC B+tree scan restarts under many concurrent walkers+writers; bound
+  // simultaneous owned walks (local page + remote serves) without serializing
+  // Scan() coordinators or remote RPC fan-out.
+  static constexpr uint32_t kMaxConcurrentOwnedScans = 2;
+  std::atomic<uint32_t> concurrent_owned_scans_{0};
   struct PendingCas {
     uint32_t source_node = 0;
     std::string key;

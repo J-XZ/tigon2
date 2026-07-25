@@ -275,20 +275,32 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   sources.push_back(std::move(local));
 
   auto acquire_scan_rpc = [this] {
-    std::unique_lock<std::mutex> lock(scan_rpc_mutex_);
-    scan_rpc_cv_.wait(lock, [&] { return inflight_scan_rpcs_ < kMaxInflightScanRpcs; });
-    ++inflight_scan_rpcs_;
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lock(scan_rpc_mutex_);
+        if (inflight_scan_rpcs_ < kMaxInflightScanRpcs) {
+          ++inflight_scan_rpcs_;
+          return;
+        }
+      }
+      // Never block without draining: peers may need this thread to apply
+      // ScanItem/Done or serve while slots are held elsewhere.
+      PollTransport();
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
   };
   auto release_scan_rpc = [this] {
-    {
-      std::lock_guard<std::mutex> lock(scan_rpc_mutex_);
-      --inflight_scan_rpcs_;
-    }
-    scan_rpc_cv_.notify_one();
+    std::lock_guard<std::mutex> lock(scan_rpc_mutex_);
+    --inflight_scan_rpcs_;
   };
 
-  // Bound in-flight ScanRPCs (ring architecture).  Multiple Scans still
-  // overlap; each remote page takes one slot only for send+await.
+  // Fan out first-page ScanRequests to every remote owner concurrently, then
+  // await — restores cross-node Scan parallelism (sequential send+await was an
+  // accidental regression under the inflight-slot cap).
+  std::vector<uint64_t> remote_request_ids;
+  std::vector<uint32_t> remote_nodes;
+  remote_request_ids.reserve(config_.vm_count > 0 ? config_.vm_count - 1 : 0);
+  remote_nodes.reserve(config_.vm_count > 0 ? config_.vm_count - 1 : 0);
   for (uint32_t node = 0; node < config_.vm_count; ++node) {
     if (node == config_.node_id) continue;
     const uint64_t request_id = NextRequestId(config_.node_id);
@@ -297,28 +309,52 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       pending_scans_.emplace(request_id, PendingScan{});
     }
     acquire_scan_rpc();
-    Status status = Status::Ok();
-    std::vector<ScanItem> remote;
     try {
       SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id, node,
                                        request_id, start_key, EncodeU64(request_limit)));
-      status = AwaitScan(request_id, &remote);
     } catch (const std::exception &e) {
-      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      pending_scans_.erase(request_id);
+      {
+        std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+        pending_scans_.erase(request_id);
+        for (const uint64_t pending_id : remote_request_ids) pending_scans_.erase(pending_id);
+      }
       release_scan_rpc();
+      for (size_t i = 0; i < remote_request_ids.size(); ++i) release_scan_rpc();
       return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
     }
+    remote_request_ids.push_back(request_id);
+    remote_nodes.push_back(node);
+  }
+
+  for (size_t remote_index = 0; remote_index < remote_request_ids.size(); ++remote_index) {
+    const uint64_t request_id = remote_request_ids[remote_index];
+    std::vector<ScanItem> remote;
+    const Status status = AwaitScan(request_id, &remote);
     release_scan_rpc();
-    if (!status.ok()) return {status, {}};
+    if (!status.ok()) {
+      {
+        std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+        for (size_t j = remote_index + 1; j < remote_request_ids.size(); ++j)
+          pending_scans_.erase(remote_request_ids[j]);
+      }
+      for (size_t j = remote_index + 1; j < remote_request_ids.size(); ++j) release_scan_rpc();
+      return {status, {}};
+    }
     Source source;
-    source.node = node;
+    source.node = remote_nodes[remote_index];
     load_page(&source, std::move(remote));
     sources.push_back(std::move(source));
   }
 
   auto refill = [&](Source *source) -> Status {
     if (!source->more) return Status::Ok();
+    if (source->node == config_.node_id) {
+      ScanResult page = ScanOwnedPartitions(source->cursor, request_limit);
+      if (!page.status.ok()) return page.status;
+      // Drop the cursor duplicate if present (exclusive resume).
+      std::vector<ScanItem> raw = std::move(page.items);
+      return load_page(source, std::move(raw));
+    }
     const uint64_t request_id = NextRequestId(config_.node_id);
     {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
@@ -376,6 +412,27 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
 }
 
 ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t limit) {
+  // Bound concurrent owned tree walks: OLC scan() restart-livelocks when too
+  // many threads walk the same private/shared trees (YCSB-E 4x4).  Coordinators
+  // and remote RPCs stay parallel; only the local walk admits a soft cap.
+  for (;;) {
+    uint32_t cur = concurrent_owned_scans_.load(std::memory_order_relaxed);
+    if (cur < kMaxConcurrentOwnedScans &&
+        concurrent_owned_scans_.compare_exchange_weak(cur, cur + 1,
+                                                      std::memory_order_acquire,
+                                                      std::memory_order_relaxed))
+      break;
+    PollTransport();
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+  struct OwnedScanSlotGuard {
+    KVEngine *engine;
+    explicit OwnedScanSlotGuard(KVEngine *e) : engine(e) {}
+    ~OwnedScanSlotGuard() {
+      engine->concurrent_owned_scans_.fetch_sub(1, std::memory_order_release);
+    }
+  } owned_slot{this};
+
   // Raise serve depth for the whole owned walk so progress PollTransport cannot
   // nest Put/Get/Scan serves that restart OLC readers on the same trees.
   std::map<std::string, std::string> merged;
