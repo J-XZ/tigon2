@@ -106,11 +106,14 @@ class KVEngine {
   static constexpr uint32_t kMaxInflightScanRpcs = 8;
   std::mutex scan_rpc_mutex_;
   uint32_t inflight_scan_rpcs_ = 0;
-  // OLC B+tree scan restarts under many concurrent walkers+writers; bound
-  // simultaneous owned walks (local page + remote serves) without serializing
-  // Scan() coordinators or remote RPC fan-out.
+  // OLC cannot sustain many concurrent walkers on the same trees; bound owned
+  // walks (local page + ServeScanRequest).  Scan() coordinators stay parallel
+  // and a transport poller keeps serving while they await responses.
   static constexpr uint32_t kMaxConcurrentOwnedScans = 2;
   std::atomic<uint32_t> concurrent_owned_scans_{0};
+  std::thread transport_poller_;
+  std::atomic<bool> transport_poller_stop_{false};
+  uint32_t transport_poller_worker_id_ = 0;
   struct PendingCas {
     uint32_t source_node = 0;
     std::string key;
