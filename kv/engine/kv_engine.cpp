@@ -589,6 +589,8 @@ Status KVEngine::Checkpoint() {
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {
+  if (rings_ == nullptr || message.destination_node >= config_.vm_count)
+    throw std::runtime_error("KV transport destination out of range");
   unsigned spins = 0;
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
@@ -720,6 +722,7 @@ void KVEngine::InboundDemuxerLoop() {
 
 void KVEngine::DemuxTransportMessage(const KvMessage &message) {
   if (message.destination_node != config_.node_id ||
+      message.source_node >= config_.vm_count ||
       message.key_size > message.key.size() || message.value_size > message.value.size())
     throw std::runtime_error("invalid KV transport message");
   if (message.type == KvMessageType::kResponse) {

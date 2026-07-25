@@ -87,7 +87,7 @@
     "outside_nic": ""
   },
   "sync": {
-    "timeout_sec": 60,
+    "timeout_sec": 180,
     "vm_ssh_user": "root",
     "vm_direct_ssh_port": 22,
     "host_rsync_dest": "",

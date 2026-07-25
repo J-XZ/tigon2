@@ -179,18 +179,35 @@ int main() {
   assert(partition.MoveOutPrivate("pinned", 1));
   assert(partition.GetPrivate("pinned", &value) && value == "hold");
 
+  // Pin failure (write_locked) must leave *pinned_existing null so Serve
+  // cannot mismatched-unpin and wrap uint8_t ref_cnt under NDEBUG.
+  assert(partition.PutPrivate("pinfail", "x"));
+  assert(partition.PromotePrivate("pinfail", 1));
+  star::TwoPLPashaMetadataShared *held = nullptr;
+  assert(!partition.PromotePrivate("pinfail", 1, &held));
+  assert(held != nullptr);
+  held->set_write_locked();
+  star::TwoPLPashaMetadataShared *no_pin =
+      reinterpret_cast<star::TwoPLPashaMetadataShared *>(0x1);
+  assert(!partition.PromotePrivate("pinfail", 1, &no_pin));
+  assert(no_pin == nullptr);
+  held->clear_write_locked();
+  star::TwoPLPashaHelper::kv_unpin_shared_ref(held);
+  assert(partition.MoveOutPrivate("pinfail", 1));
+
   // A partition scan merges the private and shared authorities in key order,
   // without resurrecting tombstones or duplicate migrated locator rows.
   std::vector<std::pair<std::string, std::string>> scan;
   assert(partition.ScanOwned("alpha", 0, &scan));
-  assert(scan.size() == 7);
+  assert(scan.size() == 8);
   assert(scan[0] == std::make_pair(std::string("alpha"), std::string("shared-update")));
   assert(scan[1] == std::make_pair(std::string("clock"), std::string("victim")));
   assert(scan[2] == std::make_pair(std::string("counter"), std::string("3")));
   assert(scan[3] == std::make_pair(std::string("gamma"), std::string("cas-shared")));
   assert(scan[4] == std::make_pair(std::string("new-cas"), std::string("created")));
   assert(scan[5] == std::make_pair(std::string("new-counter"), std::string("-2")));
-  assert(scan[6] == std::make_pair(std::string("pinned"), std::string("hold")));
+  assert(scan[6] == std::make_pair(std::string("pinfail"), std::string("x")));
+  assert(scan[7] == std::make_pair(std::string("pinned"), std::string("hold")));
   assert(partition.ScanOwned("alpha", 2, &scan));
   assert(scan.size() == 2);
   assert(scan[0].first == "alpha" && scan[1].first == "clock");

@@ -430,8 +430,10 @@ class TwoPLPashaHelper {
                 if (smeta == nullptr) return;
                 smeta->lock();
                 auto *scc_data = smeta->get_scc_data();
-                DCHECK(scc_data->ref_cnt > 0);
-                scc_data->ref_cnt--;
+                // RelWithDebInfo builds compile DCHECK out (NDEBUG). Guarding
+                // prevents a mismatched unpin from wrapping uint8_t 0→255 and
+                // permanently saturating the shared row.
+                if (scc_data->ref_cnt > 0) scc_data->ref_cnt--;
                 smeta->unlock();
         }
 

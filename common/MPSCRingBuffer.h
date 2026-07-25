@@ -10,6 +10,7 @@
 #include <boost/interprocess/offset_ptr.hpp>
 #include <stddef.h>
 #include <atomic>
+#include <stdexcept>
 #include <xmmintrin.h>
 #include <glog/logging.h>
 
@@ -69,7 +70,21 @@ class MPSCRingBuffer {
                 uint64_t cur_count = 0, cur_tail = 0;
                 Entry *entry = nullptr;
 
-                CHECK(data_size <= entry_data_size);
+                // Prefer throw over glog FATAL: aborting one guest made the
+                // remaining VMs look like a Forward/Await stall under YCSB-A.
+                if (entry_num == 0 || entry_struct_size < 9 ||
+                    entry_data_size != entry_struct_size - 9) {
+                        LOG(ERROR) << "MPSCRingBuffer corrupt metadata: data_size="
+                                   << data_size << " entry_data_size=" << entry_data_size
+                                   << " entry_struct_size=" << entry_struct_size
+                                   << " entry_num=" << entry_num;
+                        throw std::runtime_error("corrupt MPSCRingBuffer metadata");
+                }
+                if (data_size > entry_data_size) {
+                        LOG(ERROR) << "MPSCRingBuffer enqueue too large: data_size="
+                                   << data_size << " entry_data_size=" << entry_data_size;
+                        throw std::runtime_error("KV message exceeds transport entry");
+                }
 
                 /* try to gain access to the queue */
                 cur_count = std::atomic_fetch_add_explicit(&count, 1, std::memory_order_acquire);

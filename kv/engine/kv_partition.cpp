@@ -418,6 +418,10 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id,
     void *migration_policy_meta = nullptr;
     result = MoveInForMigrationManager(fixed_key.bytes, inc_ref, migration_policy_meta);
   }
+  // SUCCESS always holds an inc_ref from MoveIn; FAIL_ALREADY_IN_CXL only when
+  // MoveIn actually pinned (see MoveInForMigrationManager). Never publish
+  // smeta for FAIL_OOM / failed pin — ServeTransportRequest would unpin and
+  // underflow ref_cnt under NDEBUG.
   if (inc_ref && (result == star::migration_result::SUCCESS ||
                   result == star::migration_result::FAIL_ALREADY_IN_CXL)) {
     RegionOffset row_offset = kNullOffset;
@@ -448,12 +452,23 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     return star::migration_result::FAIL_OOM;
   }
   if (row->is_migrated) {
-    if (inc_ref_cnt && row->migrated_smeta_off != kNullOffset) {
+    if (inc_ref_cnt) {
+      // Caller (PromotePrivate with pinned_existing) will unpin exactly once.
+      // Only report FAIL_ALREADY_IN_CXL when the pin is actually held; a failed
+      // pin must not hand back smeta or RelWithDebInfo uint8_t ref_cnt wraps
+      // 0→255 and saturates every later shared read/write (YCSB Forward stall).
+      if (row->migrated_smeta_off == kNullOffset) {
+        UnlockRow(row);
+        return star::migration_result::FAIL_OOM;
+      }
       auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
           regions_.hwcc().FromOffset(row->migrated_smeta_off));
       auto *payload = smeta->get_scc_data();
-      if (star::TwoPLPashaHelper::kv_pin_shared_ref(smeta))
-        migration_policy_meta = &payload->migration_policy_meta;
+      if (!star::TwoPLPashaHelper::kv_pin_shared_ref(smeta)) {
+        UnlockRow(row);
+        return star::migration_result::FAIL_OOM;
+      }
+      migration_policy_meta = &payload->migration_policy_meta;
     }
     UnlockRow(row);
     return star::migration_result::FAIL_ALREADY_IN_CXL;
