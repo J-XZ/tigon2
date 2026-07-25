@@ -148,10 +148,25 @@ class PolicyClock : public MigrationManager {
                 new(clock_meta) ClockMeta();
         }
 
+        // tigonkv: owner attach rebuilds the DRAM Clock tracker from the shared
+        // tree without re-running move-in allocation (PLAN §4.5).
+        void track_already_migrated(ITable *table, const void *key,
+                                    const std::tuple<MetaDataType *, void *> &row,
+                                    void *migration_policy_meta)
+        {
+                ClockTracker &clock_tracker = clock_trackers[table->partitionID()];
+                clock_tracker.lock();
+                ClockTrackerNode *clock_tracker_node = new ClockTrackerNode(table, key, row);
+                clock_tracker_node->row_entity.migration_manager_meta = migration_policy_meta;
+                clock_tracker.track(clock_tracker_node);
+                clock_tracker.unlock();
+        }
+
         void access_row(void *migration_policy_meta, uint64_t partition_id) override
         {
                 ClockMeta *clock_meta = reinterpret_cast<ClockMeta *>(migration_policy_meta);
                 clock_meta->second_chance = 1;
+                (void)partition_id;
         }
 
         migration_result move_row_in(ITable *table, const void *key, const std::tuple<MetaDataType *, void *> &row, bool inc_ref_cnt) override

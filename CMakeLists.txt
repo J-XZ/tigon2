@@ -31,9 +31,10 @@ endif()
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_library(tigonkv STATIC kv/kv_store.cpp kv/engine/latency_inject.cpp
-  kv/engine/kv_engine.cpp kv/engine/kv_partition.cpp kv/engine/region_allocator.cpp
+  kv/engine/kv_engine.cpp kv/engine/kv_partition.cpp kv/engine/kv_migration.cpp
+  kv/engine/region_allocator.cpp
   common/CXLMemory.cpp common/CXL_EBR.cpp common/btree_olc_cxl/BTreeOLC_CXL.cpp
-  protocol/Pasha/SCCManager.cpp)
+  protocol/Pasha/SCCManager.cpp protocol/Pasha/MigrationManager.cpp)
 target_link_libraries(tigonkv PUBLIC pthread glog)
 
 # tigonkv: legacy transaction benchmarks retain source-only reference status.

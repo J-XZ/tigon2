@@ -252,6 +252,14 @@ class CXLMemory {
                 }
         }
 
+        // tigonkv: PolicyClock budgets against this counter; dual-region KV
+        // allocations update domain used_bytes instead of the legacy wrappers,
+        // so the engine syncs the observed HWCC total before move_row_out.
+        void set_total_hw_cc_usage(uint64_t bytes)
+        {
+                size_total_hw_cc_usage.store(bytes, std::memory_order_relaxed);
+        }
+
         void print_stats()
         {
                 LOG(INFO) << "local CXL memory usage:"

@@ -3,6 +3,7 @@
 #include "common/CXL_EBR.h"
 #include "common/MPSCRingBuffer.h"
 #include "kv/engine/kv_partition.h"
+#include "kv/engine/kv_migration.h"
 #include "kv/engine/kv_messages.h"
 #include "protocol/TwoPLPasha/TwoPLPashaSCCWriteThrough.h"
 
@@ -88,6 +89,7 @@ KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> p
 KVEngine::~KVEngine() {
   if (star::scc_manager == scc_.get()) star::scc_manager = nullptr;
   if (star::global_ebr_meta == ebr_.get()) star::global_ebr_meta = nullptr;
+  KvMigrationRuntime::Instance().Reset();
 }
 
 std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
@@ -135,6 +137,18 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     engine->partitions_.emplace_back(std::make_unique<KVPartition>(
         engine->pool_->allocator(), *engine->ebr_, partition,
         engine->OwnerForPartition(partition), attach));
+  }
+  std::vector<KVPartition *> partition_ptrs;
+  partition_ptrs.reserve(engine->partitions_.size());
+  for (auto &partition : engine->partitions_) partition_ptrs.push_back(partition.get());
+  const uint64_t hw_budget = (config.hw_cc_budget_mb * 1024ULL * 1024ULL -
+      star::CXL_EBR::max_ebr_retiring_memory) / config.vm_count;
+  KvMigrationRuntime::Instance().Install(
+      partition_ptrs, config.fixed_key_size, config.fixed_value_size,
+      config.node_id, config.partition_count, hw_budget);
+  for (auto &partition : engine->partitions_) {
+    if (engine->OwnerForPartition(partition->partition_id()) == config.node_id)
+      partition->RebuildClockTracker();
   }
   return engine;
 }
@@ -741,7 +755,15 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
       star::CXL_EBR::max_ebr_retiring_memory) / config_.vm_count;
   const bool payload_high = partition.shared_payload_used_bytes() * 10 >=
       partition.shared_payload_capacity_bytes() * 9;
-  if (partition.hwcc_used_bytes() < hw_budget && !payload_high) return;
+  const uint64_t hw_used = partition.hwcc_used_bytes();
+  if (hw_used < hw_budget && !payload_high) return;
+  // PolicyClock budgets against CXLMemory::TOTAL_HW_CC_USAGE.  When only the
+  // shared-payload watermark trips, force the counter to the budget so the
+  // original move_row_out scan still runs.
+  if (payload_high && hw_used < hw_budget)
+    star::cxl_memory.set_total_hw_cc_usage(hw_budget);
+  else
+    KvMigrationRuntime::SyncHwCcUsage(partition);
   for (uint32_t attempt = 0; attempt < 16; ++attempt) {
     if (partition.MoveOutClockVictim(config_.node_id)) {
       migration_out_.fetch_add(1, std::memory_order_relaxed);

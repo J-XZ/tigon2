@@ -1,4 +1,5 @@
 #include "kv/engine/kv_partition.h"
+#include "kv/engine/kv_migration.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -80,6 +81,14 @@ int main() {
   tigonkv::engine::KVPartition partition(regions, ebr, 5, 1, false);
   assert(regions.OwnerPrivateArenaOffset(5) ==
          regions.layout().partitions[5].private_arena);
+  {
+    std::vector<tigonkv::engine::KVPartition *> parts(8, nullptr);
+    parts[5] = &partition;
+    const uint64_t hw_budget = (1024ULL * 1024ULL * 1024ULL -
+        star::CXL_EBR::max_ebr_retiring_memory) / 2;
+    tigonkv::engine::KvMigrationRuntime::Instance().Install(
+        parts, 32, 128, 0, 8, hw_budget);
+  }
   bool wrong_owner_rejected = false;
   try {
     (void)regions.AllocateOwnerPrivate(64, 5, 0);
@@ -147,11 +156,12 @@ int main() {
   assert(partition.CompareExchangePrivate("new-cas", "", "created", &exchanged));
   assert(exchanged && partition.GetPrivate("new-cas", &value) && value == "created");
 
-  // PolicyClock's first pass consumes the shared metadata second-chance bit;
-  // the next pass selects the same quiescent key and performs real move-out.
+  // PolicyClock init sets second_chance=0, so a never-accessed migrated row is
+  // eligible on the first over-budget move_row_out (original OnDemand gate).
   assert(partition.PutPrivate("clock", "victim"));
   assert(partition.PromotePrivate("clock", 1));
-  assert(!partition.MoveOutClockVictim(1));
+  star::cxl_memory.set_total_hw_cc_usage(
+      (1024ULL * 1024ULL * 1024ULL - star::CXL_EBR::max_ebr_retiring_memory) / 2);
   assert(partition.MoveOutClockVictim(1));
   assert(partition.GetPrivate("clock", &value) && value == "victim");
   assert(partition.hwcc_used_bytes() > 0);
@@ -205,6 +215,7 @@ int main() {
   assert(waitpid(child, &status, 0) == child);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   star::global_ebr_meta = nullptr;
+  tigonkv::engine::KvMigrationRuntime::Instance().Reset();
   unlink(path.c_str());
   return 0;
 }
