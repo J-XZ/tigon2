@@ -101,8 +101,6 @@ KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> p
     : config_(config), pool_(std::move(pool)), ebr_(std::move(ebr)), scc_(std::move(scc)) {}
 
 KVEngine::~KVEngine() {
-  transport_poller_stop_.store(true, std::memory_order_release);
-  if (transport_poller_.joinable()) transport_poller_.join();
   if (star::scc_manager == scc_.get()) star::scc_manager = nullptr;
   if (star::global_ebr_meta == ebr_.get()) star::global_ebr_meta = nullptr;
   KvMigrationRuntime::Instance().Reset();
@@ -133,7 +131,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     rings = static_cast<star::MPSCRingBuffer *>(root);
   }
   auto ebr = std::make_unique<star::CXL_EBR>(config.vm_count,
-                                             config.foreground_worker_count_per_vm + 1,
+                                             config.foreground_worker_count_per_vm,
                                              &pool->allocator());
   ebr->thread_init_ebr_meta(config.node_id, 0);
   star::global_ebr_meta = ebr.get();
@@ -166,22 +164,6 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     if (engine->OwnerForPartition(partition->partition_id()) == config.node_id)
       partition->RebuildClockTracker();
   }
-  // Response + request drain while all foreground workers are inside Scan()
-  // with serve-depth raised (response-only).  Without this, deferred
-  // ScanRequests would never run and remote AwaitScan would deadlock.
-  engine->transport_poller_worker_id_ = config.foreground_worker_count_per_vm;
-  engine->transport_poller_stop_.store(false, std::memory_order_release);
-  engine->transport_poller_ = std::thread([raw = engine.get()] {
-    raw->ebr_->thread_init_ebr_meta(raw->config_.node_id, raw->transport_poller_worker_id_);
-    star::global_ebr_meta = raw->ebr_.get();
-    while (!raw->transport_poller_stop_.load(std::memory_order_acquire)) {
-      try {
-        raw->PollTransport();
-      } catch (...) {
-      }
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
-    }
-  });
   return engine;
 }
 
@@ -252,11 +234,6 @@ Status KVEngine::Delete(std::string_view key) {
 }
 
 ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
-  // Entire coordinator stays at serve-depth > 0 so Await/Send/progress only
-  // apply response traffic; the transport poller (and idle workers) serve
-  // ScanRequests.  This keeps Scan() parallel across workers without nesting
-  // owned walks from AwaitScan into the same OLC trees.
-  RequestServeDepthGuard scan_depth_guard;
   constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
   if (limit > kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
@@ -435,26 +412,16 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
 }
 
 ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t limit) {
-  // Bound concurrent owned tree walks (OLC restart livelock under 4x4).  Slot
-  // waiters only PollTransport; with Scan()-wide serve-depth they stay
-  // response-only while the transport poller performs ServeScanRequest.
+  // OLC B+tree scan restart-livelocks under many concurrent walkers.  Serialize
+  // owned walks only (local page + ServeScanRequest), while Scan() coordinators
+  // and remote RPC fan-out stay parallel.  Waiters keep PollTransport so Put
+  // and peer ScanItem/Done still drain (unlike a blocking mutex).
   for (;;) {
-    uint32_t cur = concurrent_owned_scans_.load(std::memory_order_relaxed);
-    if (cur < kMaxConcurrentOwnedScans &&
-        concurrent_owned_scans_.compare_exchange_weak(cur, cur + 1,
-                                                      std::memory_order_acquire,
-                                                      std::memory_order_relaxed))
-      break;
+    if (owned_scan_mutex_.try_lock()) break;
     PollTransport();
     std::this_thread::sleep_for(std::chrono::microseconds(50));
   }
-  struct OwnedScanSlotGuard {
-    KVEngine *engine;
-    explicit OwnedScanSlotGuard(KVEngine *e) : engine(e) {}
-    ~OwnedScanSlotGuard() {
-      engine->concurrent_owned_scans_.fetch_sub(1, std::memory_order_release);
-    }
-  } owned_slot{this};
+  std::unique_lock<std::mutex> owned_lock(owned_scan_mutex_, std::adopt_lock);
 
   // Raise serve depth for the whole owned walk so progress PollTransport cannot
   // nest Put/Get/Scan serves that restart OLC readers on the same trees.
@@ -474,12 +441,13 @@ ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t li
         PollTransport();
       }
     }
-    // Depth is 0 again only when not already under Scan()'s guard: drain
-    // requests deferred during the owned walk.
-    PollTransport();
   } catch (const std::exception &e) {
     return {Status::Error(StatusCode::kCorruption, e.what()), {}};
   }
+  // Drop the owned-walk lock before draining deferred requests so a nested
+  // ServeScanRequest can re-enter ScanOwnedPartitions without self-deadlock.
+  owned_lock.unlock();
+  PollTransport();
   ScanResult result{Status::Ok(), {}};
   for (auto &item : merged) {
     if (limit != 0 && result.items.size() >= limit) break;
