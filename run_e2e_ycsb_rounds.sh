@@ -38,19 +38,19 @@ for value in "$rounds" "$vms"; do
   [[ $value =~ ^[1-9][0-9]*$ ]] || { echo "rounds and vm count must be positive integers" >&2; exit 2; }
 done
 [[ -f $config ]] || { echo "missing config: $config" >&2; exit 2; }
-[[ -d $traces/workloadA/load && -d $traces/workloadA/run ]] || {
-  echo "missing workload A traces; run prepare_e2e_ycsb_traces.sh first" >&2; exit 2;
+[[ -d $traces/load && -d $traces/workloada ]] || {
+  echo "missing load/workloada traces; run prepare_e2e_ycsb_traces.sh first" >&2; exit 2;
 }
 mkdir -p "$logs"
 for ((round = 1; round <= rounds; ++round)); do
   round_log="$logs/round$(printf '%02d' "$round").log"
   echo "TIGONKV_E2E_YCSB_ROUND round=$round" | tee "$round_log"
   round_logs="$logs/round$(printf '%02d' "$round")"
-  TIGONKV_YCSB_WORKLOADS=A TIGONKV_VM_COUNT="$vms" TIGONKV_YCSB_THREADS_PER_VM=4 \
+  TIGONKV_YCSB_WORKLOADS=a TIGONKV_VM_COUNT="$vms" TIGONKV_YCSB_THREADS_PER_VM=4 \
   TIGONKV_E2E_TRACE_RUNNER="${TIGONKV_E2E_TRACE_RUNNER:-$root/build-relwithdebinfo/e2e_trace_runner}" \
   TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$root/build-relwithdebinfo/cxl_pool_initer}" \
   TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" \
-    "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$traces" "$round_logs" 1 A | tee -a "$round_log"
+    "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$traces" "$round_logs" 1 a | tee -a "$round_log"
 done
 python3 "$root/scripts/summarize_ycsb_experiment.py" --log-root "$logs" \
   --out-dir "$logs/summary"

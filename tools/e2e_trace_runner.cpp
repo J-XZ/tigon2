@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,6 +33,27 @@ uint64_t ReadDecimal(const std::string &line, size_t *pos, const std::string &la
   return ParseUnsigned(line.substr(begin, *pos - begin), label);
 }
 
+// Align with cxlkv FixedTraceKey: right-pad spaces to fixed_key_size.
+std::string FixedTraceKey(const std::string &key, uint32_t fixed_key_size) {
+  if (key.size() > fixed_key_size) {
+    Fail("trace key exceeds fixed_key_size: size=" + std::to_string(key.size()) +
+         " fixed_key_size=" + std::to_string(fixed_key_size));
+  }
+  std::string out = key;
+  out.resize(static_cast<size_t>(fixed_key_size), ' ');
+  return out;
+}
+
+// Align with cxlkv FixedTraceValue: printable '!'..'~', length=fixed_value_size
+// (trace PUT LEN is ignored for the payload, as in cxlkv).
+std::string FixedTraceValue(std::mt19937_64 *rng, uint32_t fixed_value_size) {
+  std::string value;
+  value.resize(static_cast<size_t>(fixed_value_size));
+  for (uint32_t i = 0; i < fixed_value_size; ++i)
+    value[static_cast<size_t>(i)] = static_cast<char>('!' + ((*rng)() % 94U));
+  return value;
+}
+
 void Barrier(const std::string &phase, uint32_t node, bool final, KVStore *store = nullptr) {
   const std::string dir = Env("TIGONKV_E2E_BARRIER_DIR", "CXLKV_E2E_BARRIER_DIR");
   if (dir.empty()) return;
@@ -44,10 +66,6 @@ void Barrier(const std::string &phase, uint32_t node, bool final, KVStore *store
   const uint64_t timeout = ParseUnsigned(Env("TIGONKV_E2E_BARRIER_TIMEOUT_SEC", "CXLKV_E2E_BARRIER_TIMEOUT_SEC", "600"), "barrier timeout");
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
   for (;;) {
-    // A node that has completed its local trace can still own requests issued
-    // by a peer that is finishing later.  Keep servicing the owner transport
-    // while waiting at the final barrier instead of leaving those requests to
-    // time out.
     if (store != nullptr) {
       const Status status = store->PollTransport();
       if (!status.ok()) Fail("transport poll failed at barrier: " + status.message);
@@ -79,7 +97,8 @@ struct ReplayResult {
   uint64_t ops = 0;
 };
 
-ReplayResult ReplayTrace(KVStore &store, const std::string &trace) {
+ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_64 *rng,
+                         uint32_t fixed_key_size, uint32_t fixed_value_size) {
   std::ifstream input(trace);
   if (!input) Fail("cannot open trace: " + trace);
   ReplayResult result;
@@ -102,46 +121,65 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace) {
     const size_t len = ReadDecimal(line, &pos, "operation length");
     while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
     if (line.size() - pos < key_len) Fail(trace + ": key length mismatch at line " + std::to_string(line_no));
-    const std::string key = line.substr(pos, key_len);
+    const std::string raw_key = line.substr(pos, key_len);
     for (size_t tail = pos + key_len; tail < line.size(); ++tail)
       if (line[tail] != ' ' && line[tail] != '\t')
         Fail(trace + ": trailing bytes after key at line " + std::to_string(line_no));
+    const std::string key = FixedTraceKey(raw_key, fixed_key_size);
     Status status;
-    if (op == "PUT") status = store.Put(key, std::string(len, 'x'));
-    else if (op == "GET") { if (len != 0) Fail("GET LEN must be zero"); status = store.Get(key).status; if (status.code == StatusCode::kNotFound) status = Status::Ok(); }
-    else if (op == "DELETE") { if (len != 0) Fail("DELETE LEN must be zero"); status = store.Delete(key); if (status.code == StatusCode::kNotFound) status = Status::Ok(); }
-    else if (op == "SCAN") {
-      ScanResult scan = store.Scan(key, len); status = scan.status;
+    if (op == "PUT") {
+      status = store.Put(key, FixedTraceValue(rng, fixed_value_size));
+      (void)len;  // cxlkv ignores PUT LEN when synthesizing FixedTraceValue
+    } else if (op == "GET") {
+      if (len != 0) Fail("GET LEN must be zero");
+      status = store.Get(key).status;
+      if (status.code == StatusCode::kNotFound) status = Status::Ok();
+    } else if (op == "DELETE") {
+      if (len != 0) Fail("DELETE LEN must be zero");
+      status = store.Delete(key);
+      if (status.code == StatusCode::kNotFound) status = Status::Ok();
+    } else if (op == "SCAN") {
+      ScanResult scan = store.Scan(key, len);
+      status = scan.status;
       if (status.ok() && len != 0 && scan.items.size() > len)
         Fail("SCAN returned more than requested at line " + std::to_string(line_no));
-    } else Fail("unknown operation at line " + std::to_string(line_no));
+    } else {
+      Fail("unknown operation at line " + std::to_string(line_no));
+    }
     if (!status.ok()) Fail("operation failed at line " + std::to_string(line_no) + ": " + status.message);
     ++result.ops;
   }
   return result;
 }
 
+void PrintTraceTime(const std::string &phase, uint32_t node, uint64_t ops, uint64_t duration_us,
+                    uint32_t trace_first, uint32_t trace_workers, uint32_t batch_ops) {
+  std::cout << "E2E_TRACE_TIME_US phase=" << phase << " node=" << node
+            << " ops=" << ops << " duration_us=" << duration_us
+            << " trace_first=" << trace_first << " trace_workers=" << trace_workers
+            << " batch_ops=" << batch_ops << "\n";
+}
+
 int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
-                  const std::string &trace_dir, uint64_t workers) {
+                  const std::string &trace_dir, uint64_t workers, uint32_t batch_ops,
+                  uint64_t value_seed) {
   const bool verbose = Env("TIGONKV_E2E_VERBOSE", "CXLKV_E2E_VERBOSE", "0") == "1";
   const auto log_stage = [&](const char *stage) {
     if (verbose) std::cerr << "E2E_TRACE_STAGE node=" << config.node_id
                            << " phase=" << phase << " stage=" << stage << "\n" << std::flush;
   };
-  std::vector<std::unique_ptr<KVStore>> stores;
+  const uint32_t trace_first = static_cast<uint32_t>(ParseUnsigned(
+      Env("TIGONKV_E2E_TRACE_FIRST", "CXLKV_E2E_TRACE_FIRST",
+          std::to_string(static_cast<uint64_t>(config.node_id) * workers)),
+      "trace first"));
   std::vector<std::string> traces;
-  stores.reserve(workers); traces.reserve(workers);
+  traces.reserve(workers);
   for (uint64_t worker = 0; worker < workers; ++worker) {
     const std::string trace = trace_dir + "/worker" + std::to_string(worker) + ".txt";
     if (!std::filesystem::exists(trace)) Fail("missing worker trace: " + trace);
     traces.push_back(trace);
   }
-  // A VM owns one inbound transport ring.  Its response dispatcher must
-  // therefore be unique: multiple KVStore instances would race to dequeue a
-  // response and strand the instance that issued the request.  Worker threads
-  // share this store; response and partition synchronization remain inside
-  // the engine.
-  stores.push_back(KVStore::Create(config, reset));
+  auto store = KVStore::Create(config, reset);
   log_stage("opened");
   Barrier(phase, config.node_id, false);
   log_stage("barrier_ready");
@@ -153,32 +191,36 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   for (uint64_t worker = 0; worker < workers; ++worker) {
     threads.emplace_back([&, worker] {
       try {
-        results[worker] = ReplayTrace(*stores.front(), traces[worker]);
+        std::mt19937_64 rng(value_seed ^ (static_cast<uint64_t>(trace_first + worker) << 32) ^
+                            worker);
+        results[worker] = ReplayTrace(*store, traces[worker], &rng, config.fixed_key_size,
+                                      config.fixed_value_size);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        if (!error) error = std::current_exception();
       }
-      catch (...) { std::lock_guard<std::mutex> lock(error_mutex); if (!error) error = std::current_exception(); }
     });
   }
   for (auto &thread : threads) thread.join();
   if (error) std::rethrow_exception(error);
   log_stage("replay_done");
-  const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::steady_clock::now() - start).count();
-  DrainTransport(*stores.front());
+  const auto duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - start).count());
+  DrainTransport(*store);
   log_stage("drain_done");
-  Barrier(phase, config.node_id, true, stores.front().get());
+  Barrier(phase, config.node_id, true, store.get());
   log_stage("barrier_done");
-  for (auto &store : stores)
-    if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
+  if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
   log_stage("checkpoint_done");
-  uint64_t ops = 0; for (const auto &result : results) ops += result.ops;
-  std::cout << "E2E_TRACE_TIME_US phase=" << phase << " node=" << config.node_id
-            << " ops=" << ops << " elapsed_us=" << elapsed
-            << " trace_workers=" << workers << "\n";
-  std::cout << stores.front()->DumpStats();
+  uint64_t ops = 0;
+  for (const auto &result : results) ops += result.ops;
+  PrintTraceTime(phase, config.node_id, ops, duration_us, trace_first,
+                 static_cast<uint32_t>(workers), batch_ops);
+  std::cout << store->DumpStats();
   std::cout << "e2e_trace_runner[node" << config.node_id << "]: passed.\n";
   return 0;
 }
-}
+}  // namespace
 
 int main() {
   std::unique_ptr<KVStore> store;
@@ -200,22 +242,30 @@ int main() {
       if (!config_file) Fail("cannot open trace config: " + trace_config);
     }
     const std::string policy_config = Env("TIGONKV_POLICY_CONFIG_JSON", "CXLKV_POLICY_CONFIG_JSON");
-    (void)policy_config;  // policy is intentionally independent of the KV API.
+    (void)policy_config;
     const bool reset = Env("TIGONKV_E2E_RESET", "CXLKV_E2E_RESET", "0") == "1";
     phase = Env("TIGONKV_E2E_TRACE_PHASE", "CXLKV_E2E_TRACE_PHASE", "run");
+    const uint32_t batch_ops = static_cast<uint32_t>(ParseUnsigned(
+        Env("TIGONKV_E2E_TRACE_BATCH_OPS", "CXLKV_E2E_TRACE_BATCH_OPS", "4096"), "batch_ops"));
+    if (batch_ops == 0) Fail("batch_ops must be >= 1");
+    const uint64_t value_seed = ParseUnsigned(
+        Env("TIGONKV_E2E_TRACE_VALUE_SEED", "CXLKV_E2E_TRACE_VALUE_SEED", "1"), "value seed");
     const uint64_t trace_workers = ParseUnsigned(
         Env("TIGONKV_E2E_TRACE_WORKERS", "CXLKV_E2E_TRACE_WORKERS", "1"), "trace workers");
     const std::string trace_dir = Env("TIGONKV_E2E_TRACE_DIR", "CXLKV_E2E_TRACE_DIR");
     if (trace_workers > 1) {
       if (trace_dir.empty()) Fail("TIGONKV_E2E_TRACE_DIR is required for multi-worker replay");
-      return RunMultiTrace(config, reset, phase, trace_dir, trace_workers);
+      return RunMultiTrace(config, reset, phase, trace_dir, trace_workers, batch_ops, value_seed);
     }
     trace = Env("TIGONKV_E2E_TRACE_FILE", "CXLKV_E2E_TRACE_FILE");
     if (trace.empty()) Fail("TIGONKV_E2E_TRACE_FILE is required for direct trace replay");
+    const uint32_t trace_first = static_cast<uint32_t>(ParseUnsigned(
+        Env("TIGONKV_E2E_TRACE_FIRST", "CXLKV_E2E_TRACE_FIRST", "0"), "trace first"));
     store = KVStore::Create(config, reset);
     std::ifstream input(trace);
     if (!input) Fail("cannot open trace: " + trace);
     Barrier(phase, config.node_id, false);
+    std::mt19937_64 rng(value_seed ^ (static_cast<uint64_t>(trace_first) << 32));
     auto start = std::chrono::steady_clock::now();
     std::string line;
     while (std::getline(input, line)) {
@@ -233,19 +283,26 @@ int main() {
       if (pos >= line.size() || (line[pos] != ' ' && line[pos] != '\t')) Fail(trace + ": missing LEN separator at line " + std::to_string(line_no));
       while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
       const size_t len = ReadDecimal(line, &pos, "operation length");
-      // cxlkv's format starts KEY immediately after LEN; accept one or more
-      // spaces as well for hand-written traces.
       while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
       if (pos > line.size() || line.size() - pos < key_len) Fail(trace + ": key length mismatch at line " + std::to_string(line_no));
-      const std::string key = line.substr(pos, key_len);
-      last_key = key;
+      const std::string raw_key = line.substr(pos, key_len);
+      last_key = raw_key;
       for (size_t tail = pos + key_len; tail < line.size(); ++tail)
         if (line[tail] != ' ' && line[tail] != '\t') Fail(trace + ": trailing bytes after key at line " + std::to_string(line_no));
+      const std::string key = FixedTraceKey(raw_key, config.fixed_key_size);
       Status status;
-      if (op == "PUT") status = store->Put(key, std::string(len, 'x'));
-      else if (op == "GET") { if (len != 0) Fail("GET LEN must be zero"); status = store->Get(key).status; if (status.code == StatusCode::kNotFound) status = Status::Ok(); }
-      else if (op == "DELETE") { if (len != 0) Fail("DELETE LEN must be zero"); status = store->Delete(key); if (status.code == StatusCode::kNotFound) status = Status::Ok(); }
-      else if (op == "SCAN") {
+      if (op == "PUT") {
+        status = store->Put(key, FixedTraceValue(&rng, config.fixed_value_size));
+        (void)len;
+      } else if (op == "GET") {
+        if (len != 0) Fail("GET LEN must be zero");
+        status = store->Get(key).status;
+        if (status.code == StatusCode::kNotFound) status = Status::Ok();
+      } else if (op == "DELETE") {
+        if (len != 0) Fail("DELETE LEN must be zero");
+        status = store->Delete(key);
+        if (status.code == StatusCode::kNotFound) status = Status::Ok();
+      } else if (op == "SCAN") {
         ScanResult result = store->Scan(key, len);
         status = result.status;
         if (status.ok()) {
@@ -256,18 +313,22 @@ int main() {
               Fail("SCAN result ordering mismatch at line " + std::to_string(line_no));
           }
         }
+      } else {
+        Fail("unknown operation at line " + std::to_string(line_no));
       }
-      else Fail("unknown operation at line " + std::to_string(line_no));
       if (!status.ok()) Fail("operation failed at line " + std::to_string(line_no) + ": " + status.message);
       ++ops;
     }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+    const auto duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count());
     DrainTransport(*store);
     Barrier(phase, config.node_id, true, store.get());
     if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
     const std::string heartbeat = Env("TIGONKV_E2E_TRACE_HEARTBEAT_SEC", "CXLKV_E2E_TRACE_HEARTBEAT_SEC", "0");
-    if (heartbeat != "0") std::cout << "E2E_TRACE_HEARTBEAT phase=" << phase << " node=" << config.node_id << " ops=" << ops << "\n";
-    std::cout << "E2E_TRACE_TIME_US phase=" << phase << " node=" << config.node_id << " ops=" << ops << " elapsed_us=" << elapsed << "\n";
+    if (heartbeat != "0")
+      std::cout << "E2E_TRACE_HEARTBEAT phase=" << phase << " node=" << config.node_id
+                << " ops=" << ops << " total=" << ops << " elapsed_s=0\n";
+    PrintTraceTime(phase, config.node_id, ops, duration_us, trace_first, 1, batch_ops);
     std::cout << store->DumpStats();
     std::cout << "e2e_trace_runner[node" << config.node_id << "]: passed.\n";
     return 0;

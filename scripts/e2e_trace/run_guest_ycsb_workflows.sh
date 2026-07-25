@@ -51,12 +51,17 @@ sync_guest_runtime() {
 sync_guest_runtime
 
 sync_traces() {
-  local round=$1 workload=$2 phase=$3 vm worker trace remote_dir
+  local round=$1 workload=$2 phase=$3 vm worker trace remote_dir wl
+  wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
   for ((vm = 0; vm < vm_count; vm++)); do
-    remote_dir="$remote_root/ycsb-guest-traces/round$round/workload$workload/$phase"
+    remote_dir="$remote_root/ycsb-guest-traces/round$round/workload$wl/$phase"
     remote "$vm" "mkdir -p '$remote_dir'"
     for ((worker = 0; worker < threads_per_vm; worker++)); do
-      trace="$trace_root/workload$workload/$phase/worker$((vm * threads_per_vm + worker)).txt"
+      if [[ "$phase" == load ]]; then
+        trace="$trace_root/load/worker$((vm * threads_per_vm + worker)).txt"
+      else
+        trace="$trace_root/workload${wl}/worker$((vm * threads_per_vm + worker)).txt"
+      fi
       [[ -f "$trace" ]] || { echo "missing trace: $trace" >&2; exit 2; }
       scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$trace" "root@127.0.0.1:$remote_dir/worker$worker.txt" >/dev/null
     done
@@ -70,27 +75,31 @@ pool_reset() {
 
 run_fixed() {
   local round=$1 workload=$2 phase=$3 vm=$4 reset=$5 log=$6
-  local trace_dir="$remote_root/ycsb-guest-traces/round$round/workload$workload/$phase"
+  local wl
+  wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
+  local trace_dir="$remote_root/ycsb-guest-traces/round$round/workload$wl/$phase"
   local zeroed=""
   [[ "$reset" == 1 ]] && zeroed="TIGONKV_DEVICE_BACKING_ZEROED=1"
+  local trace_first=$((vm * threads_per_vm))
   # The phase orchestrator consumes stage=opened to release peer VMs.  This
   # control-plane marker is outside the timed replay window and must not rely
   # on a caller remembering to enable verbose output.
-  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_VERBOSE=1 TIGONKV_E2E_RESET=$reset $zeroed '$remote_runner'"
+  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_VERBOSE=1 TIGONKV_E2E_RESET=$reset $zeroed '$remote_runner'"
   timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$command" >"$log" 2>&1
 }
 
 for ((round = 1; round <= rounds; round++)); do
   for workload in $workloads; do
+    wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
     pool_reset
     for phase in load run; do
-      sync_traces "$round" "$workload" "$phase"
-      phase_log="$log_root/round${round}-workload${workload}-${phase}"
+      sync_traces "$round" "$wl" "$phase"
+      phase_log="$log_root/round${round}-workload${wl}-${phase}"
       mkdir -p "$phase_log"
       pids=()
       first_vm=0
       if [[ "$phase" == load ]]; then
-        run_fixed "$round" "$workload" "$phase" 0 1 "$phase_log/vm0.log" &
+        run_fixed "$round" "$wl" "$phase" 0 1 "$phase_log/vm0.log" &
         pids+=("$!")
         # VM0 must finish constructing all in-process worker stores before
         # peers attach.  A fixed sleep races with a cold guest; use the
@@ -105,17 +114,17 @@ for ((round = 1; round <= rounds; round++)); do
       fi
       for ((vm = first_vm; vm < vm_count; vm++)); do
         reset=0
-        run_fixed "$round" "$workload" "$phase" "$vm" "$reset" "$phase_log/vm$vm.log" &
+        run_fixed "$round" "$wl" "$phase" "$vm" "$reset" "$phase_log/vm$vm.log" &
         pids+=("$!")
       done
       for pid in "${pids[@]}"; do wait "$pid"; done
       for ((vm = 0; vm < vm_count; vm++)); do
         rg -q "e2e_trace_runner\\[node${vm}\\]: passed\\." "$phase_log/vm${vm}.log" || {
-          echo "guest trace failed: round=$round workload=$workload phase=$phase vm=$vm" >&2
+          echo "guest trace failed: round=$round workload=$wl phase=$phase vm=$vm" >&2
           exit 1
         }
       done
-      echo "TIGONKV_GUEST_YCSB round=$round workload=$workload phase=$phase pass"
+      echo "TIGONKV_GUEST_YCSB round=$round workload=$wl phase=$phase pass"
     done
   done
 done

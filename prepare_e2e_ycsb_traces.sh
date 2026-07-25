@@ -38,6 +38,6 @@ for value in "$records" "$operations" "$workers" "$vms"; do
 done
 [[ "$vms" == 4 ]] || { echo "§6.3.1 e2e_ycsb requires exactly 4 VMs" >&2; exit 2; }
 
-TIGONKV_YCSB_WORKLOADS=A TIGONKV_VM_COUNT="$vms" \
+TIGONKV_YCSB_WORKLOADS=a TIGONKV_VM_COUNT="$vms" \
 YCSB_RECORD_COUNT="$records" YCSB_OPERATION_COUNT="$operations" YCSB_WORKERS="$workers" \
   exec "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" "$out"

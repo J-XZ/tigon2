@@ -49,18 +49,50 @@ if shared['swcc']['size_mb'] <= 0: raise SystemExit('shared size must exceed fix
 if numa: shared['numa_node']=[int(x) for x in numa.split(',')]
 lat=d['tigon_kv']['latency_inject']; lat['cache_model']='none'; lat['cache_hits_enabled']=False
 if no_latency == 'true': lat['enabled']=lat['foreground_enabled']=lat['merge_enabled']=False
+# Formal YCSB / e2e_trace alignment with cxlkv: fixed 32/32.
+d['tigon_kv']['fixed_key_size']=32
+d['tigon_kv']['fixed_value_size']=32
 json.dump(d, open(dst, 'w', encoding='utf-8'), indent=2)
-meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'threads_per_node':int(threads),'workloads':workloads.split(','),'base_config':src,'generated_config':dst,'ycsb_e':'unsupported'}
+meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'threads_per_node':int(threads),'workloads':workloads.split(','),'base_config':src,'generated_config':dst,'ycsb_e':'unsupported','fixed_key_size':32,'fixed_value_size':32}
 json.dump(meta, open(dst.rsplit('/',1)[0] + '/../run_meta.json', 'w', encoding='utf-8'), indent=2, sort_keys=True)
 PY
 echo "TIGONKV_YCSB_PREPARED out_dir=$out_dir config=$generated_config workloads=$workloads"
 if [[ "$skip_trace_gen" != true ]]; then
   generator="$root/thirdparty_libs/YCSB-cpp/scripts/generate_cxlkv_trace.sh"
   [[ -x "$generator" ]] || { echo "missing trace generator: $generator" >&2; exit 2; }
+  mkdir -p "$out_dir/logs"
+  # Align with cxlkv run_ycsb_trace_experiment.sh: one shared load via workloadc,
+  # then per-workload run traces named workloada/b/...
+  "$generator" \
+    --output-dir "$out_dir/traces" \
+    --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workloadc" \
+    --run-name workloadc \
+    --phase load \
+    --nodes 4 \
+    --threads-per-node "$threads" \
+    --record-count "$records" \
+    --operation-count "$operations" \
+    --request-distribution zipfian \
+    --force \
+    >"$out_dir/logs/trace_gen_load.log" 2>&1
   for workload in "${selected[@]}"; do
-    extra=(); [[ "$workload" == a ]] && extra+=(--update-read-before-write)
-    "$generator" --output-dir "$out_dir/traces/workload${workload^^}" --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workload$workload" \
-      --run-name run --phase both --nodes 4 --threads-per-node "$threads" --record-count "$records" --operation-count "$operations" --field-length 32 --force "${extra[@]}"
+    args=(
+      --output-dir "$out_dir/traces"
+      --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workload$workload"
+      --run-name "workload${workload}"
+      --phase run
+      --nodes 4
+      --threads-per-node "$threads"
+      --record-count "$records"
+      --operation-count "$operations"
+      --force
+    )
+    case "$workload" in
+      d) args+=(--request-distribution latest) ;;
+      *) args+=(--request-distribution zipfian) ;;
+    esac
+    [[ "$workload" == a ]] && args+=(--update-read-before-write)
+    "$generator" "${args[@]}" >"$out_dir/logs/trace_gen_workload${workload}.log" 2>&1
   done
 fi
 [[ "$prepare_only" != true ]] || exit 0
@@ -68,5 +100,5 @@ fi
 [[ "$skip_vm_init" == true ]] || "$root/tigonkv_check_vms.sh" --config "$generated_config"
 [[ "$skip_load" == true ]] || true
 TIGONKV_VM_COUNT=4 TIGONKV_E2E_TIMEOUT_SEC="$timeout" TIGONKV_EXPERIMENT_CONFIG_JSONC="$generated_config" \
-  "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$out_dir/traces" "$out_dir/round_logs" "$rounds" "${selected[*]^^}"
+  "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$out_dir/traces" "$out_dir/round_logs" "$rounds" "${selected[*]}"
 python3 "$root/scripts/summarize_ycsb_experiment.py" --log-root "$out_dir/round_logs" --out-dir "$out_dir"
