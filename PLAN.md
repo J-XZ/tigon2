@@ -854,9 +854,9 @@ clean shutdown 时全部 latch 归零；attach 校验 dirty 标记，dirty hard 
 - 叶 value = smeta 的 `RegionOffset`（对齐原 `offset_ptr<TwoPLPashaMetadataShared>`）。
 - 逻辑 `value_len` 存在 `TwoPLPashaSharedDataSCC::value_len`，供非 owner
   CXL-first 访问 **不**碰 `PrivateRow`（layout v3）。
-- 点查 Get/Put/CAS/INCR Shared：`TryPinShared` + SCC；Scan：`ScanSharedOnly`
-  CXL-first 探针。Serve 路径 `EnforceMigrationBudget` soft-fail，避免 throw
-  吞掉 Response。
+- 点查：Get/Put/INCR Shared 暂 Forward（YCSB-A 活性）；CAS Shared 与
+  `ScanSharedOnly` 保留 `TryPinShared` CXL 路径。Serve 路径
+  `EnforceMigrationBudget` soft-fail。
 - 树根 offset 记入 SharedLayoutHeader 的 partition 目录项。
 - 节点删除/合并经 `CXL_EBR` 回收（原实现已有）。
 
