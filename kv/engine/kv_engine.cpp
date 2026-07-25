@@ -766,25 +766,26 @@ void KVEngine::ServeDeferredRequests(int max_count) {
     return true;
   };
   int served = 0;
+  auto serve_from = [&](WorkerRequestQueue &queue) -> bool {
+    KvMessage deferred;
+    if (!pop_one(queue, &deferred)) return false;
+    ServeTransportRequest(deferred);
+    return true;
+  };
+  // Prefer this worker's Dispatcher shard (request_id % N affinity).
   if (TlsForegroundWorkerId < worker_request_queues_.size()) {
-    auto &queue = *worker_request_queues_[TlsForegroundWorkerId];
-    while (served < max_count) {
-      KvMessage deferred;
-      if (!pop_one(queue, &deferred)) break;
-      ServeTransportRequest(deferred);
+    while (served < max_count &&
+           serve_from(*worker_request_queues_[TlsForegroundWorkerId]))
       ++served;
-    }
-    return;
   }
-  // Unbound threads (unit tests): round-robin drain so single-threaded polls
-  // still make progress across Dispatcher shards.
-  for (int spin = 0; served < max_count && spin < max_count * 2; ++spin) {
+  // Steal from other shards so a stuck/slow worker cannot pin requests that
+  // peers need served to complete their own Forward/Await (global-queue
+  // liveness with sharded enqueue).
+  while (served < max_count) {
     bool any = false;
     for (auto &queue : worker_request_queues_) {
       if (served >= max_count) break;
-      KvMessage deferred;
-      if (!pop_one(*queue, &deferred)) continue;
-      ServeTransportRequest(deferred);
+      if (!serve_from(*queue)) continue;
       ++served;
       any = true;
     }
