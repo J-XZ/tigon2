@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck source=scripts/tigonkv_ycsb_cpp_pin.sh
+source "$root/scripts/tigonkv_ycsb_cpp_pin.sh"
+tigonkv_check_ycsb_cpp_pin
 ycsb="$root/thirdparty_libs/YCSB-cpp"
 if [[ ! -x "$ycsb/scripts/generate_cxlkv_trace.sh" ]]; then
   echo "YCSB-cpp submodule is not checked out at $ycsb" >&2

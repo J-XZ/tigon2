@@ -25,6 +25,9 @@ while (($#)); do
 done
 for n in "$rounds" "$records" "$operations" "$threads" "$timeout" "$shared_size"; do [[ "$n" =~ ^[1-9][0-9]*$ ]] || { echo "positive integer required: $n" >&2; exit 2; }; done
 [[ -r "$base_config" ]] || { echo "base config unavailable: $base_config" >&2; exit 2; }
+# shellcheck source=scripts/tigonkv_ycsb_cpp_pin.sh
+source "$root/scripts/tigonkv_ycsb_cpp_pin.sh"
+tigonkv_check_ycsb_cpp_pin
 case "$workloads" in *,,*|,*|*,) echo "invalid workload list" >&2; exit 2;; esac
 IFS=, read -r -a selected <<<"$workloads"
 for workload in "${selected[@]}"; do

@@ -17,6 +17,8 @@ emulation/ivshmem/ivshmem-user/data/
 **/e2e_ycsb_logs/
 guest_run.log
 run_meta.json
+**/ycsb_summary.json
+**/YCSB实验报告.md
 tmp*
 __pycache__
 .cache
