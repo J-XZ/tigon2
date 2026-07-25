@@ -853,7 +853,10 @@ clean shutdown 时全部 latch 归零；attach 校验 dirty 标记，dirty hard 
 - 节点经 INDEX_ALLOCATION → HWCC 区域，自动计入 `TOTAL_HW_CC_USAGE`。
 - 叶 value = smeta 的 `RegionOffset`（对齐原 `offset_ptr<TwoPLPashaMetadataShared>`）。
 - 逻辑 `value_len` 存在 `TwoPLPashaSharedDataSCC::value_len`，供非 owner
-  CXL-first Get/Put **不**碰 `PrivateRow`（layout v3）。
+  CXL-first 访问 **不**碰 `PrivateRow`（layout v3）。
+- **现状**：`ScanSharedOnly` 走 pinned CXL-first；点查 Get/Put/CAS/INCR Shared
+  在 YCSB-A 下暂一律 owner Forward（避免 Await/Poll 与 SCC 读写嵌套卡死），
+  API 仍不碰 `PrivateRow`。
 - 树根 offset 记入 SharedLayoutHeader 的 partition 目录项。
 - 节点删除/合并经 `CXL_EBR` 回收（原实现已有）。
 

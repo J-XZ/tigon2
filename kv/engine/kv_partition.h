@@ -42,8 +42,9 @@ class KVPartition {
   bool CompareExchangePrivate(std::string_view key, std::string_view expected,
                               std::string_view desired, bool *exchanged);
   bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value);
-  // Non-owner CXL-first fast paths (original TwoPLPasha get_migrated_row):
-  // look up shared_tree_ only — never private_tree_ / PrivateRow / LockRow.
+  // Non-owner CXL-first APIs never touch private_tree_ / PrivateRow / LockRow.
+  // Point-op Get/Put/CAS/INCR Shared currently Forward (return false) for
+  // YCSB-A liveness; ScanSharedOnly uses TryPinShared for CXL-first probes.
   bool GetShared(std::string_view key, uint32_t host_id, std::string *value) const;
   bool PutShared(std::string_view key, uint32_t host_id, std::string_view value);
   bool CompareExchangeShared(std::string_view key, uint32_t host_id,
