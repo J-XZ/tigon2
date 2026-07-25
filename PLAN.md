@@ -211,8 +211,10 @@ latency-injected result"。
   禁止 mkfs/fdisk/parted/wipefs、remount/umount；禁止修改网络（bridge/TAP/
   iptables/路由/NIC/SR-IOV）——例外：新 VM 启动脚本在**获用户允许执行时**
   可按 cxlkv 同款方式创建/复用其专属 tap 设备，且必须先检查现有拓扑并优先
-  复用；禁止改 SMT/turbo/governor/NUMA balancing/THP（cxlkv 的 host tuning
-  步骤在我们脚本中降级为"只检查并报告"，见 4.10）。
+  复用；host tuning（SMT/turbo/governor/NUMA balancing/THP 等）由
+  `tigonkv_init_vms.sh --allow-state-change` **默认应用**，与 cxlkv
+  `init_vm_apply_host_perf_tuning` 同款（`--skip-host-tuning` 可降为只检查）；
+  **代理不得在未经用户允许时执行会改主机的 init**。
 - 禁止执行原始 `emulation/start_vms.sh`、`emulation/setup.sh`、
   `emulation/host_setup/**`、以及 `../cxlkv` 的任何脚本（只读参考）。本仓库
   镜像脚本**只**包装本树 `emulation/image/make_vm_img.sh`（§0.3 / 4.10），
@@ -251,8 +253,9 @@ owner-partition（不改成单共享树）。
 1. 拓扑字段与 cxlkv **同名同语义**（见 §1.6）；正式对比取值**必须**等于
    §1.11 钉死数字，禁止施工时另选"差不多"的值。
 2. QEMU / ivshmem / SSH / taskset 与 cxlkv **基本相同**（bash 重写）。
-   **刻意分歧**：(a) host tuning 默认只检查（cxlkv `init_vm` 会直接应用）；
-   (b) 相位屏障见 §4.10（不假装与 cxlkv tap+TCP `sdl::notify` 同构）。
+   **刻意分歧**：(a) tap 桥接网卡默认省略（SSH 用 hostfwd）；相位屏障见
+   §4.10（不假装与 cxlkv tap+TCP `sdl::notify` 同构）。host tuning **默认
+   应用**（与 cxlkv 对齐；`--skip-host-tuning` 可选只检查）。
    镜像层包装**本仓库** `emulation/image/make_vm_img.sh`（tigon 自带
    mkosi），不调用 `../cxlkv` 的 make_img。
 3. **镜像独立性**：产出本仓库 `image/root.img`。允许对照 cxlkv 步骤拷贝脚本
@@ -1238,13 +1241,12 @@ cxlkv 的镜像制作是包装 Tigon mkosi；本仓库镜像层**只包装本树
      NUMA 上 shared∩vm 必须为空（重叠仅 `--allow-overlapping-numa`）；
      host_cpu 三组互斥、在线、核∈vm NUMA；`vm_cores` 长度足够；
      MemAvailable 覆盖全部 VM RAM；`size_mb` 为 2 的幂。
-   - **host tuning 差异点（安全约束要求，与 cxlkv 不同）**：cxlkv 会直接改
-     NMI watchdog/ASLR/KSM/NUMA balancing/THP/SMT/turbo/governor；本脚本
-     默认**只检查并打印当前值与下列钉死对照值的差异**（NMI watchdog=0、
-     ASLR=0、KSM=0、NUMA balancing=0、THP=never、governor=performance），
-     不做任何修改；
-     `--apply-host-tuning` 须用户显式授权。对比公平性要求两系统在**同一**
-     宿主机状态下运行。
+   - **host tuning（与 cxlkv 运行契约对齐）**：与 cxlkv
+     `init_vm_apply_host_perf_tuning` 相同钉死值（NMI watchdog=0、ASLR=0、
+     KSM=0、NUMA balancing=0、THP=never、SMT off、turbo/boost off、
+     governor=performance）；`--allow-state-change` 路径**默认写入**。
+     `--skip-host-tuning` 降为只检查并报告漂移；`--apply-host-tuning` 保留
+     为显式 alias（默认已开启）。正式对比禁止一边调优一边不调。
    - **清旧 VM**：按 `$VM_STORAGE/vm_*/qemu.pid` 精确 kill（须用户允许）。
    - **共享 backing 准备**：`numactl --membind=<shared_numa_csv>` 创建/校验
      共享文件（size_mb、prefault、清零）+ `tools/cxl_pool_initer`；多节点
@@ -1276,8 +1278,8 @@ cxlkv 的镜像制作是包装 Tigon mkosi；本仓库镜像层**只包装本树
      省略（SSH 用 hostfwd）；**相位屏障**默认用 **ivshmem/共享内存 barrier
      或 host 侧 SSH 编排**——**禁止**在无 guest 互通时声称与 cxlkv
      tap+TCP `sdl::notify` 同构；屏障耗时不计入应力窗口；若要实现 TCP
-     notify，必须同时提供 tap（或等价 guest 互通）并记入修改日志；
-     (b) host tuning 见上（cxlkv 应用 / 本仓只检查）。
+     notify，必须同时提供 tap（或等价 guest 互通）并记入修改日志。
+     host tuning 默认应用（与 cxlkv 同；见上）。
    - **收尾（照搬）**：等待全部 VM SSH 就绪（`ssh-keyscan` 循环）、
      `taskset -apc` 把每个 QEMU 的线程钉到其 host_cpu.vm_cores 切片、
      known_hosts 刷新、guest 内加载 ivshmem 内核模块（复用
@@ -1609,7 +1611,7 @@ HWCC=1024MB；共享池按正式覆盖 64G；随 `ops_per_sec` 并列报告
 | 内存归类 | `unclassified_shared_bytes==0`；无未计预算的 DRAM 全量镜像 |
 | 根配置互换 | cxlkv-only 键 ignore；Tigon 专用键在 `tigon_kv`（§1.6.1 全集） |
 | CPU 预算 | 报告 foreground workers；对照 cxlkv 前台 + merge 池（e2e_08 leader 另有 4 aux 线程）；本系统默认无专职 merge/转发线程，轮询计入同一 worker 预算并声明 |
-| host tuning / check | host tuning 默认只检查（与 cxlkv 应用分歧）；`check_vms`+`numa_maps` 为本仓增强 |
+| host tuning / check | host tuning 默认应用（与 cxlkv 同款；`--skip-host-tuning` 可只检查）；`check_vms`+`numa_maps` 为本仓增强 |
 | 独立仓 | §0.3 |
 
 NUMA 验证沿用 `tigonkv_check_vms.sh` + `numa_placement_probe`（页位置采样、
@@ -1702,7 +1704,7 @@ CMake 移除失效 target 不算删除）。**删除**仅限 ccd567a 之后引�
    move-in/out、延迟模拟移植完成）即使未到里程碑末尾，也应单独 commit +
    记日志。
 3. **`修改日志.md` 每条至少包含**：日期、里程碑/检查点名、commit SHA、改动
-   文件摘要、偏离决策（如 cxlalloc 弃用、host tuning 只检查）、测试命令与
+   文件摘要、偏离决策（如 cxlalloc 弃用）、测试命令与
    结果。
 4. M0 第一步：在仓库根**新建空的** `修改日志.md`（仅含标题与基线/
    `../cxlkv`/YCSB SHA），再开始功能改动；禁止从已删除的旧实施日志或旧

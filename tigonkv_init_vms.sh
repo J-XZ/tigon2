@@ -2,7 +2,9 @@
 # tigonkv_init_vms.sh — VM bring-up aligned with cxlkv init_vm / prepare_shared_mem.rs
 # Deliberate differences vs cxlkv (documented):
 #   (a) tap/bridge NIC omitted by default; SSH uses user-net hostfwd only
-#   (b) host tuning is check-only unless --apply-host-tuning is passed
+# Host tuning defaults to APPLY (same knobs as cxlkv init_vm_apply_host_perf_tuning)
+# so formal comparisons do not invent NUMA/THP/governor gaps. Use
+# --skip-host-tuning for check-only; --apply-host-tuning remains a no-op alias.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -10,7 +12,7 @@ config="${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}"
 dry_run=false
 allow=false
 overlap=false
-apply_host_tuning=false
+apply_host_tuning=true
 
 while (($#)); do
   case "$1" in
@@ -19,8 +21,9 @@ while (($#)); do
     --allow-state-change) allow=true ;;
     --allow-overlapping-numa) overlap=true ;;
     --apply-host-tuning) apply_host_tuning=true ;;
+    --skip-host-tuning) apply_host_tuning=false ;;
     -h|--help)
-      echo "usage: $0 [--config PATH] --dry-run|--allow-state-change [--allow-overlapping-numa] [--apply-host-tuning]"
+      echo "usage: $0 [--config PATH] --dry-run|--allow-state-change [--allow-overlapping-numa] [--apply-host-tuning|--skip-host-tuning]"
       exit 0
       ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -80,6 +83,17 @@ tigonkv_write_tunable() {
   printf '%s\n' "$value" >"$path"
 }
 
+tigonkv_cpu_is_online() {
+  local cpu=$1
+  local online_path="/sys/devices/system/cpu/cpu${cpu}/online"
+  if [[ -f "$online_path" ]]; then
+    [[ "$(tr -d '[:space:]' <"$online_path")" == "1" ]]
+    return
+  fi
+  [[ -d "/sys/devices/system/cpu/cpu${cpu}" ]]
+}
+
+# Mirror cxlkv init_vm_apply_host_perf_tuning (xz_scripts/init_scripts_env_3_init_vm.fish).
 tigonkv_check_or_apply_host_tuning() {
   local expected_pairs=(
     "NMI watchdog|/proc/sys/kernel/nmi_watchdog|0"
@@ -89,13 +103,16 @@ tigonkv_check_or_apply_host_tuning() {
     "transparent hugepages|/sys/kernel/mm/transparent_hugepage/enabled|never"
   )
   local pair label path want cur mismatches=0
+  if [[ "$apply_host_tuning" == true ]]; then
+    echo "[init_vm] applying host performance tuning (cxlkv-aligned; --skip-host-tuning to check-only)"
+  fi
   for pair in "${expected_pairs[@]}"; do
     IFS='|' read -r label path want <<<"$pair"
     cur=$(tigonkv_read_tunable "$path")
     if [[ "$apply_host_tuning" == true ]]; then
       tigonkv_write_tunable "$label" "$path" "$want"
     elif [[ "$cur" != "$want" && "$cur" != *"$want"* ]]; then
-      echo "[init_vm] host tuning drift: $label current='$cur' expected='$want' (pass --apply-host-tuning to set)"
+      echo "[init_vm] host tuning drift: $label current='$cur' expected='$want' (default applies; passed --skip-host-tuning)"
       mismatches=$((mismatches + 1))
     else
       echo "[init_vm] host tuning ok: $label=$cur"
@@ -105,8 +122,14 @@ tigonkv_check_or_apply_host_tuning() {
     tigonkv_write_tunable "SMT" /sys/devices/system/cpu/smt/control off || true
     tigonkv_write_tunable "Intel turbo" /sys/devices/system/cpu/intel_pstate/no_turbo 1 || true
     tigonkv_write_tunable "AMD boost" /sys/devices/system/cpu/cpufreq/boost 0 || true
-    local gov
+    local gov cpu
     while IFS= read -r -d '' gov; do
+      cpu=${gov#*/cpu}
+      cpu=${cpu%%/*}
+      if [[ "$cpu" =~ ^[0-9]+$ ]] && ! tigonkv_cpu_is_online "$cpu"; then
+        echo "[init_vm] host tuning skip performance governor: CPU $cpu is offline"
+        continue
+      fi
       tigonkv_write_tunable "performance governor" "$gov" performance || true
     done < <(find /sys/devices/system/cpu -path '*/cpufreq/scaling_governor' -type f -print0 2>/dev/null)
   fi
