@@ -1,0 +1,51 @@
+SPECIALIZED_ROUND=1
+Internal ctest changing into directory: /root/code/tigon2/build-relwithdebinfo
+Test project /root/code/tigon2/build-relwithdebinfo
+    Start 10: allocator_domain_budget_test
+1/5 Test #10: allocator_domain_budget_test .....   Passed    0.05 sec
+    Start 12: e2e_tests
+2/5 Test #12: e2e_tests ........................   Passed    0.04 sec
+    Start 18: latency_modes_test
+3/5 Test #18: latency_modes_test ...............   Passed    0.01 sec
+    Start 22: kv_engine_test
+4/5 Test #22: kv_engine_test ...................   Passed    0.07 sec
+    Start 23: scc_protocol_test
+5/5 Test #23: scc_protocol_test ................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 5
+
+Total Test time (real) =   0.17 sec
+SPECIALIZED_ROUND=2
+Internal ctest changing into directory: /root/code/tigon2/build-relwithdebinfo
+Test project /root/code/tigon2/build-relwithdebinfo
+    Start 10: allocator_domain_budget_test
+1/5 Test #10: allocator_domain_budget_test .....   Passed    0.05 sec
+    Start 12: e2e_tests
+2/5 Test #12: e2e_tests ........................   Passed    0.04 sec
+    Start 18: latency_modes_test
+3/5 Test #18: latency_modes_test ...............   Passed    0.01 sec
+    Start 22: kv_engine_test
+4/5 Test #22: kv_engine_test ...................   Passed    0.07 sec
+    Start 23: scc_protocol_test
+5/5 Test #23: scc_protocol_test ................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 5
+
+Total Test time (real) =   0.17 sec
+SPECIALIZED_ROUND=3
+Internal ctest changing into directory: /root/code/tigon2/build-relwithdebinfo
+Test project /root/code/tigon2/build-relwithdebinfo
+    Start 10: allocator_domain_budget_test
+1/5 Test #10: allocator_domain_budget_test .....   Passed    0.05 sec
+    Start 12: e2e_tests
+2/5 Test #12: e2e_tests ........................   Passed    0.04 sec
+    Start 18: latency_modes_test
+3/5 Test #18: latency_modes_test ...............   Passed    0.01 sec
+    Start 22: kv_engine_test
+4/5 Test #22: kv_engine_test ...................   Passed    0.07 sec
+    Start 23: scc_protocol_test
+5/5 Test #23: scc_protocol_test ................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 5
+
+Total Test time (real) =   0.17 sec
