@@ -79,6 +79,8 @@ values={
  'TIGONKV_IVSHMEM_CORES': ' '.join(map(str, require('host_cpu.ivshmem_server_cores', host_cpu.get('ivshmem_server_cores')))),
  'TIGONKV_E2E_WORKERS': get('e2e', 'foreground_worker_count_per_vm', default=1),
  'TIGONKV_SYNC_TIMEOUT_SEC': get('sync', 'timeout_sec', default=60),
+ 'TIGONKV_LOCAL_SSH_PUB_KEY': get('vm', 'local_ssh_pub_key', default=''),
+ 'TIGONKV_COPY_ROOT_IMG': '1' if get('vm', 'copy_root_img', default=False) else '0',
 }
 for key, value in values.items():
     print(f'{key}={shlex.quote(str(value))}')

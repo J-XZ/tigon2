@@ -80,7 +80,7 @@
     "ssh_base_port": 10022,
     "copy_root_img": true,
     "use_ivshmem_doorbell": false,
-    "local_ssh_pub_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCSOBOyFCWpVmMz0nJLY6wQ6mIBCTRhda0nVSlalZJSl8mfI7E37BlATXN5yiXf6ZP1oweV1tmrxG9B3Aa+1DZloW0GFqI1DZyJWNZg25P9MOHVfJSBzk8aBOiyTAeWZqrQysb2sf3DiIJwVyzOGlAFpEAvYZcgtw4Usm1qgY2RFutbOcmhcwLowYaDRg+QV/3jhRHnhB8a973rT5F87oFLoJnVQnU4eHDXkwxMWUBnkgLUtQO3FJxfVF15ATEvzAN44k8dZJB3DB4k4BXcVhEFGWkJdRJDfmrTNJs+tBY9wrbFpbh5zGP3OErbcLQgWT4VM9uU0yKr14SfnkKSBr+TtaS2/3sBZlbicSiHn3WfcdeKZSdH2w4sGx2Ddr7qKQA16keIcNFFYksIcmB2D1EWiUC9HbF0TPY8J3Ukk5Op8a9DotIaSphHLAQXYY9SWoemYyy+AA1NA6sO4dPqr58h2gvVAEPaxiQZSuAQghZ1+St5YoqlbR261OLiHCed5Ss= root@node0.cxl1.dpmfs-pg0.clemson.cloudlab.us"
+    "local_ssh_pub_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDJRRfQun/GuTm3/achpoel3HeV+lMqQ43H/XE1gxJJGFJK/htv4q6wBvo7O8iNQWXJs7aJ+VhEnmC+ehu3C958RfNBYUdWTkiVvM7b9PEGwSR/ZKtH+fauMiYaV4lcmpV25rJCzOx8V0Mpqro16yh0wcyrpaWoKI9yZIURkuPvziPnofx+L/ADJjAOOxFaW8hoW4hvASTUt0Zuu4ghXN5WTiQzJXm2h49uQeJNTKC2ZwsSoa4fHdVK7EcOhEJ6VS/+tpgdcYC0aIvYr6Lahs2SWBNZ20nw7PfPIZFc1eO+SSt2Kaf3+wWaLnqB30BiPxZLUHad0j4KB5gBWsNeXK2x5ZW9CYbecakgCnrxnAcviDg5EcrTkoespGjuteHJHjqiw1cmav6yDVTq/NaY+KNhwpjIPIaBWp5byXsdRfwbVFlTNc07PUuAi3kczMtFQukJODz4K9G/vOELk+Uua+pGsdgfYHi/KQrqyzroKEU3b1F2I0+fKIviBRJGfyG5SnE= root@node1.cxl2.dpmfs-pg0.clemson.cloudlab.us"
   },
   "network": {
     "sriov_nic": "",

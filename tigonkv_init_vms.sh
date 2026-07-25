@@ -177,7 +177,7 @@ tigonkv_prepare_qemu_cmd() {
   local core=$TIGONKV_VM_CORES_PER_VM
   local ssh_port=$((TIGONKV_SSH_BASE_PORT + i))
   local user_ssh_mac
-  printf -v user_ssh_mac 'de:ad:be:ef:20:%02x' "$((i & 0xff))"
+  user_ssh_mac=$(tigonkv_user_ssh_mac "$i")
 
   TIGONKV_QEMU_CMD=(
     numactl --cpunodebind="$vm_numa" --membind="$vm_numa" -- "$qemu_bin"
@@ -215,6 +215,59 @@ tigonkv_print_qemu_cmdline() {
   # Dry-run: one line + "-taskset <cpus>" annotation of the post-start pin.
   tigonkv_prepare_qemu_cmd "$1"
   printf '%s -taskset %s\n' "${TIGONKV_QEMU_CMD[*]}" "$TIGONKV_QEMU_CPU_LIST"
+}
+
+tigonkv_user_ssh_mac() {
+  printf 'de:ad:be:ef:20:%02x' "$((${1} & 0xff))"
+}
+
+# Inject user-net DHCP + SSH authorized_keys into the guest disk before boot
+# (cxlkv prepare_vm_files / guestmount equivalent; required because the mkosi
+# image ships with an empty /etc/systemd/network).
+tigonkv_prepare_vm_disk() {
+  local i=$1
+  local vm_dir="$TIGONKV_VM_STORAGE/vm_${i}"
+  local img="$vm_dir/root.img"
+  local mac
+  mac=$(tigonkv_user_ssh_mac "$i")
+  local net_file keys_file
+  net_file=$(mktemp)
+  keys_file=$(mktemp)
+  cat >"$net_file" <<EOF
+[Match]
+MACAddress=${mac}
+
+[Network]
+DHCP=yes
+EOF
+  : >"$keys_file"
+  if [[ -n "${TIGONKV_LOCAL_SSH_PUB_KEY:-}" ]]; then
+    printf '%s\n' "$TIGONKV_LOCAL_SSH_PUB_KEY" >>"$keys_file"
+  fi
+  if [[ -r "${ssh_key}.pub" ]]; then
+    local host_pub
+    host_pub=$(<"${ssh_key}.pub")
+    if [[ -n "$host_pub" ]] && ! grep -qxF "$host_pub" "$keys_file" 2>/dev/null; then
+      printf '%s\n' "$host_pub" >>"$keys_file"
+    fi
+  fi
+  [[ -s "$keys_file" ]] || {
+    echo "no SSH public keys to inject (set vm.local_ssh_pub_key or ${ssh_key}.pub)" >&2
+    rm -f "$net_file" "$keys_file"
+    return 2
+  }
+  echo "[init_vm] vm_$i: inject network DHCP (mac=$mac) and authorized_keys into $img"
+  guestfish --rw -a "$img" -i <<EOF
+mkdir-p /etc/systemd/network
+upload ${net_file} /etc/systemd/network/30-user-ssh.network
+mkdir-p /root/.ssh
+chmod 0700 /root/.ssh
+upload ${keys_file} /root/.ssh/authorized_keys
+chmod 0600 /root/.ssh/authorized_keys
+EOF
+  local st=$?
+  rm -f "$net_file" "$keys_file"
+  return $st
 }
 
 tigonkv_ssh() {
@@ -295,6 +348,7 @@ echo "TIGONKV_VM_INIT config=$config backing=$TIGONKV_SHARED_BACKING shared_numa
 
 if [[ "$dry_run" == true ]]; then
   echo "[init_vm] dry-run shared_memory: mount tmpfs size=$((TIGONKV_SHARED_MB + 100))M,mpol=bind:${TIGONKV_SHARED_NUMA} on $TIGONKV_SHARED_PATH"
+  echo "[init_vm] dry-run disk prep: guestfish inject 30-user-ssh.network + authorized_keys"
   echo "[init_vm] dry-run driver: sync $ivshmem_kernel_src -> guest /ivshmem-kernel; make; modprobe ivshmem_driver"
   for ((i = 0; i < TIGONKV_VM_COUNT; i++)); do
     tigonkv_print_qemu_cmdline "$i"
@@ -308,6 +362,7 @@ fi
   exit 2
 }
 [[ -r "$ssh_key" ]] || { echo "missing SSH key: $ssh_key" >&2; exit 2; }
+command -v guestfish >/dev/null || { echo "guestfish required to prepare guest disks" >&2; exit 2; }
 
 tigonkv_check_or_apply_host_tuning
 
@@ -320,9 +375,11 @@ for ((i = 0; i < TIGONKV_VM_COUNT; i++)); do
   vm_dir="$TIGONKV_VM_STORAGE/vm_${i}"
   mkdir -p "$vm_dir"
   rm -f -- "$vm_dir/qemu.log" "$vm_dir/serial.log" "$vm_dir/serial.sock" "$vm_dir/qemu.pid"
-  if [[ ! -f "$vm_dir/root.img" ]]; then
+  if [[ "${TIGONKV_COPY_ROOT_IMG:-0}" == "1" || ! -f "$vm_dir/root.img" ]]; then
+    echo "[init_vm] vm_$i: copy root.img"
     cp --reflink=auto --sparse=always "$image" "$vm_dir/root.img"
   fi
+  tigonkv_prepare_vm_disk "$i"
   tigonkv_prepare_qemu_cmd "$i"
   "${TIGONKV_QEMU_CMD[@]}"
   pid=$(<"$vm_dir/qemu.pid")

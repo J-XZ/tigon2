@@ -27,15 +27,25 @@ for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
   echo "$cmdline" | grep -q -- "mem-path=${TIGONKV_SHARED_BACKING}" || { echo "QEMU $pid bad mem-path" >&2; exit 2; }
 
   if [[ -r "/proc/$pid/numa_maps" ]]; then
-    # Prefer N<node>= counts on the shared backing mapping.
+    # Shared backing is often still sparse (no N<node>= yet). Accept bind:<node>
+    # policy from tmpfs/mpol mapping; require N<node>= only when any N*= is present.
     if grep -F "$TIGONKV_SHARED_BACKING" "/proc/$pid/numa_maps" >/tmp/tigonkv_numa_maps_$$.txt 2>/dev/null; then
-      if ! grep -Eq "N${TIGONKV_SHARED_NUMA_PRIMARY}=" /tmp/tigonkv_numa_maps_$$.txt; then
-        echo "warning: shared backing numa_maps for pid $pid lack N${TIGONKV_SHARED_NUMA_PRIMARY}= (see /tmp/tigonkv_numa_maps_$$.txt)" >&2
+      if ! grep -Eq "bind:${TIGONKV_SHARED_NUMA_PRIMARY}|bind:${TIGONKV_SHARED_NUMA}" /tmp/tigonkv_numa_maps_$$.txt; then
+        echo "shared backing numa_maps for pid $pid missing bind:${TIGONKV_SHARED_NUMA_PRIMARY}" >&2
+        cat /tmp/tigonkv_numa_maps_$$.txt >&2
+        rm -f /tmp/tigonkv_numa_maps_$$.txt
+        exit 2
+      fi
+      if grep -Eq 'N[0-9]+=' /tmp/tigonkv_numa_maps_$$.txt \
+        && ! grep -Eq "N${TIGONKV_SHARED_NUMA_PRIMARY}=" /tmp/tigonkv_numa_maps_$$.txt; then
+        echo "shared backing pages for pid $pid not on NUMA ${TIGONKV_SHARED_NUMA_PRIMARY}" >&2
+        cat /tmp/tigonkv_numa_maps_$$.txt >&2
+        rm -f /tmp/tigonkv_numa_maps_$$.txt
+        exit 2
       fi
       rm -f /tmp/tigonkv_numa_maps_$$.txt
     fi
   fi
-
   if [[ "$check_ssh" == true ]]; then
     timeout 15 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -p "$((TIGONKV_SSH_BASE_PORT+i))" root@127.0.0.1 \
