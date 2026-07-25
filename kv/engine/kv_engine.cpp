@@ -623,10 +623,14 @@ void KVEngine::ServeScanRequest(const KvMessage &message) {
     items = scan.items;
   }
   if (status.ok()) {
-    for (const auto &item : items)
+    for (size_t i = 0; i < items.size(); ++i) {
       SendTransportMessage(MakeRequest(KvMessageType::kScanItem, config_.node_id,
                                        message.source_node, message.request_id,
-                                       item.key, item.value));
+                                       items[i].key, items[i].value));
+      // Cooperative drain so peers blocked on a full ring into this node can
+      // make progress without waiting for the entire serve to finish.
+      if ((i + 1) % 8 == 0) PollTransport();
+    }
   }
   KvMessage done = MakeRequest(KvMessageType::kScanDone, config_.node_id,
                                message.source_node, message.request_id, {});
@@ -659,24 +663,28 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
   const std::string_view key(message.key.data(), message.key_size);
   const std::string_view value(message.value.data(), message.value_size);
   if (message.type == KvMessageType::kScanRequest) {
-    // Serialize scan-serve bookkeeping across concurrent poll threads; the
-    // actual ScanOwnedPartitions work runs without transport_poll_mutex_.
-    std::unique_lock<std::mutex> scan_lock(scan_serve_mutex_);
-    if (scan_serve_depth_ != 0) {
+    // Same-thread re-entry (Send → PollTransport while serving) must not nest
+    // unbounded ScanOwnedPartitions frames.  Concurrent threads may serve in
+    // parallel now that PollTransport releases the consumer lock before handle.
+    static thread_local uint32_t tls_scan_serve_depth = 0;
+    if (tls_scan_serve_depth != 0) {
+      std::lock_guard<std::mutex> lock(scan_serve_mutex_);
       deferred_scan_requests_.push_back(message);
       return;
     }
-    KvMessage current = message;
+    ++tls_scan_serve_depth;
+    ServeScanRequest(message);
     for (;;) {
-      ++scan_serve_depth_;
-      scan_lock.unlock();
-      ServeScanRequest(current);
-      scan_lock.lock();
-      --scan_serve_depth_;
-      if (deferred_scan_requests_.empty()) break;
-      current = deferred_scan_requests_.front();
-      deferred_scan_requests_.pop_front();
+      KvMessage deferred;
+      {
+        std::lock_guard<std::mutex> lock(scan_serve_mutex_);
+        if (deferred_scan_requests_.empty()) break;
+        deferred = deferred_scan_requests_.front();
+        deferred_scan_requests_.pop_front();
+      }
+      ServeScanRequest(deferred);
     }
+    --tls_scan_serve_depth;
     return;
   }
   KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
