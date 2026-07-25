@@ -366,9 +366,14 @@ class TwoPLPashaHelper {
                 // The write-through SCC protocol requires the writer's
                 // cache-valid bit before finish_write invalidates all peers.
                 // Transactional callers normally establish it on their read
-                // path; the standalone KV shared-write path must do so here.
-                scc_manager->prepare_read(smeta, host_id, scc_data,
-                                          sizeof(TwoPLPashaSharedDataSCC) + size);
+                // path; only establish it here when this host is not already
+                // a valid reader.  Avoiding a redundant prepare is important
+                // for the hot owner write path and preserves SCC accounting.
+                const auto host_bit = host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
+                if (!smeta->is_bit_set(host_bit)) {
+                        scc_manager->prepare_read(smeta, host_id, scc_data,
+                                                  sizeof(TwoPLPashaSharedDataSCC) + size);
+                }
                 scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
                 scc_data->set_flag(TwoPLPashaSharedDataSCC::valid_flag_index);
                 scc_manager->finish_write(smeta, host_id, scc_data,
