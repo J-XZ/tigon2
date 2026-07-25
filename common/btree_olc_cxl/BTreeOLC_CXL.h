@@ -2272,10 +2272,7 @@ restart:
 restart:
 		res.clear();
 		if (restartCount++)
-			// Match insert/update: under sustained OLC contention (YCSB-E 4x4
-			// concurrent scanners + inserts) pause briefly instead of sched_yield
-			// spinning at multi-million restart counts.
-			yield(restartCount, true);
+			yield(restartCount);
 		bool needRestart = false;
 
 		NodeBase *node = root_.load();

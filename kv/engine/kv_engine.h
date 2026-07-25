@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -105,6 +106,7 @@ class KVEngine {
   // Kept well above worker count so Scans stay parallel after nested-poll fix.
   static constexpr uint32_t kMaxInflightScanRpcs = 8;
   std::mutex scan_rpc_mutex_;
+  std::condition_variable scan_rpc_cv_;
   uint32_t inflight_scan_rpcs_ = 0;
   struct PendingCas {
     uint32_t source_node = 0;
