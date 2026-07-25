@@ -2,6 +2,7 @@
 #include "kv/engine/mem_access.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
@@ -570,7 +571,14 @@ DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,
     std::unique_ptr<DualRegionAllocator> allocator;
     try {
       if (reset) {
-        std::memset(base, 0, config.total_pool_bytes);
+        // Guest workflows set TIGONKV_DEVICE_BACKING_ZEROED=1 after the host
+        // cxl_pool_initer already zeroed the ivshmem backing.  Skipping the
+        // guest-side 32GiB memset avoids multi-minute stalls before stage=opened.
+        const char *prezeroed = std::getenv("TIGONKV_DEVICE_BACKING_ZEROED");
+        if (prezeroed == nullptr) prezeroed = std::getenv("CXLKV_DEVICE_BACKING_ZEROED");
+        const bool skip_memset =
+            prezeroed != nullptr && prezeroed[0] == '1' && prezeroed[1] == '\0';
+        if (!skip_memset) std::memset(base, 0, config.total_pool_bytes);
         allocator = std::make_unique<DualRegionAllocator>(
             DualRegionAllocator::Initialize(base, config));
       } else {
