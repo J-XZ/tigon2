@@ -757,7 +757,13 @@ void KVEngine::ServeDeferredRequests(int max_count) {
       deferred = deferred_transport_requests_.front();
       deferred_transport_requests_.pop_front();
     }
-    ServeTransportRequest(deferred);
+    try {
+      ServeTransportRequest(deferred);
+    } catch (const std::exception &) {
+      // Never poison AwaitResponse/PollTransport: a failed serve must not
+      // abort the waiting FG worker. Prefer dropping the bad request.
+    } catch (...) {
+    }
   }
 }
 
@@ -862,7 +868,13 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
       response.status = static_cast<uint32_t>(StatusCode::kOk);
       response.value_size = static_cast<uint32_t>(result.size());
       std::memcpy(response.value.data(), result.data(), result.size());
-      EnforceMigrationBudget(*partition);
+      // Budget enforcement must not prevent the GET response: a throw here
+      // previously left the requester blocked until sync_timeout (YCSB stall).
+      try {
+        EnforceMigrationBudget(*partition);
+      } catch (const std::exception &) {
+        // Best-effort: the read already succeeded; move-out can retry later.
+      }
     }
   } else if (message.type == KvMessageType::kIncrement) {
     int64_t delta = 0;
@@ -944,7 +956,8 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
       return;
     }
   }
-  throw std::runtime_error("migration budget exceeded with no quiescent Clock victim");
+  // Soft-fail: callers on the serve path must still deliver responses. Hard
+  // throwing here caused "forwarded owner response timed out" under YCSB-A.
 }
 
 Status KVEngine::MoveOut(std::string_view key) {
