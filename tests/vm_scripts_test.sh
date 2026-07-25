@@ -5,6 +5,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 output=$("$root/tigonkv_init_vms.sh" --dry-run --config "$root/experiment_config.jsonc")
 grep -q 'TIGONKV_VM_INIT' <<<"$output"
+grep -q 'ssh_base_port=10022' <<<"$output"
+grep -q 'workers=4' <<<"$output"
 grep '^numactl ' <<<"$output" > "$tmp/qemu_cmdlines"
 cmp -s "$tmp/qemu_cmdlines" "$root/tests/fixtures/golden_qemu_cmdline_4vm.txt"
 [[ $(wc -l < "$tmp/qemu_cmdlines") -eq 4 ]]

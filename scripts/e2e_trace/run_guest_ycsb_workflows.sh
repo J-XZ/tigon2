@@ -9,9 +9,9 @@ trace_root=${1:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 log_root=${2:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 rounds=${3:-${TIGONKV_E2E_ROUNDS:-10}}
 workloads=${4:-${TIGONKV_YCSB_WORKLOADS:-"A B C D E"}}
-vm_count=${TIGONKV_VM_COUNT:-4}
-threads_per_vm=${TIGONKV_YCSB_THREADS_PER_VM:-${TIGONKV_E2E_THREADS:-4}}
-base_port=${TIGONKV_VM_SSH_BASE_PORT:-10022}
+vm_count=${TIGONKV_VM_COUNT}
+threads_per_vm=${TIGONKV_YCSB_THREADS_PER_VM:-${TIGONKV_E2E_THREADS:-${TIGONKV_E2E_WORKERS:-4}}}
+base_port=${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}
 ssh_key=${TIGONKV_VM_SSH_KEY:-/root/.ssh/id_rsa}
 remote_root=${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}
 remote_config=${TIGONKV_VM_REMOTE_CONFIG:-$remote_root/experiment_config.jsonc}
@@ -20,8 +20,8 @@ runner=${TIGONKV_E2E_TRACE_RUNNER:-$root/build-relwithdebinfo/e2e_trace_runner}
 backing=${TIGONKV_SHARED_MEMORY_PATH:-$TIGONKV_SHARED_BACKING}
 pool_init=${TIGONKV_POOL_INITER:-$root/build/cxl_pool_initer}
 shared_size_mb=${TIGONKV_SHARED_SIZE_MB:-$TIGONKV_SHARED_MB}
-shared_numa=${TIGONKV_SHARED_NUMA_NODE:-$TIGONKV_SHARED_NUMA}
-timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-600}
+shared_numa=${TIGONKV_SHARED_NUMA_NODE:-${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV_SHARED_NUMA%%,*}}}
+timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-600}}
 
 [[ -d "$trace_root" ]] || { echo "missing trace root: $trace_root" >&2; exit 2; }
 [[ -x "$runner" ]] || { echo "missing trace runner: $runner" >&2; exit 2; }

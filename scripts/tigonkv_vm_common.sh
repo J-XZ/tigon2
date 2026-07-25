@@ -29,35 +29,63 @@ while i < len(text):
         i=end+2; continue
     out.append(c); i += 1
 d=json.loads(''.join(out))
+
 def get(*keys, default=None):
     x=d
     for key in keys:
         if not isinstance(x, dict) or key not in x:
             return default
         x=x[key]
-    return x if x is not None else default
-def nodes(value): return value if isinstance(value, list) else [value]
+    return default if x is None else x
+
+def nodes(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+def require(name, value):
+    if value is None or value == '':
+        raise SystemExit(f'missing required config field: {name}')
+    return value
+
 ssh_port = get('vm', 'ssh_base_port')
 if ssh_port is None:
     ssh_port = get('network', 'base_ssh_port')
+ssh_port = require('vm.ssh_base_port|network.base_ssh_port', ssh_port)
+
+vm_numa = nodes(get('vm', 'numa_node'))
+shared_numa = nodes(get('shared_memory', 'numa_node'))
+if not vm_numa:
+    raise SystemExit('missing required config field: vm.numa_node')
+if not shared_numa:
+    raise SystemExit('missing required config field: shared_memory.numa_node')
+
+host_cpu = get('host_cpu', default={}) or {}
 values={
- 'TIGONKV_VM_COUNT': get('vm','count'),
- 'TIGONKV_VM_CORES_PER_VM': get('vm','core_count_per_vm'),
- 'TIGONKV_VM_MEM_MB': get('vm','mem_size_mb_per_vm'),
- 'TIGONKV_VM_STORAGE': get('vm','storage_path'),
- 'TIGONKV_VM_NUMA': ','.join(map(str,nodes(get('vm','numa_node')))),
+ 'TIGONKV_VM_COUNT': require('vm.count', get('vm','count')),
+ 'TIGONKV_VM_CORES_PER_VM': require('vm.core_count_per_vm', get('vm','core_count_per_vm')),
+ 'TIGONKV_VM_MEM_MB': require('vm.mem_size_mb_per_vm', get('vm','mem_size_mb_per_vm')),
+ 'TIGONKV_VM_STORAGE': require('vm.storage_path', get('vm','storage_path')),
+ 'TIGONKV_VM_NUMA': ','.join(map(str, vm_numa)),
+ 'TIGONKV_VM_NUMA_PRIMARY': str(vm_numa[0]),
  'TIGONKV_SSH_BASE_PORT': ssh_port,
- 'TIGONKV_SHARED_PATH': get('shared_memory','path'),
- 'TIGONKV_SHARED_MB': get('shared_memory','size_mb'),
- 'TIGONKV_SHARED_NUMA': ','.join(map(str,nodes(get('shared_memory','numa_node')))),
- 'TIGONKV_DEVICE_PATH': get('shared_memory','device_path'),
- 'TIGONKV_VM_CORES': ' '.join(map(str,get('host_cpu','vm_cores'))),
- 'TIGONKV_RESERVED_CORES': ' '.join(map(str,get('host_cpu','reserved_cores'))),
- 'TIGONKV_IVSHMEM_CORES': ' '.join(map(str,get('host_cpu','ivshmem_server_cores'))),
+ 'TIGONKV_SHARED_PATH': require('shared_memory.path', get('shared_memory','path')),
+ 'TIGONKV_SHARED_MB': require('shared_memory.size_mb', get('shared_memory','size_mb')),
+ 'TIGONKV_SHARED_NUMA': ','.join(map(str, shared_numa)),
+ 'TIGONKV_SHARED_NUMA_PRIMARY': str(shared_numa[0]),
+ 'TIGONKV_DEVICE_PATH': require('shared_memory.device_path', get('shared_memory','device_path')),
+ 'TIGONKV_VM_CORES': ' '.join(map(str, require('host_cpu.vm_cores', host_cpu.get('vm_cores')))),
+ 'TIGONKV_RESERVED_CORES': ' '.join(map(str, require('host_cpu.reserved_cores', host_cpu.get('reserved_cores')))),
+ 'TIGONKV_IVSHMEM_CORES': ' '.join(map(str, require('host_cpu.ivshmem_server_cores', host_cpu.get('ivshmem_server_cores')))),
+ 'TIGONKV_E2E_WORKERS': get('e2e', 'foreground_worker_count_per_vm', default=1),
+ 'TIGONKV_SYNC_TIMEOUT_SEC': get('sync', 'timeout_sec', default=60),
 }
-for key, value in values.items(): print(f'{key}={shlex.quote(str(value))}')
+for key, value in values.items():
+    print(f'{key}={shlex.quote(str(value))}')
 PY
 )"
+  # Compatibility alias used by some guest/orchestration scripts.
+  TIGONKV_VM_SSH_BASE_PORT=${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}
   if [[ "$TIGONKV_SHARED_PATH" == "/mnt/xz_shared_mem" || "$TIGONKV_SHARED_PATH" == "/mnt/xz_shared_mem/" || -d "$TIGONKV_SHARED_PATH" || "$TIGONKV_SHARED_PATH" == */ ]]; then
     TIGONKV_SHARED_BACKING="${TIGONKV_SHARED_PATH%/}/ivshmem_shared_mem"
   else
@@ -69,6 +97,8 @@ tigonkv_validate_vm_config() {
   local overlap=${1:-false}
   [[ "$TIGONKV_SHARED_MB" =~ ^[0-9]+$ ]] && (( TIGONKV_SHARED_MB > 0 && (TIGONKV_SHARED_MB & (TIGONKV_SHARED_MB - 1)) == 0 )) || {
     echo "shared_memory.size_mb must be a positive power of two" >&2; return 2; }
+  [[ "$TIGONKV_SSH_BASE_PORT" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ssh base port must be a positive integer" >&2; return 2; }
   (( TIGONKV_VM_COUNT > 0 && TIGONKV_VM_CORES_PER_VM > 0 && TIGONKV_VM_MEM_MB > 0 )) || {
     echo "VM count, cores, and memory must be positive" >&2; return 2; }
   local cpu; for cpu in $TIGONKV_VM_CORES $TIGONKV_RESERVED_CORES $TIGONKV_IVSHMEM_CORES; do

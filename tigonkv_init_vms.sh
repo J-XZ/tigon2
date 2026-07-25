@@ -8,27 +8,27 @@ source "$root/scripts/tigonkv_vm_common.sh"; tigonkv_load_vm_config "$config"; t
 image="$root/image/root.img"
 module="$root/dependencies/kernel_module/cxl_ivpci.ko"
 ssh_key="${TIGONKV_VM_SSH_KEY:-$HOME/.ssh/id_rsa}"
-echo "TIGONKV_VM_INIT config=$config backing=$TIGONKV_SHARED_BACKING shared_numa=$TIGONKV_SHARED_NUMA vm_numa=$TIGONKV_VM_NUMA"
+echo "TIGONKV_VM_INIT config=$config backing=$TIGONKV_SHARED_BACKING shared_numa=$TIGONKV_SHARED_NUMA vm_numa=$TIGONKV_VM_NUMA ssh_base_port=$TIGONKV_SSH_BASE_PORT workers=$TIGONKV_E2E_WORKERS"
 if [[ "$dry_run" == true ]]; then
   read -r -a vm_cores <<< "$TIGONKV_VM_CORES"
   for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
     vm_dir="$TIGONKV_VM_STORAGE/vm_${i}"
     begin=$((i * TIGONKV_VM_CORES_PER_VM))
     cpu_list=$(IFS=,; echo "${vm_cores[*]:begin:TIGONKV_VM_CORES_PER_VM}")
-    echo "numactl --cpunodebind=$TIGONKV_VM_NUMA --membind=$TIGONKV_VM_NUMA qemu-system-x86_64 -machine q35,accel=kvm,mem-merge=off -cpu host -m ${TIGONKV_VM_MEM_MB}M -smp $TIGONKV_VM_CORES_PER_VM -enable-kvm -display none -daemonize -pidfile $vm_dir/qemu.pid -D $vm_dir/qemu.log -drive if=none,file=$vm_dir/root.img,format=raw,media=disk,id=drive0,cache=none,aio=native -device virtio-blk-pci,drive=drive0 -netdev user,id=net$i,hostfwd=tcp:127.0.0.1:$((TIGONKV_SSH_BASE_PORT+i))-:22 -device virtio-net-pci,netdev=net$i -device ivshmem-plain,memdev=ivshmem -object memory-backend-file,size=${TIGONKV_SHARED_MB}M,share=on,mem-path=$TIGONKV_SHARED_BACKING,id=ivshmem -taskset $cpu_list"
+    echo "numactl --cpunodebind=$TIGONKV_VM_NUMA_PRIMARY --membind=$TIGONKV_VM_NUMA_PRIMARY qemu-system-x86_64 -machine q35,accel=kvm,mem-merge=off -cpu host -m ${TIGONKV_VM_MEM_MB}M -smp $TIGONKV_VM_CORES_PER_VM -enable-kvm -display none -daemonize -pidfile $vm_dir/qemu.pid -D $vm_dir/qemu.log -drive if=none,file=$vm_dir/root.img,format=raw,media=disk,id=drive0,cache=none,aio=native -device virtio-blk-pci,drive=drive0 -netdev user,id=net$i,hostfwd=tcp:127.0.0.1:$((TIGONKV_SSH_BASE_PORT+i))-:22 -device virtio-net-pci,netdev=net$i -device ivshmem-plain,memdev=ivshmem -object memory-backend-file,size=${TIGONKV_SHARED_MB}M,share=on,mem-path=$TIGONKV_SHARED_BACKING,id=ivshmem -taskset $cpu_list"
   done
   exit 0
 fi
 [[ -s "$image" ]] || { echo "missing image: $image" >&2; exit 2; }
 "$root/tigonkv_kill_vms.sh" --config "$config" --allow-state-change
 mkdir -p "$(dirname "$TIGONKV_SHARED_BACKING")" "$TIGONKV_VM_STORAGE"
-numactl --membind="$TIGONKV_SHARED_NUMA" truncate -s "$((TIGONKV_SHARED_MB * 1024 * 1024))" "$TIGONKV_SHARED_BACKING"
+numactl --membind="${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV_SHARED_NUMA%%,*}}" truncate -s "$((TIGONKV_SHARED_MB * 1024 * 1024))" "$TIGONKV_SHARED_BACKING"
 read -r -a vm_cores <<< "$TIGONKV_VM_CORES"
 for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
   vm_dir="$TIGONKV_VM_STORAGE/vm_${i}"; mkdir -p "$vm_dir"
   cp --reflink=auto "$image" "$vm_dir/root.img"
   begin=$((i * TIGONKV_VM_CORES_PER_VM)); cpu_list=$(IFS=,; echo "${vm_cores[*]:begin:TIGONKV_VM_CORES_PER_VM}")
-  numactl --cpunodebind="$TIGONKV_VM_NUMA" --membind="$TIGONKV_VM_NUMA" qemu-system-x86_64 \
+  numactl --cpunodebind="$TIGONKV_VM_NUMA_PRIMARY" --membind="$TIGONKV_VM_NUMA_PRIMARY" qemu-system-x86_64 \
     -machine q35,accel=kvm,mem-merge=off -cpu host -m "${TIGONKV_VM_MEM_MB}M" \
     -smp "$TIGONKV_VM_CORES_PER_VM" -enable-kvm -display none -daemonize \
     -pidfile "$vm_dir/qemu.pid" -D "$vm_dir/qemu.log" \
