@@ -1,5 +1,6 @@
 #include "kv/kv_store.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -98,7 +99,8 @@ struct ReplayResult {
 };
 
 ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_64 *rng,
-                         uint32_t fixed_key_size, uint32_t fixed_value_size) {
+                         uint32_t fixed_key_size, uint32_t fixed_value_size,
+                         std::atomic<uint64_t> *progress_ops = nullptr) {
   std::ifstream input(trace);
   if (!input) Fail("cannot open trace: " + trace);
   ReplayResult result;
@@ -148,6 +150,7 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_
     }
     if (!status.ok()) Fail("operation failed at line " + std::to_string(line_no) + ": " + status.message);
     ++result.ops;
+    if (progress_ops != nullptr) progress_ops->fetch_add(1, std::memory_order_relaxed);
   }
   return result;
 }
@@ -187,6 +190,28 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   std::vector<std::thread> threads;
   std::mutex error_mutex;
   std::exception_ptr error;
+  std::atomic<uint64_t> progress_ops{0};
+  std::atomic<bool> replay_done{false};
+  // Heartbeat so host orchestration can fail-fast on livelock instead of
+  // mistaking a long SCAN-heavy run for a hang (YCSB-E ~55s/node is normal).
+  std::thread progress_thread;
+  if (verbose) {
+    progress_thread = std::thread([&] {
+      uint64_t last = 0;
+      auto last_print = std::chrono::steady_clock::now();
+      while (!replay_done.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_print < std::chrono::seconds(5)) continue;
+        last_print = now;
+        const uint64_t cur = progress_ops.load(std::memory_order_relaxed);
+        std::cerr << "E2E_TRACE_PROGRESS node=" << config.node_id << " phase=" << phase
+                  << " ops=" << cur << " delta=" << (cur - last) << "\n"
+                  << std::flush;
+        last = cur;
+      }
+    });
+  }
   const auto start = std::chrono::steady_clock::now();
   for (uint64_t worker = 0; worker < workers; ++worker) {
     threads.emplace_back([&, worker] {
@@ -195,7 +220,7 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
         std::mt19937_64 rng(value_seed ^ (static_cast<uint64_t>(trace_first + worker) << 32) ^
                             worker);
         results[worker] = ReplayTrace(*store, traces[worker], &rng, config.fixed_key_size,
-                                      config.fixed_value_size);
+                                      config.fixed_value_size, &progress_ops);
       } catch (...) {
         std::lock_guard<std::mutex> lock(error_mutex);
         if (!error) error = std::current_exception();
@@ -203,6 +228,8 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
     });
   }
   for (auto &thread : threads) thread.join();
+  replay_done.store(true, std::memory_order_release);
+  if (progress_thread.joinable()) progress_thread.join();
   if (error) std::rethrow_exception(error);
   log_stage("replay_done");
   const auto duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(

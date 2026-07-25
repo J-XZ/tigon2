@@ -85,7 +85,48 @@ run_fixed() {
   # control-plane marker is outside the timed replay window and must not rely
   # on a caller remembering to enable verbose output.
   local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_VERBOSE=1 TIGONKV_E2E_RESET=$reset $zeroed '$remote_runner'"
-  timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$command" >"$log" 2>&1
+  # Pre-create the log so the host wait loop never races rg against ENOENT.
+  : >"$log"
+  timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$command" >>"$log" 2>&1
+}
+
+# Fail fast when guests sit at barrier_ready with zero op progress (livelock).
+# YCSB-E SCAN-heavy runs normally emit E2E_TRACE_PROGRESS every ~5s.
+watch_phase_progress() {
+  local phase_log=$1
+  local stall_sec=${TIGONKV_E2E_STALL_SEC:-90}
+  local deadline=$((SECONDS + timeout_sec))
+  local last_ops=-1
+  local last_change=$SECONDS
+  while (( SECONDS < deadline )); do
+    local all_done=1
+    local vm
+    for ((vm = 0; vm < vm_count; vm++)); do
+      if ! rg -q "e2e_trace_runner\\[node${vm}\\]: passed\\." "$phase_log/vm${vm}.log" 2>/dev/null; then
+        all_done=0
+        break
+      fi
+    done
+    (( all_done == 1 )) && return 0
+    local ops=0
+    for ((vm = 0; vm < vm_count; vm++)); do
+      local cur
+      cur=$(rg -o 'E2E_TRACE_PROGRESS.*ops=[0-9]+' "$phase_log/vm${vm}.log" 2>/dev/null | tail -1 | sed -n 's/.*ops=\([0-9]*\).*/\1/p')
+      [[ -n "$cur" ]] && ops=$((ops + cur))
+    done
+    if (( ops != last_ops )); then
+      last_ops=$ops
+      last_change=$SECONDS
+    elif (( SECONDS - last_change >= stall_sec )); then
+      if rg -q 'stage=barrier_ready' "$phase_log"/vm*.log 2>/dev/null; then
+        echo "stall: no E2E_TRACE_PROGRESS growth for ${stall_sec}s (ops=$ops) in $phase_log" >&2
+        return 1
+      fi
+    fi
+    sleep 2
+  done
+  echo "timeout waiting for phase completion: $phase_log" >&2
+  return 1
 }
 
 for ((round = 1; round <= rounds; round++)); do
@@ -105,7 +146,7 @@ for ((round = 1; round <= rounds; round++)); do
         # peers attach.  A fixed sleep races with a cold guest; use the
         # runner's explicit verbose stage marker instead.
         deadline=$((SECONDS + ${TIGONKV_E2E_TIMEOUT_SEC:-600}))
-        while ! rg -q 'E2E_TRACE_STAGE .*stage=opened' "$phase_log/vm0.log"; do
+        while ! rg -q 'E2E_TRACE_STAGE .*stage=opened' "$phase_log/vm0.log" 2>/dev/null; do
           kill -0 "${pids[0]}" 2>/dev/null || { wait "${pids[0]}" || true; exit 1; }
           (( SECONDS < deadline )) || { echo "timeout waiting for VM0 layout publication" >&2; exit 1; }
           sleep 0.05
@@ -117,7 +158,39 @@ for ((round = 1; round <= rounds; round++)); do
         run_fixed "$round" "$wl" "$phase" "$vm" "$reset" "$phase_log/vm$vm.log" &
         pids+=("$!")
       done
-      for pid in "${pids[@]}"; do wait "$pid"; done
+      # Watch progress in parallel; kill the phase early on livelock/stall.
+      watch_phase_progress "$phase_log" &
+      watch_pid=$!
+      fail=0
+      while kill -0 "$watch_pid" 2>/dev/null; do
+        alive=0
+        for pid in "${pids[@]}"; do
+          kill -0 "$pid" 2>/dev/null && alive=1 && break
+        done
+        (( alive == 0 )) && break
+        sleep 1
+      done
+      if kill -0 "$watch_pid" 2>/dev/null; then
+        kill "$watch_pid" 2>/dev/null || true
+        wait "$watch_pid" 2>/dev/null || true
+      else
+        wait "$watch_pid" || fail=1
+      fi
+      if (( fail != 0 )); then
+        for pid in "${pids[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
+        for ((vm_kill = 0; vm_kill < vm_count; vm_kill++)); do
+          remote "$vm_kill" "pkill -9 e2e_trace_runner" >/dev/null 2>&1 || true
+        done
+        echo "guest stall/timeout: round=$round workload=$wl phase=$phase" >&2
+        exit 1
+      fi
+      for pid in "${pids[@]}"; do
+        if ! wait "$pid"; then fail=1; fi
+      done
+      (( fail == 0 )) || {
+        echo "guest ssh/timeout failed: round=$round workload=$wl phase=$phase" >&2
+        exit 1
+      }
       for ((vm = 0; vm < vm_count; vm++)); do
         rg -q "e2e_trace_runner\\[node${vm}\\]: passed\\." "$phase_log/vm${vm}.log" || {
           echo "guest trace failed: round=$round workload=$wl phase=$phase vm=$vm" >&2
