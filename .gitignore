@@ -1,10 +1,18 @@
 .vscode
+.idea
 settings.json
+*.swp
+*~
+
 build
 build-*/
 results/ycsb_traces/
 tmp*
 __pycache__
+.cache
+.ccls-cache/
+compile_commands.json
+CMakeUserPresets.json
 
 mkosi.builddir
 mkosi.cache
@@ -12,7 +20,14 @@ mkosi.extra
 .mkosi*
 root.img
 root.img.manifest
+wget-log
 
 qemu_log*.txt
+qemu.log
+qemu.pid
 OVMF_VARS.fd
 pid
+*.qcow2
+
+# VM runtime directory (OVMF copies, per-VM state); aligns with cxlkv
+emulation/vms/
