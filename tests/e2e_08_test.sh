@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# CTest entry for e2e_08: cxlkv-aligned 4VM × 4 worker guest SSH run (1 round).
+set -euo pipefail
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=tests/e2e_multivm_common.sh
+source "$root/tests/e2e_multivm_common.sh"
+tigonkv_e2e_multivm_preflight
+
+[[ -x "$TIGONKV_E2E_BINARY_DIR/e2e_08" ]] || {
+  echo "missing e2e_08 binary: $TIGONKV_E2E_BINARY_DIR/e2e_08" >&2
+  exit 2
+}
+
+log_root=${TIGONKV_E2E_CTEST_LOG_ROOT:-$(mktemp -d /tmp/tigonkv-e2e08-XXXXXX)}
+mkdir -p "$log_root"
+echo "TIGONKV_E2E08_CTEST log_root=$log_root"
+TIGONKV_E2E_ROUNDS=1 TIGONKV_E2E_SUITES=08 \
+  "$root/scripts/e2e/run_guest_e2e_workflows.sh" "$log_root" 1 08
+echo "TIGONKV_E2E08_CTEST passed"

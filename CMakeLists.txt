@@ -100,11 +100,14 @@ add_test(NAME allocator_accounting_test COMMAND allocator_accounting_test)
 add_test(NAME allocator_domain_budget_test COMMAND allocator_domain_budget_test)
 add_test(NAME allocator_local_dram_test COMMAND allocator_local_dram_test)
 add_test(NAME e2e_tests COMMAND e2e_tests)
-add_test(NAME e2e_08_test COMMAND e2e_08)
-add_test(NAME e2e_09_test COMMAND e2e_09)
-add_test(NAME e2e_trace_test COMMAND e2e_trace)
-add_test(NAME e2e_trace_multivm_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_trace_multivm_test.sh)
+# Multi-VM × multi-thread guest e2e (cxlkv-aligned: 4 VM × 4 workers via SSH).
+add_test(NAME e2e_08_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_08_test.sh)
+add_test(NAME e2e_09_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_09_test.sh)
+add_test(NAME e2e_ycsb_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_ycsb_test.sh)
 add_test(NAME e2e_ycsb_entrypoints_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_ycsb_entrypoints_test.sh)
+set_tests_properties(e2e_08_test e2e_09_test e2e_ycsb_test PROPERTIES
+  TIMEOUT 3600
+  RUN_SERIAL TRUE)
 add_test(NAME latency_modes_test COMMAND latency_modes_test)
 add_test(NAME kv_layout_test COMMAND kv_layout_test)
 add_test(NAME btree_binding_test COMMAND btree_binding_test)
@@ -116,6 +119,3 @@ add_test(NAME region_allocator_test COMMAND region_allocator_test)
 add_test(NAME vm_scripts_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/vm_scripts_test.sh)
 add_test(NAME ycsb_cpp_pin_test COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/tigonkv_ycsb_cpp_pin.sh)
 add_test(NAME ycsb_scripts_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/ycsb_scripts_test.sh)
-set_tests_properties(e2e_trace_test PROPERTIES
-  ENVIRONMENT
-    "TIGONKV_EXPERIMENT_CONFIG_JSONC=${CMAKE_SOURCE_DIR}/tests/fixtures/experiment_config.jsonc;TIGONKV_E2E_TRACE_FILE=${CMAKE_SOURCE_DIR}/tests/fixtures/trace.txt;TIGONKV_E2E_RESET=1;TIGONKV_E2E_TRACE_PHASE=fixture")

@@ -53,6 +53,12 @@ std::string Value(uint32_t generation, uint32_t i) {
 int main() {
   if (std::getenv("TIGONKV_E2E_MULTI_VM") != nullptr)
     return tigonkv::e2e_vm_workflow::RunE2E09MultiVm();
+  if (std::getenv("TIGONKV_E2E_LOCAL_FORK") == nullptr) {
+    std::cerr << "e2e_09 requires TIGONKV_E2E_MULTI_VM=1 (cxlkv-aligned guest "
+                 "4VM×4thread) or TIGONKV_E2E_LOCAL_FORK=1 for the legacy "
+                 "single-host fork smoke\n";
+    return 2;
+  }
   const std::string path = EnvOr("TIGONKV_E2E_BACKING", "/tmp/tigonkv-e2e-09-" + std::to_string(getpid()));
   std::remove(path.c_str());
   auto owner = KVStore::Create(ConfigFor(path, 0), true);

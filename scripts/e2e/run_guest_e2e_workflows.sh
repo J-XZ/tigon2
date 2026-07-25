@@ -5,7 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 config=${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}
 source "$root/scripts/tigonkv_vm_common.sh"
 tigonkv_load_vm_config "$config"
-binary_dir=${TIGONKV_E2E_BINARY_DIR:-$root/build-rel}
+binary_dir=${TIGONKV_E2E_BINARY_DIR:-$root/build-relwithdebinfo}
 log_root=${1:?usage: $0 LOG_ROOT [ROUNDS] [SUITES]}
 rounds=${2:-${TIGONKV_E2E_ROUNDS:-10}}
 suites=${3:-${TIGONKV_E2E_SUITES:-"08 09"}}
@@ -16,7 +16,7 @@ ssh_key=${TIGONKV_VM_SSH_KEY:-/root/.ssh/id_rsa}
 remote_root=${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}
 remote_config=${TIGONKV_VM_REMOTE_CONFIG:-$remote_root/experiment_config.jsonc}
 backing=${TIGONKV_SHARED_MEMORY_PATH:-$TIGONKV_SHARED_BACKING}
-pool_init=${TIGONKV_POOL_INITER:-$root/build/cxl_pool_initer}
+pool_init=${TIGONKV_POOL_INITER:-$root/build-relwithdebinfo/cxl_pool_initer}
 shared_size_mb=${TIGONKV_SHARED_SIZE_MB:-$TIGONKV_SHARED_MB}
 shared_numa=${TIGONKV_SHARED_NUMA_NODE:-${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV_SHARED_NUMA%%,*}}}
 timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-1800}}
@@ -24,6 +24,10 @@ timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-1800}}
 [[ "$vm_count" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_VM_COUNT must be positive" >&2; exit 2; }
 [[ "$threads" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_E2E_THREADS must be positive" >&2; exit 2; }
 [[ "$rounds" =~ ^[1-9][0-9]*$ ]] || { echo "rounds must be positive" >&2; exit 2; }
+[[ "$vm_count" == 4 && "$threads" == 4 ]] || {
+  echo "cxlkv-aligned guest e2e requires 4 VMs × 4 threads (got ${vm_count}×${threads})" >&2
+  exit 2
+}
 [[ -x "$pool_init" ]] || { echo "build cxl_pool_initer first: $pool_init" >&2; exit 2; }
 [[ -f "$ssh_key" ]] || { echo "missing SSH key: $ssh_key" >&2; exit 2; }
 
@@ -39,6 +43,7 @@ remote() {
 sync_guest_binary() {
   local suite=$1 vm
   for ((vm = 0; vm < vm_count; vm++)); do
+    remote "$vm" "killall -9 e2e_${suite} 2>/dev/null; true"
     remote "$vm" "mkdir -p '$remote_root/build'"
     scp "${ssh_opts[@]}" -P "$((base_port + vm))" \
       "$binary_dir/e2e_${suite}" "root@127.0.0.1:$remote_root/build/e2e_${suite}" >/dev/null
