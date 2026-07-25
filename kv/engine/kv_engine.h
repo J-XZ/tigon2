@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <string_view>
@@ -71,6 +72,7 @@ class KVEngine {
   ScanResult ScanOwnedPartitions(std::string_view start_key, uint64_t limit);
   Status AwaitScan(uint64_t request_id, std::vector<ScanItem> *items);
   void HandleTransportMessage(const KvMessage &message);
+  void ServeScanRequest(const KvMessage &message);
   void SendTransportMessage(const KvMessage &message);
   void EnforceMigrationBudget(KVPartition &partition);
 
@@ -93,6 +95,11 @@ class KVEngine {
   };
   std::mutex pending_scan_mutex_;
   std::unordered_map<uint64_t, PendingScan> pending_scans_;
+  // Nested PollTransport (ring-full send path) must not re-enter a full local
+  // ScanOwnedPartitions serve: concurrent YCSB-E scanners would otherwise
+  // nest/stall until sync_timeout.  Defer inner ScanRequests and drain after.
+  uint32_t scan_serve_depth_ = 0;
+  std::deque<KvMessage> deferred_scan_requests_;
   struct PendingCas {
     uint32_t source_node = 0;
     std::string key;

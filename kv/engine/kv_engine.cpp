@@ -581,14 +581,18 @@ CasResult KVEngine::ForwardCompareExchange(std::string_view key,
 void KVEngine::PollTransport() {
   std::lock_guard<std::recursive_mutex> poll_lock(transport_poll_mutex_);
   if (rings_ == nullptr) return;
-  alignas(64) char bytes[sizeof(KvMessage)];
-  const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
-  if (received == 0) return;
-  if (received != sizeof(KvMessage)) throw std::runtime_error("malformed KV transport entry");
-  KvMessage message{};
-  std::memcpy(&message, bytes, sizeof(message));
-  network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
-  HandleTransportMessage(message);
+  // Drain a bounded batch per poll so AwaitScan/AwaitResponse can retire peer
+  // ScanItem/ScanDone traffic without one-at-a-time round trips.
+  for (int drained = 0; drained < 64; ++drained) {
+    alignas(64) char bytes[sizeof(KvMessage)];
+    const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
+    if (received == 0) return;
+    if (received != sizeof(KvMessage)) throw std::runtime_error("malformed KV transport entry");
+    KvMessage message{};
+    std::memcpy(&message, bytes, sizeof(message));
+    network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
+    HandleTransportMessage(message);
+  }
 }
 
 void KVEngine::BindWorker(uint32_t worker_id) {
@@ -598,6 +602,36 @@ void KVEngine::BindWorker(uint32_t worker_id) {
     throw std::invalid_argument("BindWorker worker_id exceeds foreground_worker_count_per_vm");
   ebr_->thread_init_ebr_meta(config_.node_id, worker_id);
   star::global_ebr_meta = ebr_.get();
+}
+
+void KVEngine::ServeScanRequest(const KvMessage &message) {
+  struct DepthGuard {
+    uint32_t &depth;
+    explicit DepthGuard(uint32_t &value) : depth(value) { ++depth; }
+    ~DepthGuard() { --depth; }
+  } guard(scan_serve_depth_);
+  const std::string_view key(message.key.data(), message.key_size);
+  const std::string_view value(message.value.data(), message.value_size);
+  uint64_t limit = 0;
+  Status status = Status::Ok();
+  std::vector<ScanItem> items;
+  if (!DecodeU64(value, &limit)) {
+    status = Status::Error(StatusCode::kInvalidArgument, "invalid scan limit payload");
+  } else {
+    const auto scan = ScanOwnedPartitions(key, limit);
+    status = scan.status;
+    items = scan.items;
+  }
+  if (status.ok()) {
+    for (const auto &item : items)
+      SendTransportMessage(MakeRequest(KvMessageType::kScanItem, config_.node_id,
+                                       message.source_node, message.request_id,
+                                       item.key, item.value));
+  }
+  KvMessage done = MakeRequest(KvMessageType::kScanDone, config_.node_id,
+                               message.source_node, message.request_id, {});
+  done.status = static_cast<uint32_t>(status.code);
+  SendTransportMessage(done);
 }
 
 void KVEngine::HandleTransportMessage(const KvMessage &message) {
@@ -625,26 +659,16 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
   const std::string_view key(message.key.data(), message.key_size);
   const std::string_view value(message.value.data(), message.value_size);
   if (message.type == KvMessageType::kScanRequest) {
-    uint64_t limit = 0;
-    Status status = Status::Ok();
-    std::vector<ScanItem> items;
-    if (!DecodeU64(value, &limit)) {
-      status = Status::Error(StatusCode::kInvalidArgument, "invalid scan limit payload");
-    } else {
-      const auto scan = ScanOwnedPartitions(key, limit);
-      status = scan.status;
-      items = scan.items;
+    if (scan_serve_depth_ != 0) {
+      deferred_scan_requests_.push_back(message);
+      return;
     }
-    if (status.ok()) {
-      for (const auto &item : items)
-        SendTransportMessage(MakeRequest(KvMessageType::kScanItem, config_.node_id,
-                                         message.source_node, message.request_id,
-                                         item.key, item.value));
+    ServeScanRequest(message);
+    while (!deferred_scan_requests_.empty()) {
+      KvMessage deferred = deferred_scan_requests_.front();
+      deferred_scan_requests_.pop_front();
+      ServeScanRequest(deferred);
     }
-    KvMessage done = MakeRequest(KvMessageType::kScanDone, config_.node_id,
-                                 message.source_node, message.request_id, {});
-    done.status = static_cast<uint32_t>(status.code);
-    SendTransportMessage(done);
     return;
   }
   KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
