@@ -35,11 +35,14 @@ struct alignas(64) RegionAllocatorShard {
 // different mapping address because all links are offsets from base_.
 struct alignas(64) RegionAllocatorHeader {
   uint64_t magic = 0x5449474f4e414c4cULL;  // TIGONALL
-  uint32_t version = 3;
+  uint32_t version = 4;
   uint32_t shard_count = 0;
   uint64_t region_bytes = 0;
   uint64_t metadata_bytes = 0;
   uint64_t reserved_prefix_bytes = 0;
+  // Bumped on every Initialize so process-local TLS caches cannot reuse
+  // offsets after munmap+mmap recycles the same virtual address.
+  uint64_t init_id = 0;
   std::atomic<uint64_t> allocated_bytes{0};
   std::atomic<uint64_t> allocation_count{0};
   std::atomic<uint64_t> free_count{0};

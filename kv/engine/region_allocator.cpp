@@ -35,17 +35,28 @@ void FlushForRemoteVisibility(const void *address, size_t bytes) {
 constexpr uint32_t kTlsCacheCapacity = 32;
 struct AllocatorTlsCache {
   RegionAllocatorHeader *header = nullptr;
+  uint64_t init_id = 0;
   struct Slot {
     RegionOffset offsets[kTlsCacheCapacity]{};
     uint32_t count = 0;
   } slots[kAllocatorSizeClasses];
 };
 thread_local AllocatorTlsCache g_allocator_tls;
+std::atomic<uint64_t> g_allocator_init_seq{1};
 
 void TlsBind(RegionAllocatorHeader *header) {
-  if (g_allocator_tls.header == header) return;
+  if (g_allocator_tls.header == header &&
+      g_allocator_tls.init_id == header->init_id)
+    return;
   for (auto &slot : g_allocator_tls.slots) slot.count = 0;
   g_allocator_tls.header = header;
+  g_allocator_tls.init_id = header->init_id;
+}
+
+void TlsInvalidate() {
+  for (auto &slot : g_allocator_tls.slots) slot.count = 0;
+  g_allocator_tls.header = nullptr;
+  g_allocator_tls.init_id = 0;
 }
 
 }  // namespace
@@ -80,6 +91,8 @@ RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
   header->region_bytes = region_bytes;
   header->metadata_bytes = MetadataBytes();
   header->reserved_prefix_bytes = reserved_prefix_bytes;
+  header->init_id = g_allocator_init_seq.fetch_add(1, std::memory_order_relaxed);
+  TlsInvalidate();
   const uint64_t payload_begin = header->metadata_bytes + reserved_prefix_bytes;
   const uint64_t payload = region_bytes - payload_begin;
   for (uint32_t shard = 0; shard < shard_count; ++shard) {
@@ -98,10 +111,11 @@ RegionAllocator RegionAllocator::Attach(void *region, uint64_t region_bytes) {
   if (reinterpret_cast<uintptr_t>(region) % kAlignment != 0)
     throw std::invalid_argument("allocator attachment is not cacheline aligned");
   auto *header = static_cast<RegionAllocatorHeader *>(region);
-  if (header->magic != 0x5449474f4e414c4cULL || header->version != 3 ||
+  if (header->magic != 0x5449474f4e414c4cULL || header->version != 4 ||
       header->region_bytes != region_bytes || header->metadata_bytes != MetadataBytes() ||
       header->reserved_prefix_bytes > region_bytes - MetadataBytes() ||
-      header->shard_count == 0 || header->shard_count > kMaxAllocatorShards)
+      header->shard_count == 0 || header->shard_count > kMaxAllocatorShards ||
+      header->init_id == 0)
     throw std::runtime_error("allocator attachment validation failed");
   return RegionAllocator(region, region_bytes, header);
 }
