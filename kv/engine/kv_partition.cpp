@@ -104,9 +104,12 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
         row->value_len = static_cast<uint32_t>(value.size());
         ++row->version;
         // Keep shared-index length authoritative for non-owner CXL lookups.
-        indexed.value_len = row->value_len;
-        shared_tree_->remove(fixed_key);
-        shared_tree_->insert(fixed_key, indexed);
+        if (indexed.value_len != row->value_len) {
+          indexed.value_len = row->value_len;
+          shared_tree_->remove(fixed_key);
+          if (!shared_tree_->insert(fixed_key, indexed))
+            throw std::runtime_error("shared index length update insert failed");
+        }
         NoteSharedAccess(smeta);
       }
       UnlockRow(row);
@@ -365,9 +368,12 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
     }
     row->value_len = static_cast<uint32_t>(desired.size());
     ++row->version;
-    indexed.value_len = row->value_len;
-    shared_tree_->remove(fixed_key);
-    shared_tree_->insert(fixed_key, indexed);
+    if (indexed.value_len != row->value_len) {
+      indexed.value_len = row->value_len;
+      shared_tree_->remove(fixed_key);
+      if (!shared_tree_->insert(fixed_key, indexed))
+        throw std::runtime_error("shared index CAS length update insert failed");
+    }
     NoteSharedAccess(smeta);
     *exchanged = true;
   }
@@ -443,9 +449,12 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
       throw std::runtime_error("migrated increment shared write rejected");
     }
     row->value_len = static_cast<uint32_t>(encoded.size());
-    indexed.value_len = row->value_len;
-    shared_tree_->remove(fixed_key);
-    shared_tree_->insert(fixed_key, indexed);
+    if (indexed.value_len != row->value_len) {
+      indexed.value_len = row->value_len;
+      shared_tree_->remove(fixed_key);
+      if (!shared_tree_->insert(fixed_key, indexed))
+        throw std::runtime_error("shared index incr length update insert failed");
+    }
     NoteSharedAccess(smeta);
   } else {
     std::memcpy(row->kv + row->key_len, encoded.data(), encoded.size());

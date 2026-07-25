@@ -43,18 +43,20 @@ remote() {
 sync_guest_binary() {
   local suite=$1 vm
   for ((vm = 0; vm < vm_count; vm++)); do
-    remote "$vm" "killall -9 e2e_${suite} 2>/dev/null; true"
+    remote "$vm" "killall -9 e2e_${suite} 2>/dev/null; sleep 0.2; rm -f '$remote_root/build/e2e_${suite}'; true"
     remote "$vm" "mkdir -p '$remote_root/build'"
     scp "${ssh_opts[@]}" -P "$((base_port + vm))" \
-      "$binary_dir/e2e_${suite}" "root@127.0.0.1:$remote_root/build/e2e_${suite}" >/dev/null
+      "$binary_dir/e2e_${suite}" "root@127.0.0.1:$remote_root/build/e2e_${suite}.new" >/dev/null
+    remote "$vm" "mv -f '$remote_root/build/e2e_${suite}.new' '$remote_root/build/e2e_${suite}'"
     scp "${ssh_opts[@]}" -P "$((base_port + vm))" \
       "$config" "root@127.0.0.1:$remote_config" >/dev/null
-    # YCSB/other scripts may leave a 32/32 guest config; refuse to run e2e_09
-    # (value size 1000) against a drifted file.
-    remote "$vm" "grep -q '\"fixed_value_size\": 1000' '$remote_config'" || {
-      echo "guest config missing fixed_value_size 1000 after sync: vm=$vm" >&2
+    # Confirm sync landed (YCSB may previously leave 32/32 on the guest).
+    local remote_value
+    remote_value=$(remote "$vm" "grep -E '\"fixed_value_size\"[[:space:]]*:' '$remote_config' | head -1") || true
+    if ! grep -Eq '1000' <<<"$remote_value"; then
+      echo "guest config fixed_value_size not 1000 after sync: vm=$vm line='$remote_value' config=$config" >&2
       exit 2
-    }
+    fi
   done
 }
 
