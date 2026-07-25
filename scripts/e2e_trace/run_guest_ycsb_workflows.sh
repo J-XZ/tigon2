@@ -87,8 +87,6 @@ for ((round = 1; round <= rounds; round++)); do
       sync_traces "$round" "$workload" "$phase"
       phase_log="$log_root/round${round}-workload${workload}-${phase}"
       mkdir -p "$phase_log"
-      phase_reset=0
-      [[ "$phase" == load ]] && phase_reset=1
       pids=()
       first_vm=0
       if [[ "$phase" == load ]]; then

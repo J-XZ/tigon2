@@ -10,7 +10,7 @@ module="$root/dependencies/kernel_module/cxl_ivpci.ko"
 ssh_key="${TIGONKV_VM_SSH_KEY:-$HOME/.ssh/id_rsa}"
 echo "TIGONKV_VM_INIT config=$config backing=$TIGONKV_SHARED_BACKING shared_numa=$TIGONKV_SHARED_NUMA vm_numa=$TIGONKV_VM_NUMA"
 if [[ "$dry_run" == true ]]; then
-  declare -a vm_cores=( $TIGONKV_VM_CORES )
+  read -r -a vm_cores <<< "$TIGONKV_VM_CORES"
   for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
     vm_dir="$TIGONKV_VM_STORAGE/vm_${i}"
     begin=$((i * TIGONKV_VM_CORES_PER_VM))
@@ -23,7 +23,7 @@ fi
 "$root/tigonkv_kill_vms.sh" --config "$config" --allow-state-change
 mkdir -p "$(dirname "$TIGONKV_SHARED_BACKING")" "$TIGONKV_VM_STORAGE"
 numactl --membind="$TIGONKV_SHARED_NUMA" truncate -s "$((TIGONKV_SHARED_MB * 1024 * 1024))" "$TIGONKV_SHARED_BACKING"
-declare -a vm_cores=( $TIGONKV_VM_CORES )
+read -r -a vm_cores <<< "$TIGONKV_VM_CORES"
 for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
   vm_dir="$TIGONKV_VM_STORAGE/vm_${i}"; mkdir -p "$vm_dir"
   cp --reflink=auto "$image" "$vm_dir/root.img"
@@ -33,9 +33,9 @@ for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
     -smp "$TIGONKV_VM_CORES_PER_VM" -enable-kvm -display none -daemonize \
     -pidfile "$vm_dir/qemu.pid" -D "$vm_dir/qemu.log" \
     -drive if=none,file="$vm_dir/root.img",format=raw,media=disk,id=drive0,cache=none,aio=native \
-    -device virtio-blk-pci,drive=drive0 -netdev user,id=net$i,hostfwd=tcp:127.0.0.1:$((TIGONKV_SSH_BASE_PORT+i))-:22 \
-    -device virtio-net-pci,netdev=net$i -device ivshmem-plain,memdev=ivshmem \
-    -object memory-backend-file,size="${TIGONKV_SHARED_MB}M",share=on,mem-path="$TIGONKV_SHARED_BACKING",id=ivshmem
+    -device virtio-blk-pci,drive=drive0 -netdev "user,id=net$i,hostfwd=tcp:127.0.0.1:$((TIGONKV_SSH_BASE_PORT+i))-:22" \
+    -device "virtio-net-pci,netdev=net$i" -device ivshmem-plain,memdev=ivshmem \
+    -object "memory-backend-file,size=${TIGONKV_SHARED_MB}M,share=on,mem-path=${TIGONKV_SHARED_BACKING},id=ivshmem"
   pid=$(<"$vm_dir/qemu.pid"); taskset -apc "$cpu_list" "$pid"
 done
 [[ -r "$module" ]] || { echo "missing ivshmem guest module: $module" >&2; exit 2; }
