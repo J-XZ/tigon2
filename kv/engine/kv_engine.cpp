@@ -543,7 +543,9 @@ Status KVEngine::AwaitScan(uint64_t request_id, std::vector<ScanItem> *items) {
   const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::seconds(config_.sync_timeout_sec);
   for (;;) {
-    PollTransport();
+    // Keep draining while traffic is present so ScanItem bursts from multiple
+    // owners do not stall behind a single poll per yield.
+    for (int i = 0; i < 4; ++i) PollTransport();
     std::lock_guard<std::mutex> lock(pending_scan_mutex_);
     auto it = pending_scans_.find(request_id);
     if (it == pending_scans_.end())
