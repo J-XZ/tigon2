@@ -1,10 +1,17 @@
 [Distribution]
 Distribution=ubuntu
-Repositories=jammy,main,restricted,universe
+# Ubuntu 的组件（components）
+Repositories=main,restricted,universe,multiverse
 Release=jammy
 
+# 不再复用宿主机 sources（宿主机不是 jammy/源不全时会导致找不到包）
+UseHostRepositories=no
+
+# Mirror=https://mirrors.ustc.edu.cn/ubuntu
+Mirror=http://archive.ubuntu.com/ubuntu
+
 [Partitions]
-RootSize=32G
+RootSize=38G
 ESPSize=512M
 
 [Output]
@@ -17,9 +24,10 @@ WithUnifiedKernelImages=no
 
 [Content]
 WithNetwork=yes
-
 PostInstallationScript=mkosi_postinst.sh
+
 Packages=
+  sudo
   acl
   apt-transport-https
   bzip2
@@ -44,18 +52,20 @@ Packages=
   net-tools
   nftables
   openmpi-bin
-  libopenmpi3
   openssh-client
   openssh-server
   pciutils
   pkg-config
   python3
+  python3-pip
+  python3-sh
   rsync
   socat
   software-properties-common
   strace
   sysstat
   tar
+  tzdata
   ubuntu-minimal
   unzip
   util-linux
@@ -63,14 +73,26 @@ Packages=
   wget
   gdb
   numactl
-  python3-sh
-  python3-pip
   tcpdump
   chrony
   libgoogle-glog-dev
   libgflags-dev
   libzmq3-dev
   trace-cmd
+  cmake
+  fish
+
+  # 编译/安装内核模块（含 DKMS）常用依赖
+  build-essential
+  dkms
+  libelf-dev
+  kmod
+  bc
+  flex
+  bison
+  dwarves
+  libssl-dev
+  libncurses-dev
 
 [Validation]
 Password=root

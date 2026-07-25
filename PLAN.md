@@ -110,7 +110,7 @@ cxlkv、其他同级改造仓）必须互不依赖**（§0.3）：合同可同�
 |------|------|------|
 | 源码 | 人工只读对照 `../cxlkv`；将其源码/脚本**拷贝**进本树后改写 | `#include`/链接/`source`/exec/打开兄弟树路径；`CMAKE_PREFIX`/`PYTHONPATH` 指过去 |
 | 构建/测试/YCSB/e2e | 单独 clone **仅本仓库**即可完成 | 要求兄弟目录存在、可写、或作为默认输入 |
-| VM 镜像 | 本仓库独立创建机制（`tigonkv_make_vm_img.sh` → 本树 `emulation/image/make_vm_img.sh`），步骤与 cxlkv **基本一致**（可拷贝流程/脚本进本树后再改） | 默认使用兄弟仓已造好的 `image/root.img`；软链/挂载/拷贝兄弟成品镜像作正式路径；exec 兄弟 make_img/init |
+| VM 镜像 | 本仓库独立创建机制（`tigonkv_make_vm_img.sh` → 本树 `emulation/image/make_vm_img.sh`），底层 `emulation/image/{make_vm_img,mkosi_postinst,ubuntu_rootfs,mkosi.default}` 与 cxlkv **完全相同**（已从兄弟树拷贝对齐） | 默认使用兄弟仓已造好的 `image/root.img`；软链/挂载/拷贝兄弟成品镜像作正式路径；exec 兄弟 make_img/init |
 | 运行时产物 | 本仓库 `vm.storage_path` / build / trace | 共享兄弟 build、trace、pid、ssh 目录 |
 
 应急导入成品镜像：仅当本仓库 mkosi **BLOCKED** 且用户显式授权时，可从**一次性
