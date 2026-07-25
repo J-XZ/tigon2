@@ -99,6 +99,10 @@ class KVPartition {
   static void UnlockRow(PrivateRow *row);
   std::string KeyString(const FixedKey &key) const;
   void NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const;
+  // Pin shared smeta so MoveOut cannot retire it between tree lookup and SCC
+  // access (replaces the old non-owner PrivateRow LockRow quiescence window).
+  bool TryPinShared(const FixedKey &key, star::TwoPLPashaMetadataShared **smeta,
+                    RegionOffset *smeta_offset) const;
 
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;

@@ -8,6 +8,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace tigonkv::engine {
@@ -98,8 +99,14 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       // Keep the private latch through the shared operation so move-out cannot
       // remove the shared authority between lookup and the SCC write.
       if (payload != nullptr) mem_access::SharedPayloadWrite(payload->data, value.size());
-      const bool written = star::TwoPLPashaHelper::kv_shared_write(
-          smeta, owner_shard_, value.data(), value.size());
+      bool written = false;
+      // Non-owner GetShared pins via ref_cnt/reader_count without PrivateRow
+      // latch; retry while holding the row lock so move-out stays excluded.
+      for (uint32_t spin = 0; spin < 1000000u && !written; ++spin) {
+        written = star::TwoPLPashaHelper::kv_shared_write(
+            smeta, owner_shard_, value.data(), value.size());
+        if (!written) std::this_thread::yield();
+      }
       if (written) {
         row->value_len = static_cast<uint32_t>(value.size());
         ++row->version;
@@ -175,20 +182,22 @@ bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
   EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared GET output");
   // CXL-first: shared_tree_ only (original get_migrated_row). Never PrivateRow.
-  RegionOffset smeta_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
-  if (!shared_tree_->lookup(fixed_key, smeta_offset) || smeta_offset == kNullOffset)
-    return false;
-  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-      regions_.hwcc().FromOffset(smeta_offset));
+  star::TwoPLPashaMetadataShared *smeta = nullptr;
+  RegionOffset smeta_offset = kNullOffset;
+  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
   auto *payload = smeta->get_scc_data();
   const uint32_t value_len = payload->value_len;
-  if (value_len > regions_.layout().fixed_value_size) return false;
+  if (value_len > regions_.layout().fixed_value_size) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    return false;
+  }
   std::string shared(value_len, '\0');
   mem_access::SharedPayloadRead(payload->data, value_len);
   const bool read = star::TwoPLPashaHelper::kv_shared_read(
       smeta, host_id, shared.data(), value_len);
   if (read) NoteSharedAccess(smeta);
+  star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   if (!read) return false;
   *value = std::move(shared);
   return true;
@@ -199,20 +208,20 @@ bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
   EnterEbr();
   if (value.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("shared value exceeds fixed value size");
-  RegionOffset smeta_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
-  if (!shared_tree_->lookup(fixed_key, smeta_offset) || smeta_offset == kNullOffset)
-    return false;
-  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-      regions_.hwcc().FromOffset(smeta_offset));
+  star::TwoPLPashaMetadataShared *smeta = nullptr;
+  RegionOffset smeta_offset = kNullOffset;
+  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
   auto *payload = smeta->get_scc_data();
   mem_access::SharedPayloadWrite(payload->data, value.size());
   const bool written = star::TwoPLPashaHelper::kv_shared_write(
       smeta, host_id, value.data(), value.size());
-  if (!written) return false;
-  payload->value_len = static_cast<uint32_t>(value.size());
-  NoteSharedAccess(smeta);
-  return true;
+  if (written) {
+    payload->value_len = static_cast<uint32_t>(value.size());
+    NoteSharedAccess(smeta);
+  }
+  star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+  return written;
 }
 
 bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
@@ -223,31 +232,38 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
   if (desired.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("shared CAS desired value exceeds fixed value size");
   *exchanged = false;
-  RegionOffset smeta_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
-  if (!shared_tree_->lookup(fixed_key, smeta_offset) || smeta_offset == kNullOffset)
-    return false;
-  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-      regions_.hwcc().FromOffset(smeta_offset));
+  star::TwoPLPashaMetadataShared *smeta = nullptr;
+  RegionOffset smeta_offset = kNullOffset;
+  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
   auto *payload = smeta->get_scc_data();
   const uint32_t value_len = payload->value_len;
-  if (value_len > regions_.layout().fixed_value_size) return false;
+  if (value_len > regions_.layout().fixed_value_size) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    return false;
+  }
   std::string current(value_len, '\0');
   mem_access::SharedPayloadRead(payload->data, value_len);
   if (!star::TwoPLPashaHelper::kv_shared_read(smeta, host_id, current.data(),
-                                              value_len))
+                                              value_len)) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return false;
+  }
   if (current != expected) {
     NoteSharedAccess(smeta);
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return true;
   }
   mem_access::SharedPayloadWrite(payload->data, desired.size());
   if (!star::TwoPLPashaHelper::kv_shared_write(smeta, host_id, desired.data(),
-                                              desired.size()))
+                                              desired.size())) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return false;
+  }
   payload->value_len = static_cast<uint32_t>(desired.size());
   *exchanged = true;
   NoteSharedAccess(smeta);
+  star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   return true;
 }
 
@@ -255,40 +271,48 @@ bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
                                   int64_t delta, int64_t *value) {
   EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared increment output");
-  RegionOffset smeta_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
-  if (!shared_tree_->lookup(fixed_key, smeta_offset) || smeta_offset == kNullOffset)
-    return false;
-  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-      regions_.hwcc().FromOffset(smeta_offset));
+  star::TwoPLPashaMetadataShared *smeta = nullptr;
+  RegionOffset smeta_offset = kNullOffset;
+  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
   auto *payload = smeta->get_scc_data();
   const uint32_t value_len = payload->value_len;
-  if (value_len > regions_.layout().fixed_value_size) return false;
+  if (value_len > regions_.layout().fixed_value_size) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    return false;
+  }
   std::string current(value_len, '\0');
   mem_access::SharedPayloadRead(payload->data, value_len);
   if (!star::TwoPLPashaHelper::kv_shared_read(smeta, host_id, current.data(),
-                                              value_len))
+                                              value_len)) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return false;
+  }
   int64_t numeric = 0;
   try {
     numeric = std::stoll(current);
   } catch (...) {
     NoteSharedAccess(smeta);
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return false;
   }
   numeric += delta;
   const std::string encoded = std::to_string(numeric);
   if (encoded.size() > regions_.layout().fixed_value_size) {
     NoteSharedAccess(smeta);
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return false;
   }
   mem_access::SharedPayloadWrite(payload->data, encoded.size());
   if (!star::TwoPLPashaHelper::kv_shared_write(smeta, host_id, encoded.data(),
-                                              encoded.size()))
+                                              encoded.size())) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return false;
+  }
   payload->value_len = static_cast<uint32_t>(encoded.size());
   *value = numeric;
   NoteSharedAccess(smeta);
+  star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   return true;
 }
 
@@ -840,6 +864,28 @@ void KVPartition::NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const 
     star::migration_manager->access_row(&payload->migration_policy_meta, partition_id_);
 }
 
+bool KVPartition::TryPinShared(const FixedKey &key,
+                               star::TwoPLPashaMetadataShared **smeta,
+                               RegionOffset *smeta_offset) const {
+  if (smeta == nullptr || smeta_offset == nullptr) return false;
+  *smeta = nullptr;
+  *smeta_offset = kNullOffset;
+  RegionOffset offset = kNullOffset;
+  if (!shared_tree_->lookup(key, offset) || offset == kNullOffset) return false;
+  auto *candidate = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(offset));
+  // Move-out may race between lookup and pin; refuse invalid / saturated rows.
+  if (!star::TwoPLPashaHelper::kv_pin_shared_ref(candidate)) return false;
+  RegionOffset again = kNullOffset;
+  if (!shared_tree_->lookup(key, again) || again != offset) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(candidate);
+    return false;
+  }
+  *smeta = candidate;
+  *smeta_offset = offset;
+  return true;
+}
+
 void KVPartition::RebuildClockTracker() {
   EnterEbr();
   auto *clock = KvMigrationRuntime::Instance().clock();
@@ -927,17 +973,25 @@ bool KVPartition::ScanSharedOnly(
       last_raw = entry.first;
       have_last = true;
       if (entry.second == kNullOffset) continue;
-      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-          regions_.hwcc().FromOffset(entry.second));
+      star::TwoPLPashaMetadataShared *smeta = nullptr;
+      RegionOffset pinned_off = kNullOffset;
+      if (!TryPinShared(entry.first, &smeta, &pinned_off) || pinned_off != entry.second)
+        continue;
       auto *payload = smeta->get_scc_data();
       const uint32_t value_len = payload->value_len;
-      if (value_len > regions_.layout().fixed_value_size) continue;
+      if (value_len > regions_.layout().fixed_value_size) {
+        star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+        continue;
+      }
       std::string value(value_len, '\0');
       mem_access::SharedPayloadRead(payload->data, value.size());
       if (!star::TwoPLPashaHelper::kv_shared_read(smeta, host_id, value.data(),
-                                                  value.size()))
+                                                  value.size())) {
+        star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
         continue;
+      }
       NoteSharedAccess(smeta);
+      star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
       items->emplace_back(KeyString(entry.first), std::move(value));
     }
     if (unlimited) break;
