@@ -100,6 +100,8 @@ class KVEngine {
   // threads may serve scans in parallel.
   std::mutex scan_serve_mutex_;
   std::deque<KvMessage> deferred_scan_requests_;
+  // Serializes Scan() coordinators within one process (not remote serves).
+  std::mutex scan_coord_mutex_;
   struct PendingCas {
     uint32_t source_node = 0;
     std::string key;

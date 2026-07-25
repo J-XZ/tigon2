@@ -254,10 +254,14 @@ int main() {
     const uint64_t trace_workers = ParseUnsigned(
         Env("TIGONKV_E2E_TRACE_WORKERS", "CXLKV_E2E_TRACE_WORKERS", "1"), "trace workers");
     const std::string trace_dir = Env("TIGONKV_E2E_TRACE_DIR", "CXLKV_E2E_TRACE_DIR");
-    if (trace_workers > 1) {
-      if (trace_dir.empty()) Fail("TIGONKV_E2E_TRACE_DIR is required for multi-worker replay");
+    // Guest YCSB uses TRACE_DIR even for 1 worker/VM; only fall back to a
+    // single TRACE_FILE when no directory is provided.
+    if (!trace_dir.empty()) {
+      if (trace_workers == 0) Fail("TIGONKV_E2E_TRACE_WORKERS must be >= 1");
       return RunMultiTrace(config, reset, phase, trace_dir, trace_workers, batch_ops, value_seed);
     }
+    if (trace_workers > 1)
+      Fail("TIGONKV_E2E_TRACE_DIR is required for multi-worker replay");
     trace = Env("TIGONKV_E2E_TRACE_FILE", "CXLKV_E2E_TRACE_FILE");
     if (trace.empty()) Fail("TIGONKV_E2E_TRACE_FILE is required for direct trace replay");
     const uint32_t trace_first = static_cast<uint32_t>(ParseUnsigned(

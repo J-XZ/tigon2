@@ -220,6 +220,10 @@ Status KVEngine::Delete(std::string_view key) {
 }
 
 ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
+  // One in-process Scan coordinator at a time.  Concurrent YCSB-E workers on
+  // the same VM otherwise flood every owner with overlapping ScanRequests and
+  // livelock the fixed-size MPSC rings; cross-VM concurrency remains.
+  std::lock_guard<std::mutex> scan_lock(scan_coord_mutex_);
   constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
   if (limit > kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
