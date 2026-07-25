@@ -12,6 +12,7 @@
 #include <chrono>
 #include <charconv>
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <queue>
 #include <fstream>
@@ -220,10 +221,6 @@ Status KVEngine::Delete(std::string_view key) {
 }
 
 ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
-  // One in-process Scan coordinator at a time.  Concurrent YCSB-E workers on
-  // the same VM otherwise flood every owner with overlapping ScanRequests and
-  // livelock the fixed-size MPSC rings; cross-VM concurrency remains.
-  std::lock_guard<std::mutex> scan_lock(scan_coord_mutex_);
   constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
   if (limit > kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
@@ -363,14 +360,16 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
 ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t limit) {
   std::map<std::string, std::string> merged;
   const uint64_t per_partition_limit = limit == 0 ? 0 : limit;
+  const std::function<void()> progress = [this] { PollTransport(); };
   try {
     for (const auto &partition : partitions_) {
       if (OwnerForPartition(partition->partition_id()) != config_.node_id) continue;
       std::vector<std::pair<std::string, std::string>> items;
-      if (!partition->ScanOwned(start_key, per_partition_limit, &items))
+      if (!partition->ScanOwned(start_key, per_partition_limit, &items, &progress))
         return {Status::Error(StatusCode::kCorruption,
                               "partition scan exceeded migration retry budget"), {}};
       for (auto &item : items) merged.emplace(std::move(item));
+      PollTransport();
     }
   } catch (const std::exception &e) {
     return {Status::Error(StatusCode::kCorruption, e.what()), {}};
@@ -499,10 +498,16 @@ Status KVEngine::Checkpoint() {
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {
+  unsigned spins = 0;
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
     PollTransport();
-    std::this_thread::yield();
+    // Brief backoff when the peer ring is full so other threads/VMs can drain
+    // without this core pegging at 400% in a yield-only spin.
+    if ((++spins & 63u) == 0)
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    else
+      std::this_thread::yield();
   }
   network_tx_bytes_.fetch_add(sizeof(message), std::memory_order_relaxed);
 }

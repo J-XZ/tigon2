@@ -656,7 +656,8 @@ std::string KVPartition::KeyString(const FixedKey &key) const {
 
 bool KVPartition::ScanOwned(
     std::string_view start_key, uint64_t limit,
-    std::vector<std::pair<std::string, std::string>> *items) const {
+    std::vector<std::pair<std::string, std::string>> *items,
+    const std::function<void()> *progress) const {
   EnterEbr();
   if (items == nullptr) throw std::invalid_argument("null partition scan output");
   // Reuse BPlusTree::scan's native limit (0 = unlimited), matching original
@@ -672,9 +673,11 @@ bool KVPartition::ScanOwned(
     items->clear();
     FixedKey low = MakeKey(start_key);
     bool left_inclusive = true;
+    uint32_t batches = 0;
     for (;;) {
       const bool unlimited = limit == 0;
       if (!unlimited && items->size() >= limit) break;
+      if (++batches > 1048576u) break;  // safety against resume livelock
       const uint64_t remaining =
           unlimited ? 0
                     : static_cast<uint64_t>(limit - items->size());
@@ -761,6 +764,10 @@ bool KVPartition::ScanOwned(
           try_shared(shared_rows[si++]);
         }
       }
+
+      // Let the engine drain MPSC traffic between batches so concurrent Scan
+      // coordinators/serves do not stall while this partition walks keys.
+      if (progress != nullptr) (*progress)();
 
       // Unlimited tree scans already covered [low, high]; finite scans resume
       // past the last raw key when filters discarded candidates or the batch

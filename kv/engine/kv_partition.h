@@ -8,6 +8,7 @@
 #include "kv/engine/region_allocator.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -57,7 +58,8 @@ class KVPartition {
                       star::TwoPLPashaMetadataShared **pinned_existing);
   bool MoveOutPrivate(std::string_view key, uint32_t host_id);
   bool ScanOwned(std::string_view start_key, uint64_t limit,
-                 std::vector<std::pair<std::string, std::string>> *items) const;
+                 std::vector<std::pair<std::string, std::string>> *items,
+                 const std::function<void()> *progress = nullptr) const;
   // Invokes PolicyClock::move_row_out for this partition.
   bool MoveOutClockVictim(uint32_t host_id);
   // Rebuild DRAM Clock tracker entries from the shared tree after attach.
