@@ -41,6 +41,9 @@ remote() {
 sync_guest_runtime() {
   local vm
   for ((vm = 0; vm < vm_count; vm++)); do
+    # Never attach a new runner while a previous livelocked process still owns
+    # the shared MPSC rings.
+    remote "$vm" "killall -9 e2e_trace_runner 2>/dev/null; true"
     remote "$vm" "mkdir -p '$remote_root/build'"
     scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$runner" "root@127.0.0.1:$remote_runner.next" >/dev/null
     remote "$vm" "mv -f '$remote_runner.next' '$remote_runner'"
@@ -137,6 +140,10 @@ for ((round = 1; round <= rounds; round++)); do
     wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
     pool_reset
     for phase in load run; do
+      # Ensure no orphaned guest runner from a prior stalled phase.
+      for ((vm = 0; vm < vm_count; vm++)); do
+        remote "$vm" "killall -9 e2e_trace_runner 2>/dev/null; true" >/dev/null 2>&1 || true
+      done
       sync_traces "$round" "$wl" "$phase"
       phase_log="$log_root/round${round}-workload${wl}-${phase}"
       mkdir -p "$phase_log"
@@ -182,7 +189,7 @@ for ((round = 1; round <= rounds; round++)); do
       if (( fail != 0 )); then
         for pid in "${pids[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
         for ((vm_kill = 0; vm_kill < vm_count; vm_kill++)); do
-          remote "$vm_kill" "pkill -9 e2e_trace_runner" >/dev/null 2>&1 || true
+          remote "$vm_kill" "killall -9 e2e_trace_runner 2>/dev/null; true" >/dev/null 2>&1 || true
         done
         echo "guest stall/timeout: round=$round workload=$wl phase=$phase" >&2
         exit 1

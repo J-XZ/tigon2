@@ -93,8 +93,6 @@ KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> p
     : config_(config), pool_(std::move(pool)), ebr_(std::move(ebr)), scc_(std::move(scc)) {}
 
 KVEngine::~KVEngine() {
-  transport_poller_stop_.store(true, std::memory_order_release);
-  if (transport_poller_.joinable()) transport_poller_.join();
   if (star::scc_manager == scc_.get()) star::scc_manager = nullptr;
   if (star::global_ebr_meta == ebr_.get()) star::global_ebr_meta = nullptr;
   KvMigrationRuntime::Instance().Reset();
@@ -125,7 +123,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     rings = static_cast<star::MPSCRingBuffer *>(root);
   }
   auto ebr = std::make_unique<star::CXL_EBR>(config.vm_count,
-                                             config.foreground_worker_count_per_vm + 1,
+                                             config.foreground_worker_count_per_vm,
                                              &pool->allocator());
   ebr->thread_init_ebr_meta(config.node_id, 0);
   star::global_ebr_meta = ebr.get();
@@ -158,24 +156,6 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     if (engine->OwnerForPartition(partition->partition_id()) == config.node_id)
       partition->RebuildClockTracker();
   }
-  // Dedicated poller keeps the single-consumer MPSC ring draining while all
-  // foreground workers are blocked in Scan/Await — without serializing Scan().
-  engine->transport_poller_worker_id_ = config.foreground_worker_count_per_vm;
-  engine->transport_poller_stop_.store(false, std::memory_order_release);
-  engine->transport_poller_ = std::thread([raw = engine.get()] {
-    TlsIsTransportPoller = true;
-    raw->ebr_->thread_init_ebr_meta(raw->config_.node_id, raw->transport_poller_worker_id_);
-    star::global_ebr_meta = raw->ebr_.get();
-    while (!raw->transport_poller_stop_.load(std::memory_order_acquire)) {
-      try {
-        raw->PollTransport();
-      } catch (...) {
-        // Keep the poller alive across transient serve errors; foreground
-        // paths surface hard failures to the caller.
-      }
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
-    }
-  });
   return engine;
 }
 
