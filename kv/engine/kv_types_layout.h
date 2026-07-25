@@ -15,20 +15,9 @@ namespace tigonkv::engine {
 using RegionOffset = uint64_t;
 constexpr RegionOffset kNullOffset = 0;
 constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5634ULL;  // TIGONKV4
-constexpr uint32_t kSharedLayoutVersion = 2;
-
-// Shared-tree index value: HWCC smeta offset plus logical value length so
-// non-owners can complete GetShared/PutShared without touching owner-private
-// SWCC PrivateRow (matches original TwoPLPasha CXL-table lookup).
-struct SharedIndexValue {
-  RegionOffset smeta_offset = kNullOffset;
-  uint32_t value_len = 0;
-  uint32_t pad = 0;
-
-  bool operator==(const SharedIndexValue &other) const {
-    return smeta_offset == other.smeta_offset && value_len == other.value_len;
-  }
-};
+// v3: shared tree leaf value is RegionOffset (smeta) only; logical length lives
+// in TwoPLPashaSharedDataSCC::value_len (CXL-first without PrivateRow).
+constexpr uint32_t kSharedLayoutVersion = 3;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;

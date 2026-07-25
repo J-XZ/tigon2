@@ -847,11 +847,13 @@ clean shutdown 时全部 latch 归零；attach 校验 dirty 标记，dirty hard 
 ### 共享索引（每 partition 一棵）
 
 - 唯一方案：**直接持** `btreeolc_cxl::BPlusTree<FixedKey,
-  offset_ptr<TwoPLPashaMetadataShared>, FixedKeyComparator>`（分配域 =
+  RegionOffset /*smeta*/, FixedKeyComparator>`（分配域 =
   HWCC）；**不**经 `CXLTableBTreeOLC`/`ITable`（避免事务表接口耦合，
   见 §九-1）；`CXLTable.h` 仅只读参考。
 - 节点经 INDEX_ALLOCATION → HWCC 区域，自动计入 `TOTAL_HW_CC_USAGE`。
-- 叶 value = `offset_ptr<TwoPLPashaMetadataShared>`。
+- 叶 value = smeta 的 `RegionOffset`（对齐原 `offset_ptr<TwoPLPashaMetadataShared>`）。
+- 逻辑 `value_len` 存在 `TwoPLPashaSharedDataSCC::value_len`，供非 owner
+  CXL-first Get/Put **不**碰 `PrivateRow`（layout v3）。
 - 树根 offset 记入 SharedLayoutHeader 的 partition 目录项。
 - 节点删除/合并经 `CXL_EBR` 回收（原实现已有）。
 

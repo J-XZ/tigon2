@@ -62,6 +62,12 @@ struct TwoPLPashaSharedDataSCC {
         // TODO: should be moved to HWcc ultimately
         char migration_policy_meta[MigrationManager::migration_policy_meta_size];
 
+        // tigonkv: logical value length for CXL-first shared Get/Put without
+        // touching owner-private PrivateRow.  Kept after policy meta so Clock /
+        // LRU layouts are unchanged; payload alloc remains
+        // sizeof(*this) + fixed_value_size.
+        uint32_t value_len{ 0 };
+
         char data[];
 };
 

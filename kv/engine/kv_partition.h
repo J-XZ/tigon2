@@ -26,9 +26,9 @@ class KVPartition {
   using PrivateTree = btreeolc_cxl::BPlusTree<FixedKey, RegionOffset,
                                               FixedKeyComparator,
                                               std::equal_to<RegionOffset>>;
-  using SharedTree = btreeolc_cxl::BPlusTree<FixedKey, SharedIndexValue,
-                                             FixedKeyComparator,
-                                             std::equal_to<SharedIndexValue>>;
+  // Shared leaf = smeta RegionOffset only (PLAN / TwoPLPasha CXL table). Length
+  // is carried in TwoPLPashaSharedDataSCC::value_len for non-owner CXL access.
+  using SharedTree = PrivateTree;
 
   KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
               uint32_t partition_id, uint32_t owner_shard, bool attach);
