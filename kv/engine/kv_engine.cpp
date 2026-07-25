@@ -47,6 +47,11 @@ uint64_t CurrentRssKb() {
   return page_size > 0 ? resident * static_cast<uint64_t>(page_size) / 1024 : 0;
 }
 
+// Background poller must never ServeScanRequest (send can circular-wait on a
+// full peer ring).  Foreground threads drain deferred requests while polling.
+thread_local bool TlsIsTransportPoller = false;
+thread_local uint32_t TlsScanServeDepth = 0;
+
 std::string EncodeU64(uint64_t value) {
   std::string encoded(sizeof(value), '\0');
   for (size_t i = 0; i < encoded.size(); ++i)
@@ -158,6 +163,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   engine->transport_poller_worker_id_ = config.foreground_worker_count_per_vm;
   engine->transport_poller_stop_.store(false, std::memory_order_release);
   engine->transport_poller_ = std::thread([raw = engine.get()] {
+    TlsIsTransportPoller = true;
     raw->ebr_->thread_init_ebr_meta(raw->config_.node_id, raw->transport_poller_worker_id_);
     star::global_ebr_meta = raw->ebr_.get();
     while (!raw->transport_poller_stop_.load(std::memory_order_acquire)) {
@@ -625,13 +631,29 @@ void KVEngine::PollTransport() {
       std::lock_guard<std::recursive_mutex> poll_lock(transport_poll_mutex_);
       alignas(64) char bytes[sizeof(KvMessage)];
       const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
-      if (received == 0) return;
+      if (received == 0) break;
       if (received != sizeof(KvMessage))
         throw std::runtime_error("malformed KV transport entry");
       std::memcpy(&message, bytes, sizeof(message));
       network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
     }
     HandleTransportMessage(message);
+  }
+  // Foreground threads opportunistically serve deferred ScanRequests so the
+  // poller can stay non-blocking on response/item traffic.
+  if (!TlsIsTransportPoller && TlsScanServeDepth == 0) {
+    for (int i = 0; i < 2; ++i) {
+      KvMessage deferred;
+      {
+        std::lock_guard<std::mutex> lock(scan_serve_mutex_);
+        if (deferred_scan_requests_.empty()) break;
+        deferred = deferred_scan_requests_.front();
+        deferred_scan_requests_.pop_front();
+      }
+      ++TlsScanServeDepth;
+      ServeScanRequest(deferred);
+      --TlsScanServeDepth;
+    }
   }
 }
 
@@ -698,16 +720,14 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
   const std::string_view key(message.key.data(), message.key_size);
   const std::string_view value(message.value.data(), message.value_size);
   if (message.type == KvMessageType::kScanRequest) {
-    // Same-thread re-entry (Send → PollTransport while serving) must not nest
-    // unbounded ScanOwnedPartitions frames.  Concurrent threads may serve in
-    // parallel now that PollTransport releases the consumer lock before handle.
-    static thread_local uint32_t tls_scan_serve_depth = 0;
-    if (tls_scan_serve_depth != 0) {
+    // Poller never serves scans (avoids circular full-ring send waits).
+    // Same-thread re-entry also defers; foreground PollTransport drains.
+    if (TlsIsTransportPoller || TlsScanServeDepth != 0) {
       std::lock_guard<std::mutex> lock(scan_serve_mutex_);
       deferred_scan_requests_.push_back(message);
       return;
     }
-    ++tls_scan_serve_depth;
+    ++TlsScanServeDepth;
     ServeScanRequest(message);
     for (;;) {
       KvMessage deferred;
@@ -719,7 +739,7 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
       }
       ServeScanRequest(deferred);
     }
-    --tls_scan_serve_depth;
+    --TlsScanServeDepth;
     return;
   }
   KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
