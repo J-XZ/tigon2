@@ -223,21 +223,21 @@ class BPlusTree {
 
 		void iteratorEnter(bool &needRestart)
 		{
-			// if (isRWLock) {
-			//     assert(getReaderCount(word.load()) < 20);
-			//     acquireRead();
-			//     assert(getReaderCount(word.load()) < 20);
-			// } else {
-			uint64_t version;
-			version = word.load(std::memory_order_relaxed);
-			if (isLocked(version)) {
-				// acquire read lock fail
-				needRestart = true;
-				_mm_pause();
-				return;
+			// Shared-pessimistic acquire (OLC): bump reader count only while
+			// unlocked. Plain fetch_add raced with writeLock and could leave the
+			// lock word with both the lock bit and a reader count set; a later
+			// mismatched iteratorLeave then permanently corrupted the version.
+			uint64_t version = word.load(std::memory_order_relaxed);
+			for (;;) {
+				if (isLocked(version) || (version & kReaderMask) == kReaderMask) {
+					needRestart = true;
+					_mm_pause();
+					return;
+				}
+				if (word.compare_exchange_weak(version, version + 1, std::memory_order_acquire,
+							       std::memory_order_relaxed))
+					return;
 			}
-			word.fetch_add(1);
-			//}
 		}
 
 		void iteratorLeave()
@@ -2679,7 +2679,12 @@ restart:
 		// according to the `leftExist`
 		if (!leftExist && keyComp_(lowKey, leaf->keys_[pos]) == 0) {
 			if ((int)pos == leaf->getCount() - 1) {
-				leaf = leaf->next_;
+				auto *nextLeaf = leaf->next_;
+				// Validate before following next_ (OLC pointer-then-check).
+				leaf->checkOrRestart(versionNode, needRestart);
+				if (needRestart)
+					goto restart;
+				leaf = nextLeaf;
 				pos = 0;
 			} else {
 				pos++;
@@ -2689,6 +2694,11 @@ restart:
 			return;
 
 		leaf->iteratorEnter(needRestart);
+		// Must restart if enter failed: constructing an iterator without a
+		// successful enter makes ~BPlusTreeIterator call iteratorLeave and
+		// corrupt the optimistic lock word (livelock under YCSB-E writers).
+		if (needRestart)
+			goto restart;
 		{
 			BPlusTreeIterator itr(leaf, pos);
 			if (itr == retryItr())
