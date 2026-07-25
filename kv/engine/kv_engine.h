@@ -6,8 +6,10 @@
 
 #include <memory>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <string_view>
 #include <vector>
@@ -100,6 +102,17 @@ class KVEngine {
   // threads may serve scans in parallel.
   std::mutex scan_serve_mutex_;
   std::deque<KvMessage> deferred_scan_requests_;
+  // Background drain so MPSC rings keep moving when every foreground worker is
+  // inside a long Scan/Await without reducing Scan parallelism.
+  std::atomic<bool> transport_poller_stop_{false};
+  std::thread transport_poller_;
+  uint32_t transport_poller_worker_id_ = 0;
+  // Caps concurrent remote Scan RPC (send+await) per engine.  Architectural
+  // ring capacity requires a bound; Scans still overlap on local work/serves.
+  static constexpr uint32_t kMaxInflightScanRpcs = 4;
+  std::mutex scan_rpc_mutex_;
+  std::condition_variable scan_rpc_cv_;
+  uint32_t inflight_scan_rpcs_ = 0;
   struct PendingCas {
     uint32_t source_node = 0;
     std::string key;

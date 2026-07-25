@@ -88,6 +88,8 @@ KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> p
     : config_(config), pool_(std::move(pool)), ebr_(std::move(ebr)), scc_(std::move(scc)) {}
 
 KVEngine::~KVEngine() {
+  transport_poller_stop_.store(true, std::memory_order_release);
+  if (transport_poller_.joinable()) transport_poller_.join();
   if (star::scc_manager == scc_.get()) star::scc_manager = nullptr;
   if (star::global_ebr_meta == ebr_.get()) star::global_ebr_meta = nullptr;
   KvMigrationRuntime::Instance().Reset();
@@ -118,7 +120,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     rings = static_cast<star::MPSCRingBuffer *>(root);
   }
   auto ebr = std::make_unique<star::CXL_EBR>(config.vm_count,
-                                             config.foreground_worker_count_per_vm,
+                                             config.foreground_worker_count_per_vm + 1,
                                              &pool->allocator());
   ebr->thread_init_ebr_meta(config.node_id, 0);
   star::global_ebr_meta = ebr.get();
@@ -151,6 +153,23 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     if (engine->OwnerForPartition(partition->partition_id()) == config.node_id)
       partition->RebuildClockTracker();
   }
+  // Dedicated poller keeps the single-consumer MPSC ring draining while all
+  // foreground workers are blocked in Scan/Await — without serializing Scan().
+  engine->transport_poller_worker_id_ = config.foreground_worker_count_per_vm;
+  engine->transport_poller_stop_.store(false, std::memory_order_release);
+  engine->transport_poller_ = std::thread([raw = engine.get()] {
+    raw->ebr_->thread_init_ebr_meta(raw->config_.node_id, raw->transport_poller_worker_id_);
+    star::global_ebr_meta = raw->ebr_.get();
+    while (!raw->transport_poller_stop_.load(std::memory_order_acquire)) {
+      try {
+        raw->PollTransport();
+      } catch (...) {
+        // Keep the poller alive across transient serve errors; foreground
+        // paths surface hard failures to the caller.
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+  });
   return engine;
 }
 
@@ -261,12 +280,21 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   load_page(&local, std::move(local_page.items));
   sources.push_back(std::move(local));
 
-  // Register every first-page request before sending any of them so remote
-  // owners can progress concurrently.  Each response is bounded to 65 rows.
-  std::vector<uint64_t> remote_request_ids;
-  std::vector<uint32_t> remote_nodes;
-  remote_request_ids.reserve(config_.vm_count > 0 ? config_.vm_count - 1 : 0);
-  remote_nodes.reserve(config_.vm_count > 0 ? config_.vm_count - 1 : 0);
+  auto acquire_scan_rpc = [this] {
+    std::unique_lock<std::mutex> lock(scan_rpc_mutex_);
+    scan_rpc_cv_.wait(lock, [&] { return inflight_scan_rpcs_ < kMaxInflightScanRpcs; });
+    ++inflight_scan_rpcs_;
+  };
+  auto release_scan_rpc = [this] {
+    {
+      std::lock_guard<std::mutex> lock(scan_rpc_mutex_);
+      --inflight_scan_rpcs_;
+    }
+    scan_rpc_cv_.notify_one();
+  };
+
+  // Bound in-flight ScanRPCs (ring architecture).  Multiple Scans still
+  // overlap; each remote page takes one slot only for send+await.
   for (uint32_t node = 0; node < config_.vm_count; ++node) {
     if (node == config_.node_id) continue;
     const uint64_t request_id = NextRequestId(config_.node_id);
@@ -274,31 +302,23 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       pending_scans_.emplace(request_id, PendingScan{});
     }
+    acquire_scan_rpc();
+    Status status = Status::Ok();
+    std::vector<ScanItem> remote;
     try {
       SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id, node,
                                        request_id, start_key, EncodeU64(request_limit)));
+      status = AwaitScan(request_id, &remote);
     } catch (const std::exception &e) {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       pending_scans_.erase(request_id);
-      for (const uint64_t pending_id : remote_request_ids) pending_scans_.erase(pending_id);
+      release_scan_rpc();
       return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
     }
-    remote_request_ids.push_back(request_id);
-    remote_nodes.push_back(node);
-  }
-
-  for (size_t remote_index = 0; remote_index < remote_request_ids.size(); ++remote_index) {
-    const uint64_t request_id = remote_request_ids[remote_index];
-    std::vector<ScanItem> remote;
-    const Status status = AwaitScan(request_id, &remote);
-    if (!status.ok()) {
-      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      for (const uint64_t pending_id : remote_request_ids)
-        pending_scans_.erase(pending_id);
-      return {status, {}};
-    }
+    release_scan_rpc();
+    if (!status.ok()) return {status, {}};
     Source source;
-    source.node = remote_nodes[remote_index];
+    source.node = node;
     load_page(&source, std::move(remote));
     sources.push_back(std::move(source));
   }
@@ -310,17 +330,21 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       pending_scans_.emplace(request_id, PendingScan{});
     }
+    acquire_scan_rpc();
+    Status status = Status::Ok();
+    std::vector<ScanItem> raw;
     try {
       SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id,
                                        source->node, request_id, source->cursor,
                                        EncodeU64(request_limit)));
+      status = AwaitScan(request_id, &raw);
     } catch (const std::exception &e) {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       pending_scans_.erase(request_id);
+      release_scan_rpc();
       return Status::Error(StatusCode::kInvalidArgument, e.what());
     }
-    std::vector<ScanItem> raw;
-    const Status status = AwaitScan(request_id, &raw);
+    release_scan_rpc();
     if (!status.ok()) return status;
     return load_page(source, std::move(raw));
   };

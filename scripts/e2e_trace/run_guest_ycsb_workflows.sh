@@ -110,8 +110,10 @@ watch_phase_progress() {
     (( all_done == 1 )) && return 0
     local ops=0
     for ((vm = 0; vm < vm_count; vm++)); do
-      local cur
-      cur=$(rg -o 'E2E_TRACE_PROGRESS.*ops=[0-9]+' "$phase_log/vm${vm}.log" 2>/dev/null | tail -1 | sed -n 's/.*ops=\([0-9]*\).*/\1/p')
+      local cur=""
+      # rg exits 1 on no match; with pipefail that must not abort the watcher.
+      cur=$(rg -o 'E2E_TRACE_PROGRESS.*ops=[0-9]+' "$phase_log/vm${vm}.log" 2>/dev/null \
+        | tail -1 | sed -n 's/.*ops=\([0-9]*\).*/\1/p' || true)
       [[ -n "$cur" ]] && ops=$((ops + cur))
     done
     if (( ops != last_ops )); then
@@ -122,6 +124,7 @@ watch_phase_progress() {
         echo "stall: no E2E_TRACE_PROGRESS growth for ${stall_sec}s (ops=$ops) in $phase_log" >&2
         return 1
       fi
+      last_change=$SECONDS  # avoid spinning the same stall message before barrier_ready
     fi
     sleep 2
   done
