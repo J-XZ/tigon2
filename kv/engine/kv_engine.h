@@ -46,6 +46,10 @@ class KVEngine {
   // Foreground workers call this between operations; synchronous forwarding
   // also polls it while waiting so no dedicated service core is required.
   void PollTransport();
+  // Bind the calling thread as foreground worker `worker_id` for CXL_EBR TLS.
+  // Must be invoked once per worker thread before shared access (matches
+  // core/Executor thread_init_ebr_meta).
+  void BindWorker(uint32_t worker_id);
   uint32_t PartitionForKey(std::string_view key) const;
   uint32_t OwnerForKey(std::string_view key) const;
   uint64_t NetworkTxBytes() const { return network_tx_bytes_.load(std::memory_order_relaxed); }

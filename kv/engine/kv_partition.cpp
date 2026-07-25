@@ -72,6 +72,7 @@ PrivateRow *KVPartition::AllocateRow(const FixedKey &key, std::string_view value
 }
 
 bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
+  EnterEbr();
   if (value.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("private value exceeds fixed value size");
   const FixedKey fixed_key = MakeKey(key);
@@ -123,6 +124,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
 }
 
 bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
+  EnterEbr();
   RegionOffset row_offset = kNullOffset;
   if (!private_tree_->lookup(MakeKey(key), row_offset)) return false;
   auto *row = RowFromOffset(row_offset);
@@ -168,6 +170,7 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
 
 bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
                             std::string *value) const {
+  EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared GET output");
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
@@ -201,6 +204,7 @@ bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
 
 bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
                             std::string_view value) {
+  EnterEbr();
   if (value.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("shared value exceeds fixed value size");
   RegionOffset row_offset = kNullOffset;
@@ -234,6 +238,7 @@ bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
 bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
                                         std::string_view expected,
                                         std::string_view desired, bool *exchanged) {
+  EnterEbr();
   if (exchanged == nullptr) throw std::invalid_argument("null shared CAS result");
   if (desired.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("shared CAS desired value exceeds fixed value size");
@@ -276,6 +281,7 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
 
 bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
                                   int64_t delta, int64_t *value) {
+  EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared increment output");
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
@@ -328,6 +334,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
                                          std::string_view expected,
                                          std::string_view desired,
                                          bool *exchanged) {
+  EnterEbr();
   if (exchanged == nullptr) throw std::invalid_argument("null CAS result");
   if (desired.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("CAS desired value exceeds fixed value size");
@@ -394,6 +401,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
 
 bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
                                    int64_t *value) {
+  EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null increment result");
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
@@ -467,13 +475,32 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
 }
 
 bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id) {
+  return PromotePrivate(key, host_id, nullptr);
+}
+
+bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id,
+                                 star::TwoPLPashaMetadataShared **pinned_existing) {
+  EnterEbr();
+  if (pinned_existing != nullptr) *pinned_existing = nullptr;
   if (star::scc_manager == nullptr) return false;
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
   if (!private_tree_->lookup(fixed_key, row_offset)) return false;
   auto *row = RowFromOffset(row_offset);
   LockRow(row);
-  if (row->is_tombstone || row->is_migrated) {
+  if (row->is_tombstone) {
+    UnlockRow(row);
+    return false;
+  }
+  if (row->is_migrated) {
+    // Align with TwoPLPashaHelper move-in FAIL_ALREADY_IN_CXL: pin ref_cnt for
+    // the requesting host even when the row is already in the shared region.
+    if (pinned_existing != nullptr && row->migrated_smeta_off != kNullOffset) {
+      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+          regions_.hwcc().FromOffset(row->migrated_smeta_off));
+      if (star::TwoPLPashaHelper::kv_pin_shared_ref(smeta))
+        *pinned_existing = smeta;
+    }
     UnlockRow(row);
     return false;
   }
@@ -489,8 +516,22 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id) {
   star::scc_manager->do_write(smeta, host_id, payload->data, row->kv + row->key_len,
                                row->value_len);
   payload->set_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
+  // Successful move-in with a requester pin matches Helper inc_ref_cnt=true.
+  if (pinned_existing != nullptr) {
+    if (payload->ref_cnt == std::numeric_limits<uint8_t>::max()) {
+      smeta->unlock();
+      UnlockRow(row);
+      return false;
+    }
+    payload->ref_cnt++;
+    *pinned_existing = smeta;
+  }
   const RegionOffset smeta_offset = regions_.hwcc().ToOffset(smeta);
   if (!shared_tree_->insert(fixed_key, smeta_offset)) {
+    if (pinned_existing != nullptr) {
+      payload->ref_cnt--;
+      *pinned_existing = nullptr;
+    }
     smeta->unlock();
     UnlockRow(row);
     return false;
@@ -509,6 +550,7 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id) {
 }
 
 bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
+  EnterEbr();
   if (star::scc_manager == nullptr) return false;
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
@@ -582,6 +624,7 @@ std::string KVPartition::KeyString(const FixedKey &key) const {
 bool KVPartition::ScanOwned(
     std::string_view start_key, uint64_t limit,
     std::vector<std::pair<std::string, std::string>> *items) const {
+  EnterEbr();
   if (items == nullptr) throw std::invalid_argument("null partition scan output");
   const FixedKey low = MakeKey(start_key);
   FixedKey high{};
@@ -637,6 +680,7 @@ bool KVPartition::ScanOwned(
 }
 
 bool KVPartition::DeletePrivate(std::string_view key) {
+  EnterEbr();
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
   if (!private_tree_->lookup(fixed_key, row_offset)) return false;
@@ -716,6 +760,7 @@ void KVPartition::UntrackMigratedKey(const FixedKey &key) {
 }
 
 void KVPartition::RebuildClockTracker() {
+  EnterEbr();
   FixedKey low{};
   FixedKey high{};
   std::memset(high.bytes, 0xff, sizeof(high.bytes));
@@ -728,6 +773,7 @@ void KVPartition::RebuildClockTracker() {
 }
 
 bool KVPartition::MoveOutClockVictim(uint32_t host_id) {
+  EnterEbr();
   FixedKey victim{};
   bool selected = false;
   {

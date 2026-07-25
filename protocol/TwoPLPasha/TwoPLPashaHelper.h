@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <limits>
 #include <list>
 #include <tuple>
 #include <memory>
@@ -325,20 +326,25 @@ class TwoPLPashaHelper {
         }
 
         // tigonkv: KV path uses the original shared metadata word and SCC
-        // sequence without transaction Context/Table objects.  The read pin
-        // spans prepare_read/do_read so move-out can wait on reader_count.
+        // sequence without transaction Context/Table objects.  reader_count
+        // covers the SCC critical section; payload ref_cnt is pinned for the
+        // same window so move-out quiescence matches TwoPLPashaHelper
+        // remote_take_*_lock_and_read / release_migrated_row.
         static bool kv_shared_read(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
                                    void *dest, std::size_t size)
         {
                 if (smeta == nullptr || scc_manager == nullptr) return false;
                 smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                // ref_cnt is uint8_t; refuse saturation instead of wrapping.
                 if (smeta->is_write_locked() ||
-                    smeta->get_reader_count() == smeta->get_reader_count_max()) {
+                    smeta->get_reader_count() == smeta->get_reader_count_max() ||
+                    scc_data->ref_cnt == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
                         return false;
                 }
                 smeta->increase_reader_count();
-                auto *scc_data = smeta->get_scc_data();
+                scc_data->ref_cnt++;
                 smeta->unlock();
                 scc_manager->prepare_read(smeta, host_id, scc_data,
                                           sizeof(TwoPLPashaSharedDataSCC) + size);
@@ -346,6 +352,8 @@ class TwoPLPashaHelper {
                 if (valid)
                         scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
                 smeta->lock();
+                DCHECK(scc_data->ref_cnt > 0);
+                scc_data->ref_cnt--;
                 smeta->decrease_reader_count();
                 smeta->unlock();
                 return valid;
@@ -356,12 +364,14 @@ class TwoPLPashaHelper {
         {
                 if (smeta == nullptr || scc_manager == nullptr) return false;
                 smeta->lock();
-                if (smeta->is_write_locked() || smeta->get_reader_count() != 0) {
+                auto *scc_data = smeta->get_scc_data();
+                if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
+                    scc_data->ref_cnt == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
                         return false;
                 }
                 smeta->set_write_locked();
-                auto *scc_data = smeta->get_scc_data();
+                scc_data->ref_cnt++;
                 smeta->unlock();
                 // The write-through SCC protocol requires the writer's
                 // cache-valid bit before finish_write invalidates all peers.
@@ -379,9 +389,40 @@ class TwoPLPashaHelper {
                 scc_manager->finish_write(smeta, host_id, scc_data,
                                           sizeof(TwoPLPashaSharedDataSCC) + size);
                 smeta->lock();
+                DCHECK(scc_data->ref_cnt > 0);
+                scc_data->ref_cnt--;
                 smeta->clear_write_locked();
                 smeta->unlock();
                 return true;
+        }
+
+        // Explicit migration-style pin used when a requester observes an
+        // already-shared row (FAIL_ALREADY_IN_CXL) and must keep move-out
+        // blocked until the request finishes.  Matches get_migrated_row /
+        // release_migrated_row.
+        static bool kv_pin_shared_ref(TwoPLPashaMetadataShared *smeta)
+        {
+                if (smeta == nullptr) return false;
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                if (scc_data->get_flag(TwoPLPashaSharedDataSCC::valid_flag_index) == false ||
+                    scc_data->ref_cnt == std::numeric_limits<uint8_t>::max()) {
+                        smeta->unlock();
+                        return false;
+                }
+                scc_data->ref_cnt++;
+                smeta->unlock();
+                return true;
+        }
+
+        static void kv_unpin_shared_ref(TwoPLPashaMetadataShared *smeta)
+        {
+                if (smeta == nullptr) return;
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                DCHECK(scc_data->ref_cnt > 0);
+                scc_data->ref_cnt--;
+                smeta->unlock();
         }
 
 	uint64_t read(const std::tuple<MetaDataType *, void *> &row, void *dest, std::size_t size, std::atomic<uint64_t> &local_cxl_access)

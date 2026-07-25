@@ -167,6 +167,9 @@ class KVStore {
   IncrementResult Increment(std::string_view key, int64_t delta);
   // Serve inbound owner requests while this foreground worker is otherwise idle.
   Status PollTransport();
+  // Bind this OS thread as EBR worker `worker_id` (0 .. foreground_worker_count-1).
+  // Required once per foreground worker thread before KV ops.
+  void BindWorker(uint32_t worker_id);
 
   Status Checkpoint();
   MemoryStats Memory() const;

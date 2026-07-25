@@ -136,6 +136,7 @@ PhaseResult RunWorkers(KVStore &store, const Config &base, uint64_t total, Opera
   for (uint64_t worker = 0; worker < threads; ++worker) {
     workers.emplace_back([&, worker] {
       try {
+        store.BindWorker(static_cast<uint32_t>(worker));
         while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
         const uint64_t worker_start = StartForPart(node_count, threads, worker);
         const uint64_t worker_count = CountForPart(node_count, threads, worker);
@@ -168,6 +169,7 @@ inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
   for (uint64_t worker = 0; worker < threads; ++worker) {
     workers.emplace_back([&, worker] {
       try {
+        store.BindWorker(static_cast<uint32_t>(worker));
         while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
         const std::string key = Key09(static_cast<uint64_t>(base.node_id) * threads + worker);

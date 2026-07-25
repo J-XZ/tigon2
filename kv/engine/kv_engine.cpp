@@ -87,6 +87,7 @@ KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> p
 
 KVEngine::~KVEngine() {
   if (star::scc_manager == scc_.get()) star::scc_manager = nullptr;
+  if (star::global_ebr_meta == ebr_.get()) star::global_ebr_meta = nullptr;
 }
 
 std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
@@ -117,6 +118,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
                                              config.foreground_worker_count_per_vm,
                                              &pool->allocator());
   ebr->thread_init_ebr_meta(config.node_id, 0);
+  star::global_ebr_meta = ebr.get();
   auto scc = std::make_unique<star::TwoPLPashaSCCWriteThrough>();
   star::scc_manager = scc.get();
   auto engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool),
@@ -575,6 +577,15 @@ void KVEngine::PollTransport() {
   HandleTransportMessage(message);
 }
 
+void KVEngine::BindWorker(uint32_t worker_id) {
+  if (ebr_ == nullptr)
+    throw std::runtime_error("BindWorker requires an open EBR instance");
+  if (worker_id >= config_.foreground_worker_count_per_vm)
+    throw std::invalid_argument("BindWorker worker_id exceeds foreground_worker_count_per_vm");
+  ebr_->thread_init_ebr_meta(config_.node_id, worker_id);
+  star::global_ebr_meta = ebr_.get();
+}
+
 void KVEngine::HandleTransportMessage(const KvMessage &message) {
   if (message.destination_node != config_.node_id ||
       message.key_size > message.key.size() || message.value_size > message.value.size())
@@ -649,14 +660,17 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
     if (!partition->GetPrivate(key, &result)) {
       response.status = static_cast<uint32_t>(StatusCode::kNotFound);
     } else {
-      // A remote touch is the move-in trigger; a failed promotion means this
-      // row was already shared, which is equally valid for the response.
-      // A failed promotion means that another request already published the
-      // shared authority, so count only the successful transition.
-      if (partition->PromotePrivate(key, config_.node_id)) {
+      // A remote touch is the move-in trigger.  On SUCCESS or
+      // FAIL_ALREADY_IN_CXL the Helper pins ref_cnt for the requester until
+      // the response is prepared; unpin before sending so move-out can proceed
+      // after this request completes.
+      star::TwoPLPashaMetadataShared *pinned = nullptr;
+      if (partition->PromotePrivate(key, config_.node_id, &pinned)) {
         migration_in_.fetch_add(1, std::memory_order_relaxed);
         shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
       }
+      if (pinned != nullptr)
+        star::TwoPLPashaHelper::kv_unpin_shared_ref(pinned);
       response.status = static_cast<uint32_t>(StatusCode::kOk);
       response.value_size = static_cast<uint32_t>(result.size());
       std::memcpy(response.value.data(), result.data(), result.size());

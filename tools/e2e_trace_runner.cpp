@@ -191,6 +191,7 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   for (uint64_t worker = 0; worker < workers; ++worker) {
     threads.emplace_back([&, worker] {
       try {
+        store->BindWorker(static_cast<uint32_t>(worker));
         std::mt19937_64 rng(value_seed ^ (static_cast<uint64_t>(trace_first + worker) << 32) ^
                             worker);
         results[worker] = ReplayTrace(*store, traces[worker], &rng, config.fixed_key_size,

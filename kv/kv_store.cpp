@@ -426,6 +426,12 @@ Status KVStore::PollTransport() {
   return Status::Ok();
 }
 
+void KVStore::BindWorker(uint32_t worker_id) {
+  if (impl_ == nullptr || impl_->engine == nullptr)
+    throw std::runtime_error("BindWorker requires an open KVStore");
+  impl_->engine->BindWorker(worker_id);
+}
+
 Status KVStore::Checkpoint() {
   ForegroundLatencyScope latency_scope;
   Status status = impl_->engine->Checkpoint();

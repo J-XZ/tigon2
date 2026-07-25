@@ -48,6 +48,11 @@ class KVPartition {
   bool IncrementShared(std::string_view key, uint32_t host_id, int64_t delta,
                        int64_t *value);
   bool PromotePrivate(std::string_view key, uint32_t host_id);
+  // Like PromotePrivate, but when the row is already shared pins payload
+  // ref_cnt (FAIL_ALREADY_IN_CXL) and returns that smeta via *pinned_existing
+  // for the caller to unpin after the request completes.
+  bool PromotePrivate(std::string_view key, uint32_t host_id,
+                      star::TwoPLPashaMetadataShared **pinned_existing);
   bool MoveOutPrivate(std::string_view key, uint32_t host_id);
   bool ScanOwned(std::string_view start_key, uint64_t limit,
                  std::vector<std::pair<std::string, std::string>> *items) const;
@@ -64,6 +69,8 @@ class KVPartition {
   void PersistRoots();
 
  private:
+  // Matches core/Executor: enter before observing shared tree/row/move paths.
+  void EnterEbr() const { ebr_.enter_critical_section(); }
   FixedKey MakeKey(std::string_view key) const;
   PrivateRow *RowFromOffset(RegionOffset offset) const;
   PrivateRow *AllocateRow(const FixedKey &key, std::string_view value);
