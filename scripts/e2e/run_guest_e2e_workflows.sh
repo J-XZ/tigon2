@@ -49,6 +49,12 @@ sync_guest_binary() {
       "$binary_dir/e2e_${suite}" "root@127.0.0.1:$remote_root/build/e2e_${suite}" >/dev/null
     scp "${ssh_opts[@]}" -P "$((base_port + vm))" \
       "$config" "root@127.0.0.1:$remote_config" >/dev/null
+    # YCSB/other scripts may leave a 32/32 guest config; refuse to run e2e_09
+    # (value size 1000) against a drifted file.
+    remote "$vm" "grep -q '\"fixed_value_size\": 1000' '$remote_config'" || {
+      echo "guest config missing fixed_value_size 1000 after sync: vm=$vm" >&2
+      exit 2
+    }
   done
 }
 

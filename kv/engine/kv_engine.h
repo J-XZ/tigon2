@@ -3,11 +3,11 @@
 #include "kv/engine/region_allocator.h"
 #include "kv/engine/kv_messages.h"
 #include "kv/kv_store.h"
-#include "common/LockfreeQueue.h"
 
 #include <memory>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -47,7 +47,7 @@ class KVEngine {
   MemoryStats Memory() const;
   Status Checkpoint();
   // Foreground cooperative path (Tigon Worker::process_request analogue):
-  // serve deferred inbound requests from this worker's lock-free queue.
+  // serve deferred inbound requests from this worker's Dispatcher shard queue.
   // The dedicated inbound demuxer is the sole MPSC consumer — FG never
   // contends for the recv lock.
   void PollTransport();
@@ -63,9 +63,13 @@ class KVEngine {
   RuntimeStats EngineRuntime() const;
 
  private:
-  // Mirrors star::LockfreeQueue used by IncomingDispatcher → Worker::in_queue.
-  // Capacity sized for bursty ScanItem/request fan-in without huge RSS.
-  using WorkerRequestQueue = star::LockfreeQueue<KvMessage, 8192>;
+  // Per-worker inbound request shard (IncomingDispatcher → Worker::in_queue).
+  // Unbounded deque so the demuxer never blocks on enqueue: a full SPSC would
+  // stall MPSC recv and prevent Response delivery (multi-VM Forward deadlock).
+  struct WorkerRequestQueue {
+    std::mutex mutex;
+    std::deque<KvMessage> messages;
+  };
 
   KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> pool,
            std::unique_ptr<star::CXL_EBR> ebr,
@@ -112,7 +116,7 @@ class KVEngine {
   };
   std::mutex pending_scan_mutex_;
   std::unordered_map<uint64_t, PendingScan> pending_scans_;
-  // Demuxer (SPSC producer) → per-worker LockfreeQueue → FG PollTransport.
+  // Demuxer → per-worker shard → FG PollTransport (request_id % N).
   // Nested serve (TlsRequestServeDepth != 0) must not pop/serve — OLC safety.
   std::vector<std::unique_ptr<WorkerRequestQueue>> worker_request_queues_;
   // Soft cap on concurrent remote Scan send+await slots (ring backpressure).

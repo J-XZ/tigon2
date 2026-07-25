@@ -743,22 +743,27 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
     }
     return;
   }
-  // Request path: Dispatcher-style route to worker queue by request_id.
+  // Request path: Dispatcher-style route to worker shard by request_id.
+  // Unbounded enqueue keeps the demuxer free to apply Responses.
   if (worker_request_queues_.empty())
     throw std::runtime_error("worker request queues not initialized");
   const uint32_t target =
       static_cast<uint32_t>(message.request_id % worker_request_queues_.size());
-  worker_request_queues_[target]->push(message);
+  {
+    std::lock_guard<std::mutex> lock(worker_request_queues_[target]->mutex);
+    worker_request_queues_[target]->messages.push_back(message);
+  }
 }
 
 void KVEngine::ServeDeferredRequests(int max_count) {
   if (TlsRequestServeDepth != 0) return;
   if (worker_request_queues_.empty()) return;
   auto pop_one = [&](WorkerRequestQueue &queue, KvMessage *out) -> bool {
-    if (queue.empty()) return false;
-    *out = queue.front();
-    const bool ok = queue.pop();
-    return ok;
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    if (queue.messages.empty()) return false;
+    *out = queue.messages.front();
+    queue.messages.pop_front();
+    return true;
   };
   int served = 0;
   if (TlsForegroundWorkerId < worker_request_queues_.size()) {
