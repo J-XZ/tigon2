@@ -97,14 +97,14 @@ class KVEngine {
   };
   std::mutex pending_scan_mutex_;
   std::unordered_map<uint64_t, PendingScan> pending_scans_;
-  // Same-thread nested PollTransport must not unboundedly re-enter scan serve;
-  // deferred requests are drained when the outermost serve returns.  Concurrent
-  // threads may serve scans in parallel.
-  std::mutex scan_serve_mutex_;
-  std::deque<KvMessage> deferred_scan_requests_;
-  // Caps concurrent remote Scan RPC (send+await) per engine.  Architectural
-  // ring capacity requires a bound; Scans still overlap on local work/serves.
-  static constexpr uint32_t kMaxInflightScanRpcs = 2;
+  // Nested PollTransport defers request messages (Put/Get/Scan/...) so OLC
+  // tree walks are not mutated mid-scan; drained when serve depth returns to 0.
+  // Concurrent threads may still serve requests in parallel.
+  std::mutex deferred_request_mutex_;
+  std::deque<KvMessage> deferred_transport_requests_;
+  // Soft cap on concurrent remote Scan send+await slots (ring backpressure).
+  // Kept well above worker count so Scans stay parallel after nested-poll fix.
+  static constexpr uint32_t kMaxInflightScanRpcs = 8;
   std::mutex scan_rpc_mutex_;
   std::condition_variable scan_rpc_cv_;
   uint32_t inflight_scan_rpcs_ = 0;

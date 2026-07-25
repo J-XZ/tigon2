@@ -47,10 +47,18 @@ uint64_t CurrentRssKb() {
   return page_size > 0 ? resident * static_cast<uint64_t>(page_size) / 1024 : 0;
 }
 
-// Background poller must never ServeScanRequest (send can circular-wait on a
-// full peer ring).  Foreground threads drain deferred requests while polling.
-thread_local bool TlsIsTransportPoller = false;
-thread_local uint32_t TlsScanServeDepth = 0;
+// While serving a request (or walking owned trees for a local Scan), nested
+// PollTransport must only apply response/item/done traffic.  Handling Put/Get
+// or another ScanRequest here mutates the same B+trees under OLC and livelocks
+// scan() restart loops (GDB: yield counts > 10M on YCSB-E 4x4).
+thread_local uint32_t TlsRequestServeDepth = 0;
+
+struct RequestServeDepthGuard {
+  RequestServeDepthGuard() { ++TlsRequestServeDepth; }
+  ~RequestServeDepthGuard() { --TlsRequestServeDepth; }
+  RequestServeDepthGuard(const RequestServeDepthGuard &) = delete;
+  RequestServeDepthGuard &operator=(const RequestServeDepthGuard &) = delete;
+};
 
 std::string EncodeU64(uint64_t value) {
   std::string encoded(sizeof(value), '\0');
@@ -368,19 +376,26 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
 }
 
 ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t limit) {
+  // Raise serve depth for the whole owned walk so progress PollTransport cannot
+  // nest Put/Get/Scan serves that restart OLC readers on the same trees.
   std::map<std::string, std::string> merged;
   const uint64_t per_partition_limit = limit == 0 ? 0 : limit;
   const std::function<void()> progress = [this] { PollTransport(); };
   try {
-    for (const auto &partition : partitions_) {
-      if (OwnerForPartition(partition->partition_id()) != config_.node_id) continue;
-      std::vector<std::pair<std::string, std::string>> items;
-      if (!partition->ScanOwned(start_key, per_partition_limit, &items, &progress))
-        return {Status::Error(StatusCode::kCorruption,
-                              "partition scan exceeded migration retry budget"), {}};
-      for (auto &item : items) merged.emplace(std::move(item));
-      PollTransport();
+    {
+      RequestServeDepthGuard depth_guard;
+      for (const auto &partition : partitions_) {
+        if (OwnerForPartition(partition->partition_id()) != config_.node_id) continue;
+        std::vector<std::pair<std::string, std::string>> items;
+        if (!partition->ScanOwned(start_key, per_partition_limit, &items, &progress))
+          return {Status::Error(StatusCode::kCorruption,
+                                "partition scan exceeded migration retry budget"), {}};
+        for (auto &item : items) merged.emplace(std::move(item));
+        PollTransport();
+      }
     }
+    // Depth is 0 again: drain requests deferred during the owned walk.
+    PollTransport();
   } catch (const std::exception &e) {
     return {Status::Error(StatusCode::kCorruption, e.what()), {}};
   }
@@ -601,8 +616,7 @@ CasResult KVEngine::ForwardCompareExchange(std::string_view key,
 
 void KVEngine::PollTransport() {
   if (rings_ == nullptr) return;
-  // MPSC single-consumer: only the dequeue is serialized.  Handling
-  // (especially ScanRequest → ScanOwnedPartitions + multi-item send) must run
+  // MPSC single-consumer: only the dequeue is serialized.  Handling must run
   // without the poll lock so peer threads can keep draining this node's ring
   // while a serve is blocked on a full remote ring.
   for (int drained = 0; drained < 64; ++drained) {
@@ -619,20 +633,18 @@ void KVEngine::PollTransport() {
     }
     HandleTransportMessage(message);
   }
-  // Foreground threads opportunistically serve deferred ScanRequests so the
-  // poller can stay non-blocking on response/item traffic.
-  if (!TlsIsTransportPoller && TlsScanServeDepth == 0) {
-    for (int i = 0; i < 2; ++i) {
+  // Only the outermost poller drains deferred requests.  Nested polls (from
+  // Send/Await/Scan progress) must stay response-only.
+  if (TlsRequestServeDepth == 0) {
+    for (int i = 0; i < 8; ++i) {
       KvMessage deferred;
       {
-        std::lock_guard<std::mutex> lock(scan_serve_mutex_);
-        if (deferred_scan_requests_.empty()) break;
-        deferred = deferred_scan_requests_.front();
-        deferred_scan_requests_.pop_front();
+        std::lock_guard<std::mutex> lock(deferred_request_mutex_);
+        if (deferred_transport_requests_.empty()) break;
+        deferred = deferred_transport_requests_.front();
+        deferred_transport_requests_.pop_front();
       }
-      ++TlsScanServeDepth;
-      ServeScanRequest(deferred);
-      --TlsScanServeDepth;
+      HandleTransportMessage(deferred);
     }
   }
 }
@@ -697,31 +709,21 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
     }
     return;
   }
-  const std::string_view key(message.key.data(), message.key_size);
-  const std::string_view value(message.value.data(), message.value_size);
-  if (message.type == KvMessageType::kScanRequest) {
-    // Poller never serves scans (avoids circular full-ring send waits).
-    // Same-thread re-entry also defers; foreground PollTransport drains.
-    if (TlsIsTransportPoller || TlsScanServeDepth != 0) {
-      std::lock_guard<std::mutex> lock(scan_serve_mutex_);
-      deferred_scan_requests_.push_back(message);
-      return;
-    }
-    ++TlsScanServeDepth;
-    ServeScanRequest(message);
-    for (;;) {
-      KvMessage deferred;
-      {
-        std::lock_guard<std::mutex> lock(scan_serve_mutex_);
-        if (deferred_scan_requests_.empty()) break;
-        deferred = deferred_scan_requests_.front();
-        deferred_scan_requests_.pop_front();
-      }
-      ServeScanRequest(deferred);
-    }
-    --TlsScanServeDepth;
+  // Nested poll (Scan walk / request serve / Send backoff): defer every request
+  // so we only apply response traffic and do not mutate trees under OLC readers.
+  if (TlsRequestServeDepth != 0) {
+    std::lock_guard<std::mutex> lock(deferred_request_mutex_);
+    deferred_transport_requests_.push_back(message);
     return;
   }
+
+  RequestServeDepthGuard depth_guard;
+  if (message.type == KvMessageType::kScanRequest) {
+    ServeScanRequest(message);
+    return;
+  }
+  const std::string_view key(message.key.data(), message.key_size);
+  const std::string_view value(message.value.data(), message.value_size);
   KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
                                    message.source_node, message.request_id, key);
   auto *partition = OwnedPartition(key);
