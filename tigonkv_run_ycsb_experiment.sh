@@ -7,7 +7,7 @@ skip_build=false; skip_vm_init=false; skip_trace_gen=false; skip_load=false; pre
 usage() { cat <<'EOF'
 usage: tigonkv_run_ycsb_experiment.sh [options]
   --rounds N --record-count N --operation-count N --threads-per-node N
-  --workloads a,b,c,d [--out-dir DIR] [--base-config PATH]
+  --workloads a,b,c,d,e [--out-dir DIR] [--base-config PATH]
   --shared-size-mb N [--shared-numa N[,N]] [--no-latency]
   --skip-build --skip-vm-init --skip-trace-gen --skip-standalone-load --prepare-only
 EOF
@@ -29,7 +29,6 @@ case "$workloads" in *,,*|,*|*,) echo "invalid workload list" >&2; exit 2;; esac
 IFS=, read -r -a selected <<<"$workloads"
 for workload in "${selected[@]}"; do
   [[ "$workload" =~ ^[abcde]$ ]] || { echo "unsupported workload: $workload" >&2; exit 2; }
-  [[ "$workload" != e ]] || { echo "ycsb_e=unsupported until SCAN migration acceptance is complete" >&2; exit 2; }
 done
 if [[ -z "$out_dir" ]]; then out_dir="$root/exp_data/ycsb_tigonkv_$(date -u +%Y%m%dT%H%M%SZ)"; fi
 mkdir -p "$out_dir" "$out_dir/configs" "$out_dir/traces" "$out_dir/round_logs"
@@ -53,7 +52,8 @@ if no_latency == 'true': lat['enabled']=lat['foreground_enabled']=lat['merge_ena
 d['tigon_kv']['fixed_key_size']=32
 d['tigon_kv']['fixed_value_size']=32
 json.dump(d, open(dst, 'w', encoding='utf-8'), indent=2)
-meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'threads_per_node':int(threads),'workloads':workloads.split(','),'base_config':src,'generated_config':dst,'ycsb_e':'unsupported','fixed_key_size':32,'fixed_value_size':32}
+selected=workloads.split(',')
+meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32}
 json.dump(meta, open(dst.rsplit('/',1)[0] + '/../run_meta.json', 'w', encoding='utf-8'), indent=2, sort_keys=True)
 PY
 echo "TIGONKV_YCSB_PREPARED out_dir=$out_dir config=$generated_config workloads=$workloads"

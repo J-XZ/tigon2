@@ -5,7 +5,6 @@
 #include <charconv>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -660,54 +659,122 @@ bool KVPartition::ScanOwned(
     std::vector<std::pair<std::string, std::string>> *items) const {
   EnterEbr();
   if (items == nullptr) throw std::invalid_argument("null partition scan output");
-  const FixedKey low = MakeKey(start_key);
+  // Reuse BPlusTree::scan's native limit (0 = unlimited), matching original
+  // Tigon ScanProcessor early-stop and cxlkv Tree::Scan(limit).  Dual-tree
+  // merge walks sorted batches with a resume cursor so a finite limit never
+  // materializes the full range before truncate.
   FixedKey high{};
   std::memset(high.bytes, 0xff, sizeof(high.bytes));
+  const FixedKeyComparator key_cmp;
   for (uint32_t attempt = 0; attempt < 8; ++attempt) {
     const uint64_t in_before = directory_.migration_in_seq.load(std::memory_order_acquire);
     const uint64_t out_before = directory_.migration_out_seq.load(std::memory_order_acquire);
-    std::vector<PrivateTree::KeyValuePair> private_rows;
-    std::vector<SharedTree::KeyValuePair> shared_rows;
-    private_tree_->scan(low, high, true, true, 0, private_rows);
-    shared_tree_->scan(low, high, true, true, 0, shared_rows);
-    std::map<std::string, std::string> merged;
-    for (const auto &entry : private_rows) {
-      auto *row = RowFromOffset(entry.second);
-      LockRow(row);
-      if (!row->is_tombstone && !row->is_migrated)
-        merged.emplace(KeyString(entry.first),
-                       std::string(row->kv + row->key_len, row->value_len));
-      UnlockRow(row);
-    }
-    for (const auto &entry : shared_rows) {
-      RegionOffset private_offset = kNullOffset;
-      if (!private_tree_->lookup(entry.first, private_offset)) continue;
-      auto *row = RowFromOffset(private_offset);
-      LockRow(row);
-      const bool live = !row->is_tombstone && row->is_migrated &&
-                        row->migrated_smeta_off == entry.second;
-      const uint32_t value_len = row->value_len;
-      if (!live) {
+    items->clear();
+    FixedKey low = MakeKey(start_key);
+    bool left_inclusive = true;
+    for (;;) {
+      const bool unlimited = limit == 0;
+      if (!unlimited && items->size() >= limit) break;
+      const uint64_t remaining =
+          unlimited ? 0
+                    : static_cast<uint64_t>(limit - items->size());
+      const uint32_t fetch =
+          unlimited
+              ? 0
+              : (remaining > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
+                     ? 0
+                     : static_cast<uint32_t>(remaining));
+      std::vector<PrivateTree::KeyValuePair> private_rows;
+      std::vector<SharedTree::KeyValuePair> shared_rows;
+      private_tree_->scan(low, high, left_inclusive, true, fetch, private_rows);
+      shared_tree_->scan(low, high, left_inclusive, true, fetch, shared_rows);
+      if (private_rows.empty() && shared_rows.empty()) break;
+
+      size_t pi = 0;
+      size_t si = 0;
+      FixedKey last_raw{};
+      bool have_last_raw = false;
+      auto note_raw = [&](const FixedKey &key) {
+        last_raw = key;
+        have_last_raw = true;
+      };
+      auto try_private = [&](const PrivateTree::KeyValuePair &entry) {
+        note_raw(entry.first);
+        auto *row = RowFromOffset(entry.second);
+        LockRow(row);
+        const bool live = !row->is_tombstone && !row->is_migrated;
+        std::string value;
+        if (live) value.assign(row->kv + row->key_len, row->value_len);
         UnlockRow(row);
-        continue;
+        if (!live) return;
+        items->emplace_back(KeyString(entry.first), std::move(value));
+      };
+      auto try_shared = [&](const SharedTree::KeyValuePair &entry) {
+        note_raw(entry.first);
+        RegionOffset private_offset = kNullOffset;
+        if (!private_tree_->lookup(entry.first, private_offset)) return;
+        auto *row = RowFromOffset(private_offset);
+        LockRow(row);
+        const bool live = !row->is_tombstone && row->is_migrated &&
+                          row->migrated_smeta_off == entry.second;
+        const uint32_t value_len = row->value_len;
+        if (!live) {
+          UnlockRow(row);
+          return;
+        }
+        auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+            regions_.hwcc().FromOffset(entry.second));
+        std::string value(value_len, '\0');
+        mem_access::SharedPayloadRead(smeta, value.size());
+        const bool read = star::TwoPLPashaHelper::kv_shared_read(
+            smeta, owner_shard_, value.data(), value.size());
+        if (read) {
+          const std::string key = KeyString(entry.first);
+          // Same key may appear in both trees; shared applies after private
+          // (matches the previous map[] overlay for migrated authority).
+          if (!items->empty() && items->back().first == key)
+            items->back().second = std::move(value);
+          else
+            items->emplace_back(key, std::move(value));
+        }
+        UnlockRow(row);
+      };
+
+      while (pi < private_rows.size() || si < shared_rows.size()) {
+        if (!unlimited && items->size() >= limit) break;
+        const bool take_private =
+            si >= shared_rows.size() ||
+            (pi < private_rows.size() &&
+             key_cmp(private_rows[pi].first, shared_rows[si].first) <= 0);
+        const bool take_shared =
+            pi >= private_rows.size() ||
+            (si < shared_rows.size() &&
+             key_cmp(shared_rows[si].first, private_rows[pi].first) <= 0);
+        // When keys compare equal, apply private then shared (same authority
+        // order as the previous map merge: private first, shared overlays).
+        if (take_private && take_shared) {
+          try_private(private_rows[pi++]);
+          try_shared(shared_rows[si++]);
+        } else if (take_private) {
+          try_private(private_rows[pi++]);
+        } else {
+          try_shared(shared_rows[si++]);
+        }
       }
-      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-          regions_.hwcc().FromOffset(entry.second));
-      std::string value(value_len, '\0');
-      mem_access::SharedPayloadRead(smeta, value.size());
-      const bool read = star::TwoPLPashaHelper::kv_shared_read(
-          smeta, owner_shard_, value.data(), value.size());
-      if (read) merged[KeyString(entry.first)] = std::move(value);
-      UnlockRow(row);
+
+      // Unlimited tree scans already covered [low, high]; finite scans resume
+      // past the last raw key when filters discarded candidates or the batch
+      // was capped by fetch.
+      if (unlimited) break;
+      if (!unlimited && items->size() >= limit) break;
+      if (private_rows.size() < fetch && shared_rows.size() < fetch) break;
+      if (!have_last_raw) break;
+      low = last_raw;
+      left_inclusive = false;
     }
     const uint64_t in_after = directory_.migration_in_seq.load(std::memory_order_acquire);
     const uint64_t out_after = directory_.migration_out_seq.load(std::memory_order_acquire);
     if (in_before != in_after || out_before != out_after) continue;
-    items->clear();
-    for (auto &entry : merged) {
-      if (limit != 0 && items->size() >= limit) break;
-      items->emplace_back(std::move(entry));
-    }
     return true;
   }
   return false;

@@ -194,6 +194,23 @@ int main() {
   assert(partition.ScanOwned("alpha", 2, &scan));
   assert(scan.size() == 2);
   assert(scan[0].first == "alpha" && scan[1].first == "clock");
+
+  // Bounded dual-tree merge: migrated shared authority + later private rows,
+  // without collecting the full remaining keyspace before applying limit.
+  assert(partition.PutPrivate("m1", "shared-m1"));
+  assert(partition.PromotePrivate("m1", 1));
+  assert(partition.PutPrivate("m2", "priv-m2"));
+  assert(partition.PutPrivate("m3", "priv-m3"));
+  for (int i = 0; i < 128; ++i) {
+    char key[16];
+    std::snprintf(key, sizeof(key), "m9%03d", i);
+    assert(partition.PutPrivate(key, "tail"));
+  }
+  assert(partition.ScanOwned("m1", 3, &scan));
+  assert(scan.size() == 3);
+  assert(scan[0] == std::make_pair(std::string("m1"), std::string("shared-m1")));
+  assert(scan[1] == std::make_pair(std::string("m2"), std::string("priv-m2")));
+  assert(scan[2] == std::make_pair(std::string("m3"), std::string("priv-m3")));
   star::scc_manager = nullptr;
 
   const pid_t child = fork();
