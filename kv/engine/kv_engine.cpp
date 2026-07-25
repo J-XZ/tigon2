@@ -857,27 +857,25 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     if (!partition->GetPrivate(key, &result)) {
       response.status = static_cast<uint32_t>(StatusCode::kNotFound);
     } else {
-      // A remote touch is the move-in trigger.  On SUCCESS or
-      // FAIL_ALREADY_IN_CXL the Helper pins ref_cnt for the requester until
-      // the response is prepared; unpin before sending so move-out can proceed
-      // after this request completes.
-      star::TwoPLPashaMetadataShared *pinned = nullptr;
-      if (partition->PromotePrivate(key, config_.node_id, &pinned)) {
-        migration_in_.fetch_add(1, std::memory_order_relaxed);
-        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-      }
-      if (pinned != nullptr)
-        star::TwoPLPashaHelper::kv_unpin_shared_ref(pinned);
+      // Reply first so Forward/Await cannot stall behind move-in / budget.
+      // Remote GET is still the move-in trigger (cxlkv-comparable), but the
+      // requester does not wait for Promote/EnforceMigrationBudget. With
+      // point-op Shared Forwarded, no post-read CXL pin is required.
       response.status = static_cast<uint32_t>(StatusCode::kOk);
       response.value_size = static_cast<uint32_t>(result.size());
       std::memcpy(response.value.data(), result.data(), result.size());
-      // Budget enforcement must not prevent the GET response: a throw here
-      // previously left the requester blocked until sync_timeout (YCSB stall).
+      SendTransportMessage(response);
       try {
+        if (partition->PromotePrivate(key, config_.node_id)) {
+          migration_in_.fetch_add(1, std::memory_order_relaxed);
+          shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+        }
         EnforceMigrationBudget(*partition);
       } catch (const std::exception &) {
-        // Best-effort: the read already succeeded; move-out can retry later.
+        // Best-effort migration after a successful read response.
+      } catch (...) {
       }
+      return;
     }
   } else if (message.type == KvMessageType::kIncrement) {
     int64_t delta = 0;
