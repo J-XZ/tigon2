@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -99,6 +100,11 @@ class KVPartition {
   btreeolc_cxl::TreeNodeAllocation shared_binding_;
   PrivateTree *private_tree_ = nullptr;
   SharedTree *shared_tree_ = nullptr;
+  // Serialize tree-topology writers against long OLC scans (Tigon scan paths
+  // similarly avoid unbounded optimistic restart under writers). Concurrent
+  // scanners/readers share; insert/remove/promote/move-out take exclusive.
+  // Lock order with PolicyClock: Clock tracker first, then this mutex.
+  mutable std::shared_mutex tree_rw_mutex_;
 };
 
 }  // namespace tigonkv::engine

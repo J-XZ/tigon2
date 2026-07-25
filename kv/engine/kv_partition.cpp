@@ -74,6 +74,7 @@ PrivateRow *KVPartition::AllocateRow(const FixedKey &key, std::string_view value
 
 bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
   EnterEbr();
+  std::unique_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   if (value.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("private value exceeds fixed value size");
   const FixedKey fixed_key = MakeKey(key);
@@ -124,6 +125,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
 
 bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   EnterEbr();
+  std::shared_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   RegionOffset row_offset = kNullOffset;
   if (!private_tree_->lookup(MakeKey(key), row_offset)) return false;
   auto *row = RowFromOffset(row_offset);
@@ -168,6 +170,7 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
 bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
                             std::string *value) const {
   EnterEbr();
+  std::shared_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   if (value == nullptr) throw std::invalid_argument("null shared GET output");
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
@@ -200,6 +203,7 @@ bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
 bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
                             std::string_view value) {
   EnterEbr();
+  std::unique_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   if (value.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("shared value exceeds fixed value size");
   RegionOffset row_offset = kNullOffset;
@@ -232,6 +236,7 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
                                         std::string_view expected,
                                         std::string_view desired, bool *exchanged) {
   EnterEbr();
+  std::unique_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   if (exchanged == nullptr) throw std::invalid_argument("null shared CAS result");
   if (desired.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("shared CAS desired value exceeds fixed value size");
@@ -273,6 +278,7 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
 bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
                                   int64_t delta, int64_t *value) {
   EnterEbr();
+  std::unique_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   if (value == nullptr) throw std::invalid_argument("null shared increment output");
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
@@ -324,6 +330,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
                                          std::string_view desired,
                                          bool *exchanged) {
   EnterEbr();
+  std::unique_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   if (exchanged == nullptr) throw std::invalid_argument("null CAS result");
   if (desired.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("CAS desired value exceeds fixed value size");
@@ -389,6 +396,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
 bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
                                    int64_t *value) {
   EnterEbr();
+  std::unique_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   if (value == nullptr) throw std::invalid_argument("null increment result");
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
@@ -483,6 +491,7 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id,
   }
   if (inc_ref && (result == star::migration_result::SUCCESS ||
                   result == star::migration_result::FAIL_ALREADY_IN_CXL)) {
+    std::shared_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
     RegionOffset row_offset = kNullOffset;
     if (private_tree_->lookup(fixed_key, row_offset)) {
       auto *private_row = RowFromOffset(row_offset);
@@ -497,6 +506,8 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id,
 
 star::migration_result KVPartition::MoveInForMigrationManager(
     const void *key, bool inc_ref_cnt, void *&migration_policy_meta) {
+  // Called under PolicyClock tracker lock; take tree exclusive next.
+  std::unique_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   migration_policy_meta = nullptr;
   if (star::scc_manager == nullptr) return star::migration_result::FAIL_OOM;
   const FixedKey fixed_key = MakeKey(std::string_view(
@@ -584,6 +595,8 @@ bool KVPartition::MoveOutForMigrationManager(const void *key) {
 
 bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   EnterEbr();
+  // May already be under PolicyClock lock (move_row_out); tree exclusive next.
+  std::unique_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   if (star::scc_manager == nullptr) return false;
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
@@ -659,6 +672,9 @@ bool KVPartition::ScanOwned(
     std::vector<std::pair<std::string, std::string>> *items,
     const std::function<void()> *progress) const {
   EnterEbr();
+  // Shared lock: concurrent scanners OK; blocks topology writers so long OLC
+  // range scans cannot livelock against insert/promote/move-out.
+  std::shared_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   if (items == nullptr) throw std::invalid_argument("null partition scan output");
   // Reuse BPlusTree::scan's native limit (0 = unlimited), matching original
   // Tigon ScanProcessor early-stop and cxlkv Tree::Scan(limit).  Dual-tree
@@ -789,6 +805,7 @@ bool KVPartition::ScanOwned(
 
 bool KVPartition::DeletePrivate(std::string_view key) {
   EnterEbr();
+  std::unique_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
   if (!private_tree_->lookup(fixed_key, row_offset)) return false;
@@ -857,6 +874,7 @@ void KVPartition::NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const 
 
 void KVPartition::RebuildClockTracker() {
   EnterEbr();
+  std::shared_lock<std::shared_mutex> tree_lock(tree_rw_mutex_);
   auto *clock = KvMigrationRuntime::Instance().clock();
   auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
   if (clock == nullptr || table == nullptr) return;
