@@ -412,17 +412,6 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
 }
 
 ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t limit) {
-  // OLC B+tree scan restart-livelocks under many concurrent walkers.  Serialize
-  // owned walks only (local page + ServeScanRequest), while Scan() coordinators
-  // and remote RPC fan-out stay parallel.  Waiters keep PollTransport so Put
-  // and peer ScanItem/Done still drain (unlike a blocking mutex).
-  for (;;) {
-    if (owned_scan_mutex_.try_lock()) break;
-    PollTransport();
-    std::this_thread::sleep_for(std::chrono::microseconds(50));
-  }
-  std::unique_lock<std::mutex> owned_lock(owned_scan_mutex_, std::adopt_lock);
-
   // Raise serve depth for the whole owned walk so progress PollTransport cannot
   // nest Put/Get/Scan serves that restart OLC readers on the same trees.
   std::map<std::string, std::string> merged;
@@ -441,13 +430,11 @@ ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t li
         PollTransport();
       }
     }
+    // Depth is 0 again: drain requests deferred during the owned walk.
+    PollTransport();
   } catch (const std::exception &e) {
     return {Status::Error(StatusCode::kCorruption, e.what()), {}};
   }
-  // Drop the owned-walk lock before draining deferred requests so a nested
-  // ServeScanRequest can re-enter ScanOwnedPartitions without self-deadlock.
-  owned_lock.unlock();
-  PollTransport();
   ScanResult result{Status::Ok(), {}};
   for (auto &item : merged) {
     if (limit != 0 && result.items.size() >= limit) break;
