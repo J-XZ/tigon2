@@ -12,3 +12,22 @@ for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
   tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q 'qemu-system' || { echo "refusing non-QEMU pid $pid" >&2; exit 2; }
   if [[ "$allow" != true ]]; then echo "DRY-RUN kill $pid ($pidfile)"; else kill "$pid"; fi
 done
+# Align with cxlkv: tear down shared-memory tmpfs after QEMU exits so the next
+# init can remount with mpol=bind without stacking mounts.
+if [[ "$allow" == true ]]; then
+  for _ in 1 2 3 4 5; do
+    busy=false
+    for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
+      pidfile="$TIGONKV_VM_STORAGE/vm_${i}/qemu.pid"
+      [[ -r "$pidfile" ]] || continue
+      pid=$(<"$pidfile")
+      kill -0 "$pid" 2>/dev/null && busy=true
+    done
+    [[ "$busy" == false ]] && break
+    sleep 1
+  done
+  if mountpoint -q -- "$TIGONKV_SHARED_PATH" 2>/dev/null; then
+    echo "TIGONKV_VM_KILL umount shared tmpfs $TIGONKV_SHARED_PATH"
+    umount -- "$TIGONKV_SHARED_PATH" || echo "warning: failed to umount $TIGONKV_SHARED_PATH" >&2
+  fi
+fi

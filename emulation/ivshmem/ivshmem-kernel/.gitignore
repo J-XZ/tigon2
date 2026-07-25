@@ -7,3 +7,4 @@
 
 Module.symvers
 modules.order
+compile_commands.json

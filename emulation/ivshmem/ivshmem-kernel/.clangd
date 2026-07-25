@@ -1,0 +1,23 @@
+CompileFlags:
+  Add:
+    - "-D__KERNEL__"
+    - "-DMODULE"
+
+    # 避免 clangd 误用 /usr/include 下的 userspace 头
+    - "-nostdinc"
+
+    # 预包含内核配置（会间接包含 generated/autoconf.h，提供 CONFIG_* 等）
+    - "-include"
+    - "/lib/modules/5.15.0-171-generic/build/include/linux/kconfig.h"
+
+    # 内核头文件搜索路径（建议补全 uapi）
+    - "-I/lib/modules/5.15.0-171-generic/build/include"
+    - "-I/lib/modules/5.15.0-171-generic/build/include/generated"
+    - "-I/lib/modules/5.15.0-171-generic/build/arch/x86/include"
+    - "-I/lib/modules/5.15.0-171-generic/build/arch/x86/include/generated"
+    - "-I/lib/modules/5.15.0-171-generic/build/include/uapi"
+    - "-I/lib/modules/5.15.0-171-generic/build/include/generated/uapi"
+    - "-I/lib/modules/5.15.0-171-generic/build/arch/x86/include/uapi"
+    - "-I/lib/modules/5.15.0-171-generic/build/arch/x86/include/generated/uapi"
+
+    - '-DKBUILD_MODNAME="ivshmem_driver"'

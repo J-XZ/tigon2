@@ -55,11 +55,11 @@ elif [ $TASK_TYPE = "VMS" ]; then
         typeset HOST_NUM=$2
         echo "Setting up VMs..."
 
-        # sync kernel module
-        echo "Sync kernel module..."
+        # sync ivshmem-kernel sources (cxlkv-aligned: build + modprobe ivshmem_driver)
+        echo "Sync ivshmem-kernel sources..."
+        sync_files $SCRIPT_DIR/../emulation/ivshmem/ivshmem-kernel /ivshmem-kernel $HOST_NUM
         sync_files $SCRIPT_DIR/../dependencies/kernel_module/cxl_init /root/cxl_init $HOST_NUM
         sync_files $SCRIPT_DIR/../dependencies/kernel_module/cxl_recover_meta /root/cxl_recover_meta $HOST_NUM
-        sync_files $SCRIPT_DIR/../dependencies/kernel_module/cxl_ivpci.ko /root/cxl_ivpci.ko $HOST_NUM
 
         # sync dependencies
         echo "Sync dependencies..."
@@ -69,11 +69,11 @@ elif [ $TASK_TYPE = "VMS" ]; then
         sync_files /lib/x86_64-linux-gnu/libgflags.so.2.2 /lib/x86_64-linux-gnu/libgflags.so.2.2 $HOST_NUM
 
         # setup the VM(s)
-        echo "Loading kernel module..."
+        echo "Building and loading ivshmem_driver..."
         for (( i=0; i < $HOST_NUM; ++i ))
         do
-                ssh_command "rmmod cxl_ivpci 2>/dev/null" $i
-                ssh_command "insmod ./cxl_ivpci.ko 2>/dev/null" $i
+                ssh_command "cd /ivshmem-kernel && make clean && make" $i
+                ssh_command "rmmod cxl_ivpci 2>/dev/null || true; rmmod ivshmem_driver 2>/dev/null || true; mkdir -p /lib/modules/\$(uname -r)/kernel/drivers/misc; cp /ivshmem-kernel/ivshmem_driver.ko /lib/modules/\$(uname -r)/kernel/drivers/misc/; depmod -a; modprobe ivshmem_driver" $i
         done
 
         echo "Finished"
