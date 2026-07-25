@@ -666,14 +666,15 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
       deferred_scan_requests_.push_back(message);
       return;
     }
+    KvMessage current = message;
     for (;;) {
       ++scan_serve_depth_;
       scan_lock.unlock();
-      ServeScanRequest(message);
+      ServeScanRequest(current);
       scan_lock.lock();
       --scan_serve_depth_;
       if (deferred_scan_requests_.empty()) break;
-      message = deferred_scan_requests_.front();
+      current = deferred_scan_requests_.front();
       deferred_scan_requests_.pop_front();
     }
     return;
