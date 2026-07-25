@@ -148,9 +148,6 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   auto engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool),
                                                         std::move(ebr), std::move(scc)));
   engine->rings_ = rings;
-  engine->worker_request_queues_.reserve(config.foreground_worker_count_per_vm);
-  for (uint32_t i = 0; i < config.foreground_worker_count_per_vm; ++i)
-    engine->worker_request_queues_.push_back(std::make_unique<WorkerRequestQueue>());
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     const auto &directory = engine->pool_->allocator().layout().partitions[partition];
     // All VMs reconstruct the persistent roots so a non-owner can use the
@@ -595,9 +592,10 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
   unsigned spins = 0;
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
-    // Do not steal the MPSC consumer role or nest ServeDeferred here.
-    // Peer/local inbound demuxers free ring slots; nested serve+Send is what
-    // previously produced multi-node full-ring circular waits.
+    // Help serve deferred requests when not already inside a serve (depth==0).
+    // Nested serve during Send is unsafe for OLC; empty-depth Send stalls can
+    // otherwise form a full-ring circular wait with peer Forwards.
+    if (TlsRequestServeDepth == 0) ServeDeferredRequests(4);
     if ((++spins & 63u) == 0)
       std::this_thread::sleep_for(std::chrono::microseconds(50));
     else
@@ -743,59 +741,30 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
     }
     return;
   }
-  // Request path: Dispatcher-style route to worker shard by request_id.
-  // Unbounded enqueue keeps the demuxer free to apply Responses.
-  if (worker_request_queues_.empty())
-    throw std::runtime_error("worker request queues not initialized");
-  const uint32_t target =
-      static_cast<uint32_t>(message.request_id % worker_request_queues_.size());
-  {
-    std::lock_guard<std::mutex> lock(worker_request_queues_[target]->mutex);
-    worker_request_queues_[target]->messages.push_back(message);
-  }
+  // Request path: demuxer → shared deferred FIFO (IncomingDispatcher style).
+  // Any FG PollTransport may serve — required so Forward/Await cannot pin
+  // requests on a non-progressing worker shard.
+  std::lock_guard<std::mutex> lock(deferred_request_mutex_);
+  deferred_transport_requests_.push_back(message);
 }
 
 void KVEngine::ServeDeferredRequests(int max_count) {
   if (TlsRequestServeDepth != 0) return;
-  if (worker_request_queues_.empty()) return;
-  auto pop_one = [&](WorkerRequestQueue &queue, KvMessage *out) -> bool {
-    std::lock_guard<std::mutex> lock(queue.mutex);
-    if (queue.messages.empty()) return false;
-    *out = queue.messages.front();
-    queue.messages.pop_front();
-    return true;
-  };
-  int served = 0;
-  auto serve_from = [&](WorkerRequestQueue &queue) -> bool {
+  for (int i = 0; i < max_count; ++i) {
     KvMessage deferred;
-    if (!pop_one(queue, &deferred)) return false;
-    ServeTransportRequest(deferred);
-    return true;
-  };
-  // Prefer this worker's Dispatcher shard (request_id % N affinity).
-  if (TlsForegroundWorkerId < worker_request_queues_.size()) {
-    while (served < max_count &&
-           serve_from(*worker_request_queues_[TlsForegroundWorkerId]))
-      ++served;
-  }
-  // Steal from other shards so a stuck/slow worker cannot pin requests that
-  // peers need served to complete their own Forward/Await (global-queue
-  // liveness with sharded enqueue).
-  while (served < max_count) {
-    bool any = false;
-    for (auto &queue : worker_request_queues_) {
-      if (served >= max_count) break;
-      if (!serve_from(*queue)) continue;
-      ++served;
-      any = true;
+    {
+      std::lock_guard<std::mutex> lock(deferred_request_mutex_);
+      if (deferred_transport_requests_.empty()) break;
+      deferred = deferred_transport_requests_.front();
+      deferred_transport_requests_.pop_front();
     }
-    if (!any) break;
+    ServeTransportRequest(deferred);
   }
 }
 
 void KVEngine::PollTransport() {
   // FG cooperative serve only — no MPSC recv (demuxer owns that).
-  ServeDeferredRequests(8);
+  ServeDeferredRequests(64);
 }
 
 void KVEngine::BindWorker(uint32_t worker_id) {

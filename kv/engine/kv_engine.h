@@ -63,14 +63,6 @@ class KVEngine {
   RuntimeStats EngineRuntime() const;
 
  private:
-  // Per-worker inbound request shard (IncomingDispatcher → Worker::in_queue).
-  // Unbounded deque so the demuxer never blocks on enqueue: a full SPSC would
-  // stall MPSC recv and prevent Response delivery (multi-VM Forward deadlock).
-  struct WorkerRequestQueue {
-    std::mutex mutex;
-    std::deque<KvMessage> messages;
-  };
-
   KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> pool,
            std::unique_ptr<star::CXL_EBR> ebr,
            std::unique_ptr<star::SCCManager> scc);
@@ -116,9 +108,13 @@ class KVEngine {
   };
   std::mutex pending_scan_mutex_;
   std::unordered_map<uint64_t, PendingScan> pending_scans_;
-  // Demuxer → per-worker shard → FG PollTransport (request_id % N).
+  // Demuxer enqueues requests here; FG PollTransport / Await drains them.
   // Nested serve (TlsRequestServeDepth != 0) must not pop/serve — OLC safety.
-  std::vector<std::unique_ptr<WorkerRequestQueue>> worker_request_queues_;
+  // Single shared unbounded queue: demuxer never blocks on enqueue, and any
+  // polling FG worker can serve any request (required for Forward liveness
+  // under YCSB). Affinity is by cooperative steal-from-front FIFO.
+  std::mutex deferred_request_mutex_;
+  std::deque<KvMessage> deferred_transport_requests_;
   // Soft cap on concurrent remote Scan send+await slots (ring backpressure).
   static constexpr uint32_t kMaxInflightScanRpcs = 8;
   std::mutex scan_rpc_mutex_;
