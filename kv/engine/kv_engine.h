@@ -96,8 +96,10 @@ class KVEngine {
   std::mutex pending_scan_mutex_;
   std::unordered_map<uint64_t, PendingScan> pending_scans_;
   // Nested PollTransport (ring-full send path) must not re-enter a full local
-  // ScanOwnedPartitions serve: concurrent YCSB-E scanners would otherwise
-  // nest/stall until sync_timeout.  Defer inner ScanRequests and drain after.
+  // ScanOwnedPartitions serve on the same stack: concurrent YCSB-E scanners
+  // would nest until sync_timeout.  Defer inner ScanRequests and drain after.
+  // scan_serve_mutex_ guards depth/deferred across unlock-before-handle polls.
+  std::mutex scan_serve_mutex_;
   uint32_t scan_serve_depth_ = 0;
   std::deque<KvMessage> deferred_scan_requests_;
   struct PendingCas {

@@ -579,18 +579,23 @@ CasResult KVEngine::ForwardCompareExchange(std::string_view key,
 }
 
 void KVEngine::PollTransport() {
-  std::lock_guard<std::recursive_mutex> poll_lock(transport_poll_mutex_);
   if (rings_ == nullptr) return;
-  // Drain a bounded batch per poll so AwaitScan/AwaitResponse can retire peer
-  // ScanItem/ScanDone traffic without one-at-a-time round trips.
+  // MPSC single-consumer: only the dequeue is serialized.  Handling
+  // (especially ScanRequest → ScanOwnedPartitions + multi-item send) must run
+  // without the poll lock so peer threads can keep draining this node's ring
+  // while a serve is blocked on a full remote ring.
   for (int drained = 0; drained < 64; ++drained) {
-    alignas(64) char bytes[sizeof(KvMessage)];
-    const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
-    if (received == 0) return;
-    if (received != sizeof(KvMessage)) throw std::runtime_error("malformed KV transport entry");
     KvMessage message{};
-    std::memcpy(&message, bytes, sizeof(message));
-    network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::recursive_mutex> poll_lock(transport_poll_mutex_);
+      alignas(64) char bytes[sizeof(KvMessage)];
+      const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
+      if (received == 0) return;
+      if (received != sizeof(KvMessage))
+        throw std::runtime_error("malformed KV transport entry");
+      std::memcpy(&message, bytes, sizeof(message));
+      network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
+    }
     HandleTransportMessage(message);
   }
 }
@@ -605,11 +610,6 @@ void KVEngine::BindWorker(uint32_t worker_id) {
 }
 
 void KVEngine::ServeScanRequest(const KvMessage &message) {
-  struct DepthGuard {
-    uint32_t &depth;
-    explicit DepthGuard(uint32_t &value) : depth(value) { ++depth; }
-    ~DepthGuard() { --depth; }
-  } guard(scan_serve_depth_);
   const std::string_view key(message.key.data(), message.key_size);
   const std::string_view value(message.value.data(), message.value_size);
   uint64_t limit = 0;
@@ -659,15 +659,22 @@ void KVEngine::HandleTransportMessage(const KvMessage &message) {
   const std::string_view key(message.key.data(), message.key_size);
   const std::string_view value(message.value.data(), message.value_size);
   if (message.type == KvMessageType::kScanRequest) {
+    // Serialize scan-serve bookkeeping across concurrent poll threads; the
+    // actual ScanOwnedPartitions work runs without transport_poll_mutex_.
+    std::unique_lock<std::mutex> scan_lock(scan_serve_mutex_);
     if (scan_serve_depth_ != 0) {
       deferred_scan_requests_.push_back(message);
       return;
     }
-    ServeScanRequest(message);
-    while (!deferred_scan_requests_.empty()) {
-      KvMessage deferred = deferred_scan_requests_.front();
+    for (;;) {
+      ++scan_serve_depth_;
+      scan_lock.unlock();
+      ServeScanRequest(message);
+      scan_lock.lock();
+      --scan_serve_depth_;
+      if (deferred_scan_requests_.empty()) break;
+      message = deferred_scan_requests_.front();
       deferred_scan_requests_.pop_front();
-      ServeScanRequest(deferred);
     }
     return;
   }
