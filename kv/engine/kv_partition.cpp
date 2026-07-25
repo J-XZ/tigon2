@@ -622,9 +622,13 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   mem_access::SharedPayloadRead(payload->data, row->value_len);
   star::scc_manager->do_read(smeta, host_id, row->kv + row->key_len, payload->data,
                              row->value_len);
+  // Invalidate before tree remove so concurrent TryPinShared cannot pin a
+  // row that is about to be EBR-retired.
+  payload->clear_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
   row->is_migrated = 0;
   row->migrated_smeta_off = kNullOffset;
   if (!shared_tree_->remove(fixed_key)) {
+    payload->set_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
     row->is_migrated = 1;
     row->migrated_smeta_off = smeta_offset;
     smeta->clear_write_locked();

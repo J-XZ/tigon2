@@ -411,7 +411,11 @@ class TwoPLPashaHelper {
                 if (smeta == nullptr) return false;
                 smeta->lock();
                 auto *scc_data = smeta->get_scc_data();
+                // Refuse move-out / invalid rows. write_locked is set by MoveOut
+                // before tree remove; pinning through that window UAF'd smeta and
+                // wedged Forward under YCSB-A.
                 if (scc_data->get_flag(TwoPLPashaSharedDataSCC::valid_flag_index) == false ||
+                    smeta->is_write_locked() ||
                     scc_data->ref_cnt == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
                         return false;
