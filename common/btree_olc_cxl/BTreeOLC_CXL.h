@@ -72,14 +72,17 @@ struct TreeNodeAllocation {
 
 // tigonkv: one tree operation touches at least its root page.  The tree's
 // concrete allocation binding determines whether that page belongs to the
-// owner-private SWCC arena or the shared HWCC index region.
-inline void RecordTreeAccess(const TreeNodeAllocation &allocation, bool write) {
+// owner-private SWCC arena or the shared HWCC index region.  Address must be
+// non-null so latency_sim::RecordRange does not drop the sample.
+inline void RecordTreeAccess(const TreeNodeAllocation &allocation, const void *page,
+                             bool write) {
+	if (page == nullptr) return;
 	if (allocation.domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc) {
-		if (write) tigonkv::engine::mem_access::PrivateWrite(nullptr, kPageSize);
-		else tigonkv::engine::mem_access::PrivateRead(nullptr, kPageSize);
+		if (write) tigonkv::engine::mem_access::PrivateWrite(page, kPageSize);
+		else tigonkv::engine::mem_access::PrivateRead(page, kPageSize);
 	} else {
-		if (write) tigonkv::engine::mem_access::TransportWrite(nullptr, kPageSize);
-		else tigonkv::engine::mem_access::TransportRead(nullptr, kPageSize);
+		if (write) tigonkv::engine::mem_access::TransportWrite(page, kPageSize);
+		else tigonkv::engine::mem_access::TransportRead(page, kPageSize);
 	}
 }
 
@@ -1724,7 +1727,6 @@ class BPlusTree {
 	 */
 	bool insert(const KeyType &k, const ValueType &v)
 	{
-		RecordTreeAccess(allocation_, true);
 		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
 		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
@@ -1736,6 +1738,7 @@ restart:
 
 		// Current node
 		NodeBase *node = root_.load();
+		RecordTreeAccess(allocation_, node, true);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != root_.load())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2237,7 +2240,8 @@ restart:
 	 */
 	bool remove(const KeyType &key)
 	{
-		RecordTreeAccess(allocation_, true);
+		NodeBase *root = root_.load();
+		RecordTreeAccess(allocation_, root, true);
 		return _remove(key);
 	}
 
@@ -2247,7 +2251,8 @@ restart:
 	 */
 	bool remove(const KeyType &key, ValueType value)
 	{
-		RecordTreeAccess(allocation_, true);
+		NodeBase *root = root_.load();
+		RecordTreeAccess(allocation_, root, true);
 		return _remove(key);
 	}
 
@@ -2265,7 +2270,6 @@ restart:
 	 */
 	void scan(const KeyType &lowKey, const KeyType &highKey, bool leftExist, bool rightExist, uint32_t limit, std::vector<KeyValuePair> &res)
 	{
-		RecordTreeAccess(allocation_, false);
 		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
 		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
@@ -2276,6 +2280,7 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = root_.load();
+		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != root_.load())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2714,7 +2719,8 @@ restart:
 	 */
 	bool lookup(const KeyType &key, ValueType &result)
 	{
-		RecordTreeAccess(allocation_, false);
+		NodeBase *root = root_.load();
+		RecordTreeAccess(allocation_, root, false);
 		return _lookup(key, result);
 	}
 

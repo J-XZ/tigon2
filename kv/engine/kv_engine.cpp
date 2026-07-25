@@ -12,8 +12,8 @@
 #include <chrono>
 #include <charconv>
 #include <algorithm>
+#include <cstdint>
 #include <functional>
-#include <map>
 #include <queue>
 #include <fstream>
 #include <unistd.h>
@@ -54,6 +54,8 @@ uint64_t CurrentRssKb() {
 // Response/item/done traffic is applied by the inbound demuxer thread, so
 // nested FG polls only need to skip ServeDeferred.
 thread_local uint32_t TlsRequestServeDepth = 0;
+// Bound by BindWorker; UINT32_MAX means unbound (unit tests drain all queues).
+thread_local uint32_t TlsForegroundWorkerId = UINT32_MAX;
 
 struct RequestServeDepthGuard {
   RequestServeDepthGuard() { ++TlsRequestServeDepth; }
@@ -146,6 +148,9 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   auto engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool),
                                                         std::move(ebr), std::move(scc)));
   engine->rings_ = rings;
+  engine->worker_request_queues_.reserve(config.foreground_worker_count_per_vm);
+  for (uint32_t i = 0; i < config.foreground_worker_count_per_vm; ++i)
+    engine->worker_request_queues_.push_back(std::make_unique<WorkerRequestQueue>());
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     const auto &directory = engine->pool_->allocator().layout().partitions[partition];
     // All VMs reconstruct the persistent roots so a non-owner can use the
@@ -257,7 +262,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     size_t next = 0;
   };
   std::vector<Source> sources;
-  sources.reserve(config_.vm_count);
+  sources.reserve(config_.vm_count * 2);
 
   auto load_page = [&](Source *source, std::vector<ScanItem> raw) -> Status {
     source->items.clear();
@@ -281,6 +286,26 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   load_page(&local, std::move(local_page.items));
   sources.push_back(std::move(local));
 
+  // CXL-first: seed remote-owned partitions from local shared trees before RPC
+  // (TwoPLPasha remote CXL table scan). Owner RPC remains authoritative for
+  // private rows; heap merge dedups overlapping migrated keys.
+  for (const auto &partition : partitions_) {
+    if (OwnerForPartition(partition->partition_id()) == config_.node_id) continue;
+    std::vector<std::pair<std::string, std::string>> shared_items;
+    if (!partition->ScanSharedOnly(start_key, request_limit, &shared_items,
+                                   config_.node_id))
+      continue;
+    if (shared_items.empty()) continue;
+    Source cxl;
+    cxl.node = OwnerForPartition(partition->partition_id());
+    std::vector<ScanItem> raw;
+    raw.reserve(shared_items.size());
+    for (auto &item : shared_items)
+      raw.push_back({std::move(item.first), std::move(item.second)});
+    load_page(&cxl, std::move(raw));
+    if (!cxl.items.empty()) sources.push_back(std::move(cxl));
+  }
+
   auto acquire_scan_rpc = [this] {
     std::unique_lock<std::mutex> lock(scan_rpc_mutex_);
     scan_rpc_cv_.wait(lock, [&] { return inflight_scan_rpcs_ < kMaxInflightScanRpcs; });
@@ -294,8 +319,13 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     scan_rpc_cv_.notify_one();
   };
 
-  // Bound in-flight ScanRPCs (ring architecture).  Multiple Scans still
-  // overlap; each remote page takes one slot only for send+await.
+  // Fan-out ScanRPCs (processor-style): register + send all, then await.
+  struct RemoteInflights {
+    uint32_t node = 0;
+    uint64_t request_id = 0;
+  };
+  std::vector<RemoteInflights> inflight;
+  inflight.reserve(config_.vm_count);
   for (uint32_t node = 0; node < config_.vm_count; ++node) {
     if (node == config_.node_id) continue;
     const uint64_t request_id = NextRequestId(config_.node_id);
@@ -304,22 +334,30 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       pending_scans_.emplace(request_id, PendingScan{});
     }
     acquire_scan_rpc();
-    Status status = Status::Ok();
-    std::vector<ScanItem> remote;
     try {
       SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id, node,
                                        request_id, start_key, EncodeU64(request_limit)));
-      status = AwaitScan(request_id, &remote);
     } catch (const std::exception &e) {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       pending_scans_.erase(request_id);
       release_scan_rpc();
       return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
     }
+    inflight.push_back({node, request_id});
+  }
+  for (const auto &slot : inflight) {
+    std::vector<ScanItem> remote;
+    Status status = Status::Ok();
+    try {
+      status = AwaitScan(slot.request_id, &remote);
+    } catch (const std::exception &e) {
+      release_scan_rpc();
+      return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
+    }
     release_scan_rpc();
     if (!status.ok()) return {status, {}};
     Source source;
-    source.node = node;
+    source.node = slot.node;
     load_page(&source, std::move(remote));
     sources.push_back(std::move(source));
   }
@@ -385,7 +423,9 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
 ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t limit) {
   // Raise serve depth for the whole owned walk so progress PollTransport cannot
   // nest Put/Get/Scan serves that restart OLC readers on the same trees.
-  std::map<std::string, std::string> merged;
+  // Processor-style: per-partition vectors + heap merge (no std::map materialize).
+  std::vector<std::vector<ScanItem>> parts;
+  parts.reserve(partitions_.size());
   const uint64_t per_partition_limit = limit == 0 ? 0 : limit;
   const std::function<void()> progress = [this] { PollTransport(); };
   try {
@@ -397,19 +437,41 @@ ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t li
         if (!partition->ScanOwned(start_key, per_partition_limit, &items, &progress))
           return {Status::Error(StatusCode::kCorruption,
                                 "partition scan exceeded migration retry budget"), {}};
-        for (auto &item : items) merged.emplace(std::move(item));
+        std::vector<ScanItem> page;
+        page.reserve(items.size());
+        for (auto &item : items)
+          page.push_back({std::move(item.first), std::move(item.second)});
+        parts.push_back(std::move(page));
         PollTransport();
       }
     }
-    // Depth is 0 again: drain requests deferred during the owned walk.
     PollTransport();
   } catch (const std::exception &e) {
     return {Status::Error(StatusCode::kCorruption, e.what()), {}};
   }
+  struct HeapItem {
+    std::string_view key;
+    size_t part = 0;
+    size_t index = 0;
+  };
+  auto compare = [](const HeapItem &left, const HeapItem &right) {
+    return left.key > right.key;
+  };
+  std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(compare)> heap(compare);
+  for (size_t i = 0; i < parts.size(); ++i) {
+    if (!parts[i].empty()) heap.push({parts[i][0].key, i, 0});
+  }
   ScanResult result{Status::Ok(), {}};
-  for (auto &item : merged) {
+  while (!heap.empty()) {
     if (limit != 0 && result.items.size() >= limit) break;
-    result.items.push_back({std::move(item.first), std::move(item.second)});
+    const HeapItem top = heap.top();
+    heap.pop();
+    ScanItem row = std::move(parts[top.part][top.index]);
+    if (result.items.empty() || result.items.back().key != row.key)
+      result.items.push_back(std::move(row));
+    const size_t next = top.index + 1;
+    if (next < parts[top.part].size())
+      heap.push({parts[top.part][next].key, top.part, next});
   }
   return result;
 }
@@ -681,22 +743,47 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
     }
     return;
   }
-  // Request path: queue for FG workers (Tigon IncomingDispatcher → worker queue).
-  std::lock_guard<std::mutex> lock(deferred_request_mutex_);
-  deferred_transport_requests_.push_back(message);
+  // Request path: Dispatcher-style route to worker queue by request_id.
+  if (worker_request_queues_.empty())
+    throw std::runtime_error("worker request queues not initialized");
+  const uint32_t target =
+      static_cast<uint32_t>(message.request_id % worker_request_queues_.size());
+  worker_request_queues_[target]->push(message);
 }
 
 void KVEngine::ServeDeferredRequests(int max_count) {
   if (TlsRequestServeDepth != 0) return;
-  for (int i = 0; i < max_count; ++i) {
-    KvMessage deferred;
-    {
-      std::lock_guard<std::mutex> lock(deferred_request_mutex_);
-      if (deferred_transport_requests_.empty()) break;
-      deferred = deferred_transport_requests_.front();
-      deferred_transport_requests_.pop_front();
+  if (worker_request_queues_.empty()) return;
+  auto pop_one = [&](WorkerRequestQueue &queue, KvMessage *out) -> bool {
+    if (queue.empty()) return false;
+    *out = queue.front();
+    const bool ok = queue.pop();
+    return ok;
+  };
+  int served = 0;
+  if (TlsForegroundWorkerId < worker_request_queues_.size()) {
+    auto &queue = *worker_request_queues_[TlsForegroundWorkerId];
+    while (served < max_count) {
+      KvMessage deferred;
+      if (!pop_one(queue, &deferred)) break;
+      ServeTransportRequest(deferred);
+      ++served;
     }
-    ServeTransportRequest(deferred);
+    return;
+  }
+  // Unbound threads (unit tests): round-robin drain so single-threaded polls
+  // still make progress across Dispatcher shards.
+  for (int spin = 0; served < max_count && spin < max_count * 2; ++spin) {
+    bool any = false;
+    for (auto &queue : worker_request_queues_) {
+      if (served >= max_count) break;
+      KvMessage deferred;
+      if (!pop_one(*queue, &deferred)) continue;
+      ServeTransportRequest(deferred);
+      ++served;
+      any = true;
+    }
+    if (!any) break;
   }
 }
 
@@ -712,6 +799,7 @@ void KVEngine::BindWorker(uint32_t worker_id) {
     throw std::invalid_argument("BindWorker worker_id exceeds foreground_worker_count_per_vm");
   ebr_->thread_init_ebr_meta(config_.node_id, worker_id);
   star::global_ebr_meta = ebr_.get();
+  TlsForegroundWorkerId = worker_id;
 }
 
 void KVEngine::ServeScanRequest(const KvMessage &message) {

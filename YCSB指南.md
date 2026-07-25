@@ -13,9 +13,9 @@
   --record-count 10000 --operation-count 10000 --workloads a
 ```
 
-去掉 `--skip-trace-gen` 后会调用本仓 YCSB-cpp 生成 load/run trace。默认只接受
-`a,b,c,d`；在 SCAN 与迁移的完整验收完成前，`e` 会明确以
-`ycsb_e=unsupported` 失败，绝不假跑。
+去掉 `--skip-trace-gen` 后会调用本仓 YCSB-cpp 生成 load/run trace。默认接受
+`a,b,c,d,e`（Scan∥migration 与 OLC scan 修复后 YCSB-E 已验收）；若需省略 E，
+显式传 `--workloads a,b,c,d`。
 
 ## 实际回放
 

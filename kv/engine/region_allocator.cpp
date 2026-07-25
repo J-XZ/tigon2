@@ -30,6 +30,24 @@ void FlushForRemoteVisibility(const void *address, size_t bytes) {
 #endif
 }
 
+// PLAN §4.1 / §1.10: per-thread size-class cache (process-local DRAM).
+// Cached offsets are RegionFreeBlock bases; accounting already ran on Free.
+constexpr uint32_t kTlsCacheCapacity = 32;
+struct AllocatorTlsCache {
+  RegionAllocatorHeader *header = nullptr;
+  struct Slot {
+    RegionOffset offsets[kTlsCacheCapacity]{};
+    uint32_t count = 0;
+  } slots[kAllocatorSizeClasses];
+};
+thread_local AllocatorTlsCache g_allocator_tls;
+
+void TlsBind(RegionAllocatorHeader *header) {
+  if (g_allocator_tls.header == header) return;
+  for (auto &slot : g_allocator_tls.slots) slot.count = 0;
+  g_allocator_tls.header = header;
+}
+
 }  // namespace
 
 uint64_t RegionAllocator::MetadataBytes() { return Align(sizeof(RegionAllocatorHeader)); }
@@ -177,6 +195,31 @@ void *RegionAllocator::Allocate(uint64_t bytes, AllocationDomain, DomainCounter 
   ReapRemote(owner_shard, counter);
   const uint64_t requested = Align(bytes + Align(sizeof(RegionFreeBlock)));
   const uint32_t size_class = SizeClass(requested);
+  const uint64_t header_bytes = Align(sizeof(RegionFreeBlock));
+  if (size_class < kAllocatorSizeClasses) {
+    TlsBind(header_);
+    auto &slot = g_allocator_tls.slots[size_class];
+    if (slot.count == 0) {
+      // Refill a small batch under one shard lock (PLAN per-thread cache).
+      auto &shard = header_->shards[owner_shard];
+      Lock(shard);
+      while (slot.count < kTlsCacheCapacity / 2) {
+        const RegionOffset head =
+            shard.free_heads[size_class].load(std::memory_order_relaxed);
+        if (head == kNullOffset) break;
+        auto *block = static_cast<RegionFreeBlock *>(FromOffset(head));
+        shard.free_heads[size_class].store(
+            block->next.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        slot.offsets[slot.count++] = head;
+      }
+      Unlock(shard);
+    }
+    if (slot.count > 0) {
+      const RegionOffset offset = slot.offsets[--slot.count];
+      AccountAllocate(ClassBytes(size_class), counter);
+      return static_cast<std::byte *>(FromOffset(offset)) + header_bytes;
+    }
+  }
   void *result = AllocateFromShard(requested, size_class, owner_shard);
   if (size_class < kAllocatorSizeClasses) {
     auto *block = new (result) RegionFreeBlock;
@@ -184,7 +227,7 @@ void *RegionAllocator::Allocate(uint64_t bytes, AllocationDomain, DomainCounter 
     block->owner_shard = owner_shard;
   }
   AccountAllocate(size_class < kAllocatorSizeClasses ? ClassBytes(size_class) : requested, counter);
-  return static_cast<std::byte *>(result) + Align(sizeof(RegionFreeBlock));
+  return static_cast<std::byte *>(result) + header_bytes;
 }
 
 void RegionAllocator::FreeLocal(RegionOffset offset, uint32_t size_class, uint32_t owner_shard) {
@@ -213,6 +256,13 @@ void RegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain,
     throw std::runtime_error("allocator owner or size-class mismatch");
   const RegionOffset offset = ToOffset(block);
   if (owner_shard == current_shard) {
+    TlsBind(header_);
+    auto &slot = g_allocator_tls.slots[size_class];
+    if (slot.count < kTlsCacheCapacity) {
+      slot.offsets[slot.count++] = offset;
+      AccountFree(ClassBytes(size_class), counter);
+      return;
+    }
     FreeLocal(offset, size_class, owner_shard);
   } else {
     auto &shard = header_->shards[owner_shard];

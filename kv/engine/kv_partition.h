@@ -26,7 +26,9 @@ class KVPartition {
   using PrivateTree = btreeolc_cxl::BPlusTree<FixedKey, RegionOffset,
                                               FixedKeyComparator,
                                               std::equal_to<RegionOffset>>;
-  using SharedTree = PrivateTree;
+  using SharedTree = btreeolc_cxl::BPlusTree<FixedKey, SharedIndexValue,
+                                             FixedKeyComparator,
+                                             std::equal_to<SharedIndexValue>>;
 
   KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
               uint32_t partition_id, uint32_t owner_shard, bool attach);
@@ -40,9 +42,8 @@ class KVPartition {
   bool CompareExchangePrivate(std::string_view key, std::string_view expected,
                               std::string_view desired, bool *exchanged);
   bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value);
-  // Non-owner fast paths.  The persistent private row supplies the row latch
-  // and authoritative migration state; only a live migrated row is accessed
-  // through its HWCC metadata and SWCC payload.
+  // Non-owner CXL-first fast paths (original TwoPLPasha get_migrated_row):
+  // look up shared_tree_ only — never private_tree_ / PrivateRow / LockRow.
   bool GetShared(std::string_view key, uint32_t host_id, std::string *value) const;
   bool PutShared(std::string_view key, uint32_t host_id, std::string_view value);
   bool CompareExchangeShared(std::string_view key, uint32_t host_id,
@@ -57,9 +58,16 @@ class KVPartition {
   bool PromotePrivate(std::string_view key, uint32_t host_id,
                       star::TwoPLPashaMetadataShared **pinned_existing);
   bool MoveOutPrivate(std::string_view key, uint32_t host_id);
+  // Owner-only dual-tree merge (private + shared). Engine must not call this
+  // for non-owned partitions.
   bool ScanOwned(std::string_view start_key, uint64_t limit,
                  std::vector<std::pair<std::string, std::string>> *items,
                  const std::function<void()> *progress = nullptr) const;
+  // Non-owner-safe CXL shared-tree scan (no PrivateRow). Used as CXL-first
+  // probe before owner Scan RPC, matching TwoPLPasha remote CXL table scan.
+  bool ScanSharedOnly(std::string_view start_key, uint64_t limit,
+                      std::vector<std::pair<std::string, std::string>> *items,
+                      uint32_t host_id) const;
   // Invokes PolicyClock::move_row_out for this partition.
   bool MoveOutClockVictim(uint32_t host_id);
   // Rebuild DRAM Clock tracker entries from the shared tree after attach.
@@ -82,6 +90,8 @@ class KVPartition {
  private:
   // Matches core/Executor: enter before observing shared tree/row/move paths.
   void EnterEbr() const { ebr_.enter_critical_section(); }
+  // Upstream Tigon leave is unused (CHECK(0)); keep as empty no-op for pairing.
+  void LeaveEbr() const { ebr_.leave_critical_section(); }
   FixedKey MakeKey(std::string_view key) const;
   PrivateRow *RowFromOffset(RegionOffset offset) const;
   PrivateRow *AllocateRow(const FixedKey &key, std::string_view value);

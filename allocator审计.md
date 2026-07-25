@@ -28,7 +28,7 @@ TigonKV 不使用 `dependencies/cxlalloc/libcxlalloc_static.a` 作为最终共�
 | 分域 | HWCC、owner-private SWCC、shared-payload SWCC 均有独立 used/peak 统计 |
 | 回收 | 本地及 remote free 可复用，owner-shard 不匹配 hard fail |
 | 可见性 | SWCC 链发布在 flush/fence 后对远端可见 |
-| 有界性 | 每线程缓存有固定上限，进程 DRAM 不随 KV 数线性增长 |
+| 有界性 | 每线程 size-class TLS cache（容量 32，miss 时批量 refill）有固定上限；进程 DRAM 不随 KV 数线性增长 |
 
 `region_allocator_test` 与 allocator 能力测试覆盖 attach、域记账、remote free、
 reuse、并发及跨域拒绝；最近一次 RelWithDebInfo 全量 CTest 为 27/27 通过。真实多

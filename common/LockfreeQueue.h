@@ -6,6 +6,7 @@
 
 #include "glog/logging.h"
 #include <boost/lockfree/spsc_queue.hpp>
+#include <thread>
 
 namespace star
 {

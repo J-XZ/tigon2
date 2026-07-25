@@ -455,8 +455,11 @@ experiment_config 段）与根 `experiment_config.jsonc`。
 1. **并发正确性**：无全局库锁；行级 2PL + 树 OLC；owner 必判 `is_migrated`；
    DELETE 仅 owner 权威；move-out 满足 §3.3 quiescence；Scan 抗迁移漏键。
 2. **高并发**：每 VM 跑满 `foreground_worker_count_per_vm`；分配器
-   per-thread cache；worker 间隙轮询入环、**无专职抢核线程（不留配置
-   开关）**；延迟只在锁外/EBR 外补齐。
+   per-thread cache；worker 间隙 `PollTransport` 排空本 worker 的
+   Dispatcher 风格 `LockfreeQueue`；入环由 **IncomingDispatcher 同构的
+   inbound demuxer** 独占 `recv`（不服务 Put/Get/Scan，不占对比核预算的
+   KV 专职服务线程；**禁止**再加可配置的 KV service 抢核线程）；延迟只在
+   锁外/EBR 外补齐。
 3. **安全回收**：凡共享树/行路径 `enter_critical_section`；retire 经 EBR
    再 `RegionAllocator::free(...,owner_shard)`；move-out 同时 retire
    smeta+payload；drain 后 used 回基线±缓存界。

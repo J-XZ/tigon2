@@ -199,10 +199,9 @@ class CXL_EBR {
                 }
         }
 
-        void leave_critical_section()
-        {
-                CHECK(0);       // not used
-        }
+        // Upstream Tigon marks leave unused (CHECK(0)); callers may pair Enter/Leave
+        // for readability. Epoch advance still happens inside enter/retire paths.
+        void leave_critical_section() {}
 
         // Checkpoint/move-out callers invoke this only after their quiescence
         // predicate holds.  It makes bounded deterministic reclamation

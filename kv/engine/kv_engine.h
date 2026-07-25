@@ -3,11 +3,11 @@
 #include "kv/engine/region_allocator.h"
 #include "kv/engine/kv_messages.h"
 #include "kv/kv_store.h"
+#include "common/LockfreeQueue.h"
 
 #include <memory>
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -47,10 +47,12 @@ class KVEngine {
   MemoryStats Memory() const;
   Status Checkpoint();
   // Foreground cooperative path (Tigon Worker::process_request analogue):
-  // serve deferred inbound requests.  The dedicated inbound demuxer is the
-  // sole MPSC consumer — FG never contends for the recv lock.
+  // serve deferred inbound requests from this worker's lock-free queue.
+  // The dedicated inbound demuxer is the sole MPSC consumer — FG never
+  // contends for the recv lock.
   void PollTransport();
-  // Bind the calling thread as foreground worker `worker_id` for CXL_EBR TLS.
+  // Bind the calling thread as foreground worker `worker_id` for CXL_EBR TLS
+  // and Dispatcher-style per-worker request queue drainage.
   // Must be invoked once per worker thread before shared access (matches
   // core/Executor thread_init_ebr_meta).
   void BindWorker(uint32_t worker_id);
@@ -61,6 +63,10 @@ class KVEngine {
   RuntimeStats EngineRuntime() const;
 
  private:
+  // Mirrors star::LockfreeQueue used by IncomingDispatcher → Worker::in_queue.
+  // Capacity sized for bursty ScanItem/request fan-in without huge RSS.
+  using WorkerRequestQueue = star::LockfreeQueue<KvMessage, 8192>;
+
   KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> pool,
            std::unique_ptr<star::CXL_EBR> ebr,
            std::unique_ptr<star::SCCManager> scc);
@@ -106,10 +112,9 @@ class KVEngine {
   };
   std::mutex pending_scan_mutex_;
   std::unordered_map<uint64_t, PendingScan> pending_scans_;
-  // Demuxer enqueues requests here; FG PollTransport / Await drains them.
+  // Demuxer (SPSC producer) → per-worker LockfreeQueue → FG PollTransport.
   // Nested serve (TlsRequestServeDepth != 0) must not pop/serve — OLC safety.
-  std::mutex deferred_request_mutex_;
-  std::deque<KvMessage> deferred_transport_requests_;
+  std::vector<std::unique_ptr<WorkerRequestQueue>> worker_request_queues_;
   // Soft cap on concurrent remote Scan send+await slots (ring backpressure).
   static constexpr uint32_t kMaxInflightScanRpcs = 8;
   std::mutex scan_rpc_mutex_;

@@ -55,6 +55,8 @@ class RegionAllocator {
                                     uint64_t reserved_prefix_bytes = 0);
   static RegionAllocator Attach(void *region, uint64_t region_bytes);
 
+  // Hot path: per-thread size-class cache (see region_allocator.cpp) then
+  // shard freelist / bump under a short spin lock.
   // owner_shard identifies the VM which owns this allocation. current_shard
   // identifies the freeing VM; a different value is placed on the persistent
   // remote-free stack and reclaimed by the owner on its next allocation.
