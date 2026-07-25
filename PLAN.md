@@ -276,10 +276,11 @@ owner-partition（不改成单共享树）。
 
 - `--workloads` 允许集合为 `a,b,c,d,e`（封闭、小写）；默认 `a,b,c,d`（与
   cxlkv 相同）。
-- **YCSB-E 例外**：若 Scan 正确性验收未通过，允许在指南与
-  `run_meta.json` 中明确标记 `ycsb_e=unsupported`，此时一键脚本对 `--workloads`
+- **YCSB-E**：Scan∥migration 与 OLC scan 修复后已验收；一键脚本与
+  `e2e_ycsb_test` 默认可含 `e`。若回归发现 Scan 正确性失效，允许在指南与
+  `run_meta.json` 中临时标记 `ycsb_e=unsupported`，此时一键脚本对 `--workloads`
   含 `e` 必须在副作用前失败并提示，**不得假跑或静默跳过**；load/A/B/C/D
-  仍必须可完整生成与回放。Scan 验收通过后，E 必须可跑。
+  仍必须可完整生成与回放。
 - load / A / B / C / D（及支持时的 E）生成参数、UPDATE→GET+PUT、INSERT→PUT
   映射与 cxlkv 生成器一致，保证相同参数下 trace **逐字节可比**。
 
