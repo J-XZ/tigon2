@@ -127,6 +127,7 @@ int main() {
         const auto found = store->Get(key);
         assert(found.status.ok() && found.value == "value");
       }
+      store->ReleaseWorker();
     });
   }
   for (auto &worker : workers) worker.join();

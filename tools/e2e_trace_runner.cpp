@@ -267,7 +267,12 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
                             worker);
         results[worker] = ReplayTrace(*store, traces[worker], &rng, config.fixed_key_size,
                                       config.fixed_value_size, &progress_ops);
+        store->ReleaseWorker();
       } catch (...) {
+        try {
+          store->ReleaseWorker();
+        } catch (...) {
+        }
         std::lock_guard<std::mutex> lock(error_mutex);
         if (!error) error = std::current_exception();
       }

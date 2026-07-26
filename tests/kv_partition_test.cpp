@@ -228,6 +228,15 @@ int main() {
   assert(scan[0] == std::make_pair(std::string("m1"), std::string("shared-m1")));
   assert(scan[1] == std::make_pair(std::string("m2"), std::string("priv-m2")));
   assert(scan[2] == std::make_pair(std::string("m3"), std::string("priv-m3")));
+  void *handed_off = regions.Allocate(
+      64, tigonkv::engine::AllocationDomain::kSharedPayloadSwcc, 0);
+  std::thread retiring_worker([&] {
+    ebr.thread_init_ebr_meta(0, 0);
+    ebr.add_retired_object(handed_off, 64, star::CXLMemory::DATA_FREE, 0);
+    ebr.handoff_retired_objects();
+  });
+  retiring_worker.join();
+  assert(ebr.drain_quiescent() >= 64);
   star::scc_manager = nullptr;
 
   regions.PublishReady();

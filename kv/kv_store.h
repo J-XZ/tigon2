@@ -175,6 +175,7 @@ class KVStore {
   // Bind this OS thread as EBR worker `worker_id` (0 .. foreground_worker_count-1).
   // Required once per foreground worker thread before KV ops.
   void BindWorker(uint32_t worker_id);
+  void ReleaseWorker();
 
   Status Checkpoint();
   MemoryStats Memory() const;

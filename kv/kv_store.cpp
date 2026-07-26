@@ -516,6 +516,16 @@ void KVStore::BindWorker(uint32_t worker_id) {
   TlsRuntimeStats = &worker_runtime_[worker_id].stats;
 }
 
+void KVStore::ReleaseWorker() {
+  if (impl_ == nullptr || impl_->engine == nullptr)
+    throw std::runtime_error("ReleaseWorker requires an open KVStore");
+  impl_->engine->ReleaseWorker();
+  if (TlsRuntimeOwner == this) {
+    TlsRuntimeOwner = nullptr;
+    TlsRuntimeStats = nullptr;
+  }
+}
+
 Status KVStore::Checkpoint() {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);

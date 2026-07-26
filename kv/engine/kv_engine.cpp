@@ -208,9 +208,8 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     // publish via cxl_global_ebr_meta_root_index for peer attach.
     ebr = static_cast<star::CXL_EBR *>(star::cxl_memory.cxlalloc_malloc_wrapper(
         sizeof(star::CXL_EBR), star::CXLMemory::MISC_ALLOCATION));
-    // +1 EBR slot for the inbound demuxer (Tigon IncomingDispatcher analogue).
     new (ebr) star::CXL_EBR(config.vm_count,
-                            config.foreground_worker_count_per_vm + 1);
+                            config.foreground_worker_count_per_vm);
     star::CXLMemory::commit_shared_data_initialization(
         star::CXLMemory::cxl_global_ebr_meta_root_index, ebr);
   } else {
@@ -926,8 +925,6 @@ void KVEngine::InboundDemuxerLoop() {
   } catch (const std::exception &error) {
     TransportFatal(config_.node_id, "demux_affinity", error.what());
   }
-  ebr_->thread_init_ebr_meta(config_.node_id, inbound_demuxer_worker_id_);
-  star::global_ebr_meta = ebr_;
   while (!inbound_demuxer_stop_.load(std::memory_order_acquire)) {
     bool progressed = false;
     {
@@ -1068,6 +1065,12 @@ void KVEngine::BindWorker(uint32_t worker_id) {
   BindCurrentThreadToCpuIndex(affinity_cpus_, worker_id);
   ebr_->thread_init_ebr_meta(config_.node_id, worker_id);
   star::global_ebr_meta = ebr_;
+}
+
+void KVEngine::ReleaseWorker() {
+  if (ebr_ == nullptr)
+    throw std::runtime_error("ReleaseWorker requires an open EBR instance");
+  ebr_->handoff_retired_objects();
 }
 
 void KVEngine::ServeScanRequest(const KvMessage &message) {

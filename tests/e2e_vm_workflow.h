@@ -142,7 +142,12 @@ PhaseResult RunWorkers(KVStore &store, const Config &base, uint64_t total, Opera
         const uint64_t worker_count = CountForPart(node_count, threads, worker);
         for (uint64_t i = 0; i < worker_count; ++i)
           operation(store, worker, node_start + worker_start + i, i);
+        store.ReleaseWorker();
       } catch (...) {
+        try {
+          store.ReleaseWorker();
+        } catch (...) {
+        }
         std::lock_guard<std::mutex> guard(error_mutex);
         if (!error) error = std::current_exception();
       }
@@ -194,7 +199,12 @@ inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
         const GetResult deleted = store.Get(key);
         if (deleted.status.code != StatusCode::kNotFound)
           throw std::runtime_error("mixed DELETE visibility verification failed");
+        store.ReleaseWorker();
       } catch (...) {
+        try {
+          store.ReleaseWorker();
+        } catch (...) {
+        }
         std::lock_guard<std::mutex> guard(error_mutex);
         if (!error) error = std::current_exception();
       }

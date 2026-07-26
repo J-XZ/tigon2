@@ -195,6 +195,7 @@ int main() {
           const auto scan = node_one->Scan("hybrid-", 100);
           if (!scan.status.ok() || scan.items.size() != 100)
             concurrent_scan_failed.store(true, std::memory_order_release);
+          node_one->ReleaseWorker();
         });
       }
       start_concurrent_scans.store(true, std::memory_order_release);

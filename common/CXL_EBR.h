@@ -7,6 +7,9 @@
 #include "stdint.h"
 #include <glog/logging.h>
 #include <boost/interprocess/offset_ptr.hpp>
+#include <iterator>
+#include <mutex>
+#include <unordered_map>
 
 #include "common/CXLMemory.h"
 #include "kv/engine/mem_access.h"
@@ -248,7 +251,48 @@ class CXL_EBR {
                         }
                         objects.clear();
                 }
+                std::vector<retired_object> handed_off;
+                {
+                        std::lock_guard<std::mutex> lock(orphan_mutex);
+                        auto it = orphaned_retirements.find(this);
+                        if (it != orphaned_retirements.end()) {
+                                handed_off.swap(it->second);
+                                orphaned_retirements.erase(it);
+                        }
+                }
+                for (const auto &object : handed_off) {
+                        CHECK(regions != nullptr)
+                            << "tigonkv: EBR requires dual-region allocator";
+                        if (object.private_partition != UINT32_MAX) {
+                                regions->FreeOwnerPrivate(
+                                    object.ptr, object.size,
+                                    object.private_partition,
+                                    object.owner_shard);
+                        } else {
+                                regions->Free(
+                                    object.ptr, object.size,
+                                    allocation_domain(object.category),
+                                    object.owner_shard,
+                                    local_ebr_meta.coordinator_id);
+                        }
+                        reclaimed += object.size;
+                }
                 return reclaimed;
+        }
+
+        void handoff_retired_objects()
+        {
+                EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
+                std::lock_guard<std::mutex> lock(orphan_mutex);
+                auto &pending = orphaned_retirements[this];
+                for (uint64_t epoch = 0; epoch < max_epoch; ++epoch) {
+                        auto &objects = local_ebr_meta.retired_objects[epoch];
+                        pending.insert(pending.end(),
+                                       std::make_move_iterator(objects.begin()),
+                                       std::make_move_iterator(objects.end()));
+                        objects.clear();
+                }
+                if (pending.empty()) orphaned_retirements.erase(this);
         }
 
         void print_statistics()
@@ -272,6 +316,10 @@ class CXL_EBR {
 
         uint64_t coordinator_num{ 0 };
         uint64_t thread_num{ 0 };
+        inline static std::mutex orphan_mutex;
+        inline static std::unordered_map<const CXL_EBR *,
+                                         std::vector<retired_object>>
+            orphaned_retirements;
 
         static tigonkv::engine::AllocationDomain allocation_domain(uint64_t category)
         {
