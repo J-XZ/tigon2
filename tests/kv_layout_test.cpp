@@ -24,9 +24,10 @@ int main() {
   assert(!header.IsCompatible(8, 4096, 2, 16));
   assert(header.partitions[3].private_root == kNullOffset);
   header.partitions[3].private_root = 64;
-  header.partitions[3].shared_root = 128;
+  header.partitions[3].shared_root.store(128, std::memory_order_release);
   header.partitions[3].migration_in_seq.store(1, std::memory_order_release);
   assert(header.partitions[3].private_root == 64);
+  assert(header.partitions[3].shared_root.load(std::memory_order_acquire) == 128);
   assert(header.partitions[3].migration_in_seq.load(std::memory_order_acquire) == 1);
 
   alignas(PrivateRow) std::byte storage[sizeof(PrivateRow) + 16]{};

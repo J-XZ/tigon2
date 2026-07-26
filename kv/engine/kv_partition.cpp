@@ -25,15 +25,19 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
     throw std::invalid_argument("partition id outside persistent layout");
   if (attach) {
     if (directory_.private_root == kNullOffset ||
-        directory_.shared_root == kNullOffset)
+        directory_.shared_root.load(std::memory_order_acquire) == kNullOffset)
       throw std::runtime_error("partition attach missing tree root");
     private_tree_ = new PrivateTree(
         private_binding_, regions_.swcc().FromOffset(directory_.private_root));
     shared_tree_ = new SharedTree(
-        shared_binding_, regions_.hwcc().FromOffset(directory_.shared_root));
+        shared_binding_,
+        regions_.hwcc().FromOffset(
+            directory_.shared_root.load(std::memory_order_acquire)));
+    shared_tree_->bind_published_root(&directory_.shared_root);
   } else {
     private_tree_ = new PrivateTree(private_binding_);
     shared_tree_ = new SharedTree(shared_binding_);
+    shared_tree_->bind_published_root(&directory_.shared_root);
     PersistRoots();
   }
   // Clock tracker rebuild runs after KvMigrationRuntime::Install so the
@@ -950,8 +954,11 @@ bool KVPartition::ScanSharedOnly(
 void KVPartition::PersistRoots() {
   directory_.private_root = regions_.swcc().ToOffset(
       private_tree_->root_for_persistence());
-  directory_.shared_root = regions_.hwcc().ToOffset(
-      shared_tree_->root_for_persistence());
+  // Shared live root is published on every store_root via the HWCC atomic slot;
+  // keep the slot coherent after owner-local mirror updates.
+  directory_.shared_root.store(
+      regions_.hwcc().ToOffset(shared_tree_->root_for_persistence()),
+      std::memory_order_release);
 }
 
 }  // namespace tigonkv::engine

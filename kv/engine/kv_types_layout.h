@@ -14,11 +14,10 @@ namespace tigonkv::engine {
 // process virtual addresses. Zero is reserved as the null offset.
 using RegionOffset = uint64_t;
 constexpr RegionOffset kNullOffset = 0;
-constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5634ULL;  // TIGONKV4
-// v4: shared tree leaf value is RegionOffset (smeta) only; logical length and
-// other cross-node sync meta live on TwoPLPashaMetadataShared (HWCC). SWCC
-// payload is value bytes only.
-constexpr uint32_t kSharedLayoutVersion = 4;
+constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5635ULL;  // TIGONKV5
+// v5: shared B+tree live root is an HWCC atomic RegionOffset; readers refresh
+// on every operation. SWCC payload remains value bytes only (v4 meta move).
+constexpr uint32_t kSharedLayoutVersion = 5;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -89,7 +88,9 @@ struct alignas(64) PrivateRow {
 
 struct alignas(64) PartitionDirectoryEntry {
   RegionOffset private_root = kNullOffset;
-  RegionOffset shared_root = kNullOffset;
+  // Shared-tree live root (HWCC). Updated on makeRoot/merge; every shared
+  // tree op loads this atomically so already-attached peers see splits.
+  std::atomic<RegionOffset> shared_root{kNullOffset};
   RegionOffset private_arena = kNullOffset;
   std::atomic<uint64_t> migration_in_seq{0};
   std::atomic<uint64_t> migration_out_seq{0};

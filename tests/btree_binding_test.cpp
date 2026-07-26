@@ -62,14 +62,19 @@ int main() {
   // the tree lifetime within the mapped pool and releases the entire test map.
   auto *private_tree = new Tree(private_binding);
   auto *shared_tree = new Tree(shared_binding);
+  auto &shared_root_slot = regions.layout().partitions[0].shared_root;
+  shared_tree->bind_published_root(&shared_root_slot);
+  assert(shared_root_slot.load() != tigonkv::engine::kNullOffset);
   for (uint32_t i = 0; i < 400; ++i) {
     assert(private_tree->insert(Key(i), i));
     assert(shared_tree->insert(Key(i), i + 1000));
   }
+  assert(shared_root_slot.load() != tigonkv::engine::kNullOffset);
   for (uint32_t i = 0; i < 200; ++i) {
     assert(private_tree->remove(Key(i)));
     assert(shared_tree->remove(Key(i)));
   }
+  assert(shared_root_slot.load() != tigonkv::engine::kNullOffset);
   for (uint32_t i = 0; i < 200; ++i) {
     uint64_t value = 0;
     assert(!private_tree->lookup(Key(i), value));
@@ -114,6 +119,19 @@ int main() {
     for (uint32_t i = 200; i < 400; ++i) {
       uint64_t value = 0;
       if (!attached_tree.lookup(Key(i), value) || value != i) _exit(1);
+    }
+    // Peer adopts the HWCC published shared root from the layout slot.
+    btreeolc_cxl::TreeNodeAllocation attached_shared_binding{
+        &attached_regions, AllocationDomain::kHwccIndex, 1, &attached_ebr};
+    auto &live_slot = attached_regions.layout().partitions[0].shared_root;
+    const auto live = live_slot.load();
+    if (live == tigonkv::engine::kNullOffset) _exit(2);
+    Tree attached_shared(
+        attached_shared_binding, attached_regions.hwcc().FromOffset(live));
+    attached_shared.bind_published_root(&live_slot);
+    for (uint32_t i = 200; i < 400; ++i) {
+      uint64_t value = 0;
+      if (!attached_shared.lookup(Key(i), value) || value != i + 1000) _exit(3);
     }
     _exit(0);
   }

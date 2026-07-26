@@ -167,7 +167,8 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     // invoke private-row operations; binding the partition to its stable owner
     // keeps its private arena and tree nodes in the correct allocation shard.
     const bool attach = directory.private_root != kNullOffset &&
-                        directory.shared_root != kNullOffset;
+                        directory.shared_root.load(std::memory_order_acquire) !=
+                            kNullOffset;
     engine->partitions_.emplace_back(std::make_unique<KVPartition>(
         engine->pool_->allocator(), *engine->ebr_, partition,
         engine->OwnerForPartition(partition), attach));

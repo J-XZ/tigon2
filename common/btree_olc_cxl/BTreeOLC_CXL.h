@@ -68,6 +68,24 @@ struct TreeNodeAllocation {
 		ebr->add_retired_object(pointer, bytes, star::CXLMemory::INDEX_FREE, owner_shard,
 		                        private_partition);
 	}
+
+	void *FromOffset(tigonkv::engine::RegionOffset offset) const {
+		if (regions == nullptr)
+			throw std::invalid_argument("BPlusTree requires a region allocation binding");
+		if (offset == tigonkv::engine::kNullOffset) return nullptr;
+		return domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc
+		           ? regions->swcc().FromOffset(offset)
+		           : regions->hwcc().FromOffset(offset);
+	}
+
+	tigonkv::engine::RegionOffset ToOffset(void *pointer) const {
+		if (regions == nullptr)
+			throw std::invalid_argument("BPlusTree requires a region allocation binding");
+		if (pointer == nullptr) return tigonkv::engine::kNullOffset;
+		return domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc
+		           ? regions->swcc().ToOffset(pointer)
+		           : regions->hwcc().ToOffset(pointer);
+	}
 };
 
 // tigonkv: one tree operation touches at least its root page.  The tree's
@@ -1435,7 +1453,7 @@ class BPlusTree {
 	 */
 	void display()
 	{
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		// std::cout << node->getCount() << std::endl;
 		std::queue<NodeBase *> nodeQueue;
 
@@ -1474,15 +1492,14 @@ class BPlusTree {
 		, allocation_(allocation)
 	{
 		char *base = reinterpret_cast<char *>(allocation_.Allocate(LeafPageSize));
-		root_.store(new (base) BTreeLeaf()); // Placement new
+		store_root(new (base) BTreeLeaf()); // Placement new
 		stats_.leaf_nodes++;
 		// std::cout << "BTreeLeaf::maxEntries = " << BTreeLeaf::maxEntries << ", "
 		//           << "BTreeInner::maxEntries = " << BTreeInner::maxEntries << ".\n";
 	}
 
-	// The root is persisted separately as a region-relative offset.  Nodes keep
-	// only offset_ptr links, while the process-local tree instance supplies the
-	// allocator/EBR binding for future mutations and reclamation.
+	// Attach from a previously published root pointer (private trees) or bind
+	// an HWCC atomic RegionOffset slot afterward via bind_published_root.
 	BPlusTree(const TreeNodeAllocation &allocation, void *persisted_root,
 	          bool isUnique = false, const KeyComparator &keyComp = KeyComparator{},
 	          const ValueComparator &valueComp = ValueComparator{})
@@ -1497,7 +1514,29 @@ class BPlusTree {
 		root_.store(static_cast<NodeBase *>(persisted_root));
 	}
 
-	void *root_for_persistence() const { return root_.load(); }
+	// Shared CXL trees: publish/load the live root via an HWCC atomic offset so
+	// already-attached peers observe makeRoot / root merges (original shared
+	// visible-root semantics). Private trees leave published_root_ null.
+	void bind_published_root(std::atomic<tigonkv::engine::RegionOffset> *slot)
+	{
+		if (slot == nullptr)
+			throw std::invalid_argument("BPlusTree published root slot is null");
+		const auto off = slot->load(std::memory_order_acquire);
+		if (off == tigonkv::engine::kNullOffset) {
+			// Creator: publish the process-local root allocated by the ctor.
+			NodeBase *local = root_.load();
+			if (local == nullptr)
+				throw std::runtime_error("BPlusTree has no local root to publish");
+			published_root_ = slot;
+			slot->store(allocation_.ToOffset(local), std::memory_order_release);
+		} else {
+			// Attacher: adopt the HWCC live root.
+			published_root_ = slot;
+			root_.store(static_cast<NodeBase *>(allocation_.FromOffset(off)));
+		}
+	}
+
+	void *root_for_persistence() const { return load_root(); }
 
 	void makeRoot(const KeyType &k, NodeBase *leftChild, NodeBase *rightChild)
 	{
@@ -1508,7 +1547,7 @@ class BPlusTree {
 		inner->newKey(0, k);
 		inner->childAt(0) = leftChild;
 		inner->childAt(1) = rightChild;
-		root_.store(inner);
+		store_root(inner);
 	}
 
 	void destroy(NodeBase *node)
@@ -1737,10 +1776,10 @@ restart:
 		bool needRestart = false;
 
 		// Current node
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		RecordTreeAccess(allocation_, node, true);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || (node != root_.load())) {
+		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
@@ -1766,7 +1805,7 @@ restart:
 					goto restart;
 				}
 				// parent is null and node isn't root
-				if (!parent && (node != root_.load())) {
+				if (!parent && (node != load_root())) {
 					// there's a new parent
 					node->writeUnlock();
 					goto restart;
@@ -1834,7 +1873,7 @@ restart:
 					parent->writeUnlock();
 				goto restart;
 			}
-			if (!parent && (node != root_.load())) {
+			if (!parent && (node != load_root())) {
 				// there's a new parent
 				node->writeUnlock();
 				goto restart;
@@ -1902,9 +1941,9 @@ restart:
 		bool needRestart = false;
 
 		// Current node
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || (node != root_.load())) {
+		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
@@ -1930,7 +1969,7 @@ restart:
 					goto restart;
 				}
 				// parent is null and node isn't root
-				if (!parent && (node != root_.load())) {
+				if (!parent && (node != load_root())) {
 					// there's a new parent
 					node->writeUnlock();
 					goto restart;
@@ -2000,7 +2039,7 @@ restart:
 					parent->writeUnlock();
 				goto restart;
 			}
-			if (!parent && (node != root_.load())) {
+			if (!parent && (node != load_root())) {
 				// there's a new parent
 				node->writeUnlock();
 				goto restart;
@@ -2073,9 +2112,9 @@ restart:
 		bool needRestart = false;
 
 		// Current node
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || (node != root_.load())) {
+		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
@@ -2101,7 +2140,7 @@ restart:
 					goto restart;
 				}
 				// parent is null and node isn't root
-				if (!parent && (node != root_.load())) {
+				if (!parent && (node != load_root())) {
 					// there's a new parent
 					node->writeUnlock();
 					goto restart;
@@ -2172,7 +2211,7 @@ restart:
 				}
 				goto restart;
 			}
-			if (!parent && (node != root_.load())) {
+			if (!parent && (node != load_root())) {
 				// there's a new parent
 				node->writeUnlock();
 				goto restart;
@@ -2240,7 +2279,7 @@ restart:
 	 */
 	bool remove(const KeyType &key)
 	{
-		NodeBase *root = root_.load();
+		NodeBase *root = load_root();
 		RecordTreeAccess(allocation_, root, true);
 		return _remove(key);
 	}
@@ -2251,7 +2290,7 @@ restart:
 	 */
 	bool remove(const KeyType &key, ValueType value)
 	{
-		NodeBase *root = root_.load();
+		NodeBase *root = load_root();
 		RecordTreeAccess(allocation_, root, true);
 		return _remove(key);
 	}
@@ -2279,10 +2318,10 @@ restart:
 			yield(restartCount);
 		bool needRestart = false;
 
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || (node != root_.load())) {
+		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
@@ -2378,9 +2417,9 @@ restart:
 			yield(restartCount);
 		bool needRestart = false;
 
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || (node != root_.load())) {
+		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
@@ -2634,12 +2673,12 @@ restart:
 				// KeyType siblingMaxKey = sibling->max_key();
 				// parentNode->keys_[childPos] = siblingMaxKey;
 				changeRoot = parentNode->erase(childPos, allocation_);
-				// if (changeRoot && parentNode == root_.load()) {
-				if (changeRoot && parentNode == root_.load()) {
+				// if (changeRoot && parentNode == load_root()) {
+				if (changeRoot && parentNode == load_root()) {
 					assert(((uint64_t)parentNode) != 0xffffffffffffffffull);
 					allocation_.Retire(parentNode, kLeafPageSize);
-					root_.store(child);
-					// if (parentNode == root_.load()) root_.store(child);
+					store_root(child);
+					// if (parentNode == load_root()) store_root(child);
 				}
 			} else if (opt == MergeOperation::RightToLeft) {
 				sibling->merge(child, allocation_);
@@ -2647,11 +2686,11 @@ restart:
 				// KeyType childMaxKey = child->max_key();
 				// parentNode->keys_[siblingPos] = childMaxKey;
 				changeRoot = parentNode->erase(siblingPos, allocation_);
-				if (changeRoot && parentNode == root_.load()) {
+				if (changeRoot && parentNode == load_root()) {
 					// if (changeRoot) {
 					assert(((uint64_t)parentNode) != 0xffffffffffffffffull);
 					allocation_.Retire(parentNode, kLeafPageSize);
-					root_.store(sibling);
+					store_root(sibling);
 				}
 			} else if (opt == MergeOperation::BorrowFromRight) {
 				reallocNode(childNode, siblingNode, 1, parentNode, childPos);
@@ -2667,22 +2706,22 @@ restart:
 				stats_.inner_nodes--;
 				// KeyType siblingSubTreeMaxKey = _getSubTreeMaxKey(sibling);
 				changeRoot = parentNode->erase(childPos, allocation_);
-				if (changeRoot && parentNode == root_.load()) {
+				if (changeRoot && parentNode == load_root()) {
 					// if (changeRoot) {
 					assert(((uint64_t)parentNode) != 0xffffffffffffffffull);
 					allocation_.Retire(parentNode, kLeafPageSize);
-					root_.store(child);
+					store_root(child);
 				}
 			} else if (opt == MergeOperation::RightToLeft) {
 				const KeyType &subTreeMaxKey = _getSubTreeMaxKey(sibling->childAt(sibling->getCount()).get());
 				sibling->merge(child, subTreeMaxKey, allocation_);
 				stats_.inner_nodes--;
 				changeRoot = parentNode->erase(siblingPos, allocation_);
-				if (changeRoot && parentNode == root_.load()) {
+				if (changeRoot && parentNode == load_root()) {
 					// if (changeRoot) {
 					assert(((uint64_t)parentNode) != 0xffffffffffffffffull);
 					allocation_.Retire(parentNode, kLeafPageSize);
-					root_.store(sibling);
+					store_root(sibling);
 				}
 			} else if (opt == MergeOperation::BorrowFromRight) {
 				reallocNode(childNode, siblingNode, 1, parentNode, childPos);
@@ -2719,7 +2758,7 @@ restart:
 	 */
 	bool lookup(const KeyType &key, ValueType &result)
 	{
-		NodeBase *root = root_.load();
+		NodeBase *root = load_root();
 		RecordTreeAccess(allocation_, root, false);
 		return _lookup(key, result);
 	}
@@ -2802,6 +2841,24 @@ restart:
 	}
 
     private:
+	NodeBase *load_root() const
+	{
+		if (published_root_ != nullptr) {
+			const auto off = published_root_->load(std::memory_order_acquire);
+			if (off == tigonkv::engine::kNullOffset) return nullptr;
+			return static_cast<NodeBase *>(allocation_.FromOffset(off));
+		}
+		return root_.load();
+	}
+
+	void store_root(NodeBase *node)
+	{
+		root_.store(node);
+		if (published_root_ != nullptr) {
+			published_root_->store(allocation_.ToOffset(node), std::memory_order_release);
+		}
+	}
+
 	const KeyComparator keyComp_;
 	const ValueComparator valueComp_;
 
@@ -2810,6 +2867,8 @@ restart:
 	const TreeNodeAllocation allocation_;
 
         AtomicOffsetPtr<NodeBase> root_;
+	// When non-null (shared CXL trees), live root truth is this HWCC slot.
+	std::atomic<tigonkv::engine::RegionOffset> *published_root_{ nullptr };
 
 	struct tree_stats {
 		std::atomic<uint64_t> inner_nodes{ 0 };
@@ -2892,9 +2951,9 @@ restart:
 		// each element stores the node and the position in the parent node
 		// from which the current node is derived.
 		std::vector<StackNodeElement> stack;
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || node != root_.load()) {
+		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
@@ -3048,9 +3107,9 @@ restart:
 		// each element stores the node and the position in the parent node
 		// from which the current node is derived.
 		std::vector<StackNodeElement> stack;
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || node != root_.load()) {
+		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
@@ -3183,9 +3242,9 @@ restart:
 			yield(restartCount);
 		bool needRestart = false;
 
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || (node != root_.load())) {
+		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
@@ -3258,9 +3317,9 @@ restart:
 			yield(restartCount);
 		bool needRestart = false;
 
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || (node != root_.load())) {
+		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
@@ -3328,9 +3387,9 @@ restart:
 			yield(restartCount);
 		bool needRestart = false;
 
-		NodeBase *node = root_.load();
+		NodeBase *node = load_root();
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
-		if (needRestart || (node != root_.load())) {
+		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
 			goto restart;
 		}
