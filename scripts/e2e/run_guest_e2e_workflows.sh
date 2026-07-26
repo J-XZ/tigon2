@@ -125,6 +125,41 @@ run_phase() {
   echo "TIGONKV_MULTI_VM_E2E suite=$suite round=$round phase=$phase pass"
 }
 
+run_init() {
+  local suite=$1 round=$2
+  local init_dir="$log_root/round${round}/e2e_${suite}/init"
+  local vm pid
+  local -a pids=()
+  mkdir -p "$init_dir"
+  for ((vm = 0; vm < vm_count; vm++)); do
+    local reset=0
+    (( vm == 0 )) && reset=1
+    run_remote "$suite" init "$vm" "$reset" "$init_dir/vm${vm}.log" &
+    pids+=("$!")
+  done
+  local failed=0
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failed=1
+  done
+  if (( failed )); then
+    echo "init command failed: suite=$suite round=$round" >&2
+    for ((vm = 0; vm < vm_count; vm++)); do
+      echo "--- vm${vm} ---" >&2
+      tail -n 80 "$init_dir/vm${vm}.log" >&2 || true
+    done
+    return 1
+  fi
+  for ((vm = 0; vm < vm_count; vm++)); do
+    local log="$init_dir/vm${vm}.log"
+    if ! rg -q "TIGONKV_E2E_MULTI_VM_INIT node=${vm} passed\\." "$log"; then
+      echo "init failed: suite=$suite round=$round vm=$vm" >&2
+      tail -n 80 "$log" >&2 || true
+      return 1
+    fi
+  done
+  echo "TIGONKV_MULTI_VM_E2E suite=$suite round=$round phase=init pass"
+}
+
 for suite in $suites; do
   case "$suite" in
     08) phases=(fill read) ;;
@@ -144,14 +179,7 @@ for suite in $suites; do
   sync_guest_binary "$suite"
   for ((round = 1; round <= rounds; round++)); do
     reset_pool
-    init_dir="$log_root/round${round}/e2e_${suite}/init"
-    mkdir -p "$init_dir"
-    run_remote "$suite" init 0 1 "$init_dir/vm0.log"
-    rg -q "TIGONKV_E2E_MULTI_VM_INIT node=0 passed\." "$init_dir/vm0.log" || {
-      echo "init failed: suite=$suite round=$round" >&2
-      tail -n 80 "$init_dir/vm0.log" >&2 || true
-      exit 1
-    }
+    run_init "$suite" "$round"
     for phase in "${phases[@]}"; do
       run_phase "$suite" "$phase" "$round"
     done

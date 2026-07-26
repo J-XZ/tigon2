@@ -934,7 +934,11 @@ void DualRegionAllocator::FlushCheckpointRanges(
       FlushForRemoteVisibility(arena, arena->bump - arena_offset);
   }
   auto &ready = header_->layout.checkpoint_ready_epoch[node_id];
+  // The range flush must finish in simulated time before readiness becomes
+  // visible to another VM.
+  mem_access::DelayActiveScopeNow();
   mem_access::HwccAtomicStore(&ready);
+  mem_access::DelayActiveScopeNow();
   ready.store(target, std::memory_order_release);
 
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -944,6 +948,7 @@ void DualRegionAllocator::FlushCheckpointRanges(
       for (uint32_t node = 0; node < header_->layout.vm_count; ++node) {
         auto &peer = header_->layout.checkpoint_ready_epoch[node];
         mem_access::HwccAtomicLoad(&peer);
+        mem_access::DelayActiveScopeNow();
         if (peer.load(std::memory_order_acquire) < target) {
           all_ready = false;
           break;
@@ -955,13 +960,16 @@ void DualRegionAllocator::FlushCheckpointRanges(
       std::this_thread::yield();
     }
     mem_access::HwccAtomicStore(&header_->layout.state);
+    mem_access::DelayActiveScopeNow();
     header_->layout.state.store(static_cast<uint32_t>(LayoutState::kClean),
                                 std::memory_order_release);
     mem_access::HwccAtomicStore(&header_->layout.clean_epoch);
+    mem_access::DelayActiveScopeNow();
     header_->layout.clean_epoch.store(target, std::memory_order_release);
   } else {
     for (;;) {
       mem_access::HwccAtomicLoad(&header_->layout.clean_epoch);
+      mem_access::DelayActiveScopeNow();
       if (header_->layout.clean_epoch.load(std::memory_order_acquire) >= target)
         break;
       if (std::chrono::steady_clock::now() >= deadline)

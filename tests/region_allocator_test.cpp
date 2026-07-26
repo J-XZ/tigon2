@@ -221,14 +221,38 @@ void TestDualPhysicalRegions() {
              .used_bytes.load() == 0);
   assert(dual.layout().owner_migration_hwcc[0].used_bytes.load() == 0);
   assert(dual.layout().owner_migration_hwcc[1].used_bytes.load() == 0);
+  latency_sim::Config checkpoint_latency;
+  checkpoint_latency.enabled = true;
+  checkpoint_latency.foreground_enabled = true;
+  checkpoint_latency.stats_enabled = true;
+  checkpoint_latency.swcc_flush_ns_per_line = 1;
+  checkpoint_latency.hwcc_read_ns_per_line = 1;
+  checkpoint_latency.hwcc_atomic_load_ns = 1;
+  checkpoint_latency.hwcc_atomic_store_ns = 1;
+  auto &checkpoint_simulator = latency_sim::GlobalLatencySimulator();
+  checkpoint_simulator.Configure(checkpoint_latency);
+  std::atomic<bool> checkpoint_settled{true};
   std::thread checkpoint_zero([&] {
+    checkpoint_simulator.BeginScope(latency_sim::ScopeKind::kForeground);
     dual.FlushCheckpointRanges(0, std::chrono::seconds(1));
+    if (checkpoint_simulator.PendingDelayNsForTest() != 0)
+      checkpoint_settled.store(false, std::memory_order_relaxed);
+    checkpoint_simulator.EndScopeAndDelay();
   });
   std::thread checkpoint_one([&] {
+    checkpoint_simulator.BeginScope(latency_sim::ScopeKind::kForeground);
     attached.FlushCheckpointRanges(1, std::chrono::seconds(1));
+    if (checkpoint_simulator.PendingDelayNsForTest() != 0)
+      checkpoint_settled.store(false, std::memory_order_relaxed);
+    checkpoint_simulator.EndScopeAndDelay();
   });
   checkpoint_zero.join();
   checkpoint_one.join();
+  assert(checkpoint_settled.load(std::memory_order_relaxed));
+  const auto checkpoint_stats = checkpoint_simulator.TakeStatsAndReset();
+  assert(checkpoint_stats.swcc_raw_line_accesses > 0);
+  assert(checkpoint_stats.hwcc_raw_line_accesses > 0);
+  checkpoint_simulator.Configure(latency_sim::Config{});
   assert(dual.layout().clean_epoch.load(std::memory_order_acquire) == 1);
   assert(dual.layout().state.load(std::memory_order_acquire) ==
          static_cast<uint32_t>(LayoutState::kClean));

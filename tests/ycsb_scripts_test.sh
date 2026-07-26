@@ -47,6 +47,13 @@ rg -q 'TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5' "$guest_workflow"
 ! rg -q 'TIGONKV_E2E_PROGRESS=1' "$guest_workflow"
 rg -Fq '"E2E_TRACE_HEARTBEAT phase="' \
   "$root/tools/e2e_trace_runner.cpp"
+if TIGONKV_VM_COUNT=4 "$root/scripts/e2e_trace/run_ycsb_workflows.sh" \
+    "$tmp/missing-traces" >"$tmp/local-multivm.log" 2>&1; then
+  echo "local YCSB workflow accepted an invalid multi-VM participant layout" >&2
+  exit 1
+fi
+grep -q 'use run_guest_ycsb_workflows.sh for multi-VM runs' \
+  "$tmp/local-multivm.log"
 mkdir -p "$tmp/logs"
 python3 - "$tmp/logs" <<'PY'
 from pathlib import Path

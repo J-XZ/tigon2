@@ -347,6 +347,8 @@ int main() {
   try {
     const std::string experiment = Env("TIGONKV_EXPERIMENT_CONFIG_JSONC", "CXLKV_EXPERIMENT_CONFIG_JSONC", "experiment_config.jsonc");
     Config config = Config::FromJsonc(experiment);
+    // Both runner paths perform an explicit, host-coordinated checkpoint.
+    config.checkpoint_on_clean_exit = false;
     config.node_id = static_cast<uint32_t>(ParseUnsigned(Env("TIGONKV_NODE_ID", "CXLKV_NODE_ID", "0"), "node id"));
     node = config.node_id;
     if (config.latency_enabled &&

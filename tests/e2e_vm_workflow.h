@@ -243,6 +243,7 @@ inline void DrainTransport(KVStore &store) {
 
 inline int RunE2E08MultiVm() {
   Config config = LoadConfig();
+  config.checkpoint_on_clean_exit = false;
   const bool init_only = Env("TIGONKV_E2E_MULTI_VM_INIT_ONLY") == "1";
   const bool reset = Env("TIGONKV_E2E_RESET") == "1";
   auto main_store = KVStore::Create(config, reset);
@@ -293,6 +294,7 @@ inline int RunE2E08MultiVm() {
 
 inline int RunE2E09MultiVm() {
   Config config = LoadConfig();
+  config.checkpoint_on_clean_exit = false;
   const bool init_only = Env("TIGONKV_E2E_MULTI_VM_INIT_ONLY") == "1";
   const bool reset = Env("TIGONKV_E2E_RESET") == "1";
   auto main_store = KVStore::Create(config, reset);

@@ -17,3 +17,5 @@ grep '^numactl ' <<<"$output" > "$tmp/qemu_cmdlines"
 cmp -s "$tmp/qemu_cmdlines" "$root/tests/fixtures/golden_qemu_cmdline_4vm.txt"
 [[ $(wc -l < "$tmp/qemu_cmdlines") -eq 4 ]]
 grep -q "pgrep -xc 'qemu-system-x86'" "$root/scripts/vm/check_environment.sh"
+grep -q 'run_init "$suite" "$round"' "$root/scripts/e2e/run_guest_e2e_workflows.sh"
+grep -q '(( vm == 0 )) && reset=1' "$root/scripts/e2e/run_guest_e2e_workflows.sh"
