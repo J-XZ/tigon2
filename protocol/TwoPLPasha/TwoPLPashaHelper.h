@@ -105,13 +105,18 @@ retry:
 
 	void unlock()
 	{
-                // nobody can modify this atomic word without acquiring the latch
-                // so it is safe to just do regular store instead compare_and_swap
-                uint64_t v_before_unlock = atomic_word.load(std::memory_order_acquire);
-                uint64_t v_after_unlock = (v_before_unlock & ~(LATCH_BIT_MASK << LATCH_BIT_OFFSET));
-                DCHECK(((v_before_unlock & (LATCH_BIT_MASK << LATCH_BIT_OFFSET)) != 0) == true);
-
-		atomic_word.store(v_after_unlock, std::memory_order_release);
+                // CAS clear latch so concurrent bit RMWs (second-chance, SCC)
+                // are not lost by a plain store of a stale word.
+                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                for (;;) {
+                        DCHECK(((expected & (LATCH_BIT_MASK << LATCH_BIT_OFFSET)) != 0) == true);
+                        const uint64_t desired =
+                            expected & ~(LATCH_BIT_MASK << LATCH_BIT_OFFSET);
+                        if (atomic_word.compare_exchange_weak(
+                                expected, desired, std::memory_order_acq_rel,
+                                std::memory_order_acquire))
+                                return;
+                }
 	}
 
         TwoPLPashaSharedDataSCC *get_scc_data()
@@ -153,18 +158,36 @@ retry:
                 clear_bit(is_prev_key_real_bit_index);
         }
 
-        // Function to set a bit at a given position in the bitmap
+        // Function to set a bit at a given position in the bitmap.
+        // CAS so concurrent lock()/unlock() latch updates are not lost — plain
+        // load/store RMW can clear another thread's latch (YCSB Debug FATAL at
+        // unlock DCHECK) when callers touch bits without holding the latch
+        // (e.g. NoteSharedAccess second-chance, KV unlock-across-clwb).
         void set_bit(uint64_t bit_index)
         {
-                uint64_t orig_atomic_word = atomic_word.load(std::memory_order_acquire);
-                atomic_word.store(orig_atomic_word | (1ull << bit_index), std::memory_order_release);  // Set the specific bit to 1
+                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                for (;;) {
+                        const uint64_t desired = expected | (1ull << bit_index);
+                        if (desired == expected) return;
+                        if (atomic_word.compare_exchange_weak(
+                                expected, desired, std::memory_order_acq_rel,
+                                std::memory_order_acquire))
+                                return;
+                }
         }
 
         // Function to clear a bit at a given position in the bitmap
         void clear_bit(uint64_t bit_index)
         {
-                uint64_t orig_atomic_word = atomic_word.load(std::memory_order_acquire);
-                atomic_word.store(orig_atomic_word & ~(1ull << bit_index), std::memory_order_release);  // Clear the specific bit to 0
+                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                for (;;) {
+                        const uint64_t desired = expected & ~(1ull << bit_index);
+                        if (desired == expected) return;
+                        if (atomic_word.compare_exchange_weak(
+                                expected, desired, std::memory_order_acq_rel,
+                                std::memory_order_acquire))
+                                return;
+                }
         }
 
         // Function to check if a bit is set (returns true if set, false if clear)
@@ -181,24 +204,42 @@ retry:
 
         void set_reader_count(uint64_t reader_count)
         {
-                uint64_t orig_atomic_word = atomic_word.load(std::memory_order_acquire);
-                orig_atomic_word &= ~(READ_LOCK_BITS_MASK << READ_LOCK_BITS_OFFSET);
-                orig_atomic_word += (reader_count << READ_LOCK_BITS_OFFSET);
-                atomic_word.store(orig_atomic_word, std::memory_order_release);
+                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                for (;;) {
+                        uint64_t desired = expected;
+                        desired &= ~(READ_LOCK_BITS_MASK << READ_LOCK_BITS_OFFSET);
+                        desired |= (reader_count << READ_LOCK_BITS_OFFSET);
+                        if (atomic_word.compare_exchange_weak(
+                                expected, desired, std::memory_order_acq_rel,
+                                std::memory_order_acquire))
+                                return;
+                }
         }
 
         void increase_reader_count()
         {
-                uint64_t orig_atomic_word = atomic_word.load(std::memory_order_acquire);
-                orig_atomic_word += (1ull << READ_LOCK_BITS_OFFSET);
-                atomic_word.store(orig_atomic_word, std::memory_order_release);
+                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                for (;;) {
+                        const uint64_t desired =
+                            expected + (1ull << READ_LOCK_BITS_OFFSET);
+                        if (atomic_word.compare_exchange_weak(
+                                expected, desired, std::memory_order_acq_rel,
+                                std::memory_order_acquire))
+                                return;
+                }
         }
 
         void decrease_reader_count()
         {
-                uint64_t orig_atomic_word = atomic_word.load(std::memory_order_acquire);
-                orig_atomic_word -= (1ull << READ_LOCK_BITS_OFFSET);
-                atomic_word.store(orig_atomic_word, std::memory_order_release);
+                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                for (;;) {
+                        const uint64_t desired =
+                            expected - (1ull << READ_LOCK_BITS_OFFSET);
+                        if (atomic_word.compare_exchange_weak(
+                                expected, desired, std::memory_order_acq_rel,
+                                std::memory_order_acquire))
+                                return;
+                }
         }
 
         uint64_t get_reader_count_max()
@@ -240,8 +281,16 @@ retry:
         // SCC
         void clear_all_scc_bits()
         {
-                uint64_t orig_atomic_word = atomic_word.load(std::memory_order_acquire);
-                atomic_word.store(orig_atomic_word & ~(SCC_BITS_MASK << SCC_BITS_OFFSET), std::memory_order_release);  // Clear the specific bit to 0
+                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                for (;;) {
+                        const uint64_t desired =
+                            expected & ~(SCC_BITS_MASK << SCC_BITS_OFFSET);
+                        if (desired == expected) return;
+                        if (atomic_word.compare_exchange_weak(
+                                expected, desired, std::memory_order_acq_rel,
+                                std::memory_order_acquire))
+                                return;
+                }
         }
 
         void set_scc_bit(uint64_t host_id)
