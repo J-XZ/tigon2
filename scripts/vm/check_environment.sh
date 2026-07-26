@@ -17,7 +17,9 @@ stat "$backing" || { echo "backing file missing; refusing to start anything" >&2
 findmnt -T "$backing"
 numactl --hardware
 lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE
-qemu_count=$(pgrep -fc '^qemu-system-x86_64' || true)
+# Linux comm names are limited to 15 bytes, so qemu-system-x86_64 is
+# reported as qemu-system-x86. Match that exact comm name.
+qemu_count=$(pgrep -xc 'qemu-system-x86' || true)
 echo "TIGONKV_ENV qemu_count=$qemu_count vm_count=$vm_count guest_device=$device_path ssh_base_port=$ssh_base_port"
 if (( qemu_count < vm_count )); then
   echo "fewer QEMU VMs than requested; refusing to run" >&2

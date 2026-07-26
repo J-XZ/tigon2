@@ -16,3 +16,4 @@ grep -q 'mem-path=/mnt/xz_shared_mem/ivshmem_shared_mem' <<<"$output"
 grep '^numactl ' <<<"$output" > "$tmp/qemu_cmdlines"
 cmp -s "$tmp/qemu_cmdlines" "$root/tests/fixtures/golden_qemu_cmdline_4vm.txt"
 [[ $(wc -l < "$tmp/qemu_cmdlines") -eq 4 ]]
+grep -q "pgrep -xc 'qemu-system-x86'" "$root/scripts/vm/check_environment.sh"
