@@ -115,6 +115,10 @@ class KVEngine {
   // Snapshot of the process affinity mask before any KV thread is pinned.
   // Empty means affinity is disabled.
   std::vector<int> affinity_cpus_;
+  // Process-local ownership only; checked at Bind/Release, never on the op
+  // hot path. Distinct OS threads must not share one EBR/statistics worker id.
+  std::mutex worker_owner_mutex_;
+  std::vector<std::thread::id> worker_owners_;
   star::MPSCRingBuffer *rings_ = nullptr;
   // Sole MPSC consumer — mirrors Tigon IncomingDispatcher.  Never serves
   // Put/Get/Scan and never SendTransportMessage (avoids full-ring circular wait).

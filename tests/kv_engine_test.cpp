@@ -165,6 +165,26 @@ int main() {
     assert(scan.items[1].key == "counter" && scan.items[1].value == "3");
     assert(engine->Delete("alpha").ok());
     assert(engine->Get("alpha").status.code == tigonkv::StatusCode::kNotFound);
+    std::atomic<bool> worker_bound{false};
+    std::atomic<bool> release_worker{false};
+    std::thread worker_owner([&] {
+      engine->BindWorker(0);
+      worker_bound.store(true, std::memory_order_release);
+      while (!release_worker.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      engine->ReleaseWorker();
+    });
+    while (!worker_bound.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    bool duplicate_worker_rejected = false;
+    try {
+      engine->BindWorker(0);
+    } catch (const std::runtime_error &) {
+      duplicate_worker_rejected = true;
+    }
+    assert(duplicate_worker_rejected);
+    release_worker.store(true, std::memory_order_release);
+    worker_owner.join();
     assert(engine->Put("persist", "value").ok());
     assert(engine->Checkpoint().ok());
   }

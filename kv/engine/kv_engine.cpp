@@ -175,7 +175,11 @@ DualRegionConfig RegionConfig(const Config &config) {
 
 KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> pool,
                    star::CXL_EBR *ebr, std::unique_ptr<star::SCCManager> scc)
-    : config_(config), pool_(std::move(pool)), ebr_(ebr), scc_(std::move(scc)) {}
+    : config_(config),
+      pool_(std::move(pool)),
+      ebr_(ebr),
+      scc_(std::move(scc)),
+      worker_owners_(config.foreground_worker_count_per_vm) {}
 
 KVEngine::~KVEngine() {
   StopInboundDemuxer();
@@ -1101,15 +1105,30 @@ void KVEngine::BindWorker(uint32_t worker_id) {
     throw std::runtime_error("BindWorker requires an open EBR instance");
   if (worker_id >= config_.foreground_worker_count_per_vm)
     throw std::invalid_argument("BindWorker worker_id exceeds foreground_worker_count_per_vm");
+  std::lock_guard<std::mutex> lock(worker_owner_mutex_);
+  const auto current = std::this_thread::get_id();
+  if (std::find(worker_owners_.begin(), worker_owners_.end(), current) !=
+      worker_owners_.end())
+    throw std::runtime_error("BindWorker calling thread is already bound");
+  if (worker_owners_[worker_id] != std::thread::id{})
+    throw std::runtime_error("BindWorker worker_id is already owned");
   BindCurrentThreadToCpuIndex(affinity_cpus_, worker_id);
   ebr_->thread_init_ebr_meta(config_.node_id, worker_id);
   star::global_ebr_meta = ebr_;
+  worker_owners_[worker_id] = current;
 }
 
 void KVEngine::ReleaseWorker() {
   if (ebr_ == nullptr)
     throw std::runtime_error("ReleaseWorker requires an open EBR instance");
+  std::lock_guard<std::mutex> lock(worker_owner_mutex_);
+  const auto current = std::this_thread::get_id();
+  auto owner = std::find(worker_owners_.begin(), worker_owners_.end(),
+                         current);
+  if (owner == worker_owners_.end())
+    throw std::runtime_error("ReleaseWorker called by an unbound thread");
   ebr_->handoff_retired_objects();
+  *owner = std::thread::id{};
 }
 
 void KVEngine::ServeScanRequest(const KvMessage &message) {
