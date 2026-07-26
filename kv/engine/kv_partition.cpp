@@ -997,12 +997,6 @@ void KVPartition::NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const 
   if (smeta == nullptr) return;
   if (star::migration_manager != nullptr)
     star::migration_manager->access_row(&smeta->migration_policy_meta, partition_id_);
-  // Mirror Clock heat into the reserved HWCC atomic bit (bit 37).
-  // set_bit is CAS-safe vs latch; still take the latch so heat updates
-  // serialize with move-out / finish_write_bits on the same word.
-  smeta->lock();
-  smeta->set_bit(star::TwoPLPashaMetadataShared::second_chance_bit_index);
-  smeta->unlock();
 }
 
 bool KVPartition::TryPinShared(const FixedKey &key,

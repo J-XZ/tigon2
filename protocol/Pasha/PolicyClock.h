@@ -19,7 +19,7 @@ namespace star
 class PolicyClock : public MigrationManager {
     public:
         struct ClockMeta {
-                uint8_t second_chance = 0;
+                std::atomic<uint8_t> second_chance{0};
         };
 
         struct ClockTrackerNode {
@@ -170,9 +170,9 @@ class PolicyClock : public MigrationManager {
                 // ClockMeta resides in TwoPLPashaMetadataShared::migration_policy_meta
                 // (HWCC). Do not place second_chance in SWCC payload.
                 ClockMeta *clock_meta = reinterpret_cast<ClockMeta *>(migration_policy_meta);
-                tigonkv::engine::mem_access::HwccWrite(
-                    &clock_meta->second_chance, sizeof(clock_meta->second_chance));
-                clock_meta->second_chance = 1;
+                tigonkv::engine::mem_access::HwccAtomicStore(
+                    &clock_meta->second_chance);
+                clock_meta->second_chance.store(1, std::memory_order_relaxed);
                 (void)partition_id;
         }
 
@@ -212,14 +212,10 @@ class PolicyClock : public MigrationManager {
                         } else {
                                 migrated_row_entity victim_row_entity = victim->row_entity;
                                 ClockMeta *clock_meta = reinterpret_cast<ClockMeta *>(victim_row_entity.migration_manager_meta);
-                                tigonkv::engine::mem_access::HwccRead(
-                                    &clock_meta->second_chance,
-                                    sizeof(clock_meta->second_chance));
-                                if (clock_meta->second_chance == 1) {
-                                        tigonkv::engine::mem_access::HwccWrite(
-                                            &clock_meta->second_chance,
-                                            sizeof(clock_meta->second_chance));
-                                        clock_meta->second_chance = 0;
+                                tigonkv::engine::mem_access::HwccAtomicRmw(
+                                    &clock_meta->second_chance);
+                                if (clock_meta->second_chance.exchange(
+                                        0, std::memory_order_relaxed) == 1) {
                                         continue;
                                 }
                                 bool move_out_success = false;

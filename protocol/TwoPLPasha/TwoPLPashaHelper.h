@@ -370,7 +370,6 @@ retry:
 
         static constexpr int is_next_key_real_bit_index = 39;
         static constexpr int is_prev_key_real_bit_index = 38;
-        static constexpr int second_chance_bit_index = 37;
 
         static constexpr int valid_flag_index = 0;
 
@@ -438,7 +437,7 @@ retry:
         // bit 41 - 41: write lock bit
         // bit 40 - 40: is_data_modified_since_moved_in
         // bit 39 - 38: is_next_key_real, is_prev_key_real
-        // bit 37 - 37: second chance bit (also mirrored in migration_policy_meta for Clock)
+        // bit 37 - 37: reserved
         // bit 36 - 0: scc_data - enough for referencing 128 GB shared CXL memory
         std::atomic<uint64_t> atomic_word{ 0 };
 
