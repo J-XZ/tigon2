@@ -46,6 +46,9 @@ class KVPartition {
   bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value);
   // Non-owner APIs never touch PrivateRow. Point ops use TryPinShared + SCC
   // (aligned with get_migrated_row / CompareExchangeShared / ScanSharedOnly).
+  // True iff shared_tree_ currently indexes the key (no pin / SCC). Used by
+  // Get to distinguish tree-miss (migrate) from SCC contention (retry).
+  bool HasShared(std::string_view key) const;
   bool GetShared(std::string_view key, uint32_t host_id, std::string *value) const;
   bool PutShared(std::string_view key, uint32_t host_id, std::string_view value);
   bool CompareExchangeShared(std::string_view key, uint32_t host_id,

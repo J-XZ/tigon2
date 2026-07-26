@@ -182,8 +182,24 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   auto *payload = smeta->get_scc_data();
   std::string shared(value_len, '\0');
   mem_access::SharedPayloadRead(payload->data, value_len);
-  const bool read = star::TwoPLPashaHelper::kv_shared_read(
-      smeta, owner_shard_, shared.data(), value_len);
+  // Row is migrated: treat SCC refusal (writer_waiting / write lock) as
+  // contention, not NotFound. Spin like PutPrivate's shared write wait.
+  bool read = false;
+  const auto read_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < read_deadline) {
+    read = star::TwoPLPashaHelper::kv_shared_read(
+        smeta, owner_shard_, shared.data(), value_len);
+    if (read) break;
+    UnlockRow(row);
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
+    LockRow(row);
+    if (row->is_tombstone || !row->is_migrated ||
+        row->migrated_smeta_off != smeta_offset) {
+      UnlockRow(row);
+      return GetPrivate(key, value);
+    }
+  }
   if (read) {
     NoteSharedAccess(smeta);
   }
@@ -192,6 +208,12 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
     return false;
   *value = std::move(shared);
   return true;
+}
+
+bool KVPartition::HasShared(std::string_view key) const {
+  EnterEbr();
+  RegionOffset offset = kNullOffset;
+  return shared_tree_->lookup(MakeKey(key), offset) && offset != kNullOffset;
 }
 
 bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
@@ -211,8 +233,19 @@ bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
   }
   std::string shared(value_len, '\0');
   mem_access::SharedPayloadRead(payload->data, value_len);
-  const bool read = star::TwoPLPashaHelper::kv_shared_read(
-      smeta, host_id, shared.data(), value_len);
+  // Pin proves the row is in CXL. kv_shared_read may refuse while a writer
+  // waits; retry instead of returning miss (which would Migrate-storm).
+  bool read = false;
+  const auto read_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < read_deadline) {
+    read = star::TwoPLPashaHelper::kv_shared_read(
+        smeta, host_id, shared.data(), value_len);
+    if (read) break;
+    if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index))
+      break;
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
+  }
   if (read) NoteSharedAccess(smeta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   if (!read) return false;

@@ -238,19 +238,25 @@ GetResult KVEngine::Get(std::string_view key) {
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
     auto *visible = VisiblePartition(key);
-    // shared-hit CXL; miss → migrate RPC then CXL retry (not owner value-Forward).
-    for (int attempt = 0; attempt < 4; ++attempt) {
+    // shared-hit CXL; tree-miss → migrate RPC then CXL retry (not value-Forward).
+    // SCC contention (writer_waiting) is NOT a miss: retry GetShared / HasShared
+    // without Migrate, or rings fill and nested Serve/Send deadlocks under YCSB-A.
+    for (int attempt = 0; attempt < 8; ++attempt) {
       std::string shared;
       if (visible != nullptr && visible->GetShared(key, config_.node_id, &shared)) {
         shared_gets_.fetch_add(1, std::memory_order_relaxed);
         return {Status::Ok(), std::move(shared)};
+      }
+      if (visible != nullptr && visible->HasShared(key)) {
+        std::this_thread::yield();
+        continue;
       }
       const Status migrated = RequestMigrate(key);
       if (migrated.code == StatusCode::kNotFound)
         return {Status::Error(StatusCode::kNotFound, "key not found"), {}};
       if (!migrated.ok() && migrated.code != StatusCode::kOutOfMemory)
         return {migrated, {}};
-      if (migrated.code == StatusCode::kOutOfMemory && attempt == 3)
+      if (migrated.code == StatusCode::kOutOfMemory && attempt == 7)
         return {migrated, {}};
     }
     return {Status::Error(StatusCode::kNotFound, "key not found after migrate"), {}};
