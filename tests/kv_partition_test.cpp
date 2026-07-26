@@ -104,13 +104,39 @@ int main() {
       regions.swcc().FromOffset(regions.layout().partitions[5].private_root), 5));
   std::string value;
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
+  for (uint32_t i = 0; i < 256; ++i) {
+    char key[32];
+    std::snprintf(key, sizeof(key), "tree-split-%08u", i);
+    assert(partition.PutPrivate(key, "tree-value"));
+  }
+  for (uint32_t i = 0; i < 256; ++i) {
+    char key[32];
+    std::snprintf(key, sizeof(key), "tree-split-%08u", i);
+    assert(partition.GetPrivate(key, &value) && value == "tree-value");
+    assert(partition.DeletePrivate(key));
+  }
   PassthroughScc scc;
   star::scc_manager = &scc;
+  auto &simulator = latency_sim::GlobalLatencySimulator();
+  latency_sim::Config tree_write_latency;
+  tree_write_latency.enabled = true;
+  tree_write_latency.foreground_enabled = true;
+  tree_write_latency.swcc_write_ns_per_line = 1;
+  simulator.Configure(tree_write_latency);
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  assert(!partition.GetPrivate("tree-lookup-miss", &value));
+  assert(simulator.PendingDelayNsForTest() == 0);
+  simulator.EndScopeAndDelay();
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  assert(partition.PutPrivate("tree-write", "value"));
+  assert(simulator.PendingDelayNsForTest() > 0);
+  simulator.EndScopeAndDelay();
+  simulator.Configure(latency_sim::Config{});
+  assert(partition.DeletePrivate("tree-write"));
   latency_sim::Config latency;
   latency.enabled = true;
   latency.foreground_enabled = true;
   latency.stats_enabled = true;
-  auto &simulator = latency_sim::GlobalLatencySimulator();
   simulator.Configure(latency);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   assert(partition.PutPrivate("latency-only", "payload"));
