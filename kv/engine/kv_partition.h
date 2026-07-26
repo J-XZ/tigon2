@@ -84,7 +84,7 @@ class KVPartition {
   bool ScanShared(
       std::string_view start_key, uint64_t limit,
       std::vector<std::pair<std::string, std::string>> *items) const;
-  uint64_t SharedRemovalState() const;
+  uint64_t SharedMutationState() const;
   // Invokes PolicyClock::move_row_out for this partition.
   bool MoveOutClockVictim(uint32_t host_id);
   // Rebuild DRAM Clock tracker entries from the shared tree after attach.
@@ -120,17 +120,17 @@ class KVPartition {
   // access (replaces the old non-owner PrivateRow LockRow quiescence window).
   bool TryPinShared(const FixedKey &key, star::TwoPLPashaMetadataShared **smeta,
                     RegionOffset *smeta_offset) const;
-  void BeginSharedRemoval();
-  void EndSharedRemoval();
-  class SharedRemovalGuard {
+  void BeginSharedMutation();
+  void EndSharedMutation();
+  class SharedMutationGuard {
    public:
-    explicit SharedRemovalGuard(KVPartition &partition)
+    explicit SharedMutationGuard(KVPartition &partition)
         : partition_(partition) {
-      partition_.BeginSharedRemoval();
+      partition_.BeginSharedMutation();
     }
-    ~SharedRemovalGuard() { partition_.EndSharedRemoval(); }
-    SharedRemovalGuard(const SharedRemovalGuard &) = delete;
-    SharedRemovalGuard &operator=(const SharedRemovalGuard &) = delete;
+    ~SharedMutationGuard() { partition_.EndSharedMutation(); }
+    SharedMutationGuard(const SharedMutationGuard &) = delete;
+    SharedMutationGuard &operator=(const SharedMutationGuard &) = delete;
 
    private:
     KVPartition &partition_;
@@ -140,6 +140,8 @@ class KVPartition {
   star::CXL_EBR &ebr_;
   uint32_t partition_id_;
   uint32_t owner_shard_;
+  const uint32_t fixed_key_size_;
+  const uint32_t fixed_value_size_;
   PartitionDirectoryEntry &directory_;
   btreeolc_cxl::TreeNodeAllocation private_binding_;
   btreeolc_cxl::TreeNodeAllocation shared_binding_;

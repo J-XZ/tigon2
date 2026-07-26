@@ -56,7 +56,7 @@ uint64_t CurrentRssKb() {
   return page_size > 0 ? resident * static_cast<uint64_t>(page_size) / 1024 : 0;
 }
 
-bool SharedRemovalSnapshotIdle(uint64_t state) {
+bool SharedMutationSnapshotIdle(uint64_t state) {
   return static_cast<uint32_t>(state) == 0;
 }
 
@@ -259,8 +259,11 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     // shared-tree fast path after promotion.  Only the owner is allowed to
     // invoke private-row operations; binding the partition to its stable owner
     // keeps its private arena and tree nodes in the correct allocation shard.
+    mem_access::HwccRead(&directory.private_root,
+                         sizeof(directory.private_root));
+    const RegionOffset private_root = directory.private_root;
     mem_access::HwccAtomicLoad(&directory.shared_root);
-    const bool attach = directory.private_root != kNullOffset &&
+    const bool attach = private_root != kNullOffset &&
                         directory.shared_root.load(std::memory_order_acquire) !=
                             kNullOffset;
     engine->partitions_.emplace_back(std::make_unique<KVPartition>(
@@ -641,8 +644,8 @@ Status KVEngine::PrepareSharedScan(std::string_view start_key, uint64_t limit,
     for (const auto &partition : partitions_) {
       if (OwnerForPartition(partition->partition_id()) != config_.node_id)
         continue;
-      const uint64_t state = partition->SharedRemovalState();
-      if (!SharedRemovalSnapshotIdle(state)) {
+      const uint64_t state = partition->SharedMutationState();
+      if (!SharedMutationSnapshotIdle(state)) {
         preparation_unstable = true;
         break;
       }
@@ -702,10 +705,10 @@ Status KVEngine::PrepareSharedScan(std::string_view start_key, uint64_t limit,
     for (const auto &partition : partitions_) {
       if (OwnerForPartition(partition->partition_id()) != config_.node_id)
         continue;
-      const uint64_t after = partition->SharedRemovalState();
+      const uint64_t after = partition->SharedMutationState();
       stable = stable && sequence < before.size() &&
                before[sequence] == after &&
-               SharedRemovalSnapshotIdle(after);
+               SharedMutationSnapshotIdle(after);
       ++sequence;
       migration_snapshot->append(EncodeU64(after));
     }
@@ -729,8 +732,8 @@ bool KVEngine::ScanSnapshotValid(
     if (!DecodeU64(migration_snapshot.substr(position, sizeof(uint64_t)),
                    &expected))
       return false;
-    const uint64_t current = partition->SharedRemovalState();
-    if (!SharedRemovalSnapshotIdle(current) || current != expected)
+    const uint64_t current = partition->SharedMutationState();
+    if (!SharedMutationSnapshotIdle(current) || current != expected)
       return false;
     position += sizeof(uint64_t);
   }
@@ -921,6 +924,9 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
                      &message);
     }
     if (enqueued) break;
+    // A failed full-ring reservation/rollback is itself an HWCC access.
+    // Settle it before host-speed retries can amplify probe traffic.
+    mem_access::DelayActiveScopeNow();
     if (std::chrono::steady_clock::now() >= deadline) {
       const auto snapshot = rings_[message.destination_node].snapshot();
       std::ostringstream detail;

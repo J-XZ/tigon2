@@ -8,7 +8,6 @@
 #include <cstring>
 #include <limits>
 #include <new>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -34,18 +33,27 @@ void RecordPrivateRowStateWrite(const PrivateRow *row) {
       kPrivateRowStateBytes);
 }
 
+uint32_t ReadHwccConfigField(const uint32_t *field) {
+  mem_access::HwccRead(field, sizeof(*field));
+  return *field;
+}
+
 }  // namespace
 
 KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
                          uint32_t partition_id, uint32_t owner_shard,
                          bool attach)
     : regions_(regions), ebr_(ebr), partition_id_(partition_id),
-      owner_shard_(owner_shard), directory_(regions.layout().partitions.at(partition_id)),
+      owner_shard_(owner_shard),
+      fixed_key_size_(ReadHwccConfigField(&regions.layout().fixed_key_size)),
+      fixed_value_size_(ReadHwccConfigField(&regions.layout().fixed_value_size)),
+      directory_(regions.layout().partitions.at(partition_id)),
       private_binding_{&regions, AllocationDomain::kOwnerPrivateSwcc, owner_shard, &ebr,
                        partition_id},
       shared_binding_{&regions, AllocationDomain::kHwccIndex, owner_shard, &ebr} {
   star::CXLMemory::bind_dual_region_allocator(&regions, owner_shard);
-  if (partition_id >= regions.layout().partition_count)
+  if (partition_id >=
+      ReadHwccConfigField(&regions.layout().partition_count))
     throw std::invalid_argument("partition id outside persistent layout");
   if (attach) {
     mem_access::HwccRead(&directory_.private_root,
@@ -74,7 +82,7 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
 }
 
 FixedKey KVPartition::MakeKey(std::string_view key) const {
-  return FixedKey::From(key, regions_.layout().fixed_key_size);
+  return FixedKey::From(key, fixed_key_size_);
 }
 
 PrivateRow *KVPartition::RowFromOffset(RegionOffset offset) const {
@@ -101,11 +109,11 @@ void KVPartition::UnlockRow(PrivateRow *row) {
 }
 
 PrivateRow *KVPartition::AllocateRow(const FixedKey &key, std::string_view value) {
-  const uint64_t bytes = sizeof(PrivateRow) + regions_.layout().fixed_key_size +
-                         regions_.layout().fixed_value_size;
+  const uint64_t bytes =
+      sizeof(PrivateRow) + fixed_key_size_ + fixed_value_size_;
   auto *row = new (regions_.AllocateOwnerPrivate(bytes, partition_id_, owner_shard_))
       PrivateRow;
-  row->key_len = regions_.layout().fixed_key_size;
+  row->key_len = fixed_key_size_;
   row->value_len = static_cast<uint32_t>(value.size());
   mem_access::PrivateWrite(row, offsetof(PrivateRow, kv));
   std::memcpy(row->kv, key.bytes, row->key_len);
@@ -116,7 +124,7 @@ PrivateRow *KVPartition::AllocateRow(const FixedKey &key, std::string_view value
 
 bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
   EnterEbr();
-  if (value.size() > regions_.layout().fixed_value_size)
+  if (value.size() > fixed_value_size_)
     throw std::invalid_argument("private value exceeds fixed value size");
   const FixedKey fixed_key = MakeKey(key);
   RegionOffset row_offset = kNullOffset;
@@ -177,6 +185,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
     UnlockRow(row);
     return false;
   }
+  SharedMutationGuard mutation(*this);
   auto *row = AllocateRow(fixed_key, value);
   row_offset = regions_.swcc().ToOffset(row);
   if (!private_tree_->insert(fixed_key, row_offset))
@@ -213,7 +222,7 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   }
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(smeta_offset));
-  std::string shared(regions_.layout().fixed_value_size, '\0');
+  std::string shared(fixed_value_size_, '\0');
   // Row is migrated: treat SCC refusal (writer_waiting / write lock) as
   // contention, not NotFound. Spin like PutPrivate's shared write wait.
   bool read = false;
@@ -261,7 +270,7 @@ bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   RegionOffset smeta_offset = kNullOffset;
   if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
-  std::string shared(regions_.layout().fixed_value_size, '\0');
+  std::string shared(fixed_value_size_, '\0');
   // Pin proves the row is in CXL. kv_shared_read may refuse while a writer
   // waits; retry instead of returning miss (which would Migrate-storm).
   bool read = false;
@@ -289,7 +298,7 @@ bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
 bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
                             std::string_view value) {
   EnterEbr();
-  if (value.size() > regions_.layout().fixed_value_size)
+  if (value.size() > fixed_value_size_)
     throw std::invalid_argument("shared value exceeds fixed value size");
   const FixedKey fixed_key = MakeKey(key);
   star::TwoPLPashaMetadataShared *smeta = nullptr;
@@ -318,7 +327,7 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
                                         std::string_view desired, bool *exchanged) {
   EnterEbr();
   if (exchanged == nullptr) throw std::invalid_argument("null shared CAS result");
-  if (desired.size() > regions_.layout().fixed_value_size)
+  if (desired.size() > fixed_value_size_)
     throw std::invalid_argument("shared CAS desired value exceeds fixed value size");
   *exchanged = false;
   const FixedKey fixed_key = MakeKey(key);
@@ -327,7 +336,7 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
   if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
   bool changed = false;
   const bool updated = star::TwoPLPashaHelper::kv_shared_update(
-      smeta, host_id, regions_.layout().fixed_value_size,
+      smeta, host_id, fixed_value_size_,
       [&](const std::string &current, std::string *replacement) {
         if (current != expected) return false;
         replacement->assign(desired);
@@ -355,7 +364,7 @@ bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
   int64_t next = 0;
   bool changed = false;
   const bool updated = star::TwoPLPashaHelper::kv_shared_update(
-      smeta, host_id, regions_.layout().fixed_value_size,
+      smeta, host_id, fixed_value_size_,
       [&](const std::string &current, std::string *replacement) {
         int64_t previous = 0;
         const auto parsed =
@@ -389,7 +398,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
                                          bool *inserted) {
   EnterEbr();
   if (exchanged == nullptr) throw std::invalid_argument("null CAS result");
-  if (desired.size() > regions_.layout().fixed_value_size)
+  if (desired.size() > fixed_value_size_)
     throw std::invalid_argument("CAS desired value exceeds fixed value size");
   *exchanged = false;
   if (inserted != nullptr) *inserted = false;
@@ -436,7 +445,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
       regions_.hwcc().FromOffset(smeta_offset));
   bool changed = false;
   const bool read = star::TwoPLPashaHelper::kv_shared_update(
-      smeta, owner_shard_, regions_.layout().fixed_value_size,
+      smeta, owner_shard_, fixed_value_size_,
       [&](const std::string &current, std::string *replacement) {
         if (current != expected) return false;
         replacement->assign(desired);
@@ -498,7 +507,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
     int64_t next = 0;
     bool changed = false;
     if (!star::TwoPLPashaHelper::kv_shared_update(
-            smeta, owner_shard_, regions_.layout().fixed_value_size,
+            smeta, owner_shard_, fixed_value_size_,
             [&](const std::string &value_before, std::string *replacement) {
               int64_t previous = 0;
               const auto parsed = std::from_chars(
@@ -634,7 +643,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   migration_policy_meta = nullptr;
   if (star::scc_manager == nullptr) return star::migration_result::FAIL_OOM;
   const FixedKey fixed_key = MakeKey(std::string_view(
-      static_cast<const char *>(key), regions_.layout().fixed_key_size));
+      static_cast<const char *>(key), fixed_key_size_));
   RegionOffset row_offset = kNullOffset;
   if (!private_tree_->lookup(fixed_key, row_offset))
     return star::migration_result::FAIL_OOM;
@@ -665,7 +674,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     UnlockRow(row);
     return star::migration_result::FAIL_ALREADY_IN_CXL;
   }
-  const uint64_t payload_bytes = regions_.layout().fixed_value_size;
+  const uint64_t payload_bytes = fixed_value_size_;
   void *payload_mem = nullptr;
   void *smeta_mem = nullptr;
   try {
@@ -681,6 +690,9 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   auto *smeta = new (smeta_mem) star::TwoPLPashaMetadataShared(payload);
   star::scc_manager->init_scc_metadata(smeta, owner_shard_);
   smeta->lock();
+  // The shared-tree entry may become visible before synthetic latency is
+  // settled; write_locked keeps readers out without holding the HWCC latch.
+  smeta->set_write_locked();
   if (star::migration_manager != nullptr) {
     star::migration_manager->init_migration_policy_metadata(
         &smeta->migration_policy_meta, nullptr, key,
@@ -704,6 +716,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   const RegionOffset smeta_offset = regions_.hwcc().ToOffset(smeta);
   if (!shared_tree_->insert(fixed_key, smeta_offset)) {
     if (inc_ref_cnt) smeta->decrement_ref_cnt();
+    smeta->clear_write_locked();
     smeta->unlock();
     UnlockRow(row);
     return star::migration_result::FAIL_OOM;
@@ -711,8 +724,13 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   RecordPrivateRowStateWrite(row);
   row->migrated_smeta_off = smeta_offset;
   row->is_migrated = 1;
-  star::scc_manager->finish_write(smeta, owner_shard_, payload, row->value_len);
+  star::scc_manager->finish_write_bits(smeta, owner_shard_);
   migration_policy_meta = &smeta->migration_policy_meta;
+  smeta->unlock();
+  star::scc_manager->flush_scc_data(payload, row->value_len);
+  mem_access::DelayActiveScopeNow();
+  smeta->lock();
+  smeta->clear_write_locked();
   smeta->unlock();
   UnlockRow(row);
   PersistRoots();
@@ -724,7 +742,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
 
 bool KVPartition::MoveOutForMigrationManager(const void *key) {
   return MoveOutPrivate(
-      std::string_view(static_cast<const char *>(key), regions_.layout().fixed_key_size),
+      std::string_view(static_cast<const char *>(key), fixed_key_size_),
       owner_shard_);
 }
 
@@ -758,14 +776,14 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   }
   smeta->set_write_locked();
   const uint32_t value_len = smeta->get_value_len();
-  if (value_len > regions_.layout().fixed_value_size) {
+  if (value_len > fixed_value_size_) {
     smeta->clear_write_locked();
     smeta->unlock();
     UnlockRow(row);
     return false;
   }
-  // Keep removal state active until the row and root changes are published.
-  SharedRemovalGuard removal(*this);
+  // Keep mutation state active until the row and root changes are published.
+  SharedMutationGuard mutation(*this);
   star::scc_manager->prepare_read(smeta, host_id, payload, value_len);
   if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index)) {
     smeta->clear_write_locked();
@@ -798,12 +816,13 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
     UnlockRow(row);
     return false;
   }
+  mem_access::DelayActiveScopeNow();
   smeta->lock();
   smeta->clear_write_locked();
   smeta->unlock();
   ebr_.add_retired_object(smeta, sizeof(star::TwoPLPashaMetadataShared),
                           star::CXLMemory::METADATA_FREE, owner_shard_);
-  ebr_.add_retired_object(payload, regions_.layout().fixed_value_size,
+  ebr_.add_retired_object(payload, fixed_value_size_,
                           star::CXLMemory::DATA_FREE, owner_shard_);
   UnlockRow(row);
   PersistRoots();
@@ -813,7 +832,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
 }
 
 std::string KVPartition::KeyString(const FixedKey &key) const {
-  const auto bytes = regions_.layout().fixed_key_size;
+  const auto bytes = fixed_key_size_;
   size_t length = bytes;
   while (length != 0 && key.bytes[length - 1] == '\0') --length;
   return std::string(key.bytes, length);
@@ -857,7 +876,7 @@ bool KVPartition::ScanOwned(
         } else {
           auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
               regions_.hwcc().FromOffset(row->migrated_smeta_off));
-          value.resize(regions_.layout().fixed_value_size);
+          value.resize(fixed_value_size_);
           uint32_t value_len = 0;
           if (!star::TwoPLPashaHelper::kv_shared_read_value(
                   smeta, owner_shard_, value.data(), value.size(),
@@ -939,7 +958,7 @@ bool KVPartition::ScanShared(
   for (const auto &entry : rows) {
     auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
         regions_.hwcc().FromOffset(entry.second));
-    std::string value(regions_.layout().fixed_value_size, '\0');
+    std::string value(fixed_value_size_, '\0');
     uint32_t value_len = 0;
     bool read = false;
     for (uint32_t attempt = 0; attempt < 64 && !read; ++attempt) {
@@ -957,24 +976,24 @@ bool KVPartition::ScanShared(
   return complete;
 }
 
-uint64_t KVPartition::SharedRemovalState() const {
-  mem_access::HwccAtomicLoad(&directory_.shared_removal_state);
-  return directory_.shared_removal_state.load(std::memory_order_acquire);
+uint64_t KVPartition::SharedMutationState() const {
+  mem_access::HwccAtomicLoad(&directory_.shared_mutation_state);
+  return directory_.shared_mutation_state.load(std::memory_order_acquire);
 }
 
-void KVPartition::BeginSharedRemoval() {
-  mem_access::HwccAtomicRmw(&directory_.shared_removal_state);
+void KVPartition::BeginSharedMutation() {
+  mem_access::HwccAtomicRmw(&directory_.shared_mutation_state);
   const uint64_t previous =
-      directory_.shared_removal_state.fetch_add(1, std::memory_order_acq_rel);
+      directory_.shared_mutation_state.fetch_add(1, std::memory_order_acq_rel);
   if (static_cast<uint32_t>(previous) == std::numeric_limits<uint32_t>::max())
     std::abort();
 }
 
-void KVPartition::EndSharedRemoval() {
-  constexpr uint64_t kCompleteOneRemoval = (uint64_t{1} << 32) - 1;
-  mem_access::HwccAtomicRmw(&directory_.shared_removal_state);
-  const uint64_t previous = directory_.shared_removal_state.fetch_add(
-      kCompleteOneRemoval, std::memory_order_release);
+void KVPartition::EndSharedMutation() {
+  constexpr uint64_t kCompleteOneMutation = (uint64_t{1} << 32) - 1;
+  mem_access::HwccAtomicRmw(&directory_.shared_mutation_state);
+  const uint64_t previous = directory_.shared_mutation_state.fetch_add(
+      kCompleteOneMutation, std::memory_order_release);
   if (static_cast<uint32_t>(previous) == 0) std::abort();
 }
 
@@ -992,12 +1011,11 @@ bool KVPartition::DeletePrivate(std::string_view key) {
       UnlockRow(row);
       return false;
     }
+    SharedMutationGuard mutation(*this);
     RecordPrivateRowStateWrite(row);
     row->is_tombstone = 1;
     const uint64_t row_bytes =
-        sizeof(PrivateRow) + regions_.layout().fixed_key_size +
-        regions_.layout().fixed_value_size;
-    std::optional<SharedRemovalGuard> removal;
+        sizeof(PrivateRow) + fixed_key_size_ + fixed_value_size_;
     if (row->is_migrated) {
       const RegionOffset smeta_offset = row->migrated_smeta_off;
       RegionOffset indexed = kNullOffset;
@@ -1026,7 +1044,6 @@ bool KVPartition::DeletePrivate(std::string_view key) {
         std::this_thread::yield();
         continue;
       }
-      removal.emplace(*this);
       smeta->set_write_locked();
       smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
       if (!shared_tree_->remove(fixed_key)) {
@@ -1039,6 +1056,9 @@ bool KVPartition::DeletePrivate(std::string_view key) {
         throw std::runtime_error(
             "shared tree remove failed during delete");
       }
+      smeta->unlock();
+      mem_access::DelayActiveScopeNow();
+      smeta->lock();
       RecordPrivateRowStateWrite(row);
       row->is_migrated = 0;
       row->migrated_smeta_off = kNullOffset;
@@ -1047,7 +1067,7 @@ bool KVPartition::DeletePrivate(std::string_view key) {
       ebr_.add_retired_object(smeta,
                               sizeof(star::TwoPLPashaMetadataShared),
                               star::CXLMemory::METADATA_FREE, owner_shard_);
-      ebr_.add_retired_object(payload, regions_.layout().fixed_value_size,
+      ebr_.add_retired_object(payload, fixed_value_size_,
                               star::CXLMemory::DATA_FREE, owner_shard_);
     }
     if (!private_tree_->remove(fixed_key)) {
@@ -1123,8 +1143,10 @@ bool KVPartition::MoveOutClockVictim(uint32_t host_id) {
 }
 
 uint64_t KVPartition::shared_payload_used_bytes() const {
-  return regions_.layout().domains[static_cast<size_t>(
-      AllocationDomain::kSharedPayloadSwcc)].used_bytes.load(std::memory_order_relaxed);
+  const auto &counter = regions_.layout().domains[static_cast<size_t>(
+      AllocationDomain::kSharedPayloadSwcc)];
+  mem_access::HwccAtomicLoad(&counter.used_bytes);
+  return counter.used_bytes.load(std::memory_order_relaxed);
 }
 
 uint64_t KVPartition::shared_payload_capacity_bytes() const {

@@ -1,6 +1,7 @@
 #include "kv/engine/kv_engine.h"
 #include "common/CXLMemory.h"
 #include "common/MPSCRingBuffer.h"
+#include "kv/engine/latency_inject.h"
 #include "kv/engine/kv_messages.h"
 
 #ifdef NDEBUG
@@ -140,6 +141,45 @@ int main() {
   assert(WIFSIGNALED(full_status) && WTERMSIG(full_status) == SIGABRT);
   unlink(full_template);
 
+  char ring_latency_template[] = "/tmp/tigonkv-ring-latency-XXXXXX";
+  const int ring_latency_fd = mkstemp(ring_latency_template);
+  assert(ring_latency_fd >= 0);
+  close(ring_latency_fd);
+  {
+    auto engine =
+        tigonkv::engine::KVEngine::Open(
+            ConfigFor(ring_latency_template, 2, 0), true);
+    void *root = nullptr;
+    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+        star::CXLMemory::cxl_transport_root_index, &root);
+    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+    latency_sim::Config latency;
+    latency.enabled = true;
+    latency.foreground_enabled = true;
+    latency.stats_enabled = true;
+    latency.hwcc_read_ns_per_line = 1;
+    latency.hwcc_write_ns_per_line = 1;
+    latency.hwcc_atomic_load_ns = 1;
+    latency.hwcc_atomic_store_ns = 1;
+    latency.hwcc_atomic_rmw_ns = 1;
+    auto &simulator = latency_sim::GlobalLatencySimulator();
+    simulator.Configure(latency);
+    simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+    tigonkv::engine::KvMessage frame{};
+    assert(rings[1].enqueue(reinterpret_cast<char *>(&frame), sizeof(frame)));
+    assert(simulator.PendingDelayNsForTest() == 0);
+    tigonkv::engine::KvMessage received{};
+    assert(rings[1].dequeue(reinterpret_cast<char *>(&received),
+                            sizeof(received)) == sizeof(received));
+    assert(simulator.PendingDelayNsForTest() == 0);
+    simulator.EndScopeAndDelay();
+    const auto stats = simulator.TakeStatsAndReset();
+    assert(stats.hwcc_raw_line_accesses > 0);
+    assert(stats.swcc_raw_line_accesses == 0);
+    simulator.Configure(latency_sim::Config{});
+  }
+  unlink(ring_latency_template);
+
   char path_template[] = "/tmp/tigonkv-engine-XXXXXX";
   const int fd = mkstemp(path_template);
   assert(fd >= 0);
@@ -249,6 +289,13 @@ int main() {
       if (partition != promoted_partition) continue;
       assert(engine->Put(key, "owner-authority").ok());
       promoted_scan_keys.emplace_back(key);
+    }
+    std::vector<std::string> concurrent_insert_keys;
+    for (uint32_t i = 0; concurrent_insert_keys.size() < 4; ++i) {
+      const std::string key =
+          "hybrid-00000000-insert-" + std::to_string(i);
+      if (engine->OwnerForKey(key) == 0)
+        concurrent_insert_keys.push_back(key);
     }
     int scan_ready[2];
     assert(pipe2(scan_ready, O_CLOEXEC | O_NONBLOCK) == 0);
@@ -388,6 +435,7 @@ int main() {
     int status = 0;
     bool concurrent_scan_started = false;
     uint32_t removals_during_scan = 0;
+    uint32_t inserts_during_scan = 0;
     size_t removal_key = 0;
     for (;;) {
       engine->PollTransport();
@@ -401,6 +449,12 @@ int main() {
         removal_key = (removal_key + 1) % promoted_scan_keys.size();
         if (moved.ok()) ++removals_during_scan;
       }
+      if (concurrent_scan_started &&
+          inserts_during_scan < concurrent_insert_keys.size()) {
+        if (engine->Put(concurrent_insert_keys[inserts_during_scan],
+                        "concurrent-insert").ok())
+          ++inserts_during_scan;
+      }
       const pid_t done = waitpid(child, &status, WNOHANG);
       if (done == child) break;
       assert(done == 0);
@@ -408,6 +462,7 @@ int main() {
     close(scan_ready[0]);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     assert(removals_during_scan > 0);
+    assert(inserts_during_scan == concurrent_insert_keys.size());
     assert(engine->NetworkTxBytes() > 0 && engine->NetworkRxBytes() > 0);
     const auto engine_runtime = engine->EngineRuntime();
     assert(engine_runtime.migration_in > 0);

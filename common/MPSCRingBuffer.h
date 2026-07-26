@@ -163,9 +163,15 @@ class MPSCRingBuffer {
                 entry = reinterpret_cast<Entry *>(entries_buffer.get() + entry_index * entry_struct_size);
 
                 /* wait for the entry to be ready */
+                uint8_t ready = 0;
                 do {
                         tigonkv::engine::mem_access::HwccAtomicLoad(&entry->is_ready);
-                } while (entry->is_ready.load(std::memory_order_acquire) != 1);
+                        ready = entry->is_ready.load(std::memory_order_acquire);
+                        // Each poll is a real HWCC dependency. Settle it before
+                        // issuing another poll so host scheduling cannot create
+                        // an artificial burst of un-delayed loads.
+                        tigonkv::engine::mem_access::DelayActiveScopeNow();
+                } while (ready != 1);
 
                 /* Partial dequeue is not supported. Metadata or wire-size
                  * violations are protocol corruption, not an empty/full
@@ -207,14 +213,15 @@ class MPSCRingBuffer {
 
                         /* mark it as not ready */
                         tigonkv::engine::mem_access::HwccAtomicStore(&entry->is_ready);
-                        entry->is_ready.store(0, std::memory_order_relaxed);
-
                         /* increase head by 1 */
                         tigonkv::engine::mem_access::HwccAtomicStore(&head);
-                        head.store(cur_head + 1, std::memory_order_release);
-
                         /* reduce count by 1 */
                         tigonkv::engine::mem_access::HwccAtomicRmw(&count);
+                        // Do not publish a reusable slot until all dequeue
+                        // payload/metadata/atomic latency has been paid.
+                        tigonkv::engine::mem_access::DelayActiveScopeNow();
+                        entry->is_ready.store(0, std::memory_order_relaxed);
+                        head.store(cur_head + 1, std::memory_order_release);
                         std::atomic_fetch_sub_explicit(&count, 1, std::memory_order_release);
                 }
 

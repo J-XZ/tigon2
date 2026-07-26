@@ -55,6 +55,8 @@ class CXL_EBR {
         struct EBRMetaLocal {
                 uint64_t coordinator_id;
                 uint64_t thread_id;
+                uint64_t coordinator_count;
+                uint64_t thread_count;
 
                 uint64_t last_freed_epoch;
 
@@ -91,8 +93,14 @@ class CXL_EBR {
         {
                 EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
 
-                CHECK(coordinator_id < coordinator_num);
-                CHECK(thread_id < thread_num);
+                tigonkv::engine::mem_access::HwccRead(
+                    &coordinator_num, sizeof(coordinator_num));
+                tigonkv::engine::mem_access::HwccRead(
+                    &thread_num, sizeof(thread_num));
+                local_ebr_meta.coordinator_count = coordinator_num;
+                local_ebr_meta.thread_count = thread_num;
+                CHECK(coordinator_id < local_ebr_meta.coordinator_count);
+                CHECK(thread_id < local_ebr_meta.thread_count);
                 local_ebr_meta.coordinator_id = coordinator_id;
                 // The caller owns the worker identity.  A process-global
                 // counter leaked identities across independent engines and
@@ -150,8 +158,10 @@ class CXL_EBR {
                                 bool advance_global_ebr = true;
 
                                 // check if all other threads have entered the current epoch
-                                for (uint64_t i = 0; i < coordinator_num; i++) {
-                                        for (uint64_t j = 0; j < thread_num; j++) {
+                                for (uint64_t i = 0;
+                                     i < local_ebr_meta.coordinator_count; i++) {
+                                        for (uint64_t j = 0;
+                                             j < local_ebr_meta.thread_count; j++) {
                                                 tigonkv::engine::mem_access::HwccAtomicLoad(
                                                     &cxl_ebr_meta_vec[i][j].local_epoch);
                                                 uint64_t local_epoch = cxl_ebr_meta_vec[i][j].local_epoch.load(std::memory_order_acquire);

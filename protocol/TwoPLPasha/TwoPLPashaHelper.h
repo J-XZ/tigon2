@@ -505,6 +505,9 @@ class TwoPLPashaHelper {
                         tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
                         scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
                 }
+                // Pay the shared read while the protocol reader/ref pins still
+                // prevent move-out, but without holding the HWCC metadata latch.
+                tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
                 DCHECK(smeta->get_ref_cnt() > 0);
                 smeta->decrement_ref_cnt();
@@ -549,6 +552,7 @@ class TwoPLPashaHelper {
                         tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
                         scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
                 }
+                tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
                 DCHECK(smeta->get_ref_cnt() > 0);
                 smeta->decrement_ref_cnt();
@@ -603,6 +607,9 @@ class TwoPLPashaHelper {
                         scc_manager->finish_write_bits(smeta, host_id);
                         smeta->unlock();
                         scc_manager->flush_scc_data(scc_data, size);
+                        // Keep write_locked/ref_cnt published until the
+                        // synthetic payload/writeback latency has elapsed.
+                        tigonkv::engine::mem_access::DelayActiveScopeNow();
                         smeta->lock();
                         DCHECK(smeta->get_ref_cnt() > 0);
                         smeta->decrement_ref_cnt();
@@ -668,6 +675,7 @@ class TwoPLPashaHelper {
                                         throw std::length_error(
                                             "shared update exceeds value capacity");
                         } catch (...) {
+                                tigonkv::engine::mem_access::DelayActiveScopeNow();
                                 smeta->lock();
                                 DCHECK(smeta->get_ref_cnt() > 0);
                                 smeta->decrement_ref_cnt();
@@ -691,6 +699,7 @@ class TwoPLPashaHelper {
                                 scc_manager->flush_scc_data(scc_data,
                                                             replacement.size());
                         }
+                        tigonkv::engine::mem_access::DelayActiveScopeNow();
                         smeta->lock();
                         DCHECK(smeta->get_ref_cnt() > 0);
                         smeta->decrement_ref_cnt();

@@ -57,6 +57,14 @@ int main() {
   latency.enabled = true;
   latency.foreground_enabled = true;
   latency.stats_enabled = true;
+  latency.swcc_read_ns_per_line = 10;
+  latency.swcc_write_ns_per_line = 10;
+  latency.swcc_flush_ns_per_line = 10;
+  latency.hwcc_read_ns_per_line = 10;
+  latency.hwcc_write_ns_per_line = 10;
+  latency.hwcc_atomic_load_ns = 10;
+  latency.hwcc_atomic_store_ns = 10;
+  latency.hwcc_atomic_rmw_ns = 10;
   auto &simulator = latency_sim::GlobalLatencySimulator();
   simulator.Configure(latency);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
@@ -90,6 +98,7 @@ int main() {
   std::vector<std::thread> incrementers;
   for (std::size_t host = 0; host < 4; ++host) {
     incrementers.emplace_back([&, host] {
+      simulator.BeginScope(latency_sim::ScopeKind::kForeground);
       for (int iteration = 0; iteration < 250; ++iteration) {
         bool changed = false;
         assert(star::TwoPLPashaHelper::kv_shared_update(
@@ -106,6 +115,7 @@ int main() {
             &changed));
         assert(changed);
       }
+      simulator.EndScopeAndDelay();
     });
   }
   for (auto &thread : incrementers) thread.join();

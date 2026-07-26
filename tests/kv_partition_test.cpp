@@ -98,8 +98,13 @@ int main() {
   }
   assert(wrong_owner_rejected);
   assert(partition.PutPrivate("alpha", "one"));
+  const uint64_t mutation_before_insert = partition.SharedMutationState();
   assert(partition.PutPrivate("beta", "two"));
+  assert(partition.SharedMutationState() ==
+         mutation_before_insert + (uint64_t{1} << 32));
+  const uint64_t mutation_before_update = partition.SharedMutationState();
   assert(!partition.PutPrivate("alpha", "updated"));
+  assert(partition.SharedMutationState() == mutation_before_update);
   assert(regions.IsInOwnerPrivateArena(
       regions.swcc().FromOffset(regions.layout().partitions[5].private_root), 5));
   std::string value;
@@ -162,8 +167,8 @@ int main() {
   assert(partition.DeletePrivate("latency-only"));
   const uint64_t migration_in_before_alpha =
       regions.layout().partitions[5].migration_in_seq.load();
-  const uint64_t removal_before_alpha =
-      regions.layout().partitions[5].shared_removal_state.load();
+  const uint64_t mutation_before_alpha =
+      regions.layout().partitions[5].shared_mutation_state.load();
   assert(partition.PromotePrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   // Once migrated, PUT must update the shared SCC authority rather than the
@@ -178,8 +183,8 @@ int main() {
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load();
   assert(partition.MoveOutPrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
-  assert(regions.layout().partitions[5].shared_removal_state.load() ==
-         removal_before_alpha + (uint64_t{1} << 32));
+  assert(regions.layout().partitions[5].shared_mutation_state.load() ==
+         mutation_before_alpha + (uint64_t{1} << 32));
   assert(ebr.drain_quiescent() > 0);
   assert(regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load() < hwcc_before_moveout);
@@ -187,11 +192,11 @@ int main() {
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load() < swcc_before_moveout);
   assert(partition.PutPrivate("delete-shared", "value"));
   assert(partition.PromotePrivate("delete-shared", 1));
-  const uint64_t removal_before_delete =
-      regions.layout().partitions[5].shared_removal_state.load();
+  const uint64_t mutation_before_delete =
+      regions.layout().partitions[5].shared_mutation_state.load();
   assert(partition.DeletePrivate("delete-shared"));
-  assert(regions.layout().partitions[5].shared_removal_state.load() ==
-         removal_before_delete + (uint64_t{1} << 32));
+  assert(regions.layout().partitions[5].shared_mutation_state.load() ==
+         mutation_before_delete + (uint64_t{1} << 32));
   star::scc_manager = nullptr;
   assert(partition.DeletePrivate("beta"));
   assert(!partition.GetPrivate("beta", &value));
@@ -232,8 +237,20 @@ int main() {
       (1024ULL * 1024ULL * 1024ULL - star::CXL_EBR::max_ebr_retiring_memory) / 2);
   assert(partition.MoveOutClockVictim(1));
   assert(partition.GetPrivate("clock", &value) && value == "victim");
+  latency_sim::Config budget_counter_latency;
+  budget_counter_latency.enabled = true;
+  budget_counter_latency.foreground_enabled = true;
+  budget_counter_latency.stats_enabled = true;
+  simulator.Configure(budget_counter_latency);
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   assert(partition.hwcc_used_bytes() > 0);
-  assert(partition.shared_payload_used_bytes() < partition.shared_payload_capacity_bytes());
+  assert(partition.shared_payload_used_bytes() <
+         partition.shared_payload_capacity_bytes());
+  simulator.EndScopeAndDelay();
+  latency_stats = simulator.TakeStatsAndReset();
+  assert(latency_stats.hwcc_raw_line_accesses > 0);
+  assert(latency_stats.swcc_raw_line_accesses == 0);
+  simulator.Configure(latency_sim::Config{});
 
   // FAIL_ALREADY_IN_CXL must pin ref_cnt so move-out quiescence waits; unpin
   // restores the three-condition allow path used by MoveOutPrivate.
