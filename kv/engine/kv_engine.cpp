@@ -22,6 +22,7 @@
 #include <deque>
 #include <functional>
 #include <queue>
+#include <sstream>
 #include <fstream>
 #include <sched.h>
 #include <unistd.h>
@@ -762,6 +763,8 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
     TransportFatal(config_.node_id, "send_validate",
                    "invalid outgoing KV transport message", &message);
   unsigned spins = 0;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(config_.sync_timeout_sec);
   for (;;) {
     bool enqueued = false;
     try {
@@ -775,6 +778,17 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
                      &message);
     }
     if (enqueued) break;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      const auto snapshot = rings_[message.destination_node].snapshot();
+      std::ostringstream detail;
+      detail << "transport enqueue timeout destination="
+             << message.destination_node << " request_id=" << message.request_id
+             << " head=" << snapshot.head << " tail=" << snapshot.tail
+             << " count=" << snapshot.count
+             << " entries=" << snapshot.entries;
+      TransportFatal(config_.node_id, "ring_enqueue_timeout",
+                     detail.str().c_str(), &message);
+    }
     // Peer demuxers free ring slots. When called from nested Serve (depth>0)
     // we must not ServeDeferred, but top-level Send during Await may briefly
     // help demux by yielding; sleeping avoids tight livelock on full rings.

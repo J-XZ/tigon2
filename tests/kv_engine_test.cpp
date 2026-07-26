@@ -71,6 +71,39 @@ int main() {
   assert(WIFSIGNALED(corrupt_status) && WTERMSIG(corrupt_status) == SIGABRT);
   unlink(corrupt_template);
 
+  char full_template[] = "/tmp/tigonkv-engine-full-XXXXXX";
+  const int full_fd = mkstemp(full_template);
+  assert(full_fd >= 0);
+  close(full_fd);
+  const pid_t full_child = fork();
+  assert(full_child >= 0);
+  if (full_child == 0) {
+    const rlimit no_core{0, 0};
+    (void)setrlimit(RLIMIT_CORE, &no_core);
+    auto full_config = ConfigFor(full_template, 2, 0);
+    full_config.sync_timeout_sec = 1;
+    auto engine = tigonkv::engine::KVEngine::Open(full_config, true);
+    void *root = nullptr;
+    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+        star::CXLMemory::cxl_transport_root_index, &root);
+    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+    tigonkv::engine::KvMessage frame{};
+    while (rings[1].enqueue(
+        reinterpret_cast<char *>(&frame), sizeof(frame))) {
+    }
+    std::string remote_key;
+    for (uint32_t i = 0; i < 1000; ++i) {
+      remote_key = "full-ring-" + std::to_string(i);
+      if (engine->OwnerForKey(remote_key) == 1) break;
+    }
+    (void)engine->Put(remote_key, "value");
+    _exit(91);
+  }
+  int full_status = 0;
+  assert(waitpid(full_child, &full_status, 0) == full_child);
+  assert(WIFSIGNALED(full_status) && WTERMSIG(full_status) == SIGABRT);
+  unlink(full_template);
+
   char path_template[] = "/tmp/tigonkv-engine-XXXXXX";
   const int fd = mkstemp(path_template);
   assert(fd >= 0);

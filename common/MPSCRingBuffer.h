@@ -19,6 +19,12 @@ namespace star
 
 class MPSCRingBuffer {
     public:
+        struct Snapshot {
+                uint64_t head;
+                uint64_t tail;
+                uint64_t count;
+                uint64_t entries;
+        };
         struct Entry {
                 uint32_t remaining_size;
                 uint32_t dequeue_offset;
@@ -65,6 +71,16 @@ class MPSCRingBuffer {
                 cur_tail = tail.load(std::memory_order_acquire);
 
                 return cur_tail - cur_head;
+        }
+
+        Snapshot snapshot()
+        {
+                tigonkv::engine::mem_access::HwccAtomicLoad(&head);
+                tigonkv::engine::mem_access::HwccAtomicLoad(&tail);
+                tigonkv::engine::mem_access::HwccAtomicLoad(&count);
+                return {head.load(std::memory_order_acquire),
+                        tail.load(std::memory_order_acquire),
+                        count.load(std::memory_order_acquire), entry_num};
         }
 
         bool enqueue(char *data, uint64_t data_size)
