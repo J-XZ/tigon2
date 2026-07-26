@@ -100,14 +100,13 @@ DualRegionConfig RegionConfig(const Config &config) {
 }  // namespace
 
 KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> pool,
-                   std::unique_ptr<star::CXL_EBR> ebr,
-                   std::unique_ptr<star::SCCManager> scc)
-    : config_(config), pool_(std::move(pool)), ebr_(std::move(ebr)), scc_(std::move(scc)) {}
+                   star::CXL_EBR *ebr, std::unique_ptr<star::SCCManager> scc)
+    : config_(config), pool_(std::move(pool)), ebr_(ebr), scc_(std::move(scc)) {}
 
 KVEngine::~KVEngine() {
   StopInboundDemuxer();
   if (star::scc_manager == scc_.get()) star::scc_manager = nullptr;
-  if (star::global_ebr_meta == ebr_.get()) star::global_ebr_meta = nullptr;
+  if (star::global_ebr_meta == ebr_) star::global_ebr_meta = nullptr;
   KvMigrationRuntime::Instance().Reset();
 }
 
@@ -117,6 +116,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
       DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
   star::CXLMemory::bind_dual_region_allocator(&pool->allocator(), config.node_id);
   star::MPSCRingBuffer *rings = nullptr;
+  star::CXL_EBR *ebr = nullptr;
   if (reset) {
     rings = static_cast<star::MPSCRingBuffer *>(star::cxl_memory.cxlalloc_malloc_wrapper(
         sizeof(star::MPSCRingBuffer) * config.vm_count,
@@ -129,24 +129,36 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
       new (&rings[node]) star::MPSCRingBuffer(2048, entries);
     star::CXLMemory::commit_shared_data_initialization(
         star::CXLMemory::cxl_transport_root_index, rings);
+
+    // Original Tigon Coordinator::initCXLEBR: place CXL_EBR in CXL (MISC→HWCC),
+    // publish via cxl_global_ebr_meta_root_index for peer attach.
+    ebr = static_cast<star::CXL_EBR *>(star::cxl_memory.cxlalloc_malloc_wrapper(
+        sizeof(star::CXL_EBR), star::CXLMemory::MISC_ALLOCATION));
+    // +1 EBR slot for the inbound demuxer (Tigon IncomingDispatcher analogue).
+    new (ebr) star::CXL_EBR(config.vm_count,
+                            config.foreground_worker_count_per_vm + 1);
+    star::CXLMemory::commit_shared_data_initialization(
+        star::CXLMemory::cxl_global_ebr_meta_root_index, ebr);
   } else {
     void *root = nullptr;
     star::CXLMemory::wait_and_retrieve_cxl_shared_data(
         star::CXLMemory::cxl_transport_root_index, &root);
     rings = static_cast<star::MPSCRingBuffer *>(root);
+    void *ebr_root = nullptr;
+    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+        star::CXLMemory::cxl_global_ebr_meta_root_index, &ebr_root);
+    ebr = static_cast<star::CXL_EBR *>(ebr_root);
   }
-  // +1 EBR slot for the inbound demuxer (Tigon IncomingDispatcher analogue).
-  // This is a transport IO thread — it never serves Put/Get/Scan — so it does
-  // not steal foreground KV work from the cxlkv-comparable CPU budget.
-  auto ebr = std::make_unique<star::CXL_EBR>(config.vm_count,
-                                             config.foreground_worker_count_per_vm + 1,
-                                             &pool->allocator());
+  if (!pool->allocator().IsHwccAddress(ebr))
+    throw std::runtime_error("tigonkv: CXL_EBR must reside in HWCC");
+  // Process-local allocator binding (VA not portable across VMs).
+  star::CXL_EBR::bind_dual_region_allocator(&pool->allocator());
   ebr->thread_init_ebr_meta(config.node_id, 0);
-  star::global_ebr_meta = ebr.get();
+  star::global_ebr_meta = ebr;
   auto scc = std::make_unique<star::TwoPLPashaSCCWriteThrough>();
   star::scc_manager = scc.get();
-  auto engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool),
-                                                        std::move(ebr), std::move(scc)));
+  auto engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool), ebr,
+                                                        std::move(scc)));
   engine->rings_ = rings;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     const auto &directory = engine->pool_->allocator().layout().partitions[partition];
@@ -695,7 +707,7 @@ void KVEngine::StopInboundDemuxer() {
 
 void KVEngine::InboundDemuxerLoop() {
   ebr_->thread_init_ebr_meta(config_.node_id, inbound_demuxer_worker_id_);
-  star::global_ebr_meta = ebr_.get();
+  star::global_ebr_meta = ebr_;
   while (!inbound_demuxer_stop_.load(std::memory_order_acquire)) {
     bool progressed = false;
     try {
@@ -781,7 +793,7 @@ void KVEngine::BindWorker(uint32_t worker_id) {
   if (worker_id >= config_.foreground_worker_count_per_vm)
     throw std::invalid_argument("BindWorker worker_id exceeds foreground_worker_count_per_vm");
   ebr_->thread_init_ebr_meta(config_.node_id, worker_id);
-  star::global_ebr_meta = ebr_.get();
+  star::global_ebr_meta = ebr_;
   TlsForegroundWorkerId = worker_id;
 }
 

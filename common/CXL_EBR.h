@@ -23,8 +23,8 @@ class CXL_EBR {
 
         static constexpr uint64_t max_coordinator_num = 8;
         // The old benchmark-only limit of five workers was smaller than the
-        // configured foreground-worker contract.  This is process-local
-        // metadata, so keep it bounded but sized for the KV experiment.
+        // configured foreground-worker contract.  Per-host local_epoch slots
+        // live in the CXL-resident object; keep the grid sized for KV experiments.
         static constexpr uint64_t max_thread_num = 64;
 
         // try to advance global epoch when we have more than this number of garbage
@@ -66,15 +66,22 @@ class CXL_EBR {
                 std::atomic<uint64_t> local_epoch{ 0 }; // local epoch always <= global epoch
         };
 
+        // Shared epoch state (this object) must live in HWCC via cxlalloc MISC /
+        // kHwccEbr and root index cxl_global_ebr_meta_root_index — matching
+        // original Tigon Coordinator::initCXLEBR.  DualRegionAllocator is
+        // process-local: bind it after create/attach; never store its VA in CXL.
         CXL_EBR(uint64_t coordinator_num, uint64_t thread_num,
                 tigonkv::engine::DualRegionAllocator *regions = nullptr)
                 : coordinator_num(coordinator_num)
                 , thread_num(thread_num)
-                , regions(regions)
         {
                 CHECK(coordinator_num <= max_coordinator_num);
                 CHECK(thread_num <= max_thread_num);
+                if (regions != nullptr) bind_dual_region_allocator(regions);
         }
+
+        static void bind_dual_region_allocator(tigonkv::engine::DualRegionAllocator *regions);
+        static tigonkv::engine::DualRegionAllocator *bound_regions();
 
         void thread_init_ebr_meta(uint64_t coordinator_id, uint64_t thread_id)
         {
@@ -174,6 +181,7 @@ class CXL_EBR {
                                 uint64_t gc_size = 0;
                                 std::vector<retired_object> &retired_object_list_to_reclaim = local_ebr_meta.retired_objects[epoch_to_reclaim % max_epoch];
 
+                                auto *regions = bound_regions();
                                 for (uint64_t i = 0; i < retired_object_list_to_reclaim.size(); i++) {
                                         const retired_object &object = retired_object_list_to_reclaim[i];
                                         CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
@@ -209,6 +217,7 @@ class CXL_EBR {
         uint64_t drain_quiescent()
         {
                 EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
+                auto *regions = bound_regions();
                 uint64_t reclaimed = 0;
                 for (uint64_t epoch = 0; epoch < max_epoch; ++epoch) {
                         auto &objects = local_ebr_meta.retired_objects[epoch];
@@ -264,14 +273,13 @@ class CXL_EBR {
                 case CXLMemory::TRANSPORT_FREE:
                         return tigonkv::engine::AllocationDomain::kTransport;
                 case CXLMemory::MISC_FREE:
-                        return tigonkv::engine::AllocationDomain::kHwccLayout;
+                        return tigonkv::engine::AllocationDomain::kHwccEbr;
                 default:
                         LOG(FATAL) << "tigonkv: unknown EBR allocation category " << category;
                 }
         }
 
-        tigonkv::engine::DualRegionAllocator *regions{ nullptr };
-
+        // CXL-resident shared state only (no process VAs).
         std::atomic<uint64_t> global_epoch{ 0 };
 
         EBRMetaCXL cxl_ebr_meta_vec[max_coordinator_num][max_thread_num];

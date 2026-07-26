@@ -64,8 +64,7 @@ class KVEngine {
 
  private:
   KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> pool,
-           std::unique_ptr<star::CXL_EBR> ebr,
-           std::unique_ptr<star::SCCManager> scc);
+           star::CXL_EBR *ebr, std::unique_ptr<star::SCCManager> scc);
   KVPartition *OwnedPartition(std::string_view key) const;
   KVPartition *VisiblePartition(std::string_view key) const;
   uint32_t OwnerForPartition(uint32_t partition) const;
@@ -90,7 +89,8 @@ class KVEngine {
 
   Config config_;
   std::unique_ptr<DualRegionMappedPool> pool_;
-  std::unique_ptr<star::CXL_EBR> ebr_;
+  // CXL-resident shared EBR (HWCC); not owned / not deleted — pool lifetime.
+  star::CXL_EBR *ebr_ = nullptr;
   std::unique_ptr<star::SCCManager> scc_;
   std::vector<std::unique_ptr<KVPartition>> partitions_;
   star::MPSCRingBuffer *rings_ = nullptr;

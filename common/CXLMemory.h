@@ -280,7 +280,10 @@ class CXLMemory {
                 case METADATA_ALLOCATION: return tigonkv::engine::AllocationDomain::kHwccMetadata;
                 case DATA_ALLOCATION: return tigonkv::engine::AllocationDomain::kSharedPayloadSwcc;
                 case TRANSPORT_ALLOCATION: return tigonkv::engine::AllocationDomain::kTransport;
-                case MISC_ALLOCATION: return tigonkv::engine::AllocationDomain::kHwccLayout;
+                // Original Tigon places CXL_EBR (and other misc HWCC meta) via
+                // MISC_ALLOCATION into the coherent CXL heap.  Map to kHwccEbr
+                // so dual-region accounting matches PLAN's EBR domain.
+                case MISC_ALLOCATION: return tigonkv::engine::AllocationDomain::kHwccEbr;
                 default: throw std::invalid_argument("invalid CXL allocation category");
                 }
         }
