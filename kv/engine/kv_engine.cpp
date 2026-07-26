@@ -615,8 +615,12 @@ CasResult KVEngine::CompareExchange(std::string_view key,
                          : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
               exchanged};
     }
-    if (migrated.code == StatusCode::kNotFound)
-      return {Status::Error(StatusCode::kNotFound, "key not found"), false};
+    // A remote CAS with empty expected is allowed to create, like the local
+    // path. DATA_MIGRATION returns NotFound for that case, so owner CAS remains
+    // the authority instead of turning creation into a false miss.
+    if (!migrated.ok() && migrated.code != StatusCode::kNotFound &&
+        migrated.code != StatusCode::kOutOfMemory)
+      return {migrated, false};
     return ForwardCompareExchange(key, expected, desired);
   }
   try {
@@ -1174,9 +1178,27 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     MarkLayoutDirty();
   if (partition == nullptr) {
     throw std::runtime_error("request routed to a non-owner node");
-  } else if (message.type == KvMessageType::kPut) {
+  }
+  bool check_migration_budget = false;
+  auto promote_updated_row = [&] {
+    bool moved_in = false;
+    const StatusCode migrated =
+        partition->EnsureInShared(key, config_.node_id, &moved_in);
+    if (migrated == StatusCode::kNotFound)
+      throw std::runtime_error(
+          "updated owner row disappeared before move-in");
+    if (migrated == StatusCode::kOk) {
+      check_migration_budget = true;
+      if (moved_in) {
+        migration_in_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  };
+  if (message.type == KvMessageType::kPut) {
     try {
-      partition->PutPrivate(key, value);
+      const bool inserted = partition->PutPrivate(key, value);
+      if (!inserted) promote_updated_row();
       response.status = static_cast<uint32_t>(StatusCode::kOk);
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
@@ -1233,9 +1255,11 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     } else {
       try {
         int64_t result = 0;
-        if (!partition->IncrementPrivate(key, delta, &result)) {
+        bool inserted = false;
+        if (!partition->IncrementPrivate(key, delta, &result, &inserted)) {
           response.status = static_cast<uint32_t>(StatusCode::kNotFound);
         } else {
+          if (!inserted) promote_updated_row();
           const std::string encoded = std::to_string(result);
           response.status = static_cast<uint32_t>(StatusCode::kOk);
           response.value_size = static_cast<uint32_t>(encoded.size());
@@ -1247,7 +1271,11 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     }
   } else if (message.type == KvMessageType::kCasPrepare) {
     std::lock_guard<std::mutex> lock(pending_cas_mutex_);
-    pending_cas_[message.request_id] = {message.source_node, std::string(key), std::string(value)};
+    if (!pending_cas_.emplace(
+            message.request_id,
+            PendingCas{message.source_node, std::string(key),
+                       std::string(value)}).second)
+      throw std::runtime_error("duplicate CAS prepare request id");
     response.status = static_cast<uint32_t>(StatusCode::kOk);
   } else if (message.type == KvMessageType::kCasCommit) {
     PendingCas pending;
@@ -1266,11 +1294,15 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     } else {
       try {
         bool exchanged = false;
-        if (!partition->CompareExchangePrivate(key, pending.expected, value, &exchanged))
+        bool inserted = false;
+        if (!partition->CompareExchangePrivate(
+                key, pending.expected, value, &exchanged, &inserted))
           response.status = static_cast<uint32_t>(StatusCode::kNotFound);
-        else
+        else {
+          if (!inserted) promote_updated_row();
           response.status = static_cast<uint32_t>(exchanged ? StatusCode::kOk
                                                             : StatusCode::kCompareFailed);
+        }
       } catch (const std::invalid_argument &) {
         response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
       }
@@ -1279,6 +1311,7 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     throw std::runtime_error("unsupported request message type");
   }
   SendTransportMessage(response);
+  if (check_migration_budget) EnforceMigrationBudget(*partition);
 }
 
 void KVEngine::EnforceMigrationBudget(KVPartition &partition) {

@@ -362,12 +362,14 @@ bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
 bool KVPartition::CompareExchangePrivate(std::string_view key,
                                          std::string_view expected,
                                          std::string_view desired,
-                                         bool *exchanged) {
+                                         bool *exchanged,
+                                         bool *inserted) {
   EnterEbr();
   if (exchanged == nullptr) throw std::invalid_argument("null CAS result");
   if (desired.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("CAS desired value exceeds fixed value size");
   *exchanged = false;
+  if (inserted != nullptr) *inserted = false;
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
   if (!private_tree_->lookup(fixed_key, row_offset)) {
@@ -377,6 +379,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
       throw std::runtime_error("private tree CAS insert race without owner serialization");
     PersistRoots();
     *exchanged = true;
+    if (inserted != nullptr) *inserted = true;
     return true;
   }
   auto *row = RowFromOffset(row_offset);
@@ -428,9 +431,10 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
 }
 
 bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
-                                   int64_t *value) {
+                                   int64_t *value, bool *inserted) {
   EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null increment result");
+  if (inserted != nullptr) *inserted = false;
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
   if (!private_tree_->lookup(fixed_key, row_offset)) {
@@ -440,6 +444,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
       throw std::runtime_error("private tree increment insert race without owner serialization");
     PersistRoots();
     *value = delta;
+    if (inserted != nullptr) *inserted = true;
     return true;
   }
   auto *row = RowFromOffset(row_offset);

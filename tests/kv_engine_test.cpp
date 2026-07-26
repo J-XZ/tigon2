@@ -287,8 +287,10 @@ int main() {
         if (limited_scan.items[i - 1].key >= limited_scan.items[i].key) _exit(13);
       }
       if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(3);
+      const uint64_t tx_after_remote_update = node_one->NetworkTxBytes();
       const auto read = node_one->Get(owner_zero_key);
       if (!read.status.ok() || read.value != "forwarded") _exit(4);
+      if (node_one->NetworkTxBytes() != tx_after_remote_update) _exit(24);
       const uint64_t tx_after_promotion = node_one->NetworkTxBytes();
       const auto shared_read = node_one->Get(owner_zero_key);
       if (!shared_read.status.ok() || shared_read.value != "forwarded") _exit(19);
@@ -307,12 +309,50 @@ int main() {
         if (node_one->OwnerForKey(candidate) == 0) { counter_key = candidate; break; }
       }
       if (counter_key.empty() || !node_one->Put(counter_key, "1").ok()) _exit(7);
-      const auto promoted_counter = node_one->Get(counter_key);
-      if (!promoted_counter.status.ok() || promoted_counter.value != "1") _exit(22);
-      const uint64_t tx_after_counter_promotion = node_one->NetworkTxBytes();
       const auto increment = node_one->Increment(counter_key, 2);
       if (!increment.status.ok() || increment.value != 3) _exit(8);
-      if (node_one->NetworkTxBytes() != tx_after_counter_promotion) _exit(23);
+      const uint64_t tx_after_remote_increment = node_one->NetworkTxBytes();
+      const auto promoted_counter = node_one->Get(counter_key);
+      if (!promoted_counter.status.ok() || promoted_counter.value != "3") _exit(22);
+      if (node_one->NetworkTxBytes() != tx_after_remote_increment) _exit(23);
+      std::string cas_create_key;
+      for (uint32_t i = 0; i < 100; ++i) {
+        const std::string candidate = "cross-cas-create-" + std::to_string(i);
+        if (node_one->OwnerForKey(candidate) == 0) {
+          cas_create_key = candidate;
+          break;
+        }
+      }
+      const auto cas_create =
+          node_one->CompareExchange(cas_create_key, "", "created");
+      if (!cas_create.status.ok() || !cas_create.exchanged) _exit(25);
+      const auto created = node_one->Get(cas_create_key);
+      if (!created.status.ok() || created.value != "created") _exit(26);
+      std::string cas_race_key;
+      for (uint32_t i = 0; i < 100; ++i) {
+        const std::string candidate = "cross-cas-race-" + std::to_string(i);
+        if (node_one->OwnerForKey(candidate) == 0) {
+          cas_race_key = candidate;
+          break;
+        }
+      }
+      std::atomic<uint32_t> cas_winners{0};
+      std::atomic<bool> cas_protocol_failed{false};
+      std::vector<std::thread> cas_threads;
+      for (uint32_t worker = 0; worker < 4; ++worker) {
+        cas_threads.emplace_back([&, worker] {
+          node_one->BindWorker(worker);
+          const auto result =
+              node_one->CompareExchange(cas_race_key, "", "winner");
+          if (result.status.ok() && result.exchanged)
+            cas_winners.fetch_add(1, std::memory_order_relaxed);
+          else if (result.status.code != tigonkv::StatusCode::kCompareFailed)
+            cas_protocol_failed.store(true, std::memory_order_relaxed);
+          node_one->ReleaseWorker();
+        });
+      }
+      for (auto &thread : cas_threads) thread.join();
+      if (cas_winners.load() != 1 || cas_protocol_failed.load()) _exit(27);
       if (!node_one->Delete(owner_zero_key).ok()) _exit(9);
       if (node_one->Get(owner_zero_key).status.code != tigonkv::StatusCode::kNotFound) _exit(10);
       _exit(0);
