@@ -843,8 +843,10 @@ Status KVEngine::AwaitResponse(
         RemovePendingResponse(request_id);
         return Status::Error(StatusCode::kCorruption, "forwarded owner response timed out");
       }
-      pending->cv.wait_until(lock, std::min(deadline, now + std::chrono::microseconds(100)),
-                             [&] { return pending->done; });
+      // Demux notifies this CV both for the matching response and when an
+      // inbound request needs cooperative service. Holding pending->mutex
+      // across the check and wait prevents a lost wakeup.
+      pending->cv.wait_until(lock, deadline);
       continue;
     }
     KvMessage response = pending->message;
@@ -1039,8 +1041,27 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
   // Request path: demuxer → shared deferred FIFO (IncomingDispatcher style).
   // Any FG PollTransport may serve — required so Forward/Await cannot pin
   // requests on a non-progressing worker shard.
-  std::lock_guard<std::mutex> lock(deferred_request_mutex_);
-  deferred_transport_requests_.push_back(message);
+  {
+    std::lock_guard<std::mutex> lock(deferred_request_mutex_);
+    deferred_transport_requests_.push_back(message);
+  }
+  WakePendingForwarders();
+}
+
+void KVEngine::WakePendingForwarders() {
+  std::vector<std::shared_ptr<PendingResponse>> pending;
+  {
+    std::lock_guard<std::mutex> lock(pending_response_mutex_);
+    pending.reserve(pending_responses_.size());
+    for (const auto &entry : pending_responses_)
+      pending.push_back(entry.second);
+  }
+  for (const auto &entry : pending) {
+    // Synchronize with AwaitResponse's check-then-wait interval. notify_one
+    // alone is not sufficient if it races just before wait releases the lock.
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    entry->cv.notify_one();
+  }
 }
 
 void KVEngine::ServeDeferredRequests() {

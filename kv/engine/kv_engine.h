@@ -94,6 +94,7 @@ class KVEngine {
   Status AwaitScan(uint64_t request_id, std::vector<ScanItem> *items);
   // Demuxer path: apply responses / queue requests. Never sends.
   void DemuxTransportMessage(const KvMessage &message);
+  void WakePendingForwarders();
   // Foreground path: serve a queued request (may Send).
   void ServeTransportRequest(const KvMessage &message);
   void ServeDeferredRequests();
