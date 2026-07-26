@@ -18,8 +18,6 @@
 #include <random>
 #include <type_traits> // std::{enable_if,is_trivial}
 
-#include "common/btree_olc_cxl/EBR_CXL.h"
-
 #include "common/CXLMemory.h"
 #include "common/CXL_EBR.h"
 
@@ -660,24 +658,6 @@ class BPlusTree {
 		void setCount(uint16_t count)
 		{
 			meta_.count_ = count;
-		}
-	};
-
-	/**
-	 * We use `new[]` to allocate a block of memory, then use `placement new` to
-	 * construct `BTreeLeaf/BTreeInner`. So when want to free the memory occupied
-	 * by `BTreeLeaf/BTreeInner`, should use `delete[]`.
-	 */
-	struct Deallocator {
-		void operator()(void *n) const
-		{
-			assert(((uint64_t)n) != 0xffffffffffffffffull);
-			/*
-			 * `n` maybe `NodeType *` or `char *`. If it's `NodeType *`, NO need to
-			 * call its dtor manually beause there are no valid keys in that page.
-			 */
-			memset(n, 0xff, LeafPageSize);
-			// delete[] reinterpret_cast<char *>(n);  // free memory
 		}
 	};
 
@@ -1780,8 +1760,6 @@ class BPlusTree {
 	 */
 	bool insert(const KeyType &k, const ValueType &v)
 	{
-		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
 restart:
 		// need yield CPU when come here at second time
@@ -1946,8 +1924,6 @@ restart:
 	 */
 	ValueType insert(const KeyType &k, const ValueType &v, bool *result)
 	{
-		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
 restart:
 		// need yield CPU when come here at second time
@@ -2119,8 +2095,6 @@ restart:
 	 */
 	ValueType getValue(const KeyType &k, std::function<ValueType(void)> createValue)
 	{
-		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
 restart:
 		// need yield CPU when come here at second time
@@ -2324,8 +2298,6 @@ restart:
 	 */
 	void scan(const KeyType &lowKey, const KeyType &highKey, bool leftExist, bool rightExist, uint32_t limit, std::vector<KeyValuePair> &res)
 	{
-		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
 restart:
 		res.clear();
@@ -2424,8 +2396,6 @@ restart:
 	void scanForUpdate(const KeyType &startKey, std::function<bool(const KeyType &, ValueType &, bool)> processor)
 	{
 		bool leftExist = true;
-		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
 		int leavesTraversed = 0;
 		KeyType lowKey = startKey;
@@ -2621,7 +2591,6 @@ restart:
 					}
 				}
 				// release the read lock of left sibling
-				// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical();
 			}
 
 			if (rightSibling) {
@@ -2635,7 +2604,6 @@ restart:
 						return rightSibling;
 					}
 				}
-				// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical();
 			}
 			return nullptr;
 		};
@@ -2849,16 +2817,6 @@ restart:
 		return stats_.num_items / (maximumItems * 1.0);
 	}
 
-	void EBREnter()
-	{
-		EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-	}
-
-	void EBRExit()
-	{
-		EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical();
-	}
-
     private:
 	NodeBase *load_root() const
 	{
@@ -2961,8 +2919,6 @@ restart:
 	btreeolc_cxl::RemoveResult _remove_with_value_predicate(const KeyValuePair &element,
 							    std::function<btreeolc_cxl::RemovePredicateResult(const ValueType &)> predicate)
 	{
-		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
 		btreeolc_cxl::RemoveResult saved_result = btreeolc_cxl::RemoveResult::VALUE_NOT_SATISFYING_PREDICATE;
 		bool result_saved = false;
@@ -3119,8 +3075,6 @@ restart:
 	 */
 	bool _remove(const KeyType &deleteKey)
 	{
-		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
 		bool saved_success = false;
 		bool result_saved = false;
@@ -3261,8 +3215,6 @@ restart:
 
 	bool _lookupForUpdate(const KeyType &key, std::function<void(const KeyType &key, ValueType &value)> update_processor)
 	{
-		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
 restart:
 		if (restartCount++)
@@ -3340,8 +3292,6 @@ restart:
 	 */
 	bool _lookup(const KeyValuePair &element, ValueType &result, bool flag)
 	{
-		// EBR<UpdateThreshold, Deallocator>::getLocalThreadData().enterCritical();
-		// btreeolc_cxl::DeferCode c([]() { EBR<UpdateThreshold, Deallocator>::getLocalThreadData().leaveCritical(); });
 		int restartCount = 0;
 restart:
 		if (restartCount++)

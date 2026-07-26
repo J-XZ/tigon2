@@ -91,14 +91,12 @@ class KVEngine {
   ScanResult ScanOwnedPartitions(std::string_view start_key, uint64_t limit);
   ScanResult ScanSharedPartitions(uint32_t owner, std::string_view start_key,
                                   uint64_t limit);
-  Status AwaitScan(uint64_t request_id, std::vector<ScanItem> *items);
   // Demuxer path: apply responses / queue requests. Never sends.
   void DemuxTransportMessage(const KvMessage &message);
   void WakePendingForwarders();
   // Foreground path: serve a queued request (may Send).
   void ServeTransportRequest(const KvMessage &message);
   void ServeDeferredRequests();
-  void ServeScanRequest(const KvMessage &message);
   void SendTransportMessage(const KvMessage &message);
   void EnforceMigrationBudget(KVPartition &partition);
   void MarkLayoutDirty();
@@ -128,15 +126,6 @@ class KVEngine {
   std::mutex pending_response_mutex_;
   std::unordered_map<uint64_t, std::shared_ptr<PendingResponse>>
       pending_responses_;
-  struct PendingScan {
-    std::mutex mutex;
-    std::condition_variable cv;
-    StatusCode status = StatusCode::kOk;
-    bool done = false;
-    std::vector<ScanItem> items;
-  };
-  std::mutex pending_scan_mutex_;
-  std::unordered_map<uint64_t, std::shared_ptr<PendingScan>> pending_scans_;
   // Demuxer enqueues requests here; FG PollTransport / Await drains them.
   // Nested serve (TlsRequestServeDepth != 0) must not pop/serve — OLC safety.
   // Single shared unbounded queue: demuxer never blocks on enqueue, and any
@@ -144,11 +133,6 @@ class KVEngine {
   // under YCSB). Affinity is by cooperative steal-from-front FIFO.
   std::mutex deferred_request_mutex_;
   std::deque<KvMessage> deferred_transport_requests_;
-  // Soft cap on concurrent remote Scan send+await slots (ring backpressure).
-  static constexpr uint32_t kMaxInflightScanRpcs = 8;
-  std::mutex scan_rpc_mutex_;
-  std::condition_variable scan_rpc_cv_;
-  uint32_t inflight_scan_rpcs_ = 0;
   struct PendingCas {
     uint32_t source_node = 0;
     std::string key;

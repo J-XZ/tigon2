@@ -30,9 +30,9 @@ TigonKV 不使用 `dependencies/cxlalloc/libcxlalloc_static.a` 作为最终共�
 | 可见性 | SWCC 链发布在 flush/fence 后对远端可见 |
 | 有界性 | 每线程 size-class TLS cache（容量 32，miss 时批量 refill）有固定上限；进程 DRAM 不随 KV 数线性增长 |
 
-`region_allocator_test` 与 allocator 能力测试覆盖 attach、域记账、remote free、
-reuse、并发及跨域拒绝；最近一次 RelWithDebInfo 全量 CTest 为 27/27 通过。真实多
-VM/NUMA 实机验收仍待获得运行授权。
+`region_allocator_test` 覆盖 attach、域记账、remote free、reuse、并发及跨域
+拒绝；这些场景由同一测试程序一次执行，不再用多个别名重复计入测试数量。真实
+多 VM/NUMA 实机验收仍待获得运行授权。
 
 固定会计不与动态 block 重复：HWCC allocator header 归
 `kHwccAllocatorMetadata`；SWCC allocator header 加实际 arena header 总和归

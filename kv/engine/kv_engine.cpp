@@ -57,8 +57,8 @@ uint64_t CurrentRssKb() {
 }
 
 // While serving a request (or walking owned trees for a local Scan), nested
-// PollTransport must not pop/serve deferred requests.  Handling Put/Get or
-// another ScanRequest here mutates the same B+trees under OLC and livelocks
+// PollTransport must not pop/serve deferred requests. Handling another
+// Put/Get request here mutates the same B+trees under OLC and livelocks
 // scan() restart loops (GDB: yield counts > 10M on YCSB-E 4x4).
 // Response/item/done traffic is applied by the inbound demuxer thread, so
 // nested FG polls only need to skip ServeDeferred.
@@ -91,9 +91,19 @@ struct RequestServeDepthGuard {
 }
 
 bool ValidMessageType(KvMessageType type) {
-  const uint8_t raw = static_cast<uint8_t>(type);
-  return raw >= static_cast<uint8_t>(KvMessageType::kPut) &&
-         raw <= static_cast<uint8_t>(KvMessageType::kScanMigrate);
+  switch (type) {
+    case KvMessageType::kPut:
+    case KvMessageType::kGet:
+    case KvMessageType::kDelete:
+    case KvMessageType::kIncrement:
+    case KvMessageType::kCasPrepare:
+    case KvMessageType::kCasCommit:
+    case KvMessageType::kResponse:
+    case KvMessageType::kMigrate:
+    case KvMessageType::kScanMigrate:
+      return true;
+  }
+  return false;
 }
 
 bool ValidStatusCode(uint32_t status) {
@@ -883,41 +893,6 @@ Status KVEngine::AwaitResponse(
   }
 }
 
-Status KVEngine::AwaitScan(uint64_t request_id, std::vector<ScanItem> *items) {
-  std::shared_ptr<PendingScan> pending;
-  {
-    std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-    auto it = pending_scans_.find(request_id);
-    if (it == pending_scans_.end())
-      return Status::Error(StatusCode::kCorruption, "missing forwarded scan state");
-    pending = it->second;
-  }
-  const auto deadline = std::chrono::steady_clock::now() +
-      std::chrono::seconds(config_.sync_timeout_sec);
-  for (;;) {
-    PollTransport();
-    std::unique_lock<std::mutex> lock(pending->mutex);
-    if (pending->done) {
-      const Status status{pending->status,
-          pending->status == StatusCode::kOk ? "" : "forwarded owner scan failed"};
-      if (status.ok() && items != nullptr) *items = std::move(pending->items);
-      lock.unlock();
-      std::lock_guard<std::mutex> map_lock(pending_scan_mutex_);
-      pending_scans_.erase(request_id);
-      return status;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      lock.unlock();
-      std::lock_guard<std::mutex> map_lock(pending_scan_mutex_);
-      pending_scans_.erase(request_id);
-      return Status::Error(StatusCode::kCorruption, "forwarded owner scan timed out");
-    }
-    pending->cv.wait_until(lock, std::min(deadline, now + std::chrono::microseconds(100)),
-                           [&] { return pending->done; });
-  }
-}
-
 CasResult KVEngine::ForwardCompareExchange(std::string_view key,
                                            std::string_view expected,
                                            std::string_view desired) {
@@ -1029,33 +1004,6 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
     pending->cv.notify_one();
     return;
   }
-  if (message.type == KvMessageType::kScanItem || message.type == KvMessageType::kScanDone) {
-    std::shared_ptr<PendingScan> pending;
-    {
-      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      auto it = pending_scans_.find(message.request_id);
-      if (it == pending_scans_.end())
-        throw std::runtime_error("scan response has no pending request");
-      pending = it->second;
-    }
-    bool done = false;
-    {
-      std::lock_guard<std::mutex> lock(pending->mutex);
-      if (pending->done)
-        throw std::runtime_error("scan traffic arrived after ScanDone");
-      if (message.type == KvMessageType::kScanItem) {
-        pending->items.push_back(
-            {std::string(message.key.data(), message.key_size),
-             std::string(message.value.data(), message.value_size)});
-      } else {
-        pending->status = static_cast<StatusCode>(message.status);
-        pending->done = true;
-        done = true;
-      }
-    }
-    if (done) pending->cv.notify_one();
-    return;
-  }
   // Request path: demuxer → shared deferred FIFO (IncomingDispatcher style).
   // Any FG PollTransport may serve — required so Forward/Await cannot pin
   // requests on a non-progressing worker shard.
@@ -1147,49 +1095,15 @@ void KVEngine::ReleaseWorker() {
   *owner = std::thread::id{};
 }
 
-void KVEngine::ServeScanRequest(const KvMessage &message) {
-  const std::string_view key(message.key.data(), message.key_size);
-  const std::string_view value(message.value.data(), message.value_size);
-  uint64_t limit = 0;
-  Status status = Status::Ok();
-  std::vector<ScanItem> items;
-  if (!DecodeU64(value, &limit)) {
-    status = Status::Error(StatusCode::kInvalidArgument, "invalid scan limit payload");
-  } else {
-    const auto scan = ScanOwnedPartitions(key, limit);
-    status = scan.status;
-    items = scan.items;
-  }
-  if (status.ok()) {
-    for (size_t i = 0; i < items.size(); ++i) {
-      SendTransportMessage(MakeRequest(KvMessageType::kScanItem, config_.node_id,
-                                       message.source_node, message.request_id,
-                                       items[i].key, items[i].value));
-      // Cooperative deferred serve (not MPSC recv) between ScanItem bursts.
-      if ((i + 1) % 8 == 0) PollTransport();
-    }
-  }
-  KvMessage done = MakeRequest(KvMessageType::kScanDone, config_.node_id,
-                               message.source_node, message.request_id, {});
-  done.status = static_cast<uint32_t>(status.code);
-  SendTransportMessage(done);
-}
-
 void KVEngine::ServeTransportRequest(const KvMessage &message) {
   if (message.destination_node != config_.node_id ||
       message.key_size > message.key.size() || message.value_size > message.value.size())
     throw std::runtime_error("invalid KV transport message");
   // Responses must never reach the serve path (demuxer applies them).
-  if (message.type == KvMessageType::kResponse ||
-      message.type == KvMessageType::kScanItem ||
-      message.type == KvMessageType::kScanDone)
+  if (message.type == KvMessageType::kResponse)
     throw std::runtime_error("response traffic must not enter ServeTransportRequest");
 
   RequestServeDepthGuard depth_guard;
-  if (message.type == KvMessageType::kScanRequest) {
-    ServeScanRequest(message);
-    return;
-  }
   const std::string_view key(message.key.data(), message.key_size);
   const std::string_view value(message.value.data(), message.value_size);
   KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,

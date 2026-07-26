@@ -268,7 +268,7 @@ int main() {
           _exit(16);
       }
       // One range-migrate request plus one cursor range-migrate request. Values
-      // travel through CXL, so no ScanItem frames are sent by this requester.
+      // travel through CXL, so the requester sends only range-migration frames.
       if (authoritative_scan_tx != 2 * sizeof(tigonkv::engine::KvMessage)) _exit(17);
 
       std::atomic<bool> start_concurrent_scans{false};
