@@ -358,7 +358,10 @@ int main() {
       if (!config_file) Fail("cannot open trace config: " + trace_config);
     }
     const std::string policy_config = Env("TIGONKV_POLICY_CONFIG_JSON", "CXLKV_POLICY_CONFIG_JSON");
-    (void)policy_config;
+    if (!policy_config.empty())
+      Fail("TIGONKV_POLICY_CONFIG_JSON/CXLKV_POLICY_CONFIG_JSON is unsupported; "
+           "put the complete latency policy in "
+           "tigon_kv.latency_inject inside TIGONKV_EXPERIMENT_CONFIG_JSONC");
     const bool reset = Env("TIGONKV_E2E_RESET", "CXLKV_E2E_RESET", "0") == "1";
     phase = Env("TIGONKV_E2E_TRACE_PHASE", "CXLKV_E2E_TRACE_PHASE", "run");
     const uint32_t batch_ops = static_cast<uint32_t>(ParseUnsigned(

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <regex>
+#include <string_view>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -130,6 +132,450 @@ bool ExtractObjectBody(const std::string &s, const char *object, std::string *bo
   return false;
 }
 
+enum class JsonValueKind { kObject, kArray, kString, kNumber, kBool, kNull };
+
+struct JsonMemberSpan {
+  std::string key;
+  size_t value_begin = 0;
+  size_t value_end = 0;
+  JsonValueKind kind = JsonValueKind::kNull;
+};
+
+void SkipJsonWhitespace(std::string_view text, size_t *position) {
+  while (*position < text.size() &&
+         (text[*position] == ' ' || text[*position] == '\t' ||
+          text[*position] == '\n' || text[*position] == '\r')) {
+    ++*position;
+  }
+}
+
+[[noreturn]] void JsonStructureError(std::string_view detail) {
+  throw std::invalid_argument("invalid experiment_config JSON: " +
+                              std::string(detail));
+}
+
+std::string ParseJsonKey(std::string_view text, size_t *position) {
+  if (*position >= text.size() || text[*position] != '"')
+    JsonStructureError("object key must be a string");
+  const size_t begin = ++*position;
+  while (*position < text.size() && text[*position] != '"') {
+    // Configuration keys are ASCII identifiers. Rejecting escaped keys avoids
+    // two spellings of the same schema field and keeps duplicate checks exact.
+    if (text[*position] == '\\')
+      JsonStructureError("escaped object keys are not supported");
+    if (static_cast<unsigned char>(text[*position]) < 0x20)
+      JsonStructureError("control character in object key");
+    ++*position;
+  }
+  if (*position >= text.size()) JsonStructureError("unterminated object key");
+  std::string key(text.substr(begin, *position - begin));
+  ++*position;
+  return key;
+}
+
+size_t SkipJsonString(std::string_view text, size_t position) {
+  if (position >= text.size() || text[position] != '"')
+    JsonStructureError("expected string");
+  ++position;
+  while (position < text.size()) {
+    const char c = text[position++];
+    if (c == '"') return position;
+    if (c == '\\') {
+      if (position >= text.size()) JsonStructureError("unterminated string escape");
+      const char escaped = text[position++];
+      if (escaped == 'u') {
+        for (int digit = 0; digit < 4; ++digit) {
+          if (position >= text.size() ||
+              !std::isxdigit(static_cast<unsigned char>(text[position++])))
+            JsonStructureError("invalid unicode escape");
+        }
+      } else if (escaped != '"' && escaped != '\\' && escaped != '/' &&
+                 escaped != 'b' && escaped != 'f' && escaped != 'n' &&
+                 escaped != 'r' && escaped != 't') {
+        JsonStructureError("invalid string escape");
+      }
+    } else if (static_cast<unsigned char>(c) < 0x20) {
+      JsonStructureError("control character in string");
+    }
+  }
+  JsonStructureError("unterminated string");
+}
+
+size_t SkipJsonValue(std::string_view text, size_t position, JsonValueKind *kind);
+
+size_t SkipJsonObject(std::string_view text, size_t position) {
+  if (position >= text.size() || text[position] != '{')
+    JsonStructureError("expected object");
+  ++position;
+  SkipJsonWhitespace(text, &position);
+  if (position < text.size() && text[position] == '}') return position + 1;
+  for (;;) {
+    (void)ParseJsonKey(text, &position);
+    SkipJsonWhitespace(text, &position);
+    if (position >= text.size() || text[position++] != ':')
+      JsonStructureError("missing ':' after object key");
+    SkipJsonWhitespace(text, &position);
+    JsonValueKind nested_kind{};
+    position = SkipJsonValue(text, position, &nested_kind);
+    SkipJsonWhitespace(text, &position);
+    if (position >= text.size()) JsonStructureError("unterminated object");
+    if (text[position] == '}') return position + 1;
+    if (text[position++] != ',') JsonStructureError("expected ',' in object");
+    SkipJsonWhitespace(text, &position);
+    if (position < text.size() && text[position] == '}')
+      JsonStructureError("trailing comma in object");
+  }
+}
+
+size_t SkipJsonArray(std::string_view text, size_t position) {
+  if (position >= text.size() || text[position] != '[')
+    JsonStructureError("expected array");
+  ++position;
+  SkipJsonWhitespace(text, &position);
+  if (position < text.size() && text[position] == ']') return position + 1;
+  for (;;) {
+    JsonValueKind nested_kind{};
+    position = SkipJsonValue(text, position, &nested_kind);
+    SkipJsonWhitespace(text, &position);
+    if (position >= text.size()) JsonStructureError("unterminated array");
+    if (text[position] == ']') return position + 1;
+    if (text[position++] != ',') JsonStructureError("expected ',' in array");
+    SkipJsonWhitespace(text, &position);
+    if (position < text.size() && text[position] == ']')
+      JsonStructureError("trailing comma in array");
+  }
+}
+
+size_t SkipJsonNumber(std::string_view text, size_t position) {
+  const size_t begin = position;
+  if (position < text.size() && text[position] == '-') ++position;
+  if (position >= text.size()) JsonStructureError("incomplete number");
+  if (text[position] == '0') {
+    ++position;
+  } else {
+    if (text[position] < '1' || text[position] > '9')
+      JsonStructureError("invalid number");
+    while (position < text.size() && std::isdigit(
+               static_cast<unsigned char>(text[position])))
+      ++position;
+  }
+  if (position < text.size() && text[position] == '.') {
+    ++position;
+    const size_t fractional = position;
+    while (position < text.size() && std::isdigit(
+               static_cast<unsigned char>(text[position])))
+      ++position;
+    if (position == fractional) JsonStructureError("invalid fractional number");
+  }
+  if (position < text.size() &&
+      (text[position] == 'e' || text[position] == 'E')) {
+    ++position;
+    if (position < text.size() &&
+        (text[position] == '+' || text[position] == '-'))
+      ++position;
+    const size_t exponent = position;
+    while (position < text.size() && std::isdigit(
+               static_cast<unsigned char>(text[position])))
+      ++position;
+    if (position == exponent) JsonStructureError("invalid number exponent");
+  }
+  if (position == begin) JsonStructureError("invalid number");
+  return position;
+}
+
+size_t SkipJsonValue(std::string_view text, size_t position, JsonValueKind *kind) {
+  SkipJsonWhitespace(text, &position);
+  if (position >= text.size()) JsonStructureError("missing value");
+  if (text[position] == '{') {
+    *kind = JsonValueKind::kObject;
+    return SkipJsonObject(text, position);
+  }
+  if (text[position] == '[') {
+    *kind = JsonValueKind::kArray;
+    return SkipJsonArray(text, position);
+  }
+  if (text[position] == '"') {
+    *kind = JsonValueKind::kString;
+    return SkipJsonString(text, position);
+  }
+  for (const auto &[literal, literal_kind] :
+       {std::pair<std::string_view, JsonValueKind>{"true", JsonValueKind::kBool},
+        {"false", JsonValueKind::kBool},
+        {"null", JsonValueKind::kNull}}) {
+    if (text.substr(position, literal.size()) == literal) {
+      *kind = literal_kind;
+      return position + literal.size();
+    }
+  }
+  *kind = JsonValueKind::kNumber;
+  return SkipJsonNumber(text, position);
+}
+
+std::vector<JsonMemberSpan> ParseJsonObjectMembers(
+    std::string_view text, size_t object_begin, size_t *object_end = nullptr) {
+  if (object_begin >= text.size() || text[object_begin] != '{')
+    JsonStructureError("expected object");
+  size_t position = object_begin + 1;
+  std::vector<JsonMemberSpan> members;
+  SkipJsonWhitespace(text, &position);
+  if (position < text.size() && text[position] == '}') {
+    if (object_end != nullptr) *object_end = position + 1;
+    return members;
+  }
+  for (;;) {
+    JsonMemberSpan member;
+    member.key = ParseJsonKey(text, &position);
+    SkipJsonWhitespace(text, &position);
+    if (position >= text.size() || text[position++] != ':')
+      JsonStructureError("missing ':' after object key");
+    SkipJsonWhitespace(text, &position);
+    member.value_begin = position;
+    member.value_end = SkipJsonValue(text, position, &member.kind);
+    members.push_back(std::move(member));
+    position = members.back().value_end;
+    SkipJsonWhitespace(text, &position);
+    if (position >= text.size()) JsonStructureError("unterminated object");
+    if (text[position] == '}') {
+      if (object_end != nullptr) *object_end = position + 1;
+      return members;
+    }
+    if (text[position++] != ',') JsonStructureError("expected ',' in object");
+    SkipJsonWhitespace(text, &position);
+    if (position < text.size() && text[position] == '}')
+      JsonStructureError("trailing comma in object");
+  }
+}
+
+const JsonMemberSpan &RequireUniqueMember(
+    const std::vector<JsonMemberSpan> &members, std::string_view name,
+    std::string_view object_path) {
+  const JsonMemberSpan *found = nullptr;
+  for (const auto &member : members) {
+    if (member.key != name) continue;
+    if (found != nullptr)
+      throw std::invalid_argument("duplicate config field: " +
+                                  std::string(object_path) + "." +
+                                  std::string(name));
+    found = &member;
+  }
+  if (found == nullptr)
+    throw std::invalid_argument("missing required config field: " +
+                                std::string(object_path) + "." +
+                                std::string(name));
+  return *found;
+}
+
+std::string_view MemberValue(std::string_view text,
+                             const JsonMemberSpan &member) {
+  return text.substr(member.value_begin, member.value_end - member.value_begin);
+}
+
+bool ParseStrictBool(std::string_view text, const JsonMemberSpan &member,
+                     std::string_view path) {
+  if (member.kind != JsonValueKind::kBool)
+    throw std::invalid_argument("config field must be boolean: " +
+                                std::string(path));
+  return MemberValue(text, member) == "true";
+}
+
+uint64_t ParseStrictUint64(std::string_view text, const JsonMemberSpan &member,
+                           std::string_view path) {
+  if (member.kind != JsonValueKind::kNumber)
+    throw std::invalid_argument("config field must be unsigned integer: " +
+                                std::string(path));
+  const std::string_view value = MemberValue(text, member);
+  uint64_t parsed = 0;
+  const auto result =
+      std::from_chars(value.data(), value.data() + value.size(), parsed);
+  if (result.ec != std::errc{} || result.ptr != value.data() + value.size())
+    throw std::invalid_argument("config field must be unsigned integer: " +
+                                std::string(path));
+  return parsed;
+}
+
+double ParseStrictDouble(std::string_view text, const JsonMemberSpan &member,
+                         std::string_view path) {
+  if (member.kind != JsonValueKind::kNumber)
+    throw std::invalid_argument("config field must be numeric: " +
+                                std::string(path));
+  const std::string value(MemberValue(text, member));
+  size_t consumed = 0;
+  double parsed = 0;
+  try {
+    parsed = std::stod(value, &consumed);
+  } catch (const std::exception &) {
+    throw std::invalid_argument("config field must be numeric: " +
+                                std::string(path));
+  }
+  if (consumed != value.size())
+    throw std::invalid_argument("config field must be numeric: " +
+                                std::string(path));
+  return parsed;
+}
+
+std::string ParseStrictString(std::string_view text,
+                              const JsonMemberSpan &member,
+                              std::string_view path) {
+  if (member.kind != JsonValueKind::kString)
+    throw std::invalid_argument("config field must be string: " +
+                                std::string(path));
+  const std::string_view value = MemberValue(text, member);
+  if (value.size() < 2 || value.front() != '"' || value.back() != '"')
+    JsonStructureError("invalid string value");
+  if (value.find('\\') != std::string_view::npos)
+    throw std::invalid_argument("escaped latency string is not supported: " +
+                                std::string(path));
+  return std::string(value.substr(1, value.size() - 2));
+}
+
+size_t CountJsonKey(std::string_view text, std::string_view name) {
+  size_t count = 0;
+  size_t position = 0;
+  while (position < text.size()) {
+    if (text[position] != '"') {
+      ++position;
+      continue;
+    }
+    const size_t begin = position + 1;
+    const size_t end = SkipJsonString(text, position);
+    size_t after = end;
+    SkipJsonWhitespace(text, &after);
+    if (after < text.size() && text[after] == ':' &&
+        text.substr(begin, end - begin - 1) == name)
+      ++count;
+    position = end;
+  }
+  return count;
+}
+
+void ParseStrictLatencyConfig(const std::string &text, Config *config) {
+  size_t root_begin = 0;
+  SkipJsonWhitespace(text, &root_begin);
+  size_t root_end = 0;
+  const auto root = ParseJsonObjectMembers(text, root_begin, &root_end);
+  size_t trailing = root_end;
+  SkipJsonWhitespace(text, &trailing);
+  if (trailing != text.size())
+    JsonStructureError("trailing content after root object");
+
+  const auto &tigon = RequireUniqueMember(root, "tigon_kv", "$");
+  if (tigon.kind != JsonValueKind::kObject)
+    throw std::invalid_argument("config field must be object: tigon_kv");
+  if (CountJsonKey(text, "tigon_kv") != 1)
+    throw std::invalid_argument("tigon_kv must appear exactly once");
+  const auto tigon_members =
+      ParseJsonObjectMembers(text, tigon.value_begin);
+
+  const auto &verbose = RequireUniqueMember(tigon_members, "verbose", "tigon_kv");
+  const auto &extra_check =
+      RequireUniqueMember(tigon_members, "extra_check", "tigon_kv");
+  if (CountJsonKey(text, "verbose") != 1 ||
+      CountJsonKey(text, "extra_check") != 1)
+    throw std::invalid_argument(
+        "tigon_kv.verbose and tigon_kv.extra_check must appear exactly once");
+  config->verbose = ParseStrictBool(text, verbose, "tigon_kv.verbose");
+  config->extra_check =
+      ParseStrictBool(text, extra_check, "tigon_kv.extra_check");
+
+  const auto &latency =
+      RequireUniqueMember(tigon_members, "latency_inject", "tigon_kv");
+  if (latency.kind != JsonValueKind::kObject)
+    throw std::invalid_argument(
+        "config field must be object: tigon_kv.latency_inject");
+  if (CountJsonKey(text, "latency_inject") != 1)
+    throw std::invalid_argument(
+        "tigon_kv.latency_inject must appear exactly once");
+  const auto latency_members =
+      ParseJsonObjectMembers(text, latency.value_begin);
+
+  static const std::unordered_set<std::string> allowed = {
+      "enabled", "foreground_enabled", "merge_enabled", "stats_enabled",
+      "cache_line_bytes", "swcc_read_ns_per_line",
+      "swcc_write_ns_per_line", "swcc_flush_ns_per_line",
+      "hwcc_read_ns_per_line", "hwcc_write_ns_per_line",
+      "hwcc_atomic_load_ns", "hwcc_atomic_store_ns",
+      "hwcc_atomic_rmw_ns", "cache_model", "cache_hits_enabled",
+      "cache_capacity_lines", "cache_associativity",
+      "cache_fixed_hit_rate", "cache_hit_extra_ns"};
+  for (const auto &member : latency_members) {
+    if (!allowed.count(member.key))
+      throw std::invalid_argument(
+          "unknown tigon_kv.latency_inject field: " + member.key);
+  }
+  for (const auto &name : allowed) {
+    if (CountJsonKey(text, name) != 1)
+      throw std::invalid_argument(
+          "latency field must appear exactly once and only under "
+          "tigon_kv.latency_inject: " +
+          name);
+  }
+
+  const auto field = [&](std::string_view name) -> const JsonMemberSpan & {
+    return RequireUniqueMember(latency_members, name,
+                               "tigon_kv.latency_inject");
+  };
+  config->latency_enabled =
+      ParseStrictBool(text, field("enabled"),
+                      "tigon_kv.latency_inject.enabled");
+  config->latency_foreground_enabled =
+      ParseStrictBool(text, field("foreground_enabled"),
+                      "tigon_kv.latency_inject.foreground_enabled");
+  config->latency_merge_enabled =
+      ParseStrictBool(text, field("merge_enabled"),
+                      "tigon_kv.latency_inject.merge_enabled");
+  config->latency_stats_enabled =
+      ParseStrictBool(text, field("stats_enabled"),
+                      "tigon_kv.latency_inject.stats_enabled");
+  config->latency_cache_line_bytes =
+      ParseStrictUint64(text, field("cache_line_bytes"),
+                        "tigon_kv.latency_inject.cache_line_bytes");
+  config->swcc_read_ns =
+      ParseStrictDouble(text, field("swcc_read_ns_per_line"),
+                        "tigon_kv.latency_inject.swcc_read_ns_per_line");
+  config->swcc_write_ns =
+      ParseStrictDouble(text, field("swcc_write_ns_per_line"),
+                        "tigon_kv.latency_inject.swcc_write_ns_per_line");
+  config->swcc_flush_ns =
+      ParseStrictDouble(text, field("swcc_flush_ns_per_line"),
+                        "tigon_kv.latency_inject.swcc_flush_ns_per_line");
+  config->hwcc_read_ns =
+      ParseStrictDouble(text, field("hwcc_read_ns_per_line"),
+                        "tigon_kv.latency_inject.hwcc_read_ns_per_line");
+  config->hwcc_write_ns =
+      ParseStrictDouble(text, field("hwcc_write_ns_per_line"),
+                        "tigon_kv.latency_inject.hwcc_write_ns_per_line");
+  config->hwcc_atomic_load_ns =
+      ParseStrictDouble(text, field("hwcc_atomic_load_ns"),
+                        "tigon_kv.latency_inject.hwcc_atomic_load_ns");
+  config->hwcc_atomic_store_ns =
+      ParseStrictDouble(text, field("hwcc_atomic_store_ns"),
+                        "tigon_kv.latency_inject.hwcc_atomic_store_ns");
+  config->hwcc_atomic_rmw_ns =
+      ParseStrictDouble(text, field("hwcc_atomic_rmw_ns"),
+                        "tigon_kv.latency_inject.hwcc_atomic_rmw_ns");
+  config->latency_cache_model =
+      ParseStrictString(text, field("cache_model"),
+                        "tigon_kv.latency_inject.cache_model");
+  config->latency_cache_hits_enabled =
+      ParseStrictBool(text, field("cache_hits_enabled"),
+                      "tigon_kv.latency_inject.cache_hits_enabled");
+  config->latency_cache_capacity_lines =
+      ParseStrictUint64(text, field("cache_capacity_lines"),
+                        "tigon_kv.latency_inject.cache_capacity_lines");
+  config->latency_cache_associativity =
+      ParseStrictUint64(text, field("cache_associativity"),
+                        "tigon_kv.latency_inject.cache_associativity");
+  config->latency_cache_fixed_hit_rate =
+      ParseStrictDouble(text, field("cache_fixed_hit_rate"),
+                        "tigon_kv.latency_inject.cache_fixed_hit_rate");
+  config->latency_cache_hit_extra_ns =
+      ParseStrictDouble(text, field("cache_hit_extra_ns"),
+                        "tigon_kv.latency_inject.cache_hit_extra_ns");
+  config->hwcc_atomic_ns =
+      std::max({config->hwcc_atomic_load_ns, config->hwcc_atomic_store_ns,
+                config->hwcc_atomic_rmw_ns});
+}
+
 template <typename T>
 bool JsonNumberInObject(const std::string &s, const char *object, const char *name, T *out) {
   std::string body;
@@ -216,34 +662,12 @@ Config Config::FromJsonc(const std::string &path) {
   JsonString(text, "when_to_move_out", &c.when_to_move_out);
   JsonString(text, "scc_mechanism", &c.scc_mechanism);
   JsonNumber(text, "transport_ring_total_mb", &c.transport_ring_total_mb);
-  JsonBool(text, "verbose", &c.verbose);
-  JsonBool(text, "extra_check", &c.extra_check);
   JsonBool(text, "cpu_affinity", &c.cpu_affinity);
   JsonNumberInObject(text, "hwcc", "offset_mb", &c.hwcc_offset_mb);
   JsonNumberInObject(text, "hwcc", "size_mb", &c.hwcc_size_mb);
   JsonNumberInObject(text, "swcc", "offset_mb", &c.swcc_offset_mb);
   JsonNumberInObject(text, "swcc", "size_mb", &c.swcc_size_mb);
-  JsonBool(text, "enabled", &c.latency_enabled);
-  JsonBool(text, "foreground_enabled", &c.latency_foreground_enabled);
-  JsonBool(text, "merge_enabled", &c.latency_merge_enabled);
-  JsonBool(text, "stats_enabled", &c.latency_stats_enabled);
-  JsonNumber(text, "cache_line_bytes", &c.latency_cache_line_bytes);
-  JsonDouble(text, "swcc_read_ns_per_line", &c.swcc_read_ns);
-  JsonDouble(text, "swcc_write_ns_per_line", &c.swcc_write_ns);
-  JsonDouble(text, "swcc_flush_ns_per_line", &c.swcc_flush_ns);
-  JsonDouble(text, "hwcc_read_ns_per_line", &c.hwcc_read_ns);
-  JsonDouble(text, "hwcc_write_ns_per_line", &c.hwcc_write_ns);
-  JsonDouble(text, "hwcc_atomic_load_ns", &c.hwcc_atomic_load_ns);
-  JsonDouble(text, "hwcc_atomic_store_ns", &c.hwcc_atomic_store_ns);
-  JsonDouble(text, "hwcc_atomic_rmw_ns", &c.hwcc_atomic_rmw_ns);
-  c.hwcc_atomic_ns = std::max({c.hwcc_atomic_load_ns, c.hwcc_atomic_store_ns,
-                                c.hwcc_atomic_rmw_ns});
-  JsonString(text, "cache_model", &c.latency_cache_model);
-  JsonBool(text, "cache_hits_enabled", &c.latency_cache_hits_enabled);
-  JsonDouble(text, "cache_fixed_hit_rate", &c.latency_cache_fixed_hit_rate);
-  JsonNumber(text, "cache_capacity_lines", &c.latency_cache_capacity_lines);
-  JsonNumber(text, "cache_associativity", &c.latency_cache_associativity);
-  JsonDouble(text, "cache_hit_extra_ns", &c.latency_cache_hit_extra_ns);
+  ParseStrictLatencyConfig(text, &c);
   if (c.shared_memory_path == "/mnt/xz_shared_mem" || c.shared_memory_path == "/mnt/xz_shared_mem/")
     c.shared_memory_path = "/mnt/xz_shared_mem/ivshmem_shared_mem";
   struct stat device_stat {};
@@ -283,7 +707,8 @@ void Config::Validate() const {
     throw std::invalid_argument("unknown latency cache model");
   if (latency_cache_fixed_hit_rate < 0.0 || latency_cache_fixed_hit_rate > 1.0)
     throw std::invalid_argument("latency cache hit rate must be in [0,1]");
-  if (latency_cache_line_bytes != 64 || latency_cache_associativity == 0)
+  if (latency_cache_line_bytes != 64 || latency_cache_capacity_lines == 0 ||
+      latency_cache_associativity == 0)
     throw std::invalid_argument("invalid latency cache geometry");
   if (!std::isfinite(swcc_read_ns) || swcc_read_ns < 0 ||
       !std::isfinite(swcc_write_ns) || swcc_write_ns < 0 ||

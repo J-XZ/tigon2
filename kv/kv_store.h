@@ -148,8 +148,8 @@ struct Config {
   std::string latency_cache_model = "none";
   bool latency_cache_hits_enabled = false;
   double latency_cache_fixed_hit_rate = 0.0;
-  uint64_t latency_cache_capacity_lines = 0;
-  uint64_t latency_cache_associativity = 1;
+  uint64_t latency_cache_capacity_lines = 4096;
+  uint64_t latency_cache_associativity = 8;
   double latency_cache_hit_extra_ns = 0;
 
   static Config FromJsonc(const std::string &path);

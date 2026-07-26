@@ -38,28 +38,179 @@ bool ValidateThrows(const Config &config) {
   return false;
 }
 
+std::string ReplaceOnce(std::string text, const std::string &from,
+                        const std::string &to) {
+  const size_t position = text.find(from);
+  assert(position != std::string::npos);
+  text.replace(position, from.size(), to);
+  return text;
+}
+
+bool ParseTextThrows(const std::string &path, const std::string &text) {
+  {
+    std::ofstream output(path);
+    assert(output.good());
+    output << text;
+  }
+  try {
+    (void)Config::FromJsonc(path);
+  } catch (const std::invalid_argument &) {
+    return true;
+  }
+  return false;
+}
+
+std::string RemoveJsonFieldLine(std::string text, std::string_view field) {
+  const std::string needle = "\"" + std::string(field) + "\"";
+  const size_t position = text.find(needle);
+  assert(position != std::string::npos);
+  const size_t line_begin = text.rfind('\n', position) + 1;
+  size_t line_end = text.find('\n', position);
+  if (line_end == std::string::npos) line_end = text.size();
+  else ++line_end;
+  const std::string_view line(text.data() + line_begin, line_end - line_begin);
+  if (line.find(',') != std::string_view::npos) {
+    text.erase(line_begin, line_end - line_begin);
+  } else {
+    const size_t previous_comma = text.rfind(',', line_begin);
+    assert(previous_comma != std::string::npos);
+    text.erase(previous_comma, line_end - previous_comma);
+  }
+  return text;
+}
+
+std::string ReplaceLatencyObjectWithFalse(std::string text) {
+  const std::string needle = "\"latency_inject\":";
+  const size_t key = text.find(needle);
+  assert(key != std::string::npos);
+  const size_t object_begin = text.find('{', key + needle.size());
+  assert(object_begin != std::string::npos);
+  size_t depth = 1;
+  size_t position = object_begin + 1;
+  bool in_string = false;
+  bool escaped = false;
+  for (; position < text.size() && depth != 0; ++position) {
+    const char c = text[position];
+    if (in_string) {
+      if (escaped) escaped = false;
+      else if (c == '\\') escaped = true;
+      else if (c == '"') in_string = false;
+      continue;
+    }
+    if (c == '"') in_string = true;
+    else if (c == '{') ++depth;
+    else if (c == '}') --depth;
+  }
+  assert(depth == 0);
+  text.replace(object_begin, position - object_begin, "false");
+  return text;
+}
+
 }  // namespace
 
 int main() {
   const std::string latency_config_path =
       "/tmp/tigonkv-latency-config-" + std::to_string(getpid()) + ".jsonc";
+  std::string base_config_text;
   {
     std::ifstream source(std::string(TIGONKV_SOURCE_DIR) +
                          "/experiment_config.jsonc");
     assert(source.good());
-    std::string text((std::istreambuf_iterator<char>(source)),
-                     std::istreambuf_iterator<char>());
+    base_config_text.assign(std::istreambuf_iterator<char>(source),
+                            std::istreambuf_iterator<char>());
     const std::string needle = "\"swcc_read_ns_per_line\": 0";
-    const size_t position = text.find(needle);
+    const size_t position = base_config_text.find(needle);
     assert(position != std::string::npos);
-    text.replace(position, needle.size(),
-                 "\"swcc_read_ns_per_line\": 1.25");
+    std::string text = base_config_text;
+    text.replace(position, needle.size(), "\"swcc_read_ns_per_line\": 1.25e0");
     std::ofstream output(latency_config_path);
     output << text;
   }
   const Config fractional = Config::FromJsonc(latency_config_path);
   assert(fractional.swcc_read_ns == 1.25);
   assert(fractional.cpu_affinity);
+
+  static constexpr std::string_view kLatencyFields[] = {
+      "enabled", "foreground_enabled", "merge_enabled", "stats_enabled",
+      "cache_line_bytes", "swcc_read_ns_per_line",
+      "swcc_write_ns_per_line", "swcc_flush_ns_per_line",
+      "hwcc_read_ns_per_line", "hwcc_write_ns_per_line",
+      "hwcc_atomic_load_ns", "hwcc_atomic_store_ns",
+      "hwcc_atomic_rmw_ns", "cache_model", "cache_hits_enabled",
+      "cache_capacity_lines", "cache_associativity",
+      "cache_fixed_hit_rate", "cache_hit_extra_ns"};
+  for (const std::string_view field : kLatencyFields) {
+    assert(ParseTextThrows(latency_config_path,
+                           RemoveJsonFieldLine(base_config_text, field)));
+  }
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"enabled\": false",
+                  "\"enabled\": \"false\"")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"cache_line_bytes\": 64",
+                  "\"cache_line_bytes\": 64.0")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"cache_model\": \"none\"",
+                  "\"cache_model\": false")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"latency_inject\": {",
+                  "\"latency_inject\": {\"partition_count\": 16,")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"latency_inject\": {",
+                  "\"latency_inject\": {\"enabled\": true,")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "{\n", "{\n  \"enabled\": false,\n")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"network\": {",
+                  "\"network\": {\"enabled\": false,")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "{\n", "{\n  \"latency_inject\": {},\n")));
+  assert(ParseTextThrows(latency_config_path,
+                         ReplaceLatencyObjectWithFalse(base_config_text)));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"cache_capacity_lines\": 4096",
+                  "\"cache_capacity_lines\": 0")));
+
+  std::string enabled = ReplaceOnce(
+      base_config_text, "\"enabled\": false", "\"enabled\": true");
+  enabled = ReplaceOnce(enabled, "\"foreground_enabled\": false",
+                        "\"foreground_enabled\": true");
+  if (RelWithDebInfoBuild()) {
+    const Config parsed_enabled = [&] {
+      std::ofstream output(latency_config_path);
+      output << enabled;
+      output.close();
+      return Config::FromJsonc(latency_config_path);
+    }();
+    assert(parsed_enabled.latency_enabled);
+    assert(parsed_enabled.latency_foreground_enabled);
+  } else {
+    assert(ParseTextThrows(latency_config_path, enabled));
+  }
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(enabled, "\"verbose\": false", "\"verbose\": true")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(
+          ReplaceOnce(enabled, "\"verbose\": false", "\"verbose\": true"),
+          "\"network\": {", "\"network\": {\"verbose\": false,")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(enabled, "\"extra_check\": false", "\"extra_check\": true")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(enabled, "\"foreground_enabled\": true",
+                  "\"foreground_enabled\": false")));
   std::remove(latency_config_path.c_str());
 
   Config uneven;
