@@ -93,7 +93,7 @@ struct RequestServeDepthGuard {
 bool ValidMessageType(KvMessageType type) {
   const uint8_t raw = static_cast<uint8_t>(type);
   return raw >= static_cast<uint8_t>(KvMessageType::kPut) &&
-         raw <= static_cast<uint8_t>(KvMessageType::kMigrate);
+         raw <= static_cast<uint8_t>(KvMessageType::kScanMigrate);
 }
 
 bool ValidStatusCode(uint32_t status) {
@@ -362,6 +362,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
 
   struct Source {
     uint32_t node = 0;
+    bool local = false;
     std::string cursor;
     bool has_cursor = false;
     bool more = false;
@@ -388,140 +389,64 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
 
   Source local;
   local.node = config_.node_id;
+  local.local = true;
   ScanResult local_page = ScanOwnedPartitions(start_key, request_limit);
   if (!local_page.status.ok()) return local_page;
   load_page(&local, std::move(local_page.items));
   sources.push_back(std::move(local));
 
-  // A partial non-owner CXL walk is not a complete range unless the original
-  // TwoPLPasha next/prev-key protocol proves adjacency.  KV does not yet expose
-  // migrate-for-scan, so use exactly one authoritative stream per owner.  Do
-  // not merge partial CXL rows with owner rows or continue a CXL cursor by RPC.
-  auto try_acquire_scan_rpc = [this] {
-    std::lock_guard<std::mutex> lock(scan_rpc_mutex_);
-    if (inflight_scan_rpcs_ >= kMaxInflightScanRpcs) return false;
-    ++inflight_scan_rpcs_;
-    return true;
-  };
-  auto wait_acquire_scan_rpc = [this] {
-    std::unique_lock<std::mutex> lock(scan_rpc_mutex_);
-    scan_rpc_cv_.wait(lock, [&] { return inflight_scan_rpcs_ < kMaxInflightScanRpcs; });
-    ++inflight_scan_rpcs_;
-  };
-  auto release_scan_rpc = [this] {
-    {
-      std::lock_guard<std::mutex> lock(scan_rpc_mutex_);
-      --inflight_scan_rpcs_;
-    }
-    scan_rpc_cv_.notify_one();
-  };
-
-  // Fan out owner ScanRPCs through a bounded sliding window.
-  struct RemoteInflights {
+  // Original TwoPLPasha shape: owner range move-in followed by a CXL-only
+  // authoritative read. No partial CXL rows are merged with owner values.
+  struct PendingRangeMove {
     uint32_t node = 0;
     uint64_t request_id = 0;
+    std::shared_ptr<PendingResponse> pending;
   };
-  std::deque<RemoteInflights> inflight;
-  auto cancel_inflight = [&] {
-    for (const auto &slot : inflight) {
-      {
-        std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-        pending_scans_.erase(slot.request_id);
-      }
-      release_scan_rpc();
-    }
-    inflight.clear();
-  };
-  auto await_one = [&]() -> Status {
-    const RemoteInflights slot = inflight.front();
-    inflight.pop_front();
-    std::vector<ScanItem> remote;
-    Status status = Status::Ok();
-    try {
-      status = AwaitScan(slot.request_id, &remote);
-    } catch (const std::exception &e) {
-      {
-        std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-        pending_scans_.erase(slot.request_id);
-      }
-      release_scan_rpc();
-      return Status::Error(StatusCode::kInvalidArgument, e.what());
-    }
-    release_scan_rpc();
-    if (!status.ok()) return status;
-    Source source;
-    source.node = slot.node;
-    load_page(&source, std::move(remote));
-    sources.push_back(std::move(source));
-    return Status::Ok();
-  };
+  std::vector<PendingRangeMove> range_moves;
+  range_moves.reserve(config_.vm_count - 1);
   for (uint32_t node = 0; node < config_.vm_count; ++node) {
     if (node == config_.node_id) continue;
-    // Never wait for another token while retaining all of this Scan's tokens.
-    // Draining our oldest request first gives every concurrent caller a path
-    // to release the global backpressure window.
-    while (!try_acquire_scan_rpc()) {
-      if (inflight.empty()) {
-        wait_acquire_scan_rpc();
-        break;
-      }
-      const Status status = await_one();
-      if (!status.ok()) {
-        cancel_inflight();
-        return {status, {}};
-      }
-    }
     const uint64_t request_id = NextRequestId(config_.node_id);
-    {
-      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      pending_scans_.emplace(request_id, std::make_shared<PendingScan>());
-    }
-    try {
-      SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id, node,
-                                       request_id, start_key, EncodeU64(request_limit)));
-    } catch (const std::exception &e) {
-      {
-        std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-        pending_scans_.erase(request_id);
-      }
-      release_scan_rpc();
-      cancel_inflight();
-      return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
-    }
-    inflight.push_back({node, request_id});
+    auto pending = RegisterPendingResponse(request_id);
+    SendTransportMessage(MakeRequest(
+        KvMessageType::kScanMigrate, config_.node_id, node, request_id,
+        start_key, EncodeU64(request_limit)));
+    range_moves.push_back({node, request_id, std::move(pending)});
   }
-  while (!inflight.empty()) {
-    const Status status = await_one();
-    if (!status.ok()) {
-      cancel_inflight();
-      return {status, {}};
+  Status first_error = Status::Ok();
+  for (const auto &move : range_moves) {
+    const Status migrated =
+        AwaitResponse(move.request_id, move.pending, nullptr);
+    if (!migrated.ok()) {
+      if (first_error.ok()) first_error = migrated;
+      continue;
     }
+    ScanResult page =
+        ScanSharedPartitions(move.node, start_key, request_limit);
+    if (!page.status.ok()) {
+      if (first_error.ok()) first_error = page.status;
+      continue;
+    }
+    Source source;
+    source.node = move.node;
+    load_page(&source, std::move(page.items));
+    sources.push_back(std::move(source));
   }
+  if (!first_error.ok()) return {first_error, {}};
 
   auto refill = [&](Source *source) -> Status {
     if (!source->more) return Status::Ok();
-    const uint64_t request_id = NextRequestId(config_.node_id);
-    {
-      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      pending_scans_.emplace(request_id, std::make_shared<PendingScan>());
+    ScanResult page;
+    if (source->local) {
+      page = ScanOwnedPartitions(source->cursor, request_limit);
+    } else {
+      const Status migrated =
+          RequestScanMigrate(source->node, source->cursor, request_limit);
+      if (!migrated.ok()) return migrated;
+      page = ScanSharedPartitions(source->node, source->cursor, request_limit);
     }
-    wait_acquire_scan_rpc();
-    Status status = Status::Ok();
-    std::vector<ScanItem> raw;
-    try {
-      SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id,
-                                       source->node, request_id, source->cursor,
-                                       EncodeU64(request_limit)));
-      status = AwaitScan(request_id, &raw);
-    } catch (const std::exception &e) {
-      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      pending_scans_.erase(request_id);
-      release_scan_rpc();
-      return Status::Error(StatusCode::kInvalidArgument, e.what());
-    }
-    release_scan_rpc();
-    if (!status.ok()) return status;
-    return load_page(source, std::move(raw));
+    if (!page.status.ok()) return page.status;
+    return load_page(source, std::move(page.items));
   };
 
   struct HeapItem { std::string_view key; size_t source; };
@@ -605,6 +530,52 @@ ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t li
     ScanItem row = std::move(parts[top.part][top.index]);
     if (result.items.empty() || result.items.back().key != row.key)
       result.items.push_back(std::move(row));
+    const size_t next = top.index + 1;
+    if (next < parts[top.part].size())
+      heap.push({parts[top.part][next].key, top.part, next});
+  }
+  return result;
+}
+
+ScanResult KVEngine::ScanSharedPartitions(uint32_t owner,
+                                          std::string_view start_key,
+                                          uint64_t limit) {
+  std::vector<std::vector<ScanItem>> parts;
+  bool complete = true;
+  try {
+    for (const auto &partition : partitions_) {
+      if (OwnerForPartition(partition->partition_id()) != owner) continue;
+      std::vector<std::pair<std::string, std::string>> items;
+      if (!partition->ScanSharedPinned(start_key, limit, &items))
+        complete = false;
+      std::vector<ScanItem> page;
+      page.reserve(items.size());
+      for (auto &item : items)
+        page.push_back({std::move(item.first), std::move(item.second)});
+      parts.push_back(std::move(page));
+    }
+  } catch (const std::exception &error) {
+    return {Status::Error(StatusCode::kCorruption, error.what()), {}};
+  }
+  if (!complete)
+    return {Status::Error(StatusCode::kCorruption,
+                          "pinned CXL scan could not read a promoted row"), {}};
+  struct HeapItem {
+    std::string_view key;
+    size_t part = 0;
+    size_t index = 0;
+  };
+  auto compare = [](const HeapItem &left, const HeapItem &right) {
+    return left.key > right.key;
+  };
+  std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(compare)> heap(compare);
+  for (size_t i = 0; i < parts.size(); ++i)
+    if (!parts[i].empty()) heap.push({parts[i][0].key, i, 0});
+  ScanResult result{Status::Ok(), {}};
+  while (!heap.empty() && (limit == 0 || result.items.size() < limit)) {
+    const HeapItem top = heap.top();
+    heap.pop();
+    result.items.push_back(std::move(parts[top.part][top.index]));
     const size_t next = top.index + 1;
     if (next < parts[top.part].size())
       heap.push({parts[top.part][next].key, top.part, next});
@@ -817,6 +788,22 @@ Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_v
 
 Status KVEngine::RequestMigrate(std::string_view key) {
   return Forward(KvMessageType::kMigrate, key, {}, nullptr);
+}
+
+Status KVEngine::RequestScanMigrate(uint32_t owner,
+                                    std::string_view start_key,
+                                    uint64_t limit) {
+  const uint64_t request_id = NextRequestId(config_.node_id);
+  auto pending = RegisterPendingResponse(request_id);
+  try {
+    SendTransportMessage(MakeRequest(
+        KvMessageType::kScanMigrate, config_.node_id, owner, request_id,
+        start_key, EncodeU64(limit)));
+  } catch (...) {
+    RemovePendingResponse(request_id);
+    throw;
+  }
+  return AwaitResponse(request_id, pending, nullptr);
 }
 
 std::shared_ptr<KVEngine::PendingResponse>
@@ -1146,10 +1133,41 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
   const std::string_view value(message.value.data(), message.value_size);
   KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
                                    message.source_node, message.request_id, key);
+  if (message.type == KvMessageType::kScanMigrate) {
+    MarkLayoutDirty();
+    uint64_t limit = 0;
+    std::vector<star::TwoPLPashaMetadataShared *> pinned;
+    if (!DecodeU64(value, &limit)) {
+      response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
+    } else {
+      try {
+        StatusCode status = StatusCode::kOk;
+        for (const auto &entry : partitions_) {
+          if (OwnerForPartition(entry->partition_id()) != config_.node_id)
+            continue;
+          status = entry->PrepareSharedScan(key, limit, config_.node_id,
+                                            &pinned);
+          if (status != StatusCode::kOk) break;
+        }
+        response.status = static_cast<uint32_t>(status);
+      } catch (const std::bad_alloc &) {
+        for (auto *entry : pinned)
+          star::TwoPLPashaHelper::kv_unpin_shared_ref(entry);
+        response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
+      } catch (...) {
+        for (auto *entry : pinned)
+          star::TwoPLPashaHelper::kv_unpin_shared_ref(entry);
+        response.status = static_cast<uint32_t>(StatusCode::kCorruption);
+      }
+    }
+    SendTransportMessage(response);
+    return;
+  }
   auto *partition = OwnedPartition(key);
   if (message.type == KvMessageType::kPut ||
       message.type == KvMessageType::kDelete ||
       message.type == KvMessageType::kMigrate ||
+      message.type == KvMessageType::kScanMigrate ||
       message.type == KvMessageType::kIncrement ||
       message.type == KvMessageType::kCasCommit)
     MarkLayoutDirty();

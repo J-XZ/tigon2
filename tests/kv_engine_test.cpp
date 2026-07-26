@@ -179,9 +179,8 @@ int main() {
       assert(engine->Put(key, "bulk").ok());
       ++remote_scan_rows;
     }
-    // Populate one remote partition past a Scan page boundary. The requester
-    // will promote every row before scanning, so an accidental non-owner CXL
-    // seed would create a second source for the same owner.
+    // Populate one remote partition past a Scan page boundary. The owner pins
+    // each authoritative prefix; the requester reads it only through CXL.
     std::vector<std::string> promoted_scan_keys;
     uint32_t promoted_partition = UINT32_MAX;
     for (uint32_t i = 0; promoted_scan_keys.size() < 130; ++i) {
@@ -213,8 +212,8 @@ int main() {
         if (item.key.rfind("hybrid-", 0) != 0 || item.value != "owner-authority")
           _exit(16);
       }
-      // One initial owner page plus one cursor refill. A partial CXL seed used
-      // to refill as a second owner RPC and produced a third request frame.
+      // One range-migrate request plus one cursor range-migrate request. Values
+      // travel through CXL, so no ScanItem frames are sent by this requester.
       if (authoritative_scan_tx != 2 * sizeof(tigonkv::engine::KvMessage)) _exit(17);
 
       std::atomic<bool> start_concurrent_scans{false};

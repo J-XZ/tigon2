@@ -922,6 +922,72 @@ bool KVPartition::ScanOwned(
   return false;
 }
 
+StatusCode KVPartition::PrepareSharedScan(
+    std::string_view start_key, uint64_t limit, uint32_t host_id,
+    std::vector<star::TwoPLPashaMetadataShared *> *pinned,
+    const std::function<void()> *progress) {
+  if (pinned == nullptr) return StatusCode::kInvalidArgument;
+  std::vector<std::pair<std::string, std::string>> rows;
+  if (!ScanOwned(start_key, limit, &rows, progress)) {
+    for (auto *entry : *pinned)
+      star::TwoPLPashaHelper::kv_unpin_shared_ref(entry);
+    pinned->clear();
+    return StatusCode::kCorruption;
+  }
+  for (const auto &row : rows) {
+    star::TwoPLPashaMetadataShared *smeta = nullptr;
+    PromotePrivate(row.first, host_id, &smeta);
+    if (smeta == nullptr) {
+      for (auto *entry : *pinned)
+        star::TwoPLPashaHelper::kv_unpin_shared_ref(entry);
+      pinned->clear();
+      return StatusCode::kOutOfMemory;
+    }
+    pinned->push_back(smeta);
+  }
+  return StatusCode::kOk;
+}
+
+bool KVPartition::ScanSharedPinned(
+    std::string_view start_key, uint64_t limit,
+    std::vector<std::pair<std::string, std::string>> *items) const {
+  EnterEbr();
+  if (items == nullptr) throw std::invalid_argument("null shared scan output");
+  FixedKey high{};
+  std::memset(high.bytes, 0xff, sizeof(high.bytes));
+  std::vector<SharedTree::KeyValuePair> rows;
+  const uint32_t fetch =
+      limit > std::numeric_limits<uint32_t>::max()
+          ? 0
+          : static_cast<uint32_t>(limit);
+  shared_tree_->scan(MakeKey(start_key), high, true, true, fetch, rows);
+  items->clear();
+  items->reserve(rows.size());
+  bool complete = true;
+  for (const auto &entry : rows) {
+    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+        regions_.hwcc().FromOffset(entry.second));
+    std::string value(regions_.layout().fixed_value_size, '\0');
+    uint32_t value_len = 0;
+    bool read = false;
+    for (uint32_t attempt = 0; attempt < 64 && !read; ++attempt) {
+      read = star::TwoPLPashaHelper::kv_shared_read_value(
+          smeta, owner_shard_, value.data(), value.size(), &value_len);
+      if (!read) std::this_thread::yield();
+    }
+    // PrepareSharedScan owns one pin for every row in this exact prefix.
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    if (!read) {
+      complete = false;
+      continue;
+    }
+    value.resize(value_len);
+    mem_access::SharedPayloadRead(smeta->get_scc_data()->data, value_len);
+    items->emplace_back(KeyString(entry.first), std::move(value));
+  }
+  return complete;
+}
+
 bool KVPartition::DeletePrivate(std::string_view key) {
   EnterEbr();
   RegionOffset row_offset = kNullOffset;

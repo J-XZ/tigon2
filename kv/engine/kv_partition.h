@@ -73,6 +73,16 @@ class KVPartition {
   bool ScanOwned(std::string_view start_key, uint64_t limit,
                  std::vector<std::pair<std::string, std::string>> *items,
                  const std::function<void()> *progress = nullptr) const;
+  // Original TwoPLPasha range-migration analogue. The owner promotes and pins
+  // the requested private prefix; the requester subsequently consumes that
+  // single authoritative prefix through ScanSharedPinned.
+  StatusCode PrepareSharedScan(
+      std::string_view start_key, uint64_t limit, uint32_t host_id,
+      std::vector<star::TwoPLPashaMetadataShared *> *pinned,
+      const std::function<void()> *progress = nullptr);
+  bool ScanSharedPinned(
+      std::string_view start_key, uint64_t limit,
+      std::vector<std::pair<std::string, std::string>> *items) const;
   // Invokes PolicyClock::move_row_out for this partition.
   bool MoveOutClockVictim(uint32_t host_id);
   // Rebuild DRAM Clock tracker entries from the shared tree after attach.

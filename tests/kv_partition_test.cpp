@@ -212,6 +212,18 @@ int main() {
   assert(scan.size() == 2);
   assert(scan[0].first == "alpha" && scan[1].first == "clock");
 
+  // Range migration pins the exact authoritative prefix until the requester
+  // consumes the same prefix from CXL, matching TwoPLPasha scan move-in.
+  std::vector<star::TwoPLPashaMetadataShared *> scan_pins;
+  assert(partition.PrepareSharedScan("alpha", 2, 1, &scan_pins) ==
+         tigonkv::StatusCode::kOk);
+  assert(scan_pins.size() == 2);
+  assert(!partition.MoveOutPrivate("alpha", 1));
+  std::vector<std::pair<std::string, std::string>> shared_scan;
+  assert(partition.ScanSharedPinned("alpha", 2, &shared_scan));
+  assert(shared_scan == scan);
+  assert(partition.MoveOutPrivate("alpha", 1));
+
   // Bounded dual-tree merge: migrated shared authority + later private rows,
   // without collecting the full remaining keyspace before applying limit.
   assert(partition.PutPrivate("m1", "shared-m1"));

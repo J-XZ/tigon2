@@ -73,6 +73,8 @@ class KVEngine {
                  std::string *response_value);
   // TwoPLPasha DATA_MIGRATION: ask owner to move_row_in, then requester CXL-accesses.
   Status RequestMigrate(std::string_view key);
+  Status RequestScanMigrate(uint32_t owner, std::string_view start_key,
+                            uint64_t limit);
   CasResult ForwardCompareExchange(std::string_view key, std::string_view expected,
                                    std::string_view desired);
   struct PendingResponse {
@@ -87,6 +89,8 @@ class KVEngine {
                        const std::shared_ptr<PendingResponse> &pending,
                        std::string *response_value);
   ScanResult ScanOwnedPartitions(std::string_view start_key, uint64_t limit);
+  ScanResult ScanSharedPartitions(uint32_t owner, std::string_view start_key,
+                                  uint64_t limit);
   Status AwaitScan(uint64_t request_id, std::vector<ScanItem> *items);
   // Demuxer path: apply responses / queue requests. Never sends.
   void DemuxTransportMessage(const KvMessage &message);
