@@ -82,7 +82,8 @@ uint32_t RegionAllocator::SizeClass(uint64_t bytes) {
 RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
                                             uint32_t shard_count,
                                             uint64_t reserved_prefix_bytes,
-                                            bool metadata_is_hwcc) {
+                                            bool metadata_is_hwcc,
+                                            std::atomic<RegionOffset> *remote_free_heads) {
   if (region == nullptr || shard_count == 0 || shard_count > kMaxAllocatorShards ||
       region_bytes <= MetadataBytes() ||
       reserved_prefix_bytes > region_bytes - MetadataBytes())
@@ -106,11 +107,13 @@ RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
     entry.bump = entry.begin;
   }
   FlushForRemoteVisibility(header, MetadataBytes(), !metadata_is_hwcc);
-  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
+  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc,
+                         remote_free_heads);
 }
 
 RegionAllocator RegionAllocator::Attach(void *region, uint64_t region_bytes,
-                                        bool metadata_is_hwcc) {
+                                        bool metadata_is_hwcc,
+                                        std::atomic<RegionOffset> *remote_free_heads) {
   if (region == nullptr || region_bytes <= MetadataBytes())
     throw std::invalid_argument("invalid allocator attachment");
   if (reinterpret_cast<uintptr_t>(region) % kAlignment != 0)
@@ -122,7 +125,8 @@ RegionAllocator RegionAllocator::Attach(void *region, uint64_t region_bytes,
       header->shard_count == 0 || header->shard_count > kMaxAllocatorShards ||
       header->init_id == 0)
     throw std::runtime_error("allocator attachment validation failed");
-  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
+  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc,
+                         remote_free_heads);
 }
 
 void RegionAllocator::RecordAtomicLoad(const void *address) const {
@@ -154,10 +158,12 @@ void RegionAllocator::Unlock(RegionAllocatorShard &shard) const {
 }
 
 void RegionAllocator::AccountAllocate(uint64_t bytes, DomainCounter *counter) {
-  RecordAtomicRmw(&header_->allocated_bytes);
-  header_->allocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
-  RecordAtomicRmw(&header_->allocation_count);
-  header_->allocation_count.fetch_add(1, std::memory_order_relaxed);
+  if (metadata_is_hwcc_) {
+    RecordAtomicRmw(&header_->allocated_bytes);
+    header_->allocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    RecordAtomicRmw(&header_->allocation_count);
+    header_->allocation_count.fetch_add(1, std::memory_order_relaxed);
+  }
   mem_access::HwccAtomicRmw(&counter->used_bytes);
   const uint64_t used = counter->used_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
   mem_access::HwccAtomicLoad(&counter->peak_bytes);
@@ -174,19 +180,33 @@ void RegionAllocator::AccountFree(uint64_t bytes, DomainCounter *counter) {
   mem_access::HwccAtomicRmw(&counter->used_bytes);
   const uint64_t before = counter->used_bytes.fetch_sub(bytes, std::memory_order_relaxed);
   if (before < bytes) throw std::runtime_error("allocator domain accounting underflow");
-  RecordAtomicRmw(&header_->allocated_bytes);
-  const uint64_t total_before = header_->allocated_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-  if (total_before < bytes) throw std::runtime_error("allocator total accounting underflow");
-  RecordAtomicRmw(&header_->free_count);
-  header_->free_count.fetch_add(1, std::memory_order_relaxed);
+  if (metadata_is_hwcc_) {
+    RecordAtomicRmw(&header_->allocated_bytes);
+    const uint64_t total_before =
+        header_->allocated_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    if (total_before < bytes)
+      throw std::runtime_error("allocator total accounting underflow");
+    RecordAtomicRmw(&header_->free_count);
+    header_->free_count.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+std::atomic<RegionOffset> &RegionAllocator::RemoteFreeHead(
+    uint32_t owner_shard) const {
+  if (metadata_is_hwcc_) return header_->shards[owner_shard].remote_free_head;
+  if (remote_free_heads_ == nullptr)
+    throw std::logic_error(
+        "SWCC remote free requires an HWCC publication head");
+  return remote_free_heads_[owner_shard];
 }
 
 void RegionAllocator::ReapRemote(uint32_t owner_shard, DomainCounter *counter) {
   if (owner_shard >= header_->shard_count || counter == nullptr)
     throw std::invalid_argument("invalid remote-free reap");
-  auto &shard = header_->shards[owner_shard];
-  RecordAtomicRmw(&shard.remote_free_head);
-  RegionOffset head = shard.remote_free_head.exchange(kNullOffset, std::memory_order_acq_rel);
+  if (!metadata_is_hwcc_ && remote_free_heads_ == nullptr) return;
+  auto &head_source = RemoteFreeHead(owner_shard);
+  mem_access::HwccAtomicRmw(&head_source);
+  RegionOffset head = head_source.exchange(kNullOffset, std::memory_order_acq_rel);
   while (head != kNullOffset) {
     auto *block = static_cast<RegionFreeBlock *>(FromOffset(head));
     RecordAtomicLoad(&block->next);
@@ -322,15 +342,15 @@ void RegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain,
     }
     FreeLocal(offset, size_class, owner_shard);
   } else {
-    auto &shard = header_->shards[owner_shard];
-    RecordAtomicLoad(&shard.remote_free_head);
-    RegionOffset head = shard.remote_free_head.load(std::memory_order_relaxed);
+    auto &head_source = RemoteFreeHead(owner_shard);
+    mem_access::HwccAtomicLoad(&head_source);
+    RegionOffset head = head_source.load(std::memory_order_relaxed);
     do {
       RecordAtomicStore(&block->next);
       block->next.store(head, std::memory_order_relaxed);
       FlushForRemoteVisibility(block, sizeof(*block), !metadata_is_hwcc_);
-      RecordAtomicRmw(&shard.remote_free_head);
-    } while (!shard.remote_free_head.compare_exchange_weak(
+      mem_access::HwccAtomicRmw(&head_source);
+    } while (!head_source.compare_exchange_weak(
         head, offset, std::memory_order_release, std::memory_order_relaxed));
   }
   AccountFree(ClassBytes(size_class), counter);
@@ -429,7 +449,8 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
                                           0, true);
   auto swcc = RegionAllocator::Initialize(base + header->swcc_allocator_offset,
                                           header->swcc_allocator_bytes, config.vm_count,
-                                          header->owner_private_arenas_bytes);
+                                          header->owner_private_arenas_bytes, false,
+                                          header->layout.swcc_remote_free_heads.data());
   auto *swcc_base = base + header->swcc_allocator_offset;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     auto *arena = new (swcc_base + header->owner_private_arenas_offset +
@@ -507,7 +528,8 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
   auto hwcc = RegionAllocator::Attach(base + header->hwcc_allocator_offset,
                                       header->hwcc_allocator_bytes, true);
   auto swcc = RegionAllocator::Attach(base + header->swcc_allocator_offset,
-                                      header->swcc_allocator_bytes);
+                                      header->swcc_allocator_bytes, false,
+                                      header->layout.swcc_remote_free_heads.data());
   return DualRegionAllocator(base, config, header, hwcc, swcc);
 }
 

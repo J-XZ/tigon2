@@ -46,7 +46,7 @@ struct Mapping {
 
 void TestAttachReuseAndAccounting() {
   Mapping mapping(true);
-  auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2);
+  auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2, 0, true);
   DomainCounter index;
   DomainCounter payload;
   void *first = allocator.Allocate(1, AllocationDomain::kHwccIndex, &index, 0);
@@ -56,7 +56,7 @@ void TestAttachReuseAndAccounting() {
   assert(index.used_bytes.load() == 128);
   assert(payload.used_bytes.load() == 192);
   const RegionOffset offset = allocator.ToOffset(second);
-  auto attached = RegionAllocator::Attach(mapping.base, kBytes);
+  auto attached = RegionAllocator::Attach(mapping.base, kBytes, true);
   assert(attached.FromOffset(offset) == second);
   allocator.Free(first, 1, AllocationDomain::kHwccIndex, &index, 0, 0);
   assert(index.used_bytes.load() == 0);
@@ -70,7 +70,7 @@ void TestAttachReuseAndAccounting() {
 
 void TestCrossProcessRemoteFree() {
   Mapping mapping(true);
-  auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2);
+  auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2, 0, true);
   void *counter_map = mmap(nullptr, sizeof(DomainCounter), PROT_READ | PROT_WRITE,
                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   assert(counter_map != MAP_FAILED);
@@ -83,7 +83,7 @@ void TestCrossProcessRemoteFree() {
     void *child_base = mmap(nullptr, kBytes, PROT_READ | PROT_WRITE, MAP_SHARED, mapping.fd, 0);
     if (child_base == MAP_FAILED) _exit(2);
     try {
-      auto child_allocator = RegionAllocator::Attach(child_base, kBytes);
+      auto child_allocator = RegionAllocator::Attach(child_base, kBytes, true);
       child_allocator.Free(child_allocator.FromOffset(offset), 100,
                            AllocationDomain::kHwccMetadata, counter, 0, 1);
       munmap(child_base, kBytes);
@@ -164,6 +164,8 @@ void TestDualPhysicalRegions() {
   void *metadata = dual.Allocate(64, AllocationDomain::kHwccMetadata, 1);
   void *owner = dual.Allocate(80, AllocationDomain::kOwnerPrivateSwcc, 0);
   void *payload = dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 1);
+  void *remote_payload =
+      dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 0);
   assert(dual.IsHwccAddress(index) && dual.IsHwccAddress(metadata));
   assert(dual.IsSwccAddress(owner) && dual.IsSwccAddress(payload));
   assert(!dual.IsHwccAddress(owner) && !dual.IsSwccAddress(index));
@@ -178,10 +180,15 @@ void TestDualPhysicalRegions() {
          static_cast<uint32_t>(LayoutState::kDirty));
   auto attached = DualRegionAllocator::Attach(mapping.base, config);
   assert(attached.IsHwccAddress(index) && attached.IsSwccAddress(payload));
+  attached.Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 1);
+  void *reused_remote =
+      dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 0);
+  assert(reused_remote == remote_payload);
   dual.Free(index, 100, AllocationDomain::kHwccIndex, 0, 0);
   dual.Free(metadata, 64, AllocationDomain::kHwccMetadata, 1, 1);
   dual.Free(owner, 80, AllocationDomain::kOwnerPrivateSwcc, 0, 0);
   dual.Free(payload, 100, AllocationDomain::kSharedPayloadSwcc, 1, 1);
+  dual.Free(reused_remote, 100, AllocationDomain::kSharedPayloadSwcc, 0, 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
              .used_bytes.load() == 0);
 }

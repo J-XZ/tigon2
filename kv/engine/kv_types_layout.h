@@ -14,13 +14,14 @@ namespace tigonkv::engine {
 // process virtual addresses. Zero is reserved as the null offset.
 using RegionOffset = uint64_t;
 constexpr RegionOffset kNullOffset = 0;
-constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5635ULL;  // TIGONKV5
-// v5: shared B+tree live root is an HWCC atomic RegionOffset; readers refresh
-// on every operation. SWCC payload remains value bytes only (v4 meta move).
-constexpr uint32_t kSharedLayoutVersion = 5;
+constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5636ULL;  // TIGONKV6
+// v6: SWCC remote frees publish through HWCC heads; SWCC allocator metadata
+// itself remains owner-only and never relies on cross-VM C++ atomics.
+constexpr uint32_t kSharedLayoutVersion = 6;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
+constexpr uint32_t kMaxAllocatorShards = 64;
 
 enum class AllocationDomain : uint32_t {
   kHwccIndex = 0,
@@ -114,6 +115,8 @@ struct alignas(64) SharedLayoutHeader {
   uint32_t fixed_value_size = 0;
   std::atomic<uint64_t> clean_epoch{0};
   std::array<std::atomic<RegionOffset>, kRootSlotCount> roots{};
+  std::array<std::atomic<RegionOffset>, kMaxAllocatorShards>
+      swcc_remote_free_heads{};
   std::array<PartitionDirectoryEntry, kMaxPartitions> partitions{};
   std::array<DomainCounter, kAllocationDomainCount> domains{};
 

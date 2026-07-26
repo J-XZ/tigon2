@@ -13,7 +13,6 @@ namespace tigonkv::engine {
 
 // All allocator metadata is part of the mapped region.  The fixed upper bound
 // keeps the on-region format inspectable and avoids a process-local directory.
-constexpr uint32_t kMaxAllocatorShards = 64;
 constexpr uint32_t kAllocatorSizeClasses = 32;
 
 struct alignas(64) RegionFreeBlock {
@@ -56,9 +55,11 @@ class RegionAllocator {
   static RegionAllocator Initialize(void *region, uint64_t region_bytes,
                                     uint32_t shard_count,
                                     uint64_t reserved_prefix_bytes = 0,
-                                    bool metadata_is_hwcc = false);
+                                    bool metadata_is_hwcc = false,
+                                    std::atomic<RegionOffset> *remote_free_heads = nullptr);
   static RegionAllocator Attach(void *region, uint64_t region_bytes,
-                                bool metadata_is_hwcc = false);
+                                bool metadata_is_hwcc = false,
+                                std::atomic<RegionOffset> *remote_free_heads = nullptr);
 
   // Hot path: per-thread size-class cache (see region_allocator.cpp) then
   // shard freelist / bump under a short spin lock.
@@ -87,9 +88,11 @@ class RegionAllocator {
 
  private:
   RegionAllocator(void *base, uint64_t bytes, RegionAllocatorHeader *header,
-                  bool metadata_is_hwcc)
+                  bool metadata_is_hwcc,
+                  std::atomic<RegionOffset> *remote_free_heads)
       : base_(static_cast<std::byte *>(base)), bytes_(bytes), header_(header),
-        metadata_is_hwcc_(metadata_is_hwcc) {}
+        metadata_is_hwcc_(metadata_is_hwcc),
+        remote_free_heads_(remote_free_heads) {}
   static uint64_t Align(uint64_t bytes) {
     if (bytes > UINT64_MAX - (kAlignment - 1)) throw std::bad_alloc();
     return (bytes + kAlignment - 1) & ~(kAlignment - 1);
@@ -107,11 +110,13 @@ class RegionAllocator {
   void RecordAtomicLoad(const void *address) const;
   void RecordAtomicStore(const void *address) const;
   void RecordAtomicRmw(const void *address) const;
+  std::atomic<RegionOffset> &RemoteFreeHead(uint32_t owner_shard) const;
 
   std::byte *base_;
   uint64_t bytes_;
   RegionAllocatorHeader *header_;
   bool metadata_is_hwcc_;
+  std::atomic<RegionOffset> *remote_free_heads_;
 };
 
 // The pool is mapped once, but allocations are physically constrained to one
