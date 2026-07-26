@@ -13,6 +13,26 @@
 #include <vector>
 
 namespace tigonkv::engine {
+namespace {
+
+constexpr size_t kPrivateRowStateOffset =
+    offsetof(PrivateRow, is_migrated);
+constexpr size_t kPrivateRowStateBytes =
+    offsetof(PrivateRow, kv) - kPrivateRowStateOffset;
+
+void RecordPrivateRowStateRead(const PrivateRow *row) {
+  mem_access::PrivateRead(
+      reinterpret_cast<const char *>(row) + kPrivateRowStateOffset,
+      kPrivateRowStateBytes);
+}
+
+void RecordPrivateRowStateWrite(const PrivateRow *row) {
+  mem_access::PrivateWrite(
+      reinterpret_cast<const char *>(row) + kPrivateRowStateOffset,
+      kPrivateRowStateBytes);
+}
+
+}  // namespace
 
 KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
                          uint32_t partition_id, uint32_t owner_shard,
@@ -59,12 +79,19 @@ PrivateRow *KVPartition::RowFromOffset(RegionOffset offset) const {
 
 void KVPartition::LockRow(PrivateRow *row) {
   uint32_t expected = 0;
-  while (!row->latch.compare_exchange_weak(expected, 1, std::memory_order_acquire,
-                                            std::memory_order_relaxed))
+  for (;;) {
+    mem_access::PrivateAtomicRmw(&row->latch);
+    if (row->latch.compare_exchange_weak(
+            expected, 1, std::memory_order_acquire,
+            std::memory_order_relaxed))
+      break;
     expected = 0;
+  }
+  RecordPrivateRowStateRead(row);
 }
 
 void KVPartition::UnlockRow(PrivateRow *row) {
+  mem_access::PrivateAtomicStore(&row->latch);
   row->latch.store(0, std::memory_order_release);
 }
 
@@ -75,6 +102,7 @@ PrivateRow *KVPartition::AllocateRow(const FixedKey &key, std::string_view value
       PrivateRow;
   row->key_len = regions_.layout().fixed_key_size;
   row->value_len = static_cast<uint32_t>(value.size());
+  mem_access::PrivateWrite(row, offsetof(PrivateRow, kv));
   std::memcpy(row->kv, key.bytes, row->key_len);
   std::memcpy(row->kv + row->key_len, value.data(), value.size());
   mem_access::PrivateWrite(row->kv, row->key_len + value.size());
@@ -102,10 +130,8 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       auto *smeta = shared_present
           ? static_cast<star::TwoPLPashaMetadataShared *>(regions_.hwcc().FromOffset(smeta_offset))
           : nullptr;
-      auto *payload = smeta != nullptr ? smeta->get_scc_data() : nullptr;
       // Keep the private latch through the shared operation so move-out cannot
       // remove the shared authority between lookup and the SCC write.
-      if (payload != nullptr) mem_access::SharedPayloadWrite(payload->data, value.size());
       bool written = false;
       // Exclusive SCC write must wait for reader_count==0. Under YCSB-A the
       // CXL Get path keeps readers arriving; bounded yield counts starve and
@@ -127,6 +153,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
         }
       }
       if (written) {
+        RecordPrivateRowStateWrite(row);
         row->value_len = static_cast<uint32_t>(value.size());
         ++row->version;
         // Length for non-owner CXL lookups lives in SCC, not the shared tree.
@@ -137,6 +164,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       if (!written) throw std::runtime_error("migrated row shared write rejected");
       return false;
     }
+    RecordPrivateRowStateWrite(row);
     row->value_len = static_cast<uint32_t>(value.size());
     std::memcpy(row->kv + row->key_len, value.data(), value.size());
     mem_access::PrivateWrite(row->kv + row->key_len, value.size());
@@ -180,7 +208,6 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   }
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(smeta_offset));
-  auto *payload = smeta->get_scc_data();
   std::string shared(regions_.layout().fixed_value_size, '\0');
   // Row is migrated: treat SCC refusal (writer_waiting / write lock) as
   // contention, not NotFound. Spin like PutPrivate's shared write wait.
@@ -193,7 +220,6 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
         smeta, owner_shard_, shared.data(), shared.size(), &value_len);
     if (read) {
       shared.resize(value_len);
-      mem_access::SharedPayloadRead(payload->data, value_len);
     }
     if (read) break;
     UnlockRow(row);
@@ -230,7 +256,6 @@ bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   RegionOffset smeta_offset = kNullOffset;
   if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
-  auto *payload = smeta->get_scc_data();
   std::string shared(regions_.layout().fixed_value_size, '\0');
   // Pin proves the row is in CXL. kv_shared_read may refuse while a writer
   // waits; retry instead of returning miss (which would Migrate-storm).
@@ -243,7 +268,6 @@ bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
         smeta, host_id, shared.data(), shared.size(), &value_len);
     if (read) {
       shared.resize(value_len);
-      mem_access::SharedPayloadRead(payload->data, value_len);
     }
     if (read) break;
     if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index))
@@ -266,8 +290,6 @@ bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   RegionOffset smeta_offset = kNullOffset;
   if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
-  auto *payload = smeta->get_scc_data();
-  mem_access::SharedPayloadWrite(payload->data, value.size());
   bool written = false;
   const auto write_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -311,8 +333,6 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
     star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return false;
   }
-  if (changed)
-    mem_access::SharedPayloadWrite(smeta->get_scc_data()->data, desired.size());
   *exchanged = changed;
   NoteSharedAccess(smeta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
@@ -351,8 +371,6 @@ bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
     return false;
   }
   DCHECK(changed);
-  mem_access::SharedPayloadWrite(smeta->get_scc_data()->data,
-                                std::to_string(next).size());
   *value = next;
   NoteSharedAccess(smeta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
@@ -390,7 +408,9 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   }
   if (!row->is_migrated) {
     const std::string_view current(row->kv + row->key_len, row->value_len);
+    mem_access::PrivateRead(row->kv + row->key_len, row->value_len);
     if (current == expected) {
+      RecordPrivateRowStateWrite(row);
       row->value_len = static_cast<uint32_t>(desired.size());
       std::memcpy(row->kv + row->key_len, desired.data(), desired.size());
       mem_access::PrivateWrite(row->kv + row->key_len, desired.size());
@@ -409,7 +429,6 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   }
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(smeta_offset));
-  auto *payload = smeta->get_scc_data();
   bool changed = false;
   const bool read = star::TwoPLPashaHelper::kv_shared_update(
       smeta, owner_shard_, regions_.layout().fixed_value_size,
@@ -420,7 +439,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
       },
       &changed);
   if (read && changed) {
-    mem_access::SharedPayloadWrite(payload->data, desired.size());
+    RecordPrivateRowStateWrite(row);
     row->value_len = static_cast<uint32_t>(desired.size());
     ++row->version;
     NoteSharedAccess(smeta);
@@ -498,7 +517,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
     }
     DCHECK(changed);
     const std::string encoded = std::to_string(next);
-    mem_access::SharedPayloadWrite(smeta->get_scc_data()->data, encoded.size());
+    RecordPrivateRowStateWrite(row);
     row->value_len = static_cast<uint32_t>(encoded.size());
     NoteSharedAccess(smeta);
     ++row->version;
@@ -519,6 +538,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
     }
     const int64_t next = previous + delta;
     const std::string encoded = std::to_string(next);
+    RecordPrivateRowStateWrite(row);
     std::memcpy(row->kv + row->key_len, encoded.data(), encoded.size());
     mem_access::PrivateWrite(row->kv + row->key_len, encoded.size());
     row->value_len = static_cast<uint32_t>(encoded.size());
@@ -593,10 +613,12 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id,
     RegionOffset row_offset = kNullOffset;
     if (private_tree_->lookup(fixed_key, row_offset)) {
       auto *private_row = RowFromOffset(row_offset);
+      LockRow(private_row);
       if (private_row->is_migrated && private_row->migrated_smeta_off != kNullOffset) {
         *pinned_existing = static_cast<star::TwoPLPashaMetadataShared *>(
             regions_.hwcc().FromOffset(private_row->migrated_smeta_off));
       }
+      UnlockRow(private_row);
     }
   }
   return result == star::migration_result::SUCCESS;
@@ -629,7 +651,6 @@ star::migration_result KVPartition::MoveInForMigrationManager(
       }
       auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
           regions_.hwcc().FromOffset(row->migrated_smeta_off));
-      auto *payload = smeta->get_scc_data();
       if (!star::TwoPLPashaHelper::kv_pin_shared_ref(smeta)) {
         UnlockRow(row);
         return star::migration_result::FAIL_OOM;
@@ -661,6 +682,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
         std::tuple<std::atomic<uint64_t> *, void *>{nullptr, nullptr},
         sizeof(star::TwoPLPashaMetadataShared));
   }
+  mem_access::PrivateRead(row->kv + row->key_len, row->value_len);
   mem_access::SharedPayloadWrite(payload->data, row->value_len);
   star::scc_manager->do_write(smeta, owner_shard_, payload->data, row->kv + row->key_len,
                                row->value_len);
@@ -681,6 +703,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     UnlockRow(row);
     return star::migration_result::FAIL_OOM;
   }
+  RecordPrivateRowStateWrite(row);
   row->migrated_smeta_off = smeta_offset;
   row->is_migrated = 1;
   star::scc_manager->finish_write(smeta, owner_shard_, payload, row->value_len);
@@ -747,6 +770,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   mem_access::PrivateWrite(row->kv + row->key_len, value_len);
   star::scc_manager->do_read(smeta, host_id, row->kv + row->key_len, payload->data,
                              value_len);
+  RecordPrivateRowStateWrite(row);
   row->value_len = value_len;
   // Invalidate before tree remove so concurrent TryPinShared cannot pin a
   // row that is about to be EBR-retired. Drop the HWCC latch across the
@@ -759,6 +783,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   if (!shared_tree_->remove(fixed_key)) {
     smeta->lock();
     smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+    RecordPrivateRowStateWrite(row);
     row->is_migrated = 1;
     row->migrated_smeta_off = smeta_offset;
     smeta->clear_write_locked();
@@ -822,6 +847,8 @@ bool KVPartition::ScanOwned(
         std::string value;
         if (!row->is_migrated) {
           value.assign(row->kv + row->key_len, row->value_len);
+          mem_access::PrivateRead(
+              row->kv + row->key_len, row->value_len);
         } else {
           auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
               regions_.hwcc().FromOffset(row->migrated_smeta_off));
@@ -834,8 +861,6 @@ bool KVPartition::ScanOwned(
             return false;
           }
           value.resize(value_len);
-          mem_access::SharedPayloadRead(smeta->get_scc_data()->data,
-                                        value_len);
         }
         items->emplace_back(KeyString(entry.first), std::move(value));
       }
@@ -912,7 +937,6 @@ bool KVPartition::ScanSharedPinned(
       continue;
     }
     value.resize(value_len);
-    mem_access::SharedPayloadRead(smeta->get_scc_data()->data, value_len);
     items->emplace_back(KeyString(entry.first), std::move(value));
   }
   return complete;
@@ -932,6 +956,7 @@ bool KVPartition::DeletePrivate(std::string_view key) {
       UnlockRow(row);
       return false;
     }
+    RecordPrivateRowStateWrite(row);
     row->is_tombstone = 1;
     const uint64_t row_bytes =
         sizeof(PrivateRow) + regions_.layout().fixed_key_size +
@@ -942,6 +967,7 @@ bool KVPartition::DeletePrivate(std::string_view key) {
       if (smeta_offset == kNullOffset ||
           !shared_tree_->lookup(fixed_key, indexed) ||
           indexed != smeta_offset) {
+        RecordPrivateRowStateWrite(row);
         row->is_tombstone = 0;
         UnlockRow(row);
         throw std::runtime_error(
@@ -954,6 +980,7 @@ bool KVPartition::DeletePrivate(std::string_view key) {
       if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
           smeta->is_write_locked()) {
         smeta->unlock();
+        RecordPrivateRowStateWrite(row);
         row->is_tombstone = 0;
         UnlockRow(row);
         if (std::chrono::steady_clock::now() >= deadline)
@@ -968,11 +995,13 @@ bool KVPartition::DeletePrivate(std::string_view key) {
         smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
         smeta->clear_write_locked();
         smeta->unlock();
+        RecordPrivateRowStateWrite(row);
         row->is_tombstone = 0;
         UnlockRow(row);
         throw std::runtime_error(
             "shared tree remove failed during delete");
       }
+      RecordPrivateRowStateWrite(row);
       row->is_migrated = 0;
       row->migrated_smeta_off = kNullOffset;
       smeta->clear_write_locked();
@@ -1039,7 +1068,6 @@ void KVPartition::RebuildClockTracker() {
   for (const auto &entry : entries) {
     auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
         regions_.hwcc().FromOffset(entry.second));
-    auto *payload = smeta->get_scc_data();
     std::tuple<std::atomic<uint64_t> *, void *> row{nullptr, nullptr};
     clock->track_already_migrated(table, entry.first.bytes, row,
                                   &smeta->migration_policy_meta);

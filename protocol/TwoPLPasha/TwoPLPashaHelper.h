@@ -501,8 +501,10 @@ class TwoPLPashaHelper {
                         smeta->unlock();
                 }
                 const bool valid = smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                if (valid)
+                if (valid) {
+                        tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
                         scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
+                }
                 smeta->lock();
                 DCHECK(smeta->get_ref_cnt() > 0);
                 smeta->decrement_ref_cnt();
@@ -543,8 +545,10 @@ class TwoPLPashaHelper {
                 }
                 const bool valid =
                     smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                if (valid)
+                if (valid) {
+                        tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
                         scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
+                }
                 smeta->lock();
                 DCHECK(smeta->get_ref_cnt() > 0);
                 smeta->decrement_ref_cnt();
@@ -583,6 +587,8 @@ class TwoPLPashaHelper {
                         // clflush without latch; set_bit only under latch (RMW).
                         if (!smeta->is_bit_set(host_bit))
                                 scc_manager->invalidate_scc_data(scc_data, size);
+                        tigonkv::engine::mem_access::SharedPayloadWrite(
+                                scc_data->data, size);
                         scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
                         // atomic_word bit RMWs require the latch; clwb does not.
                         // Holding the latch across clwb livelocks hot keys across
@@ -650,6 +656,8 @@ class TwoPLPashaHelper {
                                 smeta->unlock();
                         }
                         std::string current(size, '\0');
+                        tigonkv::engine::mem_access::SharedPayloadRead(
+                                scc_data->data, size);
                         scc_manager->do_read(smeta, host_id, current.data(),
                                              scc_data->data, size);
                         std::string replacement;
@@ -668,6 +676,8 @@ class TwoPLPashaHelper {
                                 throw;
                         }
                         if (write) {
+                                tigonkv::engine::mem_access::SharedPayloadWrite(
+                                        scc_data->data, replacement.size());
                                 scc_manager->do_write(smeta, host_id, scc_data->data,
                                                       replacement.data(),
                                                       replacement.size());

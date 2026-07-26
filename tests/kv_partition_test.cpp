@@ -1,5 +1,6 @@
 #include "kv/engine/kv_partition.h"
 #include "kv/engine/kv_migration.h"
+#include "kv/engine/latency_inject.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -105,20 +106,49 @@ int main() {
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   PassthroughScc scc;
   star::scc_manager = &scc;
+  latency_sim::Config latency;
+  latency.enabled = true;
+  latency.foreground_enabled = true;
+  latency.stats_enabled = true;
+  auto &simulator = latency_sim::GlobalLatencySimulator();
+  simulator.Configure(latency);
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  assert(partition.PutPrivate("latency-only", "payload"));
+  assert(partition.GetPrivate("latency-only", &value) && value == "payload");
+  std::vector<std::pair<std::string, std::string>> latency_scan;
+  assert(partition.ScanOwned("latency-only", 1, &latency_scan));
+  assert(latency_scan.size() == 1 && latency_scan[0].second == "payload");
+  simulator.EndScopeAndDelay();
+  auto latency_stats = simulator.TakeStatsAndReset();
+  assert(latency_stats.swcc_raw_line_accesses > 0);
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  assert(partition.PromotePrivate("latency-only", 1));
+  assert(partition.MoveOutPrivate("latency-only", 1));
+  simulator.EndScopeAndDelay();
+  latency_stats = simulator.TakeStatsAndReset();
+  assert(latency_stats.swcc_raw_line_accesses > 0);
+  simulator.Configure(latency_sim::Config{});
+  assert(partition.DeletePrivate("latency-only"));
+  const uint64_t migration_in_before_alpha =
+      regions.layout().partitions[5].migration_in_seq.load();
+  const uint64_t migration_out_before_alpha =
+      regions.layout().partitions[5].migration_out_seq.load();
   assert(partition.PromotePrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   // Once migrated, PUT must update the shared SCC authority rather than the
   // retained private locator row.
   assert(!partition.PutPrivate("alpha", "shared-update"));
   assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
-  assert(regions.layout().partitions[5].migration_in_seq.load() == 1);
+  assert(regions.layout().partitions[5].migration_in_seq.load() ==
+         migration_in_before_alpha + 1);
   const auto hwcc_before_moveout = regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load();
   const auto swcc_before_moveout = regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load();
   assert(partition.MoveOutPrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
-  assert(regions.layout().partitions[5].migration_out_seq.load() == 1);
+  assert(regions.layout().partitions[5].migration_out_seq.load() ==
+         migration_out_before_alpha + 1);
   assert(ebr.drain_quiescent() > 0);
   assert(regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load() < hwcc_before_moveout);
