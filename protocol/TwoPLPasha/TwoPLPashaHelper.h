@@ -18,6 +18,7 @@
 #include "core/Context.h"
 #include "core/CXLTable.h"
 #include "core/Table.h"
+#include "kv/engine/mem_access.h"
 #include "glog/logging.h"
 
 #include "protocol/Pasha/MigrationManager.h"
@@ -76,6 +77,39 @@ struct TwoPLPashaMetadataLocal {
 };
 
 struct TwoPLPashaMetadataShared {
+        uint64_t load_atomic_word(std::memory_order order = std::memory_order_seq_cst)
+        {
+                tigonkv::engine::mem_access::HwccAtomicLoad(&atomic_word);
+                return atomic_word.load(order);
+        }
+
+        void store_atomic_word(uint64_t value,
+                               std::memory_order order = std::memory_order_seq_cst)
+        {
+                tigonkv::engine::mem_access::HwccAtomicStore(&atomic_word);
+                atomic_word.store(value, order);
+        }
+
+        bool compare_exchange_word_strong(
+            uint64_t &expected, uint64_t desired,
+            std::memory_order success = std::memory_order_seq_cst,
+            std::memory_order failure = std::memory_order_seq_cst)
+        {
+                tigonkv::engine::mem_access::HwccAtomicRmw(&atomic_word);
+                return atomic_word.compare_exchange_strong(
+                    expected, desired, success, failure);
+        }
+
+        bool compare_exchange_word_weak(
+            uint64_t &expected, uint64_t desired,
+            std::memory_order success = std::memory_order_seq_cst,
+            std::memory_order failure = std::memory_order_seq_cst)
+        {
+                tigonkv::engine::mem_access::HwccAtomicRmw(&atomic_word);
+                return atomic_word.compare_exchange_weak(
+                    expected, desired, success, failure);
+        }
+
         TwoPLPashaMetadataShared(TwoPLPashaSharedDataSCC *scc_data)
         {
                 uint64_t scc_data_cxl_offset = 0;
@@ -83,17 +117,28 @@ struct TwoPLPashaMetadataShared {
                 scc_data_cxl_offset = CXLMemory::pointer_to_pool_offset(scc_data);
                 DCHECK(scc_data_cxl_offset < (1ull << 37));
 
-                atomic_word.store(scc_data_cxl_offset << SCC_DATA_OFFSET, std::memory_order_release);
+                store_atomic_word(scc_data_cxl_offset << SCC_DATA_OFFSET,
+                                  std::memory_order_release);
+                // Default member initializers also materialize HWCC metadata.
+                tigonkv::engine::mem_access::HwccWrite(&tid, sizeof(tid));
+                tigonkv::engine::mem_access::HwccWrite(&flags, sizeof(flags));
+                tigonkv::engine::mem_access::HwccWrite(&ref_cnt, sizeof(ref_cnt));
+                tigonkv::engine::mem_access::HwccWrite(
+                    &writer_waiting, sizeof(writer_waiting));
+                tigonkv::engine::mem_access::HwccWrite(
+                    &value_len, sizeof(value_len));
+                tigonkv::engine::mem_access::HwccWrite(
+                    migration_policy_meta, sizeof(migration_policy_meta));
         }
 
 	void lock()
 	{
 retry:
-		uint64_t v_before_lock = atomic_word.load(std::memory_order_acquire);
+			uint64_t v_before_lock = load_atomic_word(std::memory_order_acquire);
                 uint64_t v_after_lock = (v_before_lock | (LATCH_BIT_MASK << LATCH_BIT_OFFSET));
 
 		if ((v_before_lock & (LATCH_BIT_MASK << LATCH_BIT_OFFSET)) == 0) {
-			if (atomic_word.compare_exchange_strong(v_before_lock, v_after_lock)) {
+				if (compare_exchange_word_strong(v_before_lock, v_after_lock)) {
 				return;
                         } else {
 			        goto retry;
@@ -107,12 +152,12 @@ retry:
 	{
                 // CAS clear latch so concurrent bit RMWs (second-chance, SCC)
                 // are not lost by a plain store of a stale word.
-                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                uint64_t expected = load_atomic_word(std::memory_order_acquire);
                 for (;;) {
                         DCHECK(((expected & (LATCH_BIT_MASK << LATCH_BIT_OFFSET)) != 0) == true);
                         const uint64_t desired =
                             expected & ~(LATCH_BIT_MASK << LATCH_BIT_OFFSET);
-                        if (atomic_word.compare_exchange_weak(
+                        if (compare_exchange_word_weak(
                                 expected, desired, std::memory_order_acq_rel,
                                 std::memory_order_acquire))
                                 return;
@@ -121,7 +166,9 @@ retry:
 
         TwoPLPashaSharedDataSCC *get_scc_data()
         {
-                uint64_t scc_data_cxl_offset = atomic_word.load(std::memory_order_acquire) & (SCC_DATA_MASK << SCC_DATA_OFFSET);
+                uint64_t scc_data_cxl_offset =
+                    load_atomic_word(std::memory_order_acquire) &
+                    (SCC_DATA_MASK << SCC_DATA_OFFSET);
                 void *scc_data_ptr = CXLMemory::pool_offset_to_pointer(scc_data_cxl_offset);
 
                 return reinterpret_cast<TwoPLPashaSharedDataSCC *>(scc_data_ptr);
@@ -165,11 +212,11 @@ retry:
         // (e.g. NoteSharedAccess second-chance, KV unlock-across-clwb).
         void set_bit(uint64_t bit_index)
         {
-                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                uint64_t expected = load_atomic_word(std::memory_order_acquire);
                 for (;;) {
                         const uint64_t desired = expected | (1ull << bit_index);
                         if (desired == expected) return;
-                        if (atomic_word.compare_exchange_weak(
+                        if (compare_exchange_word_weak(
                                 expected, desired, std::memory_order_acq_rel,
                                 std::memory_order_acquire))
                                 return;
@@ -179,11 +226,11 @@ retry:
         // Function to clear a bit at a given position in the bitmap
         void clear_bit(uint64_t bit_index)
         {
-                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                uint64_t expected = load_atomic_word(std::memory_order_acquire);
                 for (;;) {
                         const uint64_t desired = expected & ~(1ull << bit_index);
                         if (desired == expected) return;
-                        if (atomic_word.compare_exchange_weak(
+                        if (compare_exchange_word_weak(
                                 expected, desired, std::memory_order_acq_rel,
                                 std::memory_order_acquire))
                                 return;
@@ -193,23 +240,25 @@ retry:
         // Function to check if a bit is set (returns true if set, false if clear)
         bool is_bit_set(uint64_t bit_index)
         {
-                return (atomic_word.load(std::memory_order_acquire) & (1ull << bit_index)) != 0;
+                return (load_atomic_word(std::memory_order_acquire) &
+                        (1ull << bit_index)) != 0;
         }
 
         // read lock
         uint64_t get_reader_count()
         {
-                return (atomic_word.load(std::memory_order_acquire) >> READ_LOCK_BITS_OFFSET) & READ_LOCK_BITS_MASK;
+                return (load_atomic_word(std::memory_order_acquire) >>
+                        READ_LOCK_BITS_OFFSET) & READ_LOCK_BITS_MASK;
         }
 
         void set_reader_count(uint64_t reader_count)
         {
-                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                uint64_t expected = load_atomic_word(std::memory_order_acquire);
                 for (;;) {
                         uint64_t desired = expected;
                         desired &= ~(READ_LOCK_BITS_MASK << READ_LOCK_BITS_OFFSET);
                         desired |= (reader_count << READ_LOCK_BITS_OFFSET);
-                        if (atomic_word.compare_exchange_weak(
+                        if (compare_exchange_word_weak(
                                 expected, desired, std::memory_order_acq_rel,
                                 std::memory_order_acquire))
                                 return;
@@ -218,11 +267,11 @@ retry:
 
         void increase_reader_count()
         {
-                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                uint64_t expected = load_atomic_word(std::memory_order_acquire);
                 for (;;) {
                         const uint64_t desired =
                             expected + (1ull << READ_LOCK_BITS_OFFSET);
-                        if (atomic_word.compare_exchange_weak(
+                        if (compare_exchange_word_weak(
                                 expected, desired, std::memory_order_acq_rel,
                                 std::memory_order_acquire))
                                 return;
@@ -231,11 +280,11 @@ retry:
 
         void decrease_reader_count()
         {
-                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                uint64_t expected = load_atomic_word(std::memory_order_acquire);
                 for (;;) {
                         const uint64_t desired =
                             expected - (1ull << READ_LOCK_BITS_OFFSET);
-                        if (atomic_word.compare_exchange_weak(
+                        if (compare_exchange_word_weak(
                                 expected, desired, std::memory_order_acq_rel,
                                 std::memory_order_acquire))
                                 return;
@@ -281,12 +330,12 @@ retry:
         // SCC
         void clear_all_scc_bits()
         {
-                uint64_t expected = atomic_word.load(std::memory_order_acquire);
+                uint64_t expected = load_atomic_word(std::memory_order_acquire);
                 for (;;) {
                         const uint64_t desired =
                             expected & ~(SCC_BITS_MASK << SCC_BITS_OFFSET);
                         if (desired == expected) return;
-                        if (atomic_word.compare_exchange_weak(
+                        if (compare_exchange_word_weak(
                                 expected, desired, std::memory_order_acq_rel,
                                 std::memory_order_acquire))
                                 return;
@@ -325,15 +374,61 @@ retry:
         static constexpr int valid_flag_index = 0;
 
         bool get_flag(int flag_index) const {
+                tigonkv::engine::mem_access::HwccRead(&flags, sizeof(flags));
                 return (flags & (1 << flag_index)) != 0;
         }
 
         void set_flag(int flag_index) {
+                tigonkv::engine::mem_access::HwccRead(&flags, sizeof(flags));
+                tigonkv::engine::mem_access::HwccWrite(&flags, sizeof(flags));
                 flags = static_cast<uint8_t>(flags | (1 << flag_index));
         }
 
         void clear_flag(int flag_index) {
+                tigonkv::engine::mem_access::HwccRead(&flags, sizeof(flags));
+                tigonkv::engine::mem_access::HwccWrite(&flags, sizeof(flags));
                 flags = static_cast<uint8_t>(flags & ~(1 << flag_index));
+        }
+
+        uint8_t get_ref_cnt() const {
+                tigonkv::engine::mem_access::HwccRead(&ref_cnt, sizeof(ref_cnt));
+                return ref_cnt;
+        }
+
+        void increment_ref_cnt() {
+                tigonkv::engine::mem_access::HwccRead(&ref_cnt, sizeof(ref_cnt));
+                tigonkv::engine::mem_access::HwccWrite(&ref_cnt, sizeof(ref_cnt));
+                ++ref_cnt;
+        }
+
+        void decrement_ref_cnt() {
+                tigonkv::engine::mem_access::HwccRead(&ref_cnt, sizeof(ref_cnt));
+                tigonkv::engine::mem_access::HwccWrite(&ref_cnt, sizeof(ref_cnt));
+                --ref_cnt;
+        }
+
+        uint8_t get_writer_waiting() const {
+                tigonkv::engine::mem_access::HwccRead(
+                    &writer_waiting, sizeof(writer_waiting));
+                return writer_waiting;
+        }
+
+        void set_writer_waiting(uint8_t value) {
+                tigonkv::engine::mem_access::HwccWrite(
+                    &writer_waiting, sizeof(writer_waiting));
+                writer_waiting = value;
+        }
+
+        uint32_t get_value_len() const {
+                tigonkv::engine::mem_access::HwccRead(
+                    &value_len, sizeof(value_len));
+                return value_len;
+        }
+
+        void set_value_len(uint32_t value) {
+                tigonkv::engine::mem_access::HwccWrite(
+                    &value_len, sizeof(value_len));
+                value_len = value;
         }
 
         // bit 63: latch bit
@@ -384,14 +479,14 @@ class TwoPLPashaHelper {
                 auto *scc_data = smeta->get_scc_data();
                 // ref_cnt is uint8_t; refuse saturation instead of wrapping.
                 // writer_waiting: prefer draining writers over admitting more readers.
-                if (smeta->is_write_locked() || smeta->writer_waiting != 0 ||
+                if (smeta->is_write_locked() || smeta->get_writer_waiting() != 0 ||
                     smeta->get_reader_count() == smeta->get_reader_count_max() ||
-                    smeta->ref_cnt == std::numeric_limits<uint8_t>::max()) {
+                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
                         return false;
                 }
                 smeta->increase_reader_count();
-                smeta->ref_cnt++;
+                smeta->increment_ref_cnt();
                 const auto host_bit =
                     host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
                 const bool need_fill = !smeta->is_bit_set(host_bit);
@@ -409,8 +504,8 @@ class TwoPLPashaHelper {
                 if (valid)
                         scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
                 smeta->lock();
-                DCHECK(smeta->ref_cnt > 0);
-                smeta->ref_cnt--;
+                DCHECK(smeta->get_ref_cnt() > 0);
+                smeta->decrement_ref_cnt();
                 smeta->decrease_reader_count();
                 smeta->unlock();
                 return valid;
@@ -424,19 +519,19 @@ class TwoPLPashaHelper {
                         smeta->lock();
                         auto *scc_data = smeta->get_scc_data();
                         if (smeta->is_write_locked() ||
-                            smeta->ref_cnt == std::numeric_limits<uint8_t>::max()) {
+                            smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
                                 smeta->unlock();
                                 return false;
                         }
                         if (smeta->get_reader_count() != 0) {
-                                smeta->writer_waiting = 1;
+                                smeta->set_writer_waiting(1);
                                 smeta->unlock();
                                 std::this_thread::yield();
                                 continue;
                         }
-                        smeta->writer_waiting = 0;
+                        smeta->set_writer_waiting(0);
                         smeta->set_write_locked();
-                        smeta->ref_cnt++;
+                        smeta->increment_ref_cnt();
                         smeta->unlock();
                         // The write-through SCC protocol requires the writer's
                         // cache-valid bit before finish_write invalidates all peers.
@@ -455,13 +550,13 @@ class TwoPLPashaHelper {
                         if (!smeta->is_bit_set(host_bit))
                                 smeta->set_bit(host_bit);
                         smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                        smeta->value_len = static_cast<uint32_t>(size);
+                        smeta->set_value_len(static_cast<uint32_t>(size));
                         scc_manager->finish_write_bits(smeta, host_id);
                         smeta->unlock();
                         scc_manager->flush_scc_data(scc_data, size);
                         smeta->lock();
-                        DCHECK(smeta->ref_cnt > 0);
-                        smeta->ref_cnt--;
+                        DCHECK(smeta->get_ref_cnt() > 0);
+                        smeta->decrement_ref_cnt();
                         smeta->clear_write_locked();
                         smeta->unlock();
                         return true;
@@ -482,11 +577,11 @@ class TwoPLPashaHelper {
                 // wedged Forward under YCSB-A.
                 if (smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) == false ||
                     smeta->is_write_locked() ||
-                    smeta->ref_cnt == std::numeric_limits<uint8_t>::max()) {
+                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
                         return false;
                 }
-                smeta->ref_cnt++;
+                smeta->increment_ref_cnt();
                 smeta->unlock();
                 return true;
         }
@@ -498,7 +593,7 @@ class TwoPLPashaHelper {
                 // RelWithDebInfo builds compile DCHECK out (NDEBUG). Guarding
                 // prevents a mismatched unpin from wrapping uint8_t 0→255 and
                 // permanently saturating the shared row.
-                if (smeta->ref_cnt > 0) smeta->ref_cnt--;
+                if (smeta->get_ref_cnt() > 0) smeta->decrement_ref_cnt();
                 smeta->unlock();
         }
 
@@ -838,7 +933,7 @@ out_unlock_lmeta:
 
                 // increase reference counting only if we get the lock
                 if (inc_ref_cnt == true) {
-                        smeta->ref_cnt++;
+                        smeta->increment_ref_cnt();
                 }
 
                 smeta->unlock();
@@ -879,7 +974,7 @@ out_unlock_lmeta:
                 success = true;
 
                 // increase reference counting only if we get the lock
-                smeta->ref_cnt++;
+                smeta->increment_ref_cnt();
 
                 smeta->unlock();
 
@@ -1105,7 +1200,7 @@ out_unlock_lmeta:
 
                 // increase reference counting only if we get the lock
                 if (inc_ref_cnt == true) {
-                        smeta->ref_cnt++;
+                        smeta->increment_ref_cnt();
                 }
 
                 smeta->unlock();
@@ -1146,7 +1241,7 @@ out_unlock_lmeta:
                 success = true;
 
                 // increase reference counting only if we get the lock
-                smeta->ref_cnt++;
+                smeta->increment_ref_cnt();
 
                 smeta->unlock();
 
@@ -1317,7 +1412,7 @@ out_unlock_lmeta:
                 TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
 
 		smeta->lock();
-                DCHECK(smeta->ref_cnt > 0);
+                DCHECK(smeta->get_ref_cnt() > 0);
                 DCHECK(smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) == !is_valid);
                 if (is_valid == true) {
                         smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
@@ -1393,7 +1488,7 @@ out_unlock_lmeta:
                         smeta->lock();
                         if (smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) == true) {
                                 if (inc_ref_cnt == true) {
-                                        smeta->ref_cnt++;
+                                        smeta->increment_ref_cnt();
                                         migration_policy_meta = &smeta->migration_policy_meta;
                                 }
                         } else {
@@ -1420,8 +1515,8 @@ out_unlock_lmeta:
                 TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
 
                 smeta->lock();
-                DCHECK(smeta->ref_cnt > 0);
-                smeta->ref_cnt--;
+                DCHECK(smeta->get_ref_cnt() > 0);
+                smeta->decrement_ref_cnt();
                 smeta->unlock();
         }
 
@@ -1432,8 +1527,8 @@ out_unlock_lmeta:
                 TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
 
                 smeta->lock();
-                DCHECK(smeta->ref_cnt > 0);
-                smeta->ref_cnt--;
+                DCHECK(smeta->get_ref_cnt() > 0);
+                smeta->decrement_ref_cnt();
                 smeta->unlock();
         }
 
@@ -1513,7 +1608,7 @@ out_unlock_lmeta:
 
                         // increase the reference count for the requesting host
                         if (inc_ref_cnt == true) {
-                                smeta->ref_cnt++;
+                                smeta->increment_ref_cnt();
                         }
 
                         // insert into the corresponding CXL table
@@ -1540,7 +1635,7 @@ out_unlock_lmeta:
                                 TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
 
                                 smeta->lock();
-                                smeta->ref_cnt++;
+                                smeta->increment_ref_cnt();
                                 smeta->unlock();
                         }
                         res = migration_result::FAIL_ALREADY_IN_CXL;
@@ -1650,7 +1745,7 @@ out_unlock_lmeta:
 
                                 // increase the reference count for the requesting host
                                 if (inc_ref_cnt == true) {
-                                        cur_smeta->ref_cnt++;
+                                        cur_smeta->increment_ref_cnt();
                                 }
 
                                 // update the next-key information
@@ -1741,7 +1836,7 @@ out_unlock_lmeta:
                                         auto cur_scc_data = reinterpret_cast<TwoPLPashaSharedDataSCC *>(cur_smeta->get_scc_data());
 
                                         cur_smeta->lock();
-                                        cur_smeta->ref_cnt++;
+                                        cur_smeta->increment_ref_cnt();
                                         cur_smeta->unlock();
                                 }
                                 res = migration_result::FAIL_ALREADY_IN_CXL;
@@ -1799,7 +1894,7 @@ out_unlock_lmeta:
                         smeta->lock();
 
                         // reference count > 0, cannot move out the tuple
-                        if (smeta->ref_cnt > 0) {
+                        if (smeta->get_ref_cnt() > 0) {
                                 smeta->unlock();
                                 lmeta->unlock();
                                 return false;
@@ -1904,7 +1999,7 @@ out_unlock_lmeta:
                                 cur_smeta->lock();
 
                                 // reference count > 0, cannot move out the tuple -> early return
-                                if (cur_smeta->ref_cnt > 0) {
+                                if (cur_smeta->get_ref_cnt() > 0) {
                                         cur_smeta->unlock();
                                         cur_lmeta->unlock();
                                         move_out_success = false;

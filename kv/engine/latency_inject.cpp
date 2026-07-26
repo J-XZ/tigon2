@@ -5,12 +5,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -40,8 +40,6 @@ uint64_t NextSimulatorGeneration() {
 void CpuRelax() {
 #if defined(__x86_64__) || defined(__i386__)
   _mm_pause();
-#else
-  std::this_thread::yield();
 #endif
 }
 
@@ -76,17 +74,32 @@ void CalibrateTscOnce() {
   });
 }
 
+double RequireCalibratedTsc() {
+  CalibrateTscOnce();
+  const double ticks_per_ns =
+      g_tsc_ticks_per_ns.load(std::memory_order_acquire);
+  if (!std::isfinite(ticks_per_ns) || ticks_per_ns <= 0.0)
+    throw std::runtime_error(
+        "latency injection requires a calibrated x86 TSC; sleep fallback is forbidden");
+  return ticks_per_ns;
+}
+
+[[noreturn]] void AbortLostTscCalibration() {
+  std::fputs(
+      "TIGONKV_LATENCY_FATAL calibrated TSC unavailable during delay\n",
+      stderr);
+  std::fflush(stderr);
+  std::abort();
+}
+
 void DelaySpinNs(uint64_t ns) {
   if (ns == 0) {
     return;
   }
-  CalibrateTscOnce();
   const double ticks_per_ns =
       g_tsc_ticks_per_ns.load(std::memory_order_acquire);
-  if (ticks_per_ns <= 0.0) {
-    std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
-    return;
-  }
+  if (!std::isfinite(ticks_per_ns) || ticks_per_ns <= 0.0)
+    AbortLostTscCalibration();
 #if defined(__x86_64__) || defined(__i386__)
   const uint64_t start = ReadTsc();
   const uint64_t ticks =
@@ -96,7 +109,7 @@ void DelaySpinNs(uint64_t ns) {
     CpuRelax();
   }
 #else
-  std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+  AbortLostTscCalibration();
 #endif
 }
 
@@ -310,6 +323,7 @@ bool InstrumentationEnabledFast() {
 
 LatencySimulator::LatencySimulator(Config config)
     : config_(config), generation_(NextSimulatorGeneration()) {
+  if (config.enabled) (void)RequireCalibratedTsc();
   g_instrumentation_enabled.store(config.enabled, std::memory_order_relaxed);
 }
 
@@ -328,12 +342,10 @@ void LatencySimulator::Configure(Config config) {
   if (config.cache_associativity == 0) {
     config.cache_associativity = 1;
   }
+  if (config.enabled) (void)RequireCalibratedTsc();
   config_ = config;
   g_instrumentation_enabled.store(config.enabled, std::memory_order_relaxed);
   generation_ = NextSimulatorGeneration();
-  if (config.enabled) {
-    CalibrateTscOnce();
-  }
 }
 
 void LatencySimulator::BeginScope(ScopeKind scope) {

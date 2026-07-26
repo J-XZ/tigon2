@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <sys/wait.h>
 #include <thread>
@@ -18,8 +19,48 @@
 
 using namespace tigonkv;
 
+namespace {
+
+bool RelWithDebInfoBuild() {
+#ifdef TIGONKV_CMAKE_BUILD_TYPE
+  return std::string_view(TIGONKV_CMAKE_BUILD_TYPE) == "RelWithDebInfo";
+#else
+  return false;
+#endif
+}
+
+bool ValidateThrows(const Config &config) {
+  try {
+    config.Validate();
+  } catch (const std::invalid_argument &) {
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
 
 int main() {
+  const std::string latency_config_path =
+      "/tmp/tigonkv-latency-config-" + std::to_string(getpid()) + ".jsonc";
+  {
+    std::ifstream source(std::string(TIGONKV_SOURCE_DIR) +
+                         "/experiment_config.jsonc");
+    assert(source.good());
+    std::string text((std::istreambuf_iterator<char>(source)),
+                     std::istreambuf_iterator<char>());
+    const std::string needle = "\"swcc_read_ns_per_line\": 0";
+    const size_t position = text.find(needle);
+    assert(position != std::string::npos);
+    text.replace(position, needle.size(),
+                 "\"swcc_read_ns_per_line\": 1.25");
+    std::ofstream output(latency_config_path);
+    output << text;
+  }
+  const Config fractional = Config::FromJsonc(latency_config_path);
+  assert(fractional.swcc_read_ns == 1.25);
+  std::remove(latency_config_path.c_str());
+
   Config uneven;
   uneven.size_mb = 16;
   uneven.hwcc_size_mb = 4;
@@ -46,7 +87,18 @@ int main() {
   config.fixed_value_size = 128;
   config.foreground_worker_count_per_vm = 4;
   config.transport_ring_total_mb = 1;
-  config.latency_enabled = true;
+  Config gated = config;
+  gated.latency_enabled = true;
+  if (RelWithDebInfoBuild()) {
+    gated.verbose = true;
+    assert(ValidateThrows(gated));
+    gated.verbose = false;
+    gated.extra_check = true;
+    assert(ValidateThrows(gated));
+  } else {
+    assert(ValidateThrows(gated));
+  }
+  config.latency_enabled = RelWithDebInfoBuild();
   config.latency_foreground_enabled = true;
   config.latency_stats_enabled = true;
   config.swcc_read_ns = 1;
@@ -85,8 +137,13 @@ int main() {
   assert(stats.find("allocator_shared_overhead_bytes=") != std::string::npos);
   assert(stats.find("reclaimed_total_bytes=") != std::string::npos);
   assert(stats.find("network_tx_bytes=") != std::string::npos);
-  assert(stats.find("\nswcc_raw=0\n") == std::string::npos);
-  assert(stats.find("\nswcc_misses=0\n") == std::string::npos);
+  if (RelWithDebInfoBuild()) {
+    assert(stats.find("\nswcc_raw=0\n") == std::string::npos);
+    assert(stats.find("\nswcc_misses=0\n") == std::string::npos);
+  } else {
+    assert(stats.find("\nswcc_raw=0\n") != std::string::npos);
+    assert(stats.find("\nhwcc_raw=0\n") != std::string::npos);
+  }
   store.reset();
   auto attached = KVStore::Create(config, false);
   assert(attached->Get("alpha").value == "three");

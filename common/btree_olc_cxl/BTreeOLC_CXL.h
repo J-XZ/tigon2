@@ -88,19 +88,19 @@ struct TreeNodeAllocation {
 	}
 };
 
-// tigonkv: one tree operation touches at least its root page.  The tree's
-// concrete allocation binding determines whether that page belongs to the
-// owner-private SWCC arena or the shared HWCC index region.  Address must be
-// non-null so latency_sim::RecordRange does not drop the sample.
+// Record the cache line containing the node latch and metadata at each node
+// actually visited.  Charging an entire 4 KiB page per operation both
+// over-counted untouched payload and missed non-root nodes.
 inline void RecordTreeAccess(const TreeNodeAllocation &allocation, const void *page,
                              bool write) {
 	if (page == nullptr) return;
+	constexpr uint64_t kNodeMetadataBytes = 64;
 	if (allocation.domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc) {
-		if (write) tigonkv::engine::mem_access::PrivateWrite(page, kPageSize);
-		else tigonkv::engine::mem_access::PrivateRead(page, kPageSize);
+		if (write) tigonkv::engine::mem_access::PrivateWrite(page, kNodeMetadataBytes);
+		else tigonkv::engine::mem_access::PrivateRead(page, kNodeMetadataBytes);
 	} else {
-		if (write) tigonkv::engine::mem_access::TransportWrite(page, kPageSize);
-		else tigonkv::engine::mem_access::TransportRead(page, kPageSize);
+		if (write) tigonkv::engine::mem_access::HwccWrite(page, kNodeMetadataBytes);
+		else tigonkv::engine::mem_access::HwccRead(page, kNodeMetadataBytes);
 	}
 }
 
@@ -925,6 +925,7 @@ class BPlusTree {
 		{
 			char *base = reinterpret_cast<char *>(allocation.Allocate(LeafPageSize));
 			BTreeLeaf *newLeaf = new (base) BTreeLeaf(); // Placement new
+			RecordTreeAccess(allocation, newLeaf, true);
 
 			newLeaf->setCount(this->getCount() - (this->getCount() / 2));
 			newLeaf->next_ = next_.get();
@@ -1169,6 +1170,7 @@ class BPlusTree {
 		{
 			char *base = reinterpret_cast<char *>(allocation.Allocate(InnerPageSize));
 			BTreeInner *newInner = new (base) BTreeInner(); // Placement new
+			RecordTreeAccess(allocation, newInner, true);
 
 			newInner->setCount(this->getCount() - (this->getCount() / 2));
 			this->setCount(this->getCount() - newInner->getCount() - 1);
@@ -1266,6 +1268,7 @@ class BPlusTree {
 			: curNode_(nullptr)
 			, curPos_(-1)
 			, state_(VALID)
+			, allocation_(nullptr)
 		{
 		}
 
@@ -1279,9 +1282,12 @@ class BPlusTree {
 		/**
 		 * Assuming that curNode has increase the number of readers by one
 		 */
-		BPlusTreeIterator(BTreeLeaf *curNode, int curPos)
+		BPlusTreeIterator(BTreeLeaf *curNode, int curPos,
+		                  const TreeNodeAllocation *allocation = nullptr)
 			: curNode_(curNode)
 			, curPos_(curPos)
+			, state_(VALID)
+			, allocation_(allocation)
 		{
 			if (curNode_.get() == nullptr || curNode_->getCount() == curPos) {
 				setEndIterator(true);
@@ -1409,6 +1415,8 @@ class BPlusTree {
 				}
 				auto preNode = curNode_.get();
 				curNode_ = curNode_->next_.get();
+				if (allocation_ != nullptr)
+					RecordTreeAccess(*allocation_, curNode_.get(), false);
 				curNode_->iteratorEnter(needRestart);
 				if (needRestart) {
 					preNode->iteratorLeave();
@@ -1436,6 +1444,8 @@ class BPlusTree {
 				}
 				auto preNode = curNode_.get();
 				curNode_ = curNode_->pre_.get();
+				if (allocation_ != nullptr)
+					RecordTreeAccess(*allocation_, curNode_.get(), false);
 				curNode_->iteratorEnter(needRestart);
 				if (needRestart) {
 					preNode->iteratorLeave();
@@ -1446,6 +1456,8 @@ class BPlusTree {
 				curPos_ = curNode_->getCount() - 1;
 			}
 		}
+
+		const TreeNodeAllocation *allocation_{ nullptr };
 	};
 
 	/**
@@ -1521,6 +1533,7 @@ class BPlusTree {
 	{
 		if (slot == nullptr)
 			throw std::invalid_argument("BPlusTree published root slot is null");
+		tigonkv::engine::mem_access::HwccAtomicLoad(slot);
 		const auto off = slot->load(std::memory_order_acquire);
 		if (off == tigonkv::engine::kNullOffset) {
 			// Creator: publish the process-local root allocated by the ctor.
@@ -1528,6 +1541,7 @@ class BPlusTree {
 			if (local == nullptr)
 				throw std::runtime_error("BPlusTree has no local root to publish");
 			published_root_ = slot;
+			tigonkv::engine::mem_access::HwccAtomicStore(slot);
 			slot->store(allocation_.ToOffset(local), std::memory_order_release);
 		} else {
 			// Attacher: adopt the HWCC live root.
@@ -1542,6 +1556,7 @@ class BPlusTree {
 	{
 		char *base = reinterpret_cast<char *>(allocation_.Allocate(InnerPageSize));
 		auto inner = new (base) BTreeInner(); // Placement new
+		RecordTreeAccess(allocation_, inner, true);
 
 		inner->setCount(1);
 		inner->newKey(0, k);
@@ -1837,6 +1852,7 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, true);
 			// prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -1942,6 +1958,7 @@ restart:
 
 		// Current node
 		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, true);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2008,6 +2025,7 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, true);
 			// prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -2113,6 +2131,7 @@ restart:
 
 		// Current node
 		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, true);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2179,6 +2198,7 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, true);
 			// prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -2279,8 +2299,6 @@ restart:
 	 */
 	bool remove(const KeyType &key)
 	{
-		NodeBase *root = load_root();
-		RecordTreeAccess(allocation_, root, true);
 		return _remove(key);
 	}
 
@@ -2290,8 +2308,6 @@ restart:
 	 */
 	bool remove(const KeyType &key, ValueType value)
 	{
-		NodeBase *root = load_root();
-		RecordTreeAccess(allocation_, root, true);
 		return _remove(key);
 	}
 
@@ -2343,6 +2359,7 @@ restart:
 			parent = inner;
 			versionParent = versionNode;
 			node = inner->childAt(inner->lowerBound(lowKey, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, false);
 
 			// prefetch((char *)node, kPageSize);
 			inner->checkOrRestart(versionNode, needRestart);
@@ -2369,6 +2386,7 @@ restart:
 				if (needRestart)
 					goto restart;
 				leaf = nextLeaf;
+				RecordTreeAccess(allocation_, leaf, false);
 				pos = 0;
 			} else {
 				pos++;
@@ -2384,7 +2402,7 @@ restart:
 		if (needRestart)
 			goto restart;
 		{
-			BPlusTreeIterator itr(leaf, pos);
+			BPlusTreeIterator itr(leaf, pos, &allocation_);
 			if (itr == retryItr())
 				goto restart;
 
@@ -2418,6 +2436,7 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, true);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2441,6 +2460,7 @@ restart:
 			parent = inner;
 			versionParent = versionNode;
 			node = inner->childAt(inner->lowerBound(lowKey, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, true);
 
 			// prefetch((char *)node, kPageSize);
 			inner->checkOrRestart(versionNode, needRestart);
@@ -2758,8 +2778,6 @@ restart:
 	 */
 	bool lookup(const KeyType &key, ValueType &result)
 	{
-		NodeBase *root = load_root();
-		RecordTreeAccess(allocation_, root, false);
 		return _lookup(key, result);
 	}
 
@@ -2844,6 +2862,7 @@ restart:
 	NodeBase *load_root() const
 	{
 		if (published_root_ != nullptr) {
+			tigonkv::engine::mem_access::HwccAtomicLoad(published_root_);
 			const auto off = published_root_->load(std::memory_order_acquire);
 			if (off == tigonkv::engine::kNullOffset) return nullptr;
 			return static_cast<NodeBase *>(allocation_.FromOffset(off));
@@ -2855,6 +2874,7 @@ restart:
 	{
 		root_.store(node);
 		if (published_root_ != nullptr) {
+			tigonkv::engine::mem_access::HwccAtomicStore(published_root_);
 			published_root_->store(allocation_.ToOffset(node), std::memory_order_release);
 		}
 	}
@@ -2888,6 +2908,7 @@ restart:
 			yield(restartCount);
 
 		bool needRestart = false;
+		RecordTreeAccess(allocation_, node, false);
 		uint64_t version = node->readLockOrRestart(needRestart);
 		if (needRestart)
 			goto restart;
@@ -2909,6 +2930,7 @@ restart:
 			// get the last child
 			auto pos = node->getCount();
 			node = inner->childAt(pos).get();
+			RecordTreeAccess(allocation_, node, false);
 
 			inner->checkOrRestart(version, needRestart);
 			if (needRestart)
@@ -2952,6 +2974,7 @@ restart:
 		// from which the current node is derived.
 		std::vector<StackNodeElement> stack;
 		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, true);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2978,6 +3001,7 @@ restart:
 
 			unsigned pos = inner->lowerBound(element.first, keyComp_);
 			node = inner->childAt(pos).get();
+			RecordTreeAccess(allocation_, node, true);
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart) {
 				goto restart;
@@ -3108,6 +3132,7 @@ restart:
 		// from which the current node is derived.
 		std::vector<StackNodeElement> stack;
 		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, true);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -3134,6 +3159,7 @@ restart:
 
 			unsigned pos = inner->lowerBound(deleteKey, keyComp_);
 			node = inner->childAt(pos).get();
+			RecordTreeAccess(allocation_, node, true);
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart) {
 				goto restart;
@@ -3243,6 +3269,7 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, true);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -3266,6 +3293,7 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(key, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, true);
 			prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -3318,6 +3346,7 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -3341,6 +3370,7 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(element.first, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, false);
 			prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -3388,6 +3418,7 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -3411,6 +3442,7 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(key, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, false);
 			prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)

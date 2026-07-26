@@ -293,6 +293,9 @@ int main() {
     Config config = Config::FromJsonc(experiment);
     config.node_id = static_cast<uint32_t>(ParseUnsigned(Env("TIGONKV_NODE_ID", "CXLKV_NODE_ID", "0"), "node id"));
     node = config.node_id;
+    if (config.latency_enabled &&
+        Env("TIGONKV_E2E_VERBOSE", "CXLKV_E2E_VERBOSE", "0") == "1")
+      Fail("latency_inject.enabled=true requires TIGONKV_E2E_VERBOSE=0");
     const std::string trace_config = Env("TIGONKV_E2E_TRACE_CONFIG_JSONC", "CXLKV_E2E_TRACE_CONFIG_JSONC");
     if (!trace_config.empty()) {
       std::ifstream config_file(trace_config);

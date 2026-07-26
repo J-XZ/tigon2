@@ -50,6 +50,13 @@ int main() {
   assert(pool != MAP_FAILED);
   auto regions = tigonkv::engine::DualRegionAllocator::Initialize(pool, Config(bytes));
   star::CXLMemory::bind_dual_region_allocator(&regions, 0);
+  latency_sim::Config latency;
+  latency.enabled = true;
+  latency.foreground_enabled = true;
+  latency.stats_enabled = true;
+  auto &simulator = latency_sim::GlobalLatencySimulator();
+  simulator.Configure(latency);
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   auto *payload = new (regions.Allocate(16,
       tigonkv::engine::AllocationDomain::kSharedPayloadSwcc, 0)) star::TwoPLPashaSharedDataSCC;
   auto *meta = new (regions.Allocate(sizeof(star::TwoPLPashaMetadataShared),
@@ -75,6 +82,11 @@ int main() {
   star::TwoPLPashaHelper::kv_unpin_shared_ref(meta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(meta);
   assert(meta->ref_cnt == 0);
+  simulator.EndScopeAndDelay();
+  const auto latency_stats = simulator.TakeStatsAndReset();
+  assert(latency_stats.hwcc_raw_line_accesses > 0);
+  assert(latency_stats.hwcc_cache_misses ==
+         latency_stats.hwcc_raw_line_accesses);
   star::scc_manager = nullptr;
   munmap(pool, bytes);
   return 0;

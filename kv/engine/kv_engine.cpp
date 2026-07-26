@@ -4,6 +4,7 @@
 #include "common/MPSCRingBuffer.h"
 #include "kv/engine/kv_partition.h"
 #include "kv/engine/kv_migration.h"
+#include "kv/engine/mem_access.h"
 #include "kv/engine/kv_messages.h"
 #include "protocol/TwoPLPasha/TwoPLPashaSCCWriteThrough.h"
 
@@ -828,32 +829,38 @@ void KVEngine::InboundDemuxerLoop() {
   star::global_ebr_meta = ebr_;
   while (!inbound_demuxer_stop_.load(std::memory_order_acquire)) {
     bool progressed = false;
-    if (rings_ != nullptr) {
-      for (int drained = 0; drained < 64; ++drained) {
-        alignas(64) char bytes[sizeof(KvMessage)];
-        uint64_t received = 0;
-        try {
-          received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
-        } catch (const std::exception &error) {
-          TransportFatal(config_.node_id, "ring_recv", error.what());
-        } catch (...) {
-          TransportFatal(config_.node_id, "ring_recv", "non-std exception");
+    {
+      // The demuxer is the actual thread touching the inbound HWCC ring, so it
+      // needs its own foreground scope; scopes do not propagate across threads.
+      mem_access::LatencyScope latency_scope(
+          latency_sim::ScopeKind::kForeground);
+      if (rings_ != nullptr) {
+        for (int drained = 0; drained < 64; ++drained) {
+          alignas(64) char bytes[sizeof(KvMessage)];
+          uint64_t received = 0;
+          try {
+            received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
+          } catch (const std::exception &error) {
+            TransportFatal(config_.node_id, "ring_recv", error.what());
+          } catch (...) {
+            TransportFatal(config_.node_id, "ring_recv", "non-std exception");
+          }
+          if (received == 0) break;
+          if (received != sizeof(KvMessage))
+            TransportFatal(config_.node_id, "ring_recv",
+                           "malformed KV transport entry");
+          KvMessage message{};
+          std::memcpy(&message, bytes, sizeof(message));
+          network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
+          try {
+            DemuxTransportMessage(message);
+          } catch (const std::exception &error) {
+            TransportFatal(config_.node_id, "demux", error.what(), &message);
+          } catch (...) {
+            TransportFatal(config_.node_id, "demux", "non-std exception", &message);
+          }
+          progressed = true;
         }
-        if (received == 0) break;
-        if (received != sizeof(KvMessage))
-          TransportFatal(config_.node_id, "ring_recv",
-                         "malformed KV transport entry");
-        KvMessage message{};
-        std::memcpy(&message, bytes, sizeof(message));
-        network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
-        try {
-          DemuxTransportMessage(message);
-        } catch (const std::exception &error) {
-          TransportFatal(config_.node_id, "demux", error.what(), &message);
-        } catch (...) {
-          TransportFatal(config_.node_id, "demux", "non-std exception", &message);
-        }
-        progressed = true;
       }
     }
     if (!progressed) std::this_thread::sleep_for(std::chrono::microseconds(20));

@@ -2,11 +2,13 @@
 
 #include "kv/engine/kv_engine.h"
 #include "kv/engine/latency_inject.h"
+#include "kv/engine/mem_access.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -84,7 +86,8 @@ bool JsonString(const std::string &s, const char *name, std::string *out) {
 }
 
 bool JsonDouble(const std::string &s, const char *name, double *out) {
-  std::regex r(std::string("\\\"") + name + R"(\"\s*:\s*([0-9]+(?:\.[0-9]+)?))");
+  std::regex r(std::string("\\\"") + name +
+      R"(\"\s*:\s*(-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?))");
   std::smatch m;
   if (!std::regex_search(s, m, r)) return false;
   *out = std::stod(m[1].str());
@@ -162,6 +165,7 @@ void ValidateKnownKeys(const std::string &s) {
       "fixed_key_size", "fixed_value_size", "hw_cc_budget_mb",
       "owner_private_swcc_fraction", "migration_policy", "when_to_move_out",
       "scc_mechanism", "transport_ring_total_mb",
+      "verbose", "extra_check",
       "latency_inject", "enabled", "foreground_enabled", "merge_enabled",
       "stats_enabled", "cache_line_bytes", "swcc_read_ns_per_line",
       "swcc_write_ns_per_line", "swcc_flush_ns_per_line", "hwcc_read_ns_per_line",
@@ -212,6 +216,8 @@ Config Config::FromJsonc(const std::string &path) {
   JsonString(text, "when_to_move_out", &c.when_to_move_out);
   JsonString(text, "scc_mechanism", &c.scc_mechanism);
   JsonNumber(text, "transport_ring_total_mb", &c.transport_ring_total_mb);
+  JsonBool(text, "verbose", &c.verbose);
+  JsonBool(text, "extra_check", &c.extra_check);
   JsonNumberInObject(text, "hwcc", "offset_mb", &c.hwcc_offset_mb);
   JsonNumberInObject(text, "hwcc", "size_mb", &c.hwcc_size_mb);
   JsonNumberInObject(text, "swcc", "offset_mb", &c.swcc_offset_mb);
@@ -221,14 +227,14 @@ Config Config::FromJsonc(const std::string &path) {
   JsonBool(text, "merge_enabled", &c.latency_merge_enabled);
   JsonBool(text, "stats_enabled", &c.latency_stats_enabled);
   JsonNumber(text, "cache_line_bytes", &c.latency_cache_line_bytes);
-  JsonNumber(text, "swcc_read_ns_per_line", &c.swcc_read_ns);
-  JsonNumber(text, "swcc_write_ns_per_line", &c.swcc_write_ns);
-  JsonNumber(text, "swcc_flush_ns_per_line", &c.swcc_flush_ns);
-  JsonNumber(text, "hwcc_read_ns_per_line", &c.hwcc_read_ns);
-  JsonNumber(text, "hwcc_write_ns_per_line", &c.hwcc_write_ns);
-  JsonNumber(text, "hwcc_atomic_load_ns", &c.hwcc_atomic_load_ns);
-  JsonNumber(text, "hwcc_atomic_store_ns", &c.hwcc_atomic_store_ns);
-  JsonNumber(text, "hwcc_atomic_rmw_ns", &c.hwcc_atomic_rmw_ns);
+  JsonDouble(text, "swcc_read_ns_per_line", &c.swcc_read_ns);
+  JsonDouble(text, "swcc_write_ns_per_line", &c.swcc_write_ns);
+  JsonDouble(text, "swcc_flush_ns_per_line", &c.swcc_flush_ns);
+  JsonDouble(text, "hwcc_read_ns_per_line", &c.hwcc_read_ns);
+  JsonDouble(text, "hwcc_write_ns_per_line", &c.hwcc_write_ns);
+  JsonDouble(text, "hwcc_atomic_load_ns", &c.hwcc_atomic_load_ns);
+  JsonDouble(text, "hwcc_atomic_store_ns", &c.hwcc_atomic_store_ns);
+  JsonDouble(text, "hwcc_atomic_rmw_ns", &c.hwcc_atomic_rmw_ns);
   c.hwcc_atomic_ns = std::max({c.hwcc_atomic_load_ns, c.hwcc_atomic_store_ns,
                                 c.hwcc_atomic_rmw_ns});
   JsonString(text, "cache_model", &c.latency_cache_model);
@@ -236,7 +242,7 @@ Config Config::FromJsonc(const std::string &path) {
   JsonDouble(text, "cache_fixed_hit_rate", &c.latency_cache_fixed_hit_rate);
   JsonNumber(text, "cache_capacity_lines", &c.latency_cache_capacity_lines);
   JsonNumber(text, "cache_associativity", &c.latency_cache_associativity);
-  JsonNumber(text, "cache_hit_extra_ns", &c.latency_cache_hit_extra_ns);
+  JsonDouble(text, "cache_hit_extra_ns", &c.latency_cache_hit_extra_ns);
   if (c.shared_memory_path == "/mnt/xz_shared_mem" || c.shared_memory_path == "/mnt/xz_shared_mem/")
     c.shared_memory_path = "/mnt/xz_shared_mem/ivshmem_shared_mem";
   struct stat device_stat {};
@@ -274,19 +280,35 @@ void Config::Validate() const {
     throw std::invalid_argument("latency cache hit rate must be in [0,1]");
   if (latency_cache_line_bytes != 64 || latency_cache_associativity == 0)
     throw std::invalid_argument("invalid latency cache geometry");
+  if (!std::isfinite(swcc_read_ns) || swcc_read_ns < 0 ||
+      !std::isfinite(swcc_write_ns) || swcc_write_ns < 0 ||
+      !std::isfinite(swcc_flush_ns) || swcc_flush_ns < 0 ||
+      !std::isfinite(hwcc_read_ns) || hwcc_read_ns < 0 ||
+      !std::isfinite(hwcc_write_ns) || hwcc_write_ns < 0 ||
+      !std::isfinite(hwcc_atomic_load_ns) || hwcc_atomic_load_ns < 0 ||
+      !std::isfinite(hwcc_atomic_store_ns) || hwcc_atomic_store_ns < 0 ||
+      !std::isfinite(hwcc_atomic_rmw_ns) || hwcc_atomic_rmw_ns < 0 ||
+      !std::isfinite(latency_cache_hit_extra_ns) ||
+      latency_cache_hit_extra_ns < 0)
+    throw std::invalid_argument("latency values must be finite and non-negative");
+  if (latency_enabled) {
+    if (verbose)
+      throw std::invalid_argument(
+          "latency_inject.enabled=true is incompatible with verbose=true");
+    if (extra_check)
+      throw std::invalid_argument(
+          "latency_inject.enabled=true is incompatible with extra_check=true");
+#if !defined(TIGONKV_CMAKE_BUILD_TYPE)
+    throw std::invalid_argument(
+        "latency_inject.enabled=true requires a known RelWithDebInfo build");
+#else
+    if (std::string_view(TIGONKV_CMAKE_BUILD_TYPE) != "RelWithDebInfo")
+      throw std::invalid_argument(
+          "latency_inject.enabled=true is only supported in RelWithDebInfo builds");
+#endif
+  }
 }
 
-
-namespace {
-class ForegroundLatencyScope {
- public:
-  ForegroundLatencyScope() {
-    latency_sim::GlobalLatencySimulator().BeginScope(
-        latency_sim::ScopeKind::kForeground);
-  }
-  ~ForegroundLatencyScope() { latency_sim::GlobalLatencySimulator().EndScopeAndDelay(); }
-};
-}  // namespace
 
 std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
   auto store = std::unique_ptr<KVStore>(new KVStore(config));
@@ -375,7 +397,8 @@ RuntimeStats &KVStore::ThreadRuntime() {
 }
 
 Status KVStore::Put(std::string_view key, std::string_view value) {
-  ForegroundLatencyScope latency_scope;
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
   try { ValidateKeyValue(key, value); }
   catch (const std::exception &e) { return Status::Error(StatusCode::kInvalidArgument, e.what()); }
@@ -388,7 +411,8 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
 }
 
 GetResult KVStore::Get(std::string_view key) {
-  ForegroundLatencyScope latency_scope;
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
@@ -401,7 +425,8 @@ GetResult KVStore::Get(std::string_view key) {
 }
 
 Status KVStore::Delete(std::string_view key) {
-  ForegroundLatencyScope latency_scope;
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return Status::Error(StatusCode::kInvalidArgument, "invalid key");
@@ -414,7 +439,8 @@ Status KVStore::Delete(std::string_view key) {
 }
 
 Status KVStore::MoveOut(std::string_view key) {
-  ForegroundLatencyScope latency_scope;
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
@@ -424,7 +450,8 @@ Status KVStore::MoveOut(std::string_view key) {
 }
 
 ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
-  ForegroundLatencyScope latency_scope;
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
   if (!config_.enable_scan)
     return {Status::Error(StatusCode::kInvalidArgument, "SCAN disabled"), {}};
@@ -438,7 +465,8 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
 
 CasResult KVStore::CompareExchange(std::string_view key, std::string_view expected,
                                    std::string_view desired) {
-  ForegroundLatencyScope latency_scope;
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
   try { ValidateKeyValue(key, desired); }
   catch (const std::exception &e) { return {Status::Error(StatusCode::kInvalidArgument, e.what()), false}; }
@@ -451,7 +479,8 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
 }
 
 IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
-  ForegroundLatencyScope latency_scope;
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), 0};
@@ -464,6 +493,8 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
 }
 
 Status KVStore::PollTransport() {
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kForeground);
   if (impl_ == nullptr || impl_->engine == nullptr)
     return Status::Error(StatusCode::kCorruption, "KVStore is closed");
   impl_->engine->PollTransport();
@@ -481,7 +512,8 @@ void KVStore::BindWorker(uint32_t worker_id) {
 }
 
 Status KVStore::Checkpoint() {
-  ForegroundLatencyScope latency_scope;
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kForeground);
   Status status = impl_->engine->Checkpoint();
   if (status.ok()) ++ThreadRuntime().checkpoint_swcc_flushes;
   return status;

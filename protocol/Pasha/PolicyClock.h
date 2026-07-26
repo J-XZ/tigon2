@@ -10,6 +10,7 @@
 
 #include "common/CXLMemory.h"
 #include "core/Table.h"
+#include "kv/engine/mem_access.h"
 #include "protocol/Pasha/MigrationManager.h"
 
 namespace star
@@ -145,6 +146,8 @@ class PolicyClock : public MigrationManager {
         void init_migration_policy_metadata(void *migration_policy_meta, ITable *table, const void *key, const std::tuple<MetaDataType *, void *> &row, uint64_t metadata_size) override
         {
                 ClockMeta *clock_meta = reinterpret_cast<ClockMeta *>(migration_policy_meta);
+                tigonkv::engine::mem_access::HwccWrite(
+                    clock_meta, sizeof(ClockMeta));
                 new(clock_meta) ClockMeta();
         }
 
@@ -167,6 +170,8 @@ class PolicyClock : public MigrationManager {
                 // ClockMeta resides in TwoPLPashaMetadataShared::migration_policy_meta
                 // (HWCC). Do not place second_chance in SWCC payload.
                 ClockMeta *clock_meta = reinterpret_cast<ClockMeta *>(migration_policy_meta);
+                tigonkv::engine::mem_access::HwccWrite(
+                    &clock_meta->second_chance, sizeof(clock_meta->second_chance));
                 clock_meta->second_chance = 1;
                 (void)partition_id;
         }
@@ -207,7 +212,13 @@ class PolicyClock : public MigrationManager {
                         } else {
                                 migrated_row_entity victim_row_entity = victim->row_entity;
                                 ClockMeta *clock_meta = reinterpret_cast<ClockMeta *>(victim_row_entity.migration_manager_meta);
+                                tigonkv::engine::mem_access::HwccRead(
+                                    &clock_meta->second_chance,
+                                    sizeof(clock_meta->second_chance));
                                 if (clock_meta->second_chance == 1) {
+                                        tigonkv::engine::mem_access::HwccWrite(
+                                            &clock_meta->second_chance,
+                                            sizeof(clock_meta->second_chance));
                                         clock_meta->second_chance = 0;
                                         continue;
                                 }
