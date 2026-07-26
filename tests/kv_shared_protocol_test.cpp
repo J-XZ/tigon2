@@ -43,7 +43,7 @@ int main() {
   assert(pool != MAP_FAILED);
   auto regions = tigonkv::engine::DualRegionAllocator::Initialize(pool, Config(bytes));
   star::CXLMemory::bind_dual_region_allocator(&regions, 0);
-  auto *payload = new (regions.Allocate(sizeof(star::TwoPLPashaSharedDataSCC) + 16,
+  auto *payload = new (regions.Allocate(16,
       tigonkv::engine::AllocationDomain::kSharedPayloadSwcc, 0)) star::TwoPLPashaSharedDataSCC;
   auto *meta = new (regions.Allocate(sizeof(star::TwoPLPashaMetadataShared),
       tigonkv::engine::AllocationDomain::kHwccMetadata, 0)) star::TwoPLPashaMetadataShared(payload);
@@ -51,20 +51,22 @@ int main() {
   star::scc_manager = &fake;
   fake.init_scc_metadata(meta, 0);
   assert(star::TwoPLPashaHelper::kv_shared_write(meta, 0, "shared-value", 12));
-  assert(payload->ref_cnt == 0);
+  assert(meta->ref_cnt == 0);
+  assert(meta->value_len == 12);
+  assert(meta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index));
   char out[13] = {};
   assert(star::TwoPLPashaHelper::kv_shared_read(meta, 1, out, 12));
   assert(std::string(out, 12) == "shared-value");
-  assert(payload->ref_cnt == 0);
+  assert(meta->ref_cnt == 0);
   assert(fake.writes == 1 && fake.finishes == 1 && fake.prepares == 1 && fake.reads == 1);
   assert(meta->get_reader_count() == 0 && !meta->is_write_locked());
   assert(star::TwoPLPashaHelper::kv_pin_shared_ref(meta));
-  assert(payload->ref_cnt == 1);
+  assert(meta->ref_cnt == 1);
   assert(star::TwoPLPashaHelper::kv_pin_shared_ref(meta));
-  assert(payload->ref_cnt == 2);
+  assert(meta->ref_cnt == 2);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(meta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(meta);
-  assert(payload->ref_cnt == 0);
+  assert(meta->ref_cnt == 0);
   star::scc_manager = nullptr;
   munmap(pool, bytes);
   return 0;

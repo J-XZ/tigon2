@@ -104,7 +104,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
         row->value_len = static_cast<uint32_t>(value.size());
         ++row->version;
         // Length for non-owner CXL lookups lives in SCC, not the shared tree.
-        if (payload != nullptr) payload->value_len = row->value_len;
+        if (smeta != nullptr) smeta->value_len = row->value_len;
         NoteSharedAccess(smeta);
       }
       UnlockRow(row);
@@ -206,7 +206,7 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
   RegionOffset smeta_offset = kNullOffset;
   if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
   auto *payload = smeta->get_scc_data();
-  const uint32_t value_len = payload->value_len;
+  const uint32_t value_len = smeta->value_len;
   if (value_len > regions_.layout().fixed_value_size) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return false;
@@ -229,7 +229,7 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
     star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return false;
   }
-  payload->value_len = static_cast<uint32_t>(desired.size());
+  smeta->value_len = static_cast<uint32_t>(desired.size());
   *exchanged = true;
   NoteSharedAccess(smeta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
@@ -307,7 +307,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
     }
     row->value_len = static_cast<uint32_t>(desired.size());
     ++row->version;
-    payload->value_len = row->value_len;
+    smeta->value_len = row->value_len;
     NoteSharedAccess(smeta);
     *exchanged = true;
   }
@@ -383,7 +383,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
       throw std::runtime_error("migrated increment shared write rejected");
     }
     row->value_len = static_cast<uint32_t>(encoded.size());
-    payload_w->value_len = row->value_len;
+    smeta->value_len = row->value_len;
     NoteSharedAccess(smeta);
   } else {
     std::memcpy(row->kv + row->key_len, encoded.data(), encoded.size());
@@ -468,13 +468,12 @@ star::migration_result KVPartition::MoveInForMigrationManager(
         UnlockRow(row);
         return star::migration_result::FAIL_OOM;
       }
-      migration_policy_meta = &payload->migration_policy_meta;
+      migration_policy_meta = &smeta->migration_policy_meta;
     }
     UnlockRow(row);
     return star::migration_result::FAIL_ALREADY_IN_CXL;
   }
-  const uint64_t payload_bytes = sizeof(star::TwoPLPashaSharedDataSCC) +
-                                 regions_.layout().fixed_value_size;
+  const uint64_t payload_bytes = regions_.layout().fixed_value_size;
   void *payload_mem = nullptr;
   void *smeta_mem = nullptr;
   try {
@@ -492,35 +491,34 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   smeta->lock();
   if (star::migration_manager != nullptr) {
     star::migration_manager->init_migration_policy_metadata(
-        &payload->migration_policy_meta, nullptr, key,
+        &smeta->migration_policy_meta, nullptr, key,
         std::tuple<std::atomic<uint64_t> *, void *>{nullptr, nullptr},
         sizeof(star::TwoPLPashaMetadataShared));
   }
   mem_access::SharedPayloadWrite(payload->data, row->value_len);
   star::scc_manager->do_write(smeta, owner_shard_, payload->data, row->kv + row->key_len,
                                row->value_len);
-  payload->value_len = row->value_len;
-  payload->set_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
+  smeta->value_len = row->value_len;
+  smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
   if (inc_ref_cnt) {
-    if (payload->ref_cnt == std::numeric_limits<uint8_t>::max()) {
+    if (smeta->ref_cnt == std::numeric_limits<uint8_t>::max()) {
       smeta->unlock();
       UnlockRow(row);
       return star::migration_result::FAIL_OOM;
     }
-    payload->ref_cnt++;
+    smeta->ref_cnt++;
   }
   const RegionOffset smeta_offset = regions_.hwcc().ToOffset(smeta);
   if (!shared_tree_->insert(fixed_key, smeta_offset)) {
-    if (inc_ref_cnt) payload->ref_cnt--;
+    if (inc_ref_cnt) smeta->ref_cnt--;
     smeta->unlock();
     UnlockRow(row);
     return star::migration_result::FAIL_OOM;
   }
   row->migrated_smeta_off = smeta_offset;
   row->is_migrated = 1;
-  star::scc_manager->finish_write(smeta, owner_shard_, payload,
-                                  sizeof(star::TwoPLPashaSharedDataSCC) + row->value_len);
-  migration_policy_meta = &payload->migration_policy_meta;
+  star::scc_manager->finish_write(smeta, owner_shard_, payload, row->value_len);
+  migration_policy_meta = &smeta->migration_policy_meta;
   smeta->unlock();
   UnlockRow(row);
   PersistRoots();
@@ -557,15 +555,14 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
       regions_.hwcc().FromOffset(smeta_offset));
   smeta->lock();
   auto *payload = smeta->get_scc_data();
-  if (payload->ref_cnt != 0 || smeta->get_reader_count() != 0 || smeta->is_write_locked()) {
+  if (smeta->ref_cnt != 0 || smeta->get_reader_count() != 0 || smeta->is_write_locked()) {
     smeta->unlock();
     UnlockRow(row);
     return false;
   }
   smeta->set_write_locked();
-  star::scc_manager->prepare_read(smeta, host_id, payload,
-                                  sizeof(star::TwoPLPashaSharedDataSCC) + row->value_len);
-  if (!payload->get_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index)) {
+  star::scc_manager->prepare_read(smeta, host_id, payload, row->value_len);
+  if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index)) {
     smeta->clear_write_locked();
     smeta->unlock();
     UnlockRow(row);
@@ -576,11 +573,11 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
                              row->value_len);
   // Invalidate before tree remove so concurrent TryPinShared cannot pin a
   // row that is about to be EBR-retired.
-  payload->clear_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
+  smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
   row->is_migrated = 0;
   row->migrated_smeta_off = kNullOffset;
   if (!shared_tree_->remove(fixed_key)) {
-    payload->set_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
+    smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
     row->is_migrated = 1;
     row->migrated_smeta_off = smeta_offset;
     smeta->clear_write_locked();
@@ -592,9 +589,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   smeta->unlock();
   ebr_.add_retired_object(smeta, sizeof(star::TwoPLPashaMetadataShared),
                           star::CXLMemory::METADATA_FREE, owner_shard_);
-  ebr_.add_retired_object(payload,
-                          sizeof(star::TwoPLPashaSharedDataSCC) +
-                              regions_.layout().fixed_value_size,
+  ebr_.add_retired_object(payload, regions_.layout().fixed_value_size,
                           star::CXLMemory::DATA_FREE, owner_shard_);
   UnlockRow(row);
   PersistRoots();
@@ -685,7 +680,7 @@ bool KVPartition::ScanOwned(
         auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
             regions_.hwcc().FromOffset(entry.second));
         auto *payload = smeta->get_scc_data();
-        const uint32_t value_len = payload->value_len != 0 ? payload->value_len
+        const uint32_t value_len = smeta->value_len != 0 ? smeta->value_len
                                                           : row->value_len;
         std::string value(value_len, '\0');
         mem_access::SharedPayloadRead(payload->data, value.size());
@@ -768,16 +763,16 @@ bool KVPartition::DeletePrivate(std::string_view key) {
         regions_.hwcc().FromOffset(smeta_offset));
     smeta->lock();
     auto *payload = smeta->get_scc_data();
-    if (payload->ref_cnt != 0 || smeta->get_reader_count() != 0 || smeta->is_write_locked()) {
+    if (smeta->ref_cnt != 0 || smeta->get_reader_count() != 0 || smeta->is_write_locked()) {
       smeta->unlock();
       row->is_tombstone = 0;
       UnlockRow(row);
       return false;
     }
     smeta->set_write_locked();
-    payload->clear_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
+    smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
     if (!shared_tree_->remove(fixed_key)) {
-      payload->set_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index);
+      smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
       smeta->clear_write_locked();
       smeta->unlock();
       row->is_tombstone = 0;
@@ -790,9 +785,7 @@ bool KVPartition::DeletePrivate(std::string_view key) {
     smeta->unlock();
     ebr_.add_retired_object(smeta, sizeof(star::TwoPLPashaMetadataShared),
                             star::CXLMemory::METADATA_FREE, owner_shard_);
-    ebr_.add_retired_object(payload,
-                            sizeof(star::TwoPLPashaSharedDataSCC) +
-                                regions_.layout().fixed_value_size,
+    ebr_.add_retired_object(payload, regions_.layout().fixed_value_size,
                             star::CXLMemory::DATA_FREE, owner_shard_);
   }
   if (!private_tree_->remove(fixed_key)) {
@@ -808,9 +801,10 @@ bool KVPartition::DeletePrivate(std::string_view key) {
 
 void KVPartition::NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const {
   if (smeta == nullptr) return;
-  auto *payload = smeta->get_scc_data();
   if (star::migration_manager != nullptr)
-    star::migration_manager->access_row(&payload->migration_policy_meta, partition_id_);
+    star::migration_manager->access_row(&smeta->migration_policy_meta, partition_id_);
+  // Mirror Clock heat into the reserved HWCC atomic bit (bit 37).
+  smeta->set_bit(star::TwoPLPashaMetadataShared::second_chance_bit_index);
 }
 
 bool KVPartition::TryPinShared(const FixedKey &key,
@@ -851,7 +845,7 @@ void KVPartition::RebuildClockTracker() {
     auto *payload = smeta->get_scc_data();
     std::tuple<std::atomic<uint64_t> *, void *> row{nullptr, nullptr};
     clock->track_already_migrated(table, entry.first.bytes, row,
-                                  &payload->migration_policy_meta);
+                                  &smeta->migration_policy_meta);
   }
 }
 
@@ -927,7 +921,7 @@ bool KVPartition::ScanSharedOnly(
       if (!TryPinShared(entry.first, &smeta, &pinned_off) || pinned_off != entry.second)
         continue;
       auto *payload = smeta->get_scc_data();
-      const uint32_t value_len = payload->value_len;
+      const uint32_t value_len = smeta->value_len;
       if (value_len > regions_.layout().fixed_value_size) {
         star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
         continue;

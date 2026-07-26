@@ -15,9 +15,10 @@ namespace tigonkv::engine {
 using RegionOffset = uint64_t;
 constexpr RegionOffset kNullOffset = 0;
 constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5634ULL;  // TIGONKV4
-// v3: shared tree leaf value is RegionOffset (smeta) only; logical length lives
-// in TwoPLPashaSharedDataSCC::value_len (CXL-first without PrivateRow).
-constexpr uint32_t kSharedLayoutVersion = 3;
+// v4: shared tree leaf value is RegionOffset (smeta) only; logical length and
+// other cross-node sync meta live on TwoPLPashaMetadataShared (HWCC). SWCC
+// payload is value bytes only.
+constexpr uint32_t kSharedLayoutVersion = 4;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;

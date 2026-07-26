@@ -164,6 +164,8 @@ class PolicyClock : public MigrationManager {
 
         void access_row(void *migration_policy_meta, uint64_t partition_id) override
         {
+                // ClockMeta resides in TwoPLPashaMetadataShared::migration_policy_meta
+                // (HWCC). Do not place second_chance in SWCC payload.
                 ClockMeta *clock_meta = reinterpret_cast<ClockMeta *>(migration_policy_meta);
                 clock_meta->second_chance = 1;
                 (void)partition_id;
