@@ -12,8 +12,10 @@
 #include <thread>
 #include <chrono>
 #include <charconv>
+#include <cerrno>
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +23,7 @@
 #include <functional>
 #include <queue>
 #include <fstream>
+#include <sched.h>
 #include <unistd.h>
 
 namespace tigonkv::engine {
@@ -59,8 +62,6 @@ uint64_t CurrentRssKb() {
 // Response/item/done traffic is applied by the inbound demuxer thread, so
 // nested FG polls only need to skip ServeDeferred.
 thread_local uint32_t TlsRequestServeDepth = 0;
-// Bound by BindWorker; UINT32_MAX means unbound (unit tests drain all queues).
-thread_local uint32_t TlsForegroundWorkerId = UINT32_MAX;
 
 struct RequestServeDepthGuard {
   RequestServeDepthGuard() { ++TlsRequestServeDepth; }
@@ -113,6 +114,44 @@ bool DecodeU64(std::string_view encoded, uint64_t *value) {
   return true;
 }
 
+std::vector<int> AllowedCpus() {
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (::sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
+    throw std::runtime_error(
+        "sched_getaffinity failed: " + std::string(std::strerror(errno)));
+  std::vector<int> cpus;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+    if (CPU_ISSET(cpu, &allowed)) cpus.push_back(cpu);
+  return cpus;
+}
+
+std::vector<int> ResolveAffinityCpus(const Config &config) {
+  if (!config.cpu_affinity) return {};
+  const size_t required =
+      static_cast<size_t>(config.foreground_worker_count_per_vm) + 1;
+  auto allowed = AllowedCpus();
+  if (allowed.size() < required)
+    throw std::runtime_error(
+        "cpu_affinity requires " + std::to_string(required) +
+        " allowed CPUs (foreground workers + inbound demuxer), found " +
+        std::to_string(allowed.size()));
+  return allowed;
+}
+
+void BindCurrentThreadToCpuIndex(const std::vector<int> &allowed,
+                                 uint32_t index) {
+  if (allowed.empty()) return;
+  if (index >= allowed.size())
+    throw std::runtime_error("cpu affinity index exceeds allowed CPU set");
+  cpu_set_t target;
+  CPU_ZERO(&target);
+  CPU_SET(allowed[index], &target);
+  if (::sched_setaffinity(0, sizeof(target), &target) != 0)
+    throw std::runtime_error(
+        "sched_setaffinity failed: " + std::string(std::strerror(errno)));
+}
+
 DualRegionConfig RegionConfig(const Config &config) {
   DualRegionConfig region;
   region.total_pool_bytes = config.size_mb * 1024ULL * 1024ULL;
@@ -146,6 +185,7 @@ KVEngine::~KVEngine() {
 
 std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   config.Validate();
+  auto affinity_cpus = ResolveAffinityCpus(config);
   auto pool = std::make_unique<DualRegionMappedPool>(
       DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
   star::CXLMemory::bind_dual_region_allocator(&pool->allocator(), config.node_id);
@@ -193,6 +233,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   star::scc_manager = scc.get();
   auto engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool), ebr,
                                                         std::move(scc)));
+  engine->affinity_cpus_ = std::move(affinity_cpus);
   engine->rings_ = rings;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     const auto &directory = engine->pool_->allocator().layout().partitions[partition];
@@ -428,7 +469,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     const uint64_t request_id = NextRequestId(config_.node_id);
     {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      pending_scans_.emplace(request_id, PendingScan{});
+      pending_scans_.emplace(request_id, std::make_shared<PendingScan>());
     }
     try {
       SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id, node,
@@ -457,7 +498,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     const uint64_t request_id = NextRequestId(config_.node_id);
     {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      pending_scans_.emplace(request_id, PendingScan{});
+      pending_scans_.emplace(request_id, std::make_shared<PendingScan>());
     }
     wait_acquire_scan_rpc();
     Status status = Status::Ok();
@@ -736,31 +777,61 @@ Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_v
                          std::string *response_value) {
   const uint32_t owner = OwnerForKey(key);
   const uint64_t request_id = NextRequestId(config_.node_id);
-  SendTransportMessage(MakeRequest(type, config_.node_id, owner, request_id, key, value));
-  return AwaitResponse(request_id, response_value);
+  auto pending = RegisterPendingResponse(request_id);
+  try {
+    SendTransportMessage(
+        MakeRequest(type, config_.node_id, owner, request_id, key, value));
+  } catch (...) {
+    RemovePendingResponse(request_id);
+    throw;
+  }
+  return AwaitResponse(request_id, pending, response_value);
 }
 
 Status KVEngine::RequestMigrate(std::string_view key) {
   return Forward(KvMessageType::kMigrate, key, {}, nullptr);
 }
 
-Status KVEngine::AwaitResponse(uint64_t request_id, std::string *response_value) {
+std::shared_ptr<KVEngine::PendingResponse>
+KVEngine::RegisterPendingResponse(uint64_t request_id) {
+  auto pending = std::make_shared<PendingResponse>();
+  std::lock_guard<std::mutex> lock(pending_response_mutex_);
+  if (!pending_responses_.emplace(request_id, pending).second)
+    throw std::runtime_error("duplicate pending response request id");
+  return pending;
+}
+
+void KVEngine::RemovePendingResponse(uint64_t request_id) {
+  std::lock_guard<std::mutex> lock(pending_response_mutex_);
+  pending_responses_.erase(request_id);
+}
+
+Status KVEngine::AwaitResponse(
+    uint64_t request_id, const std::shared_ptr<PendingResponse> &pending,
+    std::string *response_value) {
   const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::seconds(config_.sync_timeout_sec);
   for (;;) {
     // Help serve deferred requests so peers waiting on us make progress, while
-    // the demuxer independently publishes our response into responses_.
+    // the demuxer wakes exactly this request when its response arrives. A
+    // bounded timed wait preserves cooperative service liveness without a
+    // busy-yield loop when the peer has no request for us.
     PollTransport();
-    std::lock_guard<std::mutex> lock(response_mutex_);
-    auto it = responses_.find(request_id);
-    if (it == responses_.end()) {
-      if (std::chrono::steady_clock::now() >= deadline)
+    std::unique_lock<std::mutex> lock(pending->mutex);
+    if (!pending->done) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        lock.unlock();
+        RemovePendingResponse(request_id);
         return Status::Error(StatusCode::kCorruption, "forwarded owner response timed out");
-      std::this_thread::yield();
+      }
+      pending->cv.wait_until(lock, std::min(deadline, now + std::chrono::microseconds(100)),
+                             [&] { return pending->done; });
       continue;
     }
-    KvMessage response = it->second;
-    responses_.erase(it);
+    KvMessage response = pending->message;
+    lock.unlock();
+    RemovePendingResponse(request_id);
     if (response_value != nullptr)
       response_value->assign(response.value.data(), response.value_size);
     const StatusCode code = static_cast<StatusCode>(response.status);
@@ -775,26 +846,37 @@ Status KVEngine::AwaitResponse(uint64_t request_id, std::string *response_value)
 }
 
 Status KVEngine::AwaitScan(uint64_t request_id, std::vector<ScanItem> *items) {
-  const auto deadline = std::chrono::steady_clock::now() +
-      std::chrono::seconds(config_.sync_timeout_sec);
-  for (;;) {
-    for (int i = 0; i < 4; ++i) PollTransport();
+  std::shared_ptr<PendingScan> pending;
+  {
     std::lock_guard<std::mutex> lock(pending_scan_mutex_);
     auto it = pending_scans_.find(request_id);
     if (it == pending_scans_.end())
       return Status::Error(StatusCode::kCorruption, "missing forwarded scan state");
-    if (it->second.done) {
-      const Status status{it->second.status,
-          it->second.status == StatusCode::kOk ? "" : "forwarded owner scan failed"};
-      if (status.ok() && items != nullptr) *items = std::move(it->second.items);
-      pending_scans_.erase(it);
+    pending = it->second;
+  }
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::seconds(config_.sync_timeout_sec);
+  for (;;) {
+    PollTransport();
+    std::unique_lock<std::mutex> lock(pending->mutex);
+    if (pending->done) {
+      const Status status{pending->status,
+          pending->status == StatusCode::kOk ? "" : "forwarded owner scan failed"};
+      if (status.ok() && items != nullptr) *items = std::move(pending->items);
+      lock.unlock();
+      std::lock_guard<std::mutex> map_lock(pending_scan_mutex_);
+      pending_scans_.erase(request_id);
       return status;
     }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      pending_scans_.erase(it);
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      lock.unlock();
+      std::lock_guard<std::mutex> map_lock(pending_scan_mutex_);
+      pending_scans_.erase(request_id);
       return Status::Error(StatusCode::kCorruption, "forwarded owner scan timed out");
     }
-    std::this_thread::yield();
+    pending->cv.wait_until(lock, std::min(deadline, now + std::chrono::microseconds(100)),
+                           [&] { return pending->done; });
   }
 }
 
@@ -803,13 +885,25 @@ CasResult KVEngine::ForwardCompareExchange(std::string_view key,
                                            std::string_view desired) {
   const uint32_t owner = OwnerForKey(key);
   const uint64_t request_id = NextRequestId(config_.node_id);
-  SendTransportMessage(MakeRequest(KvMessageType::kCasPrepare, config_.node_id, owner,
-                                   request_id, key, expected));
-  Status status = AwaitResponse(request_id, nullptr);
+  auto prepare = RegisterPendingResponse(request_id);
+  try {
+    SendTransportMessage(MakeRequest(KvMessageType::kCasPrepare, config_.node_id,
+                                     owner, request_id, key, expected));
+  } catch (...) {
+    RemovePendingResponse(request_id);
+    throw;
+  }
+  Status status = AwaitResponse(request_id, prepare, nullptr);
   if (!status.ok()) return {std::move(status), false};
-  SendTransportMessage(MakeRequest(KvMessageType::kCasCommit, config_.node_id, owner,
-                                   request_id, key, desired));
-  status = AwaitResponse(request_id, nullptr);
+  auto commit = RegisterPendingResponse(request_id);
+  try {
+    SendTransportMessage(MakeRequest(KvMessageType::kCasCommit, config_.node_id,
+                                     owner, request_id, key, desired));
+  } catch (...) {
+    RemovePendingResponse(request_id);
+    throw;
+  }
+  status = AwaitResponse(request_id, commit, nullptr);
   return {status, status.ok()};
 }
 
@@ -825,6 +919,11 @@ void KVEngine::StopInboundDemuxer() {
 }
 
 void KVEngine::InboundDemuxerLoop() {
+  try {
+    BindCurrentThreadToCpuIndex(affinity_cpus_, inbound_demuxer_worker_id_);
+  } catch (const std::exception &error) {
+    TransportFatal(config_.node_id, "demux_affinity", error.what());
+  }
   ebr_->thread_init_ebr_meta(config_.node_id, inbound_demuxer_worker_id_);
   star::global_ebr_meta = ebr_;
   while (!inbound_demuxer_stop_.load(std::memory_order_acquire)) {
@@ -876,21 +975,48 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
       !ValidStatusCode(message.status))
     throw std::runtime_error("invalid KV transport message");
   if (message.type == KvMessageType::kResponse) {
-    std::lock_guard<std::mutex> lock(response_mutex_);
-    responses_.emplace(message.request_id, message);
+    std::shared_ptr<PendingResponse> pending;
+    {
+      std::lock_guard<std::mutex> lock(pending_response_mutex_);
+      auto it = pending_responses_.find(message.request_id);
+      if (it == pending_responses_.end())
+        throw std::runtime_error("response has no pending request");
+      pending = it->second;
+    }
+    {
+      std::lock_guard<std::mutex> lock(pending->mutex);
+      if (pending->done)
+        throw std::runtime_error("duplicate response for request");
+      pending->message = message;
+      pending->done = true;
+    }
+    pending->cv.notify_one();
     return;
   }
   if (message.type == KvMessageType::kScanItem || message.type == KvMessageType::kScanDone) {
-    std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-    auto it = pending_scans_.find(message.request_id);
-    if (it == pending_scans_.end()) return;
-    if (message.type == KvMessageType::kScanItem) {
-      it->second.items.push_back({std::string(message.key.data(), message.key_size),
-                                  std::string(message.value.data(), message.value_size)});
-    } else {
-      it->second.status = static_cast<StatusCode>(message.status);
-      it->second.done = true;
+    std::shared_ptr<PendingScan> pending;
+    {
+      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+      auto it = pending_scans_.find(message.request_id);
+      if (it == pending_scans_.end()) return;
+      pending = it->second;
     }
+    bool done = false;
+    {
+      std::lock_guard<std::mutex> lock(pending->mutex);
+      if (pending->done)
+        throw std::runtime_error("scan traffic arrived after ScanDone");
+      if (message.type == KvMessageType::kScanItem) {
+        pending->items.push_back(
+            {std::string(message.key.data(), message.key_size),
+             std::string(message.value.data(), message.value_size)});
+      } else {
+        pending->status = static_cast<StatusCode>(message.status);
+        pending->done = true;
+        done = true;
+      }
+    }
+    if (done) pending->cv.notify_one();
     return;
   }
   // Request path: demuxer → shared deferred FIFO (IncomingDispatcher style).
@@ -900,16 +1026,23 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
   deferred_transport_requests_.push_back(message);
 }
 
-void KVEngine::ServeDeferredRequests(int max_count) {
+void KVEngine::ServeDeferredRequests() {
   if (TlsRequestServeDepth != 0) return;
-  for (int i = 0; i < max_count; ++i) {
-    KvMessage deferred;
-    {
-      std::lock_guard<std::mutex> lock(deferred_request_mutex_);
-      if (deferred_transport_requests_.empty()) break;
-      deferred = deferred_transport_requests_.front();
+  constexpr size_t kMaxBatch = 64;
+  // Reuse one per-worker batch buffer: no heap allocation on PollTransport's
+  // hot path and only one shared-FIFO lock acquisition per batch.
+  thread_local std::array<KvMessage, kMaxBatch> batch;
+  size_t batch_count = 0;
+  {
+    std::lock_guard<std::mutex> lock(deferred_request_mutex_);
+    batch_count = std::min(kMaxBatch, deferred_transport_requests_.size());
+    for (size_t i = 0; i < batch_count; ++i) {
+      batch[i] = std::move(deferred_transport_requests_.front());
       deferred_transport_requests_.pop_front();
     }
+  }
+  for (size_t i = 0; i < batch_count; ++i) {
+    const KvMessage &deferred = batch[i];
     try {
       ServeTransportRequest(deferred);
     } catch (const std::exception &error) {
@@ -922,7 +1055,7 @@ void KVEngine::ServeDeferredRequests(int max_count) {
 
 void KVEngine::PollTransport() {
   // FG cooperative serve only — no MPSC recv (demuxer owns that).
-  ServeDeferredRequests(8);
+  ServeDeferredRequests();
 }
 
 void KVEngine::BindWorker(uint32_t worker_id) {
@@ -930,9 +1063,9 @@ void KVEngine::BindWorker(uint32_t worker_id) {
     throw std::runtime_error("BindWorker requires an open EBR instance");
   if (worker_id >= config_.foreground_worker_count_per_vm)
     throw std::invalid_argument("BindWorker worker_id exceeds foreground_worker_count_per_vm");
+  BindCurrentThreadToCpuIndex(affinity_cpus_, worker_id);
   ebr_->thread_init_ebr_meta(config_.node_id, worker_id);
   star::global_ebr_meta = ebr_;
-  TlsForegroundWorkerId = worker_id;
 }
 
 void KVEngine::ServeScanRequest(const KvMessage &message) {

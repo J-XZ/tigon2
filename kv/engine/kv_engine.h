@@ -47,12 +47,12 @@ class KVEngine {
   MemoryStats Memory() const;
   Status Checkpoint();
   // Foreground cooperative path (Tigon Worker::process_request analogue):
-  // serve deferred inbound requests from this worker's Dispatcher shard queue.
+  // batch-pop deferred inbound requests from the shared Dispatcher FIFO.
   // The dedicated inbound demuxer is the sole MPSC consumer — FG never
   // contends for the recv lock.
   void PollTransport();
   // Bind the calling thread as foreground worker `worker_id` for CXL_EBR TLS
-  // and Dispatcher-style per-worker request queue drainage.
+  // and, when configured, its distinct guest CPU.
   // Must be invoked once per worker thread before shared access (matches
   // core/Executor thread_init_ebr_meta).
   void BindWorker(uint32_t worker_id);
@@ -74,14 +74,24 @@ class KVEngine {
   Status RequestMigrate(std::string_view key);
   CasResult ForwardCompareExchange(std::string_view key, std::string_view expected,
                                    std::string_view desired);
-  Status AwaitResponse(uint64_t request_id, std::string *response_value);
+  struct PendingResponse {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    KvMessage message{};
+  };
+  std::shared_ptr<PendingResponse> RegisterPendingResponse(uint64_t request_id);
+  void RemovePendingResponse(uint64_t request_id);
+  Status AwaitResponse(uint64_t request_id,
+                       const std::shared_ptr<PendingResponse> &pending,
+                       std::string *response_value);
   ScanResult ScanOwnedPartitions(std::string_view start_key, uint64_t limit);
   Status AwaitScan(uint64_t request_id, std::vector<ScanItem> *items);
   // Demuxer path: apply responses / queue requests. Never sends.
   void DemuxTransportMessage(const KvMessage &message);
   // Foreground path: serve a queued request (may Send).
   void ServeTransportRequest(const KvMessage &message);
-  void ServeDeferredRequests(int max_count);
+  void ServeDeferredRequests();
   void ServeScanRequest(const KvMessage &message);
   void SendTransportMessage(const KvMessage &message);
   void EnforceMigrationBudget(KVPartition &partition);
@@ -95,21 +105,27 @@ class KVEngine {
   star::CXL_EBR *ebr_ = nullptr;
   std::unique_ptr<star::SCCManager> scc_;
   std::vector<std::unique_ptr<KVPartition>> partitions_;
+  // Snapshot of the process affinity mask before any KV thread is pinned.
+  // Empty means affinity is disabled.
+  std::vector<int> affinity_cpus_;
   star::MPSCRingBuffer *rings_ = nullptr;
   // Sole MPSC consumer — mirrors Tigon IncomingDispatcher.  Never serves
   // Put/Get/Scan and never SendTransportMessage (avoids full-ring circular wait).
   std::thread inbound_demuxer_;
   std::atomic<bool> inbound_demuxer_stop_{false};
   uint32_t inbound_demuxer_worker_id_ = 0;
-  std::mutex response_mutex_;
-  std::unordered_map<uint64_t, KvMessage> responses_;
+  std::mutex pending_response_mutex_;
+  std::unordered_map<uint64_t, std::shared_ptr<PendingResponse>>
+      pending_responses_;
   struct PendingScan {
+    std::mutex mutex;
+    std::condition_variable cv;
     StatusCode status = StatusCode::kOk;
     bool done = false;
     std::vector<ScanItem> items;
   };
   std::mutex pending_scan_mutex_;
-  std::unordered_map<uint64_t, PendingScan> pending_scans_;
+  std::unordered_map<uint64_t, std::shared_ptr<PendingScan>> pending_scans_;
   // Demuxer enqueues requests here; FG PollTransport / Await drains them.
   // Nested serve (TlsRequestServeDepth != 0) must not pop/serve — OLC safety.
   // Single shared unbounded queue: demuxer never blocks on enqueue, and any

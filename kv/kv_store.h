@@ -124,6 +124,9 @@ struct Config {
   bool checkpoint_on_clean_exit = true;
   bool verbose = false;
   bool extra_check = false;
+  // Pin foreground workers and the inbound demuxer to distinct CPUs from the
+  // process's allowed affinity mask. Performance configurations enable this.
+  bool cpu_affinity = false;
   bool latency_enabled = false;
   bool latency_foreground_enabled = false;
   bool latency_merge_enabled = false;

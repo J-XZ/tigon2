@@ -111,6 +111,7 @@
     "transport_ring_total_mb": 16,
     "verbose": false,
     "extra_check": false,
+    "cpu_affinity": true,
     "latency_inject": {
       "enabled": false,
       "foreground_enabled": false,

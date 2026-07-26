@@ -211,6 +211,16 @@ inline void CheckpointOrThrow(KVStore &store) {
   if (!status.ok()) throw std::runtime_error("phase checkpoint failed: " + status.message);
 }
 
+inline void PrintThreadTopology(const Config &config, uint64_t foreground) {
+  std::cout << "E2E_THREAD_TOPOLOGY node=" << config.node_id
+            << " foreground=" << foreground
+            << " demuxer=1"
+            << " kv_threads=" << (foreground + 1)
+            << " affinity="
+            << (config.cpu_affinity ? "distinct_allowed_cpus" : "scheduler")
+            << "\n";
+}
+
 inline void DrainTransport(KVStore &store) {
   const uint64_t drain_ms = PositiveEnv("TIGONKV_E2E_TRANSPORT_DRAIN_MS", 5000);
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(drain_ms);
@@ -261,6 +271,10 @@ inline int RunE2E08MultiVm() {
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";
   std::cout << "E2E_08_THREADS node=" << config.node_id << " threads="
             << PositiveEnv("TIGONKV_E2E_THREADS", config.foreground_worker_count_per_vm) << "\n";
+  PrintThreadTopology(
+      config,
+      PositiveEnv("TIGONKV_E2E_THREADS",
+                  config.foreground_worker_count_per_vm));
   CheckpointOrThrow(*main_store);
   std::cout << main_store->DumpStats();
   std::cout << "e2e_08_vm[node" << config.node_id << "]: passed.\n";
@@ -305,6 +319,10 @@ inline int RunE2E09MultiVm() {
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";
   std::cout << "E2E_09_THREADS node=" << config.node_id << " threads="
             << PositiveEnv("TIGONKV_E2E_THREADS", config.foreground_worker_count_per_vm) << "\n";
+  PrintThreadTopology(
+      config,
+      PositiveEnv("TIGONKV_E2E_THREADS",
+                  config.foreground_worker_count_per_vm));
   CheckpointOrThrow(*main_store);
   std::cout << main_store->DumpStats();
   std::cout << "e2e_09_vm[node" << config.node_id << "]: passed.\n";

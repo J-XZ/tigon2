@@ -29,7 +29,10 @@
 
 脚本默认在 `exp_data/ycsb_tigonkv_<UTC 时间>` 写入生成配置、trace、逐轮日志、
 CSV、JSON 和报告。每个 workload 的 load/run 分开执行；计时只来自 runner 输出的
-`E2E_TRACE_TIME_US`。
+`E2E_TRACE_TIME_US`。每个 VM 还必须保留
+`E2E_THREAD_TOPOLOGY foreground=4 demuxer=1 kv_threads=5
+affinity=distinct_allowed_cpus`；demuxer 是原 Tigon IncomingDispatcher 同构
+接收线程，虽然不执行 KV 请求，仍计入 CPU 使用，不能只报告 4 个 worker。
 
 正式 5M 对比须显式传入 `--record-count 5000000 --operation-count 5000000`
 和 `--shared-size-mb 65536 --no-latency`，并在 VM 授权、完整单测和所需多轮 e2e

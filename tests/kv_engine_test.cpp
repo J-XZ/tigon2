@@ -222,7 +222,11 @@ int main() {
       const auto read = node_one->Get(owner_zero_key);
       if (!read.status.ok() || read.value != "forwarded") _exit(4);
       const uint64_t tx_after_promotion = node_one->NetworkTxBytes();
-      const auto cas = node_one->CompareExchange(owner_zero_key, "forwarded", "cas-forwarded");
+      const auto shared_read = node_one->Get(owner_zero_key);
+      if (!shared_read.status.ok() || shared_read.value != "forwarded") _exit(19);
+      if (!node_one->Put(owner_zero_key, "shared-put").ok()) _exit(20);
+      if (node_one->NetworkTxBytes() != tx_after_promotion) _exit(21);
+      const auto cas = node_one->CompareExchange(owner_zero_key, "shared-put", "cas-forwarded");
       if (!cas.status.ok() || !cas.exchanged) _exit(5);
       const auto cas_miss = node_one->CompareExchange(owner_zero_key, "forwarded", "ignored");
       if (cas_miss.status.code != tigonkv::StatusCode::kCompareFailed || cas_miss.exchanged) _exit(6);
@@ -235,8 +239,12 @@ int main() {
         if (node_one->OwnerForKey(candidate) == 0) { counter_key = candidate; break; }
       }
       if (counter_key.empty() || !node_one->Put(counter_key, "1").ok()) _exit(7);
+      const auto promoted_counter = node_one->Get(counter_key);
+      if (!promoted_counter.status.ok() || promoted_counter.value != "1") _exit(22);
+      const uint64_t tx_after_counter_promotion = node_one->NetworkTxBytes();
       const auto increment = node_one->Increment(counter_key, 2);
       if (!increment.status.ok() || increment.value != 3) _exit(8);
+      if (node_one->NetworkTxBytes() != tx_after_counter_promotion) _exit(23);
       if (!node_one->Delete(owner_zero_key).ok()) _exit(9);
       if (node_one->Get(owner_zero_key).status.code != tigonkv::StatusCode::kNotFound) _exit(10);
       _exit(0);

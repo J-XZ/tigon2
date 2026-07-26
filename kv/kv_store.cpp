@@ -165,7 +165,7 @@ void ValidateKnownKeys(const std::string &s) {
       "fixed_key_size", "fixed_value_size", "hw_cc_budget_mb",
       "owner_private_swcc_fraction", "migration_policy", "when_to_move_out",
       "scc_mechanism", "transport_ring_total_mb",
-      "verbose", "extra_check",
+      "verbose", "extra_check", "cpu_affinity",
       "latency_inject", "enabled", "foreground_enabled", "merge_enabled",
       "stats_enabled", "cache_line_bytes", "swcc_read_ns_per_line",
       "swcc_write_ns_per_line", "swcc_flush_ns_per_line", "hwcc_read_ns_per_line",
@@ -218,6 +218,7 @@ Config Config::FromJsonc(const std::string &path) {
   JsonNumber(text, "transport_ring_total_mb", &c.transport_ring_total_mb);
   JsonBool(text, "verbose", &c.verbose);
   JsonBool(text, "extra_check", &c.extra_check);
+  JsonBool(text, "cpu_affinity", &c.cpu_affinity);
   JsonNumberInObject(text, "hwcc", "offset_mb", &c.hwcc_offset_mb);
   JsonNumberInObject(text, "hwcc", "size_mb", &c.hwcc_size_mb);
   JsonNumberInObject(text, "swcc", "offset_mb", &c.swcc_offset_mb);
@@ -266,6 +267,10 @@ void Config::Validate() const {
       network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0 ||
       foreground_worker_count_per_vm > 64 || vm_count > 8)
     throw std::invalid_argument("invalid KV configuration");
+  if (cpu_affinity && vm_core_count_per_vm != 0 &&
+      vm_core_count_per_vm < foreground_worker_count_per_vm + 1)
+    throw std::invalid_argument(
+        "cpu_affinity requires vm.core_count_per_vm >= foreground workers + demuxer");
   if (hw_cc_budget_mb == 0 || hw_cc_budget_mb > hwcc_size_mb ||
       owner_private_swcc_fraction <= 0.0 || owner_private_swcc_fraction >= 1.0 ||
       node_id >= vm_count ||

@@ -428,8 +428,9 @@ experiment_config 段）与根 `experiment_config.jsonc`。
    伪 WriteThrough、同 slot 状态翻转。
 2. **新增代码选最快合理方案**：双区域分配器 = per-thread cache + size-class
    + shard（禁止全局 next-fit）；热路径内联、无虚调用兜底；延迟 = cxlkv
-   TSC spin（禁止 sleep）；消息轮询只在 worker 间隙执行——**不实现**专职
-   service 线程（无配置开关，删除该活口以保持与 cxlkv CPU 预算可比）。
+   TSC spin（禁止 sleep）；原 Tigon `IncomingDispatcher` 同构 demuxer 只收包
+   和分发，业务请求仍由 worker 间隙服务——**不实现**另一个执行 KV 的专职
+   service 线程。demuxer 是真实 CPU 线程，正式报告和绑核必须将其计入。
 3. **严格禁止故意弱化**：额外全局锁、持锁路径延迟自旋、不必要拷贝、
    关闭 `-O3/-march=native` 打正式性能、用 msync 替代 SCC。
 4. 弃 cxlalloc 等“更慢/未知”替代必须在 `allocator审计.md` 证明能力与热路径
@@ -458,8 +459,11 @@ experiment_config 段）与根 `experiment_config.jsonc`。
 2. **高并发**：每 VM 跑满 `foreground_worker_count_per_vm`；分配器
    per-thread cache；worker 间隙 `PollTransport` 排空 demuxer 入队的
    deferred FIFO；入环由 **IncomingDispatcher 同构的 inbound demuxer**
-   独占 `recv`（不服务 Put/Get/Scan，不占对比核预算的 KV 专职服务线程；
-   **禁止**再加可配置的 KV service 抢核线程）。分片 worker 队列在 YCSB
+   独占 `recv`（不服务 Put/Get/Scan，但按真实 CPU 线程计入实验预算；
+   **禁止**再加可配置的 KV service 抢核线程）。默认正式拓扑明确为
+   `foreground=4 + demuxer=1`；`cpu_affinity=true` 时依次绑定进程允许
+   CPU 集合中的 5 个独立 CPU，并输出 `E2E_THREAD_TOPOLOGY`。分片 worker
+   队列在 YCSB
    Forward 活性上不成立，故正式路径为共享 deferred FIFO。延迟只在
    锁外/EBR 外补齐。
 3. **安全回收**：凡共享树/行路径 `enter_critical_section`；retire 经 EBR
@@ -1034,9 +1038,12 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
 - 新消息编码 `kv/engine/kv_messages.h`（借用 `common/Message.h` 帧格式）：
   `PUT_FWD / GET_MISS / DELETE_FWD / CAS_FWD / INCR_FWD / SCAN_REQ` 及响应、
   `MOVEIN_DONE`。payload 定长 key + 可选 value。
-- 每 VM 的 worker 线程在自身操作间隙轮询本机入环并服务请求（与原
-  Executor 的 process_request 模式一致），避免专职线程抢核；worker 数 =
-  `foreground_worker_count_per_vm`。
+- 每 VM 一个原 Tigon `IncomingDispatcher` 同构 demuxer 独占本机入环
+  `recv`，只发布 response/scan 通知或把请求批量入共享 deferred FIFO；
+  `foreground_worker_count_per_vm` 个 worker 在操作间隙批量 pop 并执行请求。
+  Await 使用 per-request condition-variable 通知，并以短时限唤醒继续协作
+  service，不 busy-yield。正式 CPU 口径是 FG worker 数再加一个 demuxer，
+  二者在 `cpu_affinity=true` 时绑定不同 guest CPU。
 - 何时转发（对齐 Tigon 语义）：
   - 请求方先查本 VM 可见路径：owner 分区 → 私有树直达；非 owner → 查
     shared 树，命中 SHARED_ACTIVE 时：**GET/PUT/CAS/INCR 就地**行锁+SCC，
@@ -1126,8 +1133,8 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
 
 | 资产 | 处置 |
 |------|------|
-| `experiment_config.jsonc` + `Config::FromJsonc` | 保留；`tigon_kv` 段字段以 §1.6.1 为准（含 `latency_inject`、`fixed_key_size`/`fixed_value_size`、`scc_mechanism`、`when_to_move_out`、`hw_cc_budget_mb`（默认=hwcc.size_mb）、`owner_private_swcc_fraction`、`partition_count`、`transport_ring_total_mb`）；延迟字段 schema ≡ cxlkv `LatencyInjectPolicyConfig`（**位置**在 `tigon_kv.`，cxlkv 在 delta_policy）；`tigon_kv` 内 unknown field 仍 hard fail；根级 cxlkv-only 键（`network`/`sync`/`vm.copy_root_img`/`vm.use_ivshmem_doorbell`）parse-and-ignore（§1.6.1 规则 6）；HEAD 遗留键 `hwcc_budget_mb`/`hwcc_reserved_mb`/`shared_payload_swcc_fraction` 出现即 hard fail（§1.6.1 规则 8）；`scc_mechanism` 只接受 `"WriteThrough"`、`migration_policy` 只接受 `"Clock"`、`when_to_move_out` 只接受 `"OnDemand"`，其它取值 hard fail |
-| `tools/e2e_trace_runner.cpp` | 保留框架；改为按 `foreground_worker_count_per_vm` 起 N 线程，线程 t 回放 `worker{node*N+t}.txt`（对齐 cxlkv）；PUT value 生成与 cxlkv `FixedTraceValue` 一致（`'!'..'~'` 字符集、定长 `fixed_value_size`）；心跳行 `E2E_TRACE_HEARTBEAT phase=<p> node=<n> ops=<delta> total=<cum> elapsed_s=<s>` 与最终行 `E2E_TRACE_TIME_US phase=<p> node=<n> ops=<ops> duration_us=<us> trace_first=<f> trace_workers=<w> batch_ops=<b>` 字段与 cxlkv 逐字段对齐；**相位屏障**默认 ivshmem/host 编排（与 cxlkv tap+TCP `sdl::notify` 刻意分歧，见 §4.10；不计入应力窗口） |
+| `experiment_config.jsonc` + `Config::FromJsonc` | 保留；`tigon_kv` 段字段以 §1.6.1 为准（含 `latency_inject`、`fixed_key_size`/`fixed_value_size`、`scc_mechanism`、`when_to_move_out`、`hw_cc_budget_mb`（默认=hwcc.size_mb）、`owner_private_swcc_fraction`、`partition_count`、`transport_ring_total_mb`、`cpu_affinity`）；延迟字段 schema ≡ cxlkv `LatencyInjectPolicyConfig`（**位置**在 `tigon_kv.`，cxlkv 在 delta_policy）；`tigon_kv` 内 unknown field 仍 hard fail；根级 cxlkv-only 键（`network`/`sync`/`vm.copy_root_img`/`vm.use_ivshmem_doorbell`）parse-and-ignore（§1.6.1 规则 6）；HEAD 遗留键 `hwcc_budget_mb`/`hwcc_reserved_mb`/`shared_payload_swcc_fraction` 出现即 hard fail（§1.6.1 规则 8）；`scc_mechanism` 只接受 `"WriteThrough"`、`migration_policy` 只接受 `"Clock"`、`when_to_move_out` 只接受 `"OnDemand"`，其它取值 hard fail |
+| `tools/e2e_trace_runner.cpp` | 保留框架；改为按 `foreground_worker_count_per_vm` 起 N 线程，线程 t 回放 `worker{node*N+t}.txt`（对齐 cxlkv）；另输出 `E2E_THREAD_TOPOLOGY node=<n> foreground=<N> demuxer=1 kv_threads=<N+1> affinity=<...>`，禁止只报告 worker 隐藏 demuxer CPU；PUT value 生成与 cxlkv `FixedTraceValue` 一致（`'!'..'~'` 字符集、定长 `fixed_value_size`）；心跳行 `E2E_TRACE_HEARTBEAT phase=<p> node=<n> ops=<delta> total=<cum> elapsed_s=<s>` 与最终行 `E2E_TRACE_TIME_US phase=<p> node=<n> ops=<ops> duration_us=<us> trace_first=<f> trace_workers=<w> batch_ops=<b>` 字段与 cxlkv 逐字段对齐；**相位屏障**默认 ivshmem/host 编排（与 cxlkv tap+TCP `sdl::notify` 刻意分歧，见 §4.10；不计入应力窗口） |
 | trace 格式 | 与 cxlkv 逐字节同构：`<OP> <KEY_LEN> <LEN><KEY>`（`LEN` 与 `KEY` 紧挨、无空格）；PUT/GET/DELETE/SCAN；GET/DELETE 要求 `LEN=0`；SCAN 的 `LEN`=limit；key 右填空格至 `fixed_key_size`；PUT 不含 value 正文，runner 用 `FixedTraceValue`（`'!'..'~'`，长度=`fixed_value_size`） |
 | YCSB / trace 生成 | 满足 §1.5.2：同 SHA 的 `thirdparty_libs/YCSB-cpp` + 本仓库可调用的 `generate_cxlkv_trace.sh`（禁止依赖 `../cxlkv` 路径）；须能生成 load/A/B/C/D/E；根级一键封装见 4.11；旧 `prepare_ycsb_traces.sh`/`run_ycsb_workflows.sh` 可保留为低层入口 |
 | `tools/cxl_pool_initer.cpp`、`tools/numa_placement_probe.cpp` | 保留；probe 采样点换成新布局的分配样本 |

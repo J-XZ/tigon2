@@ -59,6 +59,7 @@ int main() {
   }
   const Config fractional = Config::FromJsonc(latency_config_path);
   assert(fractional.swcc_read_ns == 1.25);
+  assert(fractional.cpu_affinity);
   std::remove(latency_config_path.c_str());
 
   Config uneven;
@@ -87,6 +88,10 @@ int main() {
   config.fixed_value_size = 128;
   config.foreground_worker_count_per_vm = 4;
   config.transport_ring_total_mb = 1;
+  Config insufficient_cpu = config;
+  insufficient_cpu.cpu_affinity = true;
+  insufficient_cpu.vm_core_count_per_vm = 4;
+  assert(ValidateThrows(insufficient_cpu));
   Config gated = config;
   gated.latency_enabled = true;
   if (RelWithDebInfoBuild()) {

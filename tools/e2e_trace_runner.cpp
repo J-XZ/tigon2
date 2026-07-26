@@ -190,6 +190,17 @@ void PrintTraceTime(const std::string &phase, uint32_t node, uint64_t ops, uint6
             << " batch_ops=" << batch_ops << "\n";
 }
 
+void PrintThreadTopology(uint32_t node, uint64_t foreground,
+                         bool cpu_affinity) {
+  std::cout << "E2E_THREAD_TOPOLOGY node=" << node
+            << " foreground=" << foreground
+            << " demuxer=1"
+            << " kv_threads=" << (foreground + 1)
+            << " affinity="
+            << (cpu_affinity ? "distinct_allowed_cpus" : "scheduler")
+            << "\n";
+}
+
 int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
                   const std::string &trace_dir, uint64_t workers, uint32_t batch_ops,
                   uint64_t value_seed) {
@@ -271,6 +282,7 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   log_stage("checkpoint_done");
   uint64_t ops = 0;
   for (const auto &result : results) ops += result.ops;
+  PrintThreadTopology(config.node_id, workers, config.cpu_affinity);
   PrintTraceTime(phase, config.node_id, ops, duration_us, trace_first,
                  static_cast<uint32_t>(workers), batch_ops);
   std::cout << store->DumpStats();
@@ -326,6 +338,7 @@ int main() {
     const uint32_t trace_first = static_cast<uint32_t>(ParseUnsigned(
         Env("TIGONKV_E2E_TRACE_FIRST", "CXLKV_E2E_TRACE_FIRST", "0"), "trace first"));
     store = KVStore::Create(config, reset);
+    store->BindWorker(0);
     std::ifstream input(trace);
     if (!input) Fail("cannot open trace: " + trace);
     Barrier(phase, config.node_id, false);
@@ -393,6 +406,7 @@ int main() {
     if (heartbeat != "0")
       std::cout << "E2E_TRACE_HEARTBEAT phase=" << phase << " node=" << config.node_id
                 << " ops=" << ops << " total=" << ops << " elapsed_s=0\n";
+    PrintThreadTopology(config.node_id, 1, config.cpu_affinity);
     PrintTraceTime(phase, config.node_id, ops, duration_us, trace_first, 1, batch_ops);
     std::cout << store->DumpStats();
     std::cout << "e2e_trace_runner[node" << config.node_id << "]: passed.\n";
