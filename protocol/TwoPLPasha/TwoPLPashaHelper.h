@@ -9,6 +9,7 @@
 #include <list>
 #include <tuple>
 #include <memory>
+#include <string>
 #include <thread>
 
 #include "common/CCSet.h"
@@ -511,6 +512,49 @@ class TwoPLPashaHelper {
                 return valid;
         }
 
+        static bool kv_shared_read_value(TwoPLPashaMetadataShared *smeta,
+                                         std::size_t host_id, void *dest,
+                                         std::size_t capacity,
+                                         uint32_t *value_size)
+        {
+                if (smeta == nullptr || scc_manager == nullptr ||
+                    value_size == nullptr) return false;
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                const uint32_t size = smeta->get_value_len();
+                if (size > capacity || smeta->is_write_locked() ||
+                    smeta->get_writer_waiting() != 0 ||
+                    smeta->get_reader_count() == smeta->get_reader_count_max() ||
+                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+                        smeta->unlock();
+                        return false;
+                }
+                smeta->increase_reader_count();
+                smeta->increment_ref_cnt();
+                const auto host_bit =
+                    host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
+                const bool need_fill = !smeta->is_bit_set(host_bit);
+                smeta->unlock();
+                if (need_fill) {
+                        scc_manager->invalidate_scc_data(scc_data, size);
+                        smeta->lock();
+                        if (!smeta->is_bit_set(host_bit))
+                                smeta->set_bit(host_bit);
+                        smeta->unlock();
+                }
+                const bool valid =
+                    smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
+                if (valid)
+                        scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
+                smeta->lock();
+                DCHECK(smeta->get_ref_cnt() > 0);
+                smeta->decrement_ref_cnt();
+                smeta->decrease_reader_count();
+                smeta->unlock();
+                if (valid) *value_size = size;
+                return valid;
+        }
+
         static bool kv_shared_write(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
                                     const void *src, std::size_t size)
         {
@@ -559,6 +603,91 @@ class TwoPLPashaHelper {
                         smeta->decrement_ref_cnt();
                         smeta->clear_write_locked();
                         smeta->unlock();
+                        return true;
+                }
+        }
+
+        template <typename Mutator>
+        static bool kv_shared_update(TwoPLPashaMetadataShared *smeta,
+                                     std::size_t host_id, std::size_t capacity,
+                                     Mutator &&mutator, bool *changed)
+        {
+                if (smeta == nullptr || scc_manager == nullptr || changed == nullptr)
+                        return false;
+                for (;;) {
+                        smeta->lock();
+                        auto *scc_data = smeta->get_scc_data();
+                        const uint32_t size = smeta->get_value_len();
+                        if (size > capacity ||
+                            !smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) ||
+                            smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+                                smeta->unlock();
+                                return false;
+                        }
+                        if (smeta->is_write_locked()) {
+                                smeta->unlock();
+                                std::this_thread::yield();
+                                continue;
+                        }
+                        if (smeta->get_reader_count() != 0) {
+                                smeta->set_writer_waiting(1);
+                                smeta->unlock();
+                                std::this_thread::yield();
+                                continue;
+                        }
+                        smeta->set_writer_waiting(0);
+                        smeta->set_write_locked();
+                        smeta->increment_ref_cnt();
+                        const auto host_bit =
+                            host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
+                        const bool need_fill = !smeta->is_bit_set(host_bit);
+                        smeta->unlock();
+
+                        if (need_fill) {
+                                scc_manager->invalidate_scc_data(scc_data, size);
+                                smeta->lock();
+                                if (!smeta->is_bit_set(host_bit))
+                                        smeta->set_bit(host_bit);
+                                smeta->unlock();
+                        }
+                        std::string current(size, '\0');
+                        scc_manager->do_read(smeta, host_id, current.data(),
+                                             scc_data->data, size);
+                        std::string replacement;
+                        bool write = false;
+                        try {
+                                write = mutator(current, &replacement);
+                                if (write && replacement.size() > capacity)
+                                        throw std::length_error(
+                                            "shared update exceeds value capacity");
+                        } catch (...) {
+                                smeta->lock();
+                                DCHECK(smeta->get_ref_cnt() > 0);
+                                smeta->decrement_ref_cnt();
+                                smeta->clear_write_locked();
+                                smeta->unlock();
+                                throw;
+                        }
+                        if (write) {
+                                scc_manager->do_write(smeta, host_id, scc_data->data,
+                                                      replacement.data(),
+                                                      replacement.size());
+                                smeta->lock();
+                                smeta->set_flag(
+                                    TwoPLPashaMetadataShared::valid_flag_index);
+                                smeta->set_value_len(
+                                    static_cast<uint32_t>(replacement.size()));
+                                scc_manager->finish_write_bits(smeta, host_id);
+                                smeta->unlock();
+                                scc_manager->flush_scc_data(scc_data,
+                                                            replacement.size());
+                        }
+                        smeta->lock();
+                        DCHECK(smeta->get_ref_cnt() > 0);
+                        smeta->decrement_ref_cnt();
+                        smeta->clear_write_locked();
+                        smeta->unlock();
+                        *changed = write;
                         return true;
                 }
         }
