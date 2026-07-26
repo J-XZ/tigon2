@@ -379,10 +379,17 @@ class TwoPLPashaHelper {
                 }
                 scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
                 // valid + logical length are HWCC; publish before peer invalidate.
+                // Re-take the latch for bit repair + finish_write: a concurrent
+                // reader's prepare_read / another finish_write can clear host
+                // bits via clear_all_scc_bits while we were unlocked for memcpy,
+                // which trips WriteThrough's CHECK and aborts the guest under
+                // YCSB-A (CXL Get/Put).
+                smeta->lock();
+                if (!smeta->is_bit_set(host_bit))
+                        smeta->set_bit(host_bit);
                 smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
                 smeta->value_len = static_cast<uint32_t>(size);
                 scc_manager->finish_write(smeta, host_id, scc_data, size);
-                smeta->lock();
                 DCHECK(smeta->ref_cnt > 0);
                 smeta->ref_cnt--;
                 smeta->clear_write_locked();
