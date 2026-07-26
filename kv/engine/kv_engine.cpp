@@ -224,15 +224,9 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
       shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
       return Status::Ok();
     }
-    // Miss: DATA_MIGRATION then retry CXL write. Create-path / races still
-    // fall back to owner PutPrivate (key may not exist yet).
-    const Status migrated = RequestMigrate(key);
-    if (visible != nullptr && visible->PutShared(key, config_.node_id, value)) {
-      shared_puts_.fetch_add(1, std::memory_order_relaxed);
-      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-      return Status::Ok();
-    }
-    if (migrated.code == StatusCode::kOutOfMemory) return migrated;
+    // Put miss: do not DATA_MIGRATION first. Load/create paths would issue a
+    // NotFound migrate+Put pair per key and fill MPSC rings until nested
+    // Serve/Send deadlocks. Owner PutPrivate creates/updates; Get migrates.
     return Forward(KvMessageType::kPut, key, value, nullptr);
   }
   try { partition->PutPrivate(key, value); return Status::Ok(); }
@@ -563,15 +557,7 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
       shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
       return {Status::Ok(), shared};
     }
-    const Status migrated = RequestMigrate(key);
-    if (visible != nullptr && visible->IncrementShared(key, config_.node_id, delta, &shared)) {
-      shared_puts_.fetch_add(1, std::memory_order_relaxed);
-      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-      return {Status::Ok(), shared};
-    }
-    if (migrated.code == StatusCode::kNotFound)
-      return {Status::Error(StatusCode::kNotFound, "key not found"), 0};
-    // Create-on-increment / races: owner IncrementPrivate.
+    // Same as Put: avoid migrate-before-create storms; owner IncrementPrivate.
     std::string value;
     const auto status = Forward(KvMessageType::kIncrement, key,
                                 std::to_string(delta), &value);
@@ -650,9 +636,9 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
   unsigned spins = 0;
   while (!rings_[message.destination_node].enqueue(
       const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
-    // Do not steal the MPSC consumer role or nest ServeDeferred here.
-    // Peer/local inbound demuxers free ring slots; nested serve+Send is what
-    // previously produced multi-node full-ring circular waits.
+    // Peer demuxers free ring slots. When called from nested Serve (depth>0)
+    // we must not ServeDeferred, but top-level Send during Await may briefly
+    // help demux by yielding; sleeping avoids tight livelock on full rings.
     if ((++spins & 63u) == 0)
       std::this_thread::sleep_for(std::chrono::microseconds(50));
     else
@@ -917,18 +903,15 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     if (!partition->GetPrivate(key, &result)) {
       response.status = static_cast<uint32_t>(StatusCode::kNotFound);
     } else {
-      // Residual owner GET (e.g. tests): migrate before reply so cost stays on
-      // the request path (TwoPLPasha DATA_MIGRATION timing). Soft-fail budget.
+      // Residual owner GET: migrate before reply (move_in on request path).
+      // Budget after Send so the requester is not blocked behind move_out.
       try {
         bool moved_in = false;
         const StatusCode migrated =
             partition->EnsureInShared(key, config_.node_id, &moved_in);
-        if (migrated == StatusCode::kOk) {
-          if (moved_in) {
-            migration_in_.fetch_add(1, std::memory_order_relaxed);
-            shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-          }
-          EnforceMigrationBudget(*partition);
+        if (migrated == StatusCode::kOk && moved_in) {
+          migration_in_.fetch_add(1, std::memory_order_relaxed);
+          shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
         }
       } catch (const std::exception &) {
       } catch (...) {
@@ -936,6 +919,13 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
       response.status = static_cast<uint32_t>(StatusCode::kOk);
       response.value_size = static_cast<uint32_t>(result.size());
       std::memcpy(response.value.data(), result.data(), result.size());
+      SendTransportMessage(response);
+      try {
+        EnforceMigrationBudget(*partition);
+      } catch (const std::exception &) {
+      } catch (...) {
+      }
+      return;
     }
   } else if (message.type == KvMessageType::kMigrate) {
     try {
@@ -943,19 +933,22 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
       const StatusCode migrated =
           partition->EnsureInShared(key, config_.node_id, &moved_in);
       response.status = static_cast<uint32_t>(migrated);
+      if (migrated == StatusCode::kOk && moved_in) {
+        migration_in_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      }
+      // Ack move_in before OnDemand move_out so the requester can TryPin /
+      // CXL-access without racing the same-handler eviction (liveness under
+      // YCSB-A). move_in cost remains on the Migrate critical path.
+      SendTransportMessage(response);
       if (migrated == StatusCode::kOk) {
-        if (moved_in) {
-          migration_in_.fetch_add(1, std::memory_order_relaxed);
-          shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-        }
-        // OnDemand analogue: move_row_out after successful move_in, before ack
-        // is observed by the requester (original handler order).
         try {
           EnforceMigrationBudget(*partition);
         } catch (const std::exception &) {
         } catch (...) {
         }
       }
+      return;
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
     } catch (const std::exception &error) {

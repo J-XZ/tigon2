@@ -8,6 +8,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace tigonkv::engine {
@@ -102,8 +103,23 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       // Keep the private latch through the shared operation so move-out cannot
       // remove the shared authority between lookup and the SCC write.
       if (payload != nullptr) mem_access::SharedPayloadWrite(payload->data, value.size());
-      const bool written = star::TwoPLPashaHelper::kv_shared_write(
-          smeta, owner_shard_, value.data(), value.size());
+      bool written = false;
+      for (uint32_t spin = 0; spin < 100000u && smeta != nullptr; ++spin) {
+        written = star::TwoPLPashaHelper::kv_shared_write(
+            smeta, owner_shard_, value.data(), value.size());
+        if (written) break;
+        // Drop PrivateRow latch so concurrent GetShared readers / move-out
+        // checks can progress; re-validate after reacquire.
+        UnlockRow(row);
+        std::this_thread::yield();
+        LockRow(row);
+        if (row->is_tombstone || !row->is_migrated ||
+            row->migrated_smeta_off != smeta_offset) {
+          UnlockRow(row);
+          // Row left shared authority; retry as a fresh private put.
+          return PutPrivate(key, value);
+        }
+      }
       if (written) {
         row->value_len = static_cast<uint32_t>(value.size());
         ++row->version;
@@ -211,8 +227,14 @@ bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
   if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
   auto *payload = smeta->get_scc_data();
   mem_access::SharedPayloadWrite(payload->data, value.size());
-  const bool written = star::TwoPLPashaHelper::kv_shared_write(
-      smeta, host_id, value.data(), value.size());
+  bool written = false;
+  for (uint32_t spin = 0; spin < 100000u; ++spin) {
+    written = star::TwoPLPashaHelper::kv_shared_write(
+        smeta, host_id, value.data(), value.size());
+    if (written) break;
+    // Pin keeps move-out out; yield so concurrent readers can drop reader_count.
+    std::this_thread::yield();
+  }
   if (written) {
     smeta->value_len = static_cast<uint32_t>(value.size());
     NoteSharedAccess(smeta);
@@ -672,11 +694,15 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   star::scc_manager->do_read(smeta, host_id, row->kv + row->key_len, payload->data,
                              row->value_len);
   // Invalidate before tree remove so concurrent TryPinShared cannot pin a
-  // row that is about to be EBR-retired.
+  // row that is about to be EBR-retired. Drop the HWCC latch across the
+  // shared-tree remove so GetShared/PutShared (tree then smeta) cannot
+  // deadlock against MoveOut (smeta then tree).
   smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
   row->is_migrated = 0;
   row->migrated_smeta_off = kNullOffset;
+  smeta->unlock();
   if (!shared_tree_->remove(fixed_key)) {
+    smeta->lock();
     smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
     row->is_migrated = 1;
     row->migrated_smeta_off = smeta_offset;
@@ -685,6 +711,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
     UnlockRow(row);
     return false;
   }
+  smeta->lock();
   smeta->clear_write_locked();
   smeta->unlock();
   ebr_.add_retired_object(smeta, sizeof(star::TwoPLPashaMetadataShared),
