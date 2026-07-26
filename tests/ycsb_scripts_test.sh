@@ -44,15 +44,41 @@ rg -q 'TIGONKV_E2E_RELEASE_FILE=' "$guest_workflow"
 rg -q 'all_replayed' "$guest_workflow"
 rg -q "remote .*touch.*release_file" "$guest_workflow"
 mkdir -p "$tmp/logs"
-printf '%s\n' \
-  'E2E_THREAD_TOPOLOGY node=0 foreground=4 demuxer=1 kv_threads=5 affinity=distinct_allowed_cpus' \
-  'E2E_TRACE_TIME_US phase=run node=0 ops=10 duration_us=100 trace_first=0 trace_workers=4 batch_ops=4096' \
-  >"$tmp/logs/node0.log"
+python3 - "$tmp/logs" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for workload in ('a', 'b'):
+    for round_id in (1, 2):
+        for stage in ('load', 'run'):
+            directory = root / f'round{round_id}-workload{workload}-{stage}'
+            directory.mkdir(parents=True)
+            for node in range(4):
+                ops = (10 if workload == 'a' else 30) * round_id
+                seconds = (node + 1) * round_id
+                (directory / f'vm{node}.log').write_text(
+                    'E2E_THREAD_TOPOLOGY node=%d foreground=4 demuxer=1 '
+                    'kv_threads=5 affinity=distinct_allowed_cpus\n'
+                    'E2E_TRACE_TIME_US phase=%s node=%d ops=%d '
+                    'duration_us=%d trace_first=0 trace_workers=4 batch_ops=4096\n'
+                    % (node, stage, node, ops, seconds * 1_000_000)
+                )
+PY
 python3 "$root/scripts/summarize_ycsb_experiment.py" --log-root "$tmp/logs" --out-dir "$tmp/summary"
 test -s "$tmp/summary/ycsb_summary.json"
 python3 - "$tmp/summary/ycsb_summary.json" <<'PY'
 import json, sys
 d=json.load(open(sys.argv[1]))
+assert len(d['round_summary']) == 8
+assert len(d['case_summary']) == 4
+for row in d['round_summary']:
+    expected = 10.0 if row['case'] == 'workloada' else 30.0
+    assert row['nodes'] == 4
+    assert row['ops_per_sec'] == expected
+for row in d['case_summary']:
+    expected = 10.0 if row['case'] == 'workloada' else 30.0
+    assert row['rounds'] == 2
+    assert row['ops_per_sec_from_avg_round_max'] == expected
 assert d['thread_topologies'] == [
     'foreground=4 demuxer=1 kv_threads=5 affinity=distinct_allowed_cpus'
 ]
