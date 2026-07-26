@@ -741,6 +741,10 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
       !ValidStatusCode(message.status))
     TransportFatal(config_.node_id, "send_validate",
                    "invalid outgoing KV transport message", &message);
+  // A deferred owner request has an isolated latency scope. Pay all database
+  // access delay after its locks/EBR guards have been released but before the
+  // response becomes visible in the peer's ring.
+  mem_access::DelayIsolatedScopeNow();
   unsigned spins = 0;
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::seconds(config_.sync_timeout_sec);
@@ -1085,6 +1089,8 @@ void KVEngine::ServeDeferredRequests() {
   }
   for (size_t i = 0; i < batch_count; ++i) {
     const KvMessage &deferred = batch[i];
+    mem_access::IsolatedLatencyScope request_scope(
+        latency_sim::ScopeKind::kForeground);
     try {
       ServeTransportRequest(deferred);
     } catch (const std::exception &error) {

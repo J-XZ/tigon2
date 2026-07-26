@@ -104,6 +104,14 @@ public:
 
   void BeginScope(ScopeKind scope);
   void EndScopeAndDelay();
+  // Run one independently timed request while preserving any outer foreground
+  // scope on this thread. Only one isolated request may be active at a time.
+  void BeginIsolatedScope(ScopeKind scope);
+  void EndIsolatedScopeAndDelay();
+  // Safe-point settlement used immediately before publishing a response.
+  // The isolated scope remains active so later transport accesses stay
+  // attributed to the request rather than its outer helper operation.
+  void DelayIsolatedScopeNow();
 
   void RecordRange(PoolKind pool, AccessKind kind, const void *addr,
                    uint64_t bytes);

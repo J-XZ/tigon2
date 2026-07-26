@@ -62,6 +62,32 @@ int main() {
   simulator.EndScopeAndDelay();
   simulator.TakeStatsAndReset();
 
+  simulator.Configure(BaseConfig());
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kRead,
+                       reinterpret_cast<void *>(0x5000));
+  assert(simulator.PendingDelayNsForTest() == 10);
+  simulator.BeginIsolatedScope(latency_sim::ScopeKind::kForeground);
+  assert(simulator.PendingDelayNsForTest() == 0);
+  simulator.RecordLine(latency_sim::PoolKind::kHwcc,
+                       latency_sim::AccessKind::kRead,
+                       reinterpret_cast<void *>(0x6000));
+  assert(simulator.PendingDelayNsForTest() == 40);
+  simulator.DelayIsolatedScopeNow();
+  assert(simulator.PendingDelayNsForTest() == 0);
+  simulator.RecordLine(latency_sim::PoolKind::kHwcc,
+                       latency_sim::AccessKind::kWrite,
+                       reinterpret_cast<void *>(0x6000));
+  assert(simulator.PendingDelayNsForTest() == 50);
+  simulator.EndIsolatedScopeAndDelay();
+  assert(simulator.PendingDelayNsForTest() == 10);
+  stats = simulator.SnapshotStats();
+  assert(stats.swcc_raw_line_accesses == 1);
+  assert(stats.hwcc_raw_line_accesses == 2);
+  simulator.EndScopeAndDelay();
+  simulator.TakeStatsAndReset();
+
   auto fixed = BaseConfig();
   fixed.cache_model = latency_sim::CacheModel::kFixedHitRate;
   fixed.cache_fixed_hit_rate = 1.0;

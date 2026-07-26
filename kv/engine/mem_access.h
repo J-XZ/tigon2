@@ -22,6 +22,29 @@ class LatencyScope {
   bool active_ = false;
 };
 
+class IsolatedLatencyScope {
+ public:
+  explicit IsolatedLatencyScope(latency_sim::ScopeKind scope) {
+    active_ = latency_sim::InstrumentationEnabledFast();
+    if (active_)
+      latency_sim::GlobalLatencySimulator().BeginIsolatedScope(scope);
+  }
+  ~IsolatedLatencyScope() {
+    if (active_)
+      latency_sim::GlobalLatencySimulator().EndIsolatedScopeAndDelay();
+  }
+  IsolatedLatencyScope(const IsolatedLatencyScope &) = delete;
+  IsolatedLatencyScope &operator=(const IsolatedLatencyScope &) = delete;
+
+ private:
+  bool active_ = false;
+};
+
+inline void DelayIsolatedScopeNow() {
+  if (latency_sim::InstrumentationEnabledFast())
+    latency_sim::GlobalLatencySimulator().DelayIsolatedScopeNow();
+}
+
 inline void Record(latency_sim::PoolKind pool, latency_sim::AccessKind kind,
                    const void *address, size_t bytes) {
   if (latency_sim::InstrumentationEnabledFast())
