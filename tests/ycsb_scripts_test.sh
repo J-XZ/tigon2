@@ -37,5 +37,10 @@ guest_workflow="$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh"
 rg -q 'kill_guest_runners' "$guest_workflow"
 rg -Fq 'for proc in /proc/[0-9]*' "$guest_workflow"
 rg -Fq 'readlink \"\$proc/exe\"' "$guest_workflow"
+# A guest that finishes replay first must keep servicing peer transport until
+# every VM reaches replay_done.
+rg -q 'TIGONKV_E2E_RELEASE_FILE=' "$guest_workflow"
+rg -q 'all_replayed' "$guest_workflow"
+rg -q "remote .*touch.*release_file" "$guest_workflow"
 python3 "$root/scripts/summarize_ycsb_experiment.py" --log-root "$tmp/logs" --out-dir "$tmp/summary"
 test -s "$tmp/summary/ycsb_summary.json"

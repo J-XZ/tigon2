@@ -105,16 +105,18 @@ pool_reset() {
 
 run_fixed() {
   local round=$1 workload=$2 phase=$3 vm=$4 reset=$5 log=$6
-  local wl
+  local wl release_file
   wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
   local trace_dir="$remote_root/ycsb-guest-traces/round$round/workload$wl/$phase"
+  release_file="$remote_root/ycsb-guest-release/round${round}-workload${wl}-${phase}"
+  remote "$vm" "mkdir -p '$remote_root/ycsb-guest-release'; rm -f '$release_file' '$release_file.waiting'"
   local zeroed=""
   [[ "$reset" == 1 ]] && zeroed="TIGONKV_DEVICE_BACKING_ZEROED=1"
   local trace_first=$((vm * threads_per_vm))
   # The phase orchestrator consumes stage=opened to release peer VMs.  This
   # control-plane marker is outside the timed replay window and must not rely
   # on a caller remembering to enable verbose output.
-  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_VERBOSE=1 TIGONKV_E2E_RESET=$reset $zeroed '$remote_runner'"
+  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_VERBOSE=1 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $zeroed '$remote_runner'"
   # Pre-create the log so the host wait loop never races rg against ENOENT.
   : >"$log"
   timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$command" >>"$log" 2>&1
@@ -123,11 +125,12 @@ run_fixed() {
 # Fail fast when guests sit at barrier_ready with zero op progress (livelock).
 # YCSB-E SCAN-heavy runs normally emit E2E_TRACE_PROGRESS every ~5s.
 watch_phase_progress() {
-  local phase_log=$1
+  local phase_log=$1 round=$2 workload=$3 phase=$4
   local stall_sec=${TIGONKV_E2E_STALL_SEC:-90}
   local deadline=$((SECONDS + timeout_sec))
   local last_ops=-1
   local last_change=$SECONDS
+  local released=0
   while (( SECONDS < deadline )); do
     local all_done=1
     local vm
@@ -138,6 +141,22 @@ watch_phase_progress() {
       fi
     done
     (( all_done == 1 )) && return 0
+    if (( released == 0 )); then
+      local all_replayed=1
+      for ((vm = 0; vm < vm_count; vm++)); do
+        if ! rg -q 'stage=replay_done' "$phase_log/vm${vm}.log" 2>/dev/null; then
+          all_replayed=0
+          break
+        fi
+      done
+      if (( all_replayed == 1 )); then
+        local release_file="$remote_root/ycsb-guest-release/round${round}-workload${workload}-${phase}"
+        for ((vm = 0; vm < vm_count; vm++)); do
+          remote "$vm" "touch '$release_file'"
+        done
+        released=1
+      fi
+    fi
     local ops=0
     for ((vm = 0; vm < vm_count; vm++)); do
       local cur=""
@@ -196,7 +215,7 @@ for ((round = 1; round <= rounds; round++)); do
         pids+=("$!")
       done
       # Watch progress in parallel; kill the phase early on livelock/stall.
-      watch_phase_progress "$phase_log" &
+      watch_phase_progress "$phase_log" "$round" "$wl" "$phase" &
       watch_pid=$!
       fail=0
       while kill -0 "$watch_pid" 2>/dev/null; do

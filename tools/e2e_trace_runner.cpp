@@ -94,6 +94,33 @@ void DrainTransport(KVStore &store) {
   }
 }
 
+// Guest VMs do not share a filesystem, so the host orchestrator cannot use the
+// file-marker Barrier directly across them.  Keep a VM's transport alive after
+// its timed replay until the host observes that every peer has also finished.
+void WaitForHostRelease(const std::string &phase, KVStore &store) {
+  const std::string release_file =
+      Env("TIGONKV_E2E_RELEASE_FILE", "CXLKV_E2E_RELEASE_FILE");
+  if (release_file.empty()) return;
+  {
+    std::ofstream waiting(release_file + ".waiting");
+    if (!waiting) Fail("cannot publish host-release wait marker");
+    waiting << "waiting\n";
+  }
+  const uint64_t timeout = ParseUnsigned(
+      Env("TIGONKV_E2E_RELEASE_TIMEOUT_SEC", "CXLKV_E2E_RELEASE_TIMEOUT_SEC", "600"),
+      "host release timeout");
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+  while (!std::filesystem::exists(release_file)) {
+    const Status status = store.PollTransport();
+    if (!status.ok())
+      Fail("transport poll failed while waiting for host release: " + status.message);
+    if (std::chrono::steady_clock::now() >= deadline)
+      Fail("host release timeout for phase " + phase);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
 struct ReplayResult {
   uint64_t ops = 0;
 };
@@ -234,6 +261,8 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   log_stage("replay_done");
   const auto duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - start).count());
+  WaitForHostRelease(phase, *store);
+  log_stage("release_done");
   DrainTransport(*store);
   log_stage("drain_done");
   Barrier(phase, config.node_id, true, store.get());
@@ -353,6 +382,7 @@ int main() {
     }
     const auto duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start).count());
+    WaitForHostRelease(phase, *store);
     DrainTransport(*store);
     Barrier(phase, config.node_id, true, store.get());
     if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
