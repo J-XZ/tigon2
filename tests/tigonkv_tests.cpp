@@ -100,6 +100,10 @@ int main() {
     gated.verbose = false;
     gated.extra_check = true;
     assert(ValidateThrows(gated));
+    gated.extra_check = false;
+    gated.latency_foreground_enabled = false;
+    gated.latency_merge_enabled = true;
+    assert(ValidateThrows(gated));
   } else {
     assert(ValidateThrows(gated));
   }

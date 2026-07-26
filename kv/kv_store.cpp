@@ -297,6 +297,12 @@ void Config::Validate() const {
       latency_cache_hit_extra_ns < 0)
     throw std::invalid_argument("latency values must be finite and non-negative");
   if (latency_enabled) {
+    // This build has no independent merge worker: migration/EBR maintenance
+    // runs inside foreground operations. Allowing foreground=false would
+    // advertise enabled injection while recording and delaying no accesses.
+    if (!latency_foreground_enabled)
+      throw std::invalid_argument(
+          "latency_inject.enabled=true requires foreground_enabled=true");
     if (verbose)
       throw std::invalid_argument(
           "latency_inject.enabled=true is incompatible with verbose=true");
