@@ -1,5 +1,6 @@
 #include "kv/kv_store.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -233,42 +234,29 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   std::mutex error_mutex;
   std::exception_ptr error;
   std::atomic<uint64_t> progress_ops{0};
+  std::atomic<uint64_t> ready_workers{0};
+  std::atomic<uint64_t> completed_workers{0};
+  std::atomic<bool> replay_start{false};
   std::atomic<bool> replay_done{false};
-  // Heartbeat so host orchestration can fail-fast on livelock instead of
-  // mistaking a long SCAN-heavy run for a hang (YCSB-E ~55s/node is normal).
-  std::thread progress_thread;
-  if (progress) {
-    progress_thread = std::thread([&] {
-      uint64_t last = 0;
-      const auto heartbeat_start = std::chrono::steady_clock::now();
-      auto last_print = std::chrono::steady_clock::now();
-      while (!replay_done.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last_print < std::chrono::seconds(5)) continue;
-        last_print = now;
-        const uint64_t cur = progress_ops.load(std::memory_order_relaxed);
-        const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
-            now - heartbeat_start).count();
-        std::cerr << "E2E_TRACE_HEARTBEAT node=" << config.node_id << " phase=" << phase
-                  << " ops=" << (cur - last) << " total=" << cur
-                  << " elapsed_s=" << elapsed_s << "\n"
-                  << std::flush;
-        last = cur;
-      }
-    });
-  }
-  const auto start = std::chrono::steady_clock::now();
+  std::vector<std::chrono::steady_clock::time_point> worker_end(workers);
   for (uint64_t worker = 0; worker < workers; ++worker) {
     threads.emplace_back([&, worker] {
+      bool ready_published = false;
       try {
         store->BindWorker(static_cast<uint32_t>(worker));
         std::mt19937_64 rng(value_seed ^ (static_cast<uint64_t>(trace_first + worker) << 32) ^
                             worker);
+        ready_workers.fetch_add(1, std::memory_order_release);
+        ready_published = true;
+        while (!replay_start.load(std::memory_order_acquire))
+          std::this_thread::yield();
         results[worker] = ReplayTrace(*store, traces[worker], &rng, config.fixed_key_size,
                                       config.fixed_value_size, &progress_ops);
+        worker_end[worker] = std::chrono::steady_clock::now();
         store->ReleaseWorker();
       } catch (...) {
+        if (!ready_published)
+          ready_workers.fetch_add(1, std::memory_order_release);
         try {
           store->ReleaseWorker();
         } catch (...) {
@@ -276,15 +264,43 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
         std::lock_guard<std::mutex> lock(error_mutex);
         if (!error) error = std::current_exception();
       }
+      if (completed_workers.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+          workers)
+        replay_done.store(true, std::memory_order_release);
     });
   }
+  while (ready_workers.load(std::memory_order_acquire) != workers)
+    std::this_thread::yield();
+  const auto start = std::chrono::steady_clock::now();
+  replay_start.store(true, std::memory_order_release);
+  // Reuse the existing orchestration thread for low-frequency progress. A
+  // dedicated heartbeat thread would be an unreported CPU resource.
+  uint64_t last_progress = 0;
+  auto last_print = start;
+  while (progress &&
+         !replay_done.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_print < std::chrono::seconds(5)) continue;
+    last_print = now;
+    const uint64_t current =
+        progress_ops.load(std::memory_order_relaxed);
+    const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+        now - start).count();
+    std::cerr << "E2E_TRACE_HEARTBEAT node=" << config.node_id
+              << " phase=" << phase
+              << " ops=" << (current - last_progress)
+              << " total=" << current
+              << " elapsed_s=" << elapsed_s << "\n"
+              << std::flush;
+    last_progress = current;
+  }
   for (auto &thread : threads) thread.join();
-  replay_done.store(true, std::memory_order_release);
-  if (progress_thread.joinable()) progress_thread.join();
   if (error) std::rethrow_exception(error);
   log_stage("replay_done");
+  const auto end = *std::max_element(worker_end.begin(), worker_end.end());
   const auto duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::steady_clock::now() - start).count());
+      end - start).count());
   WaitForHostRelease(phase, *store);
   log_stage("release_done");
   DrainTransport(*store);
@@ -415,10 +431,6 @@ int main() {
     DrainTransport(*store);
     Barrier(phase, config.node_id, true, store.get());
     if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
-    const std::string heartbeat = Env("TIGONKV_E2E_TRACE_HEARTBEAT_SEC", "CXLKV_E2E_TRACE_HEARTBEAT_SEC", "0");
-    if (heartbeat != "0")
-      std::cout << "E2E_TRACE_HEARTBEAT phase=" << phase << " node=" << config.node_id
-                << " ops=" << ops << " total=" << ops << " elapsed_s=0\n";
     PrintThreadTopology(config.node_id, 1, config.cpu_affinity);
     PrintTraceTime(phase, config.node_id, ops, duration_us, trace_first, 1, batch_ops);
     std::cout << store->DumpStats();
