@@ -178,13 +178,26 @@ bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
                             std::string *value) const {
   EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared GET output");
-  // YCSB-A liveness: point-op CXL GET nested with owner migrated writes and
-  // Await/Poll stalls FG workers. Forward to owner instead. Boundary holds
-  // (no PrivateRow). ScanSharedOnly + CompareExchangeShared keep CXL paths.
-  (void)key;
-  (void)host_id;
-  (void)value;
-  return false;
+  // CXL-first: shared_tree_ only (original get_migrated_row). Never PrivateRow.
+  const FixedKey fixed_key = MakeKey(key);
+  star::TwoPLPashaMetadataShared *smeta = nullptr;
+  RegionOffset smeta_offset = kNullOffset;
+  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
+  auto *payload = smeta->get_scc_data();
+  const uint32_t value_len = smeta->value_len;
+  if (value_len > regions_.layout().fixed_value_size) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    return false;
+  }
+  std::string shared(value_len, '\0');
+  mem_access::SharedPayloadRead(payload->data, value_len);
+  const bool read = star::TwoPLPashaHelper::kv_shared_read(
+      smeta, host_id, shared.data(), value_len);
+  if (read) NoteSharedAccess(smeta);
+  star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+  if (!read) return false;
+  *value = std::move(shared);
+  return true;
 }
 
 bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
@@ -192,9 +205,20 @@ bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
   EnterEbr();
   if (value.size() > regions_.layout().fixed_value_size)
     throw std::invalid_argument("shared value exceeds fixed value size");
-  (void)key;
-  (void)host_id;
-  return false;
+  const FixedKey fixed_key = MakeKey(key);
+  star::TwoPLPashaMetadataShared *smeta = nullptr;
+  RegionOffset smeta_offset = kNullOffset;
+  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
+  auto *payload = smeta->get_scc_data();
+  mem_access::SharedPayloadWrite(payload->data, value.size());
+  const bool written = star::TwoPLPashaHelper::kv_shared_write(
+      smeta, host_id, value.data(), value.size());
+  if (written) {
+    smeta->value_len = static_cast<uint32_t>(value.size());
+    NoteSharedAccess(smeta);
+  }
+  star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+  return written;
 }
 
 bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
@@ -244,10 +268,49 @@ bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
                                   int64_t delta, int64_t *value) {
   EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared increment output");
-  (void)key;
-  (void)host_id;
-  (void)delta;
-  return false;
+  const FixedKey fixed_key = MakeKey(key);
+  star::TwoPLPashaMetadataShared *smeta = nullptr;
+  RegionOffset smeta_offset = kNullOffset;
+  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
+  auto *payload = smeta->get_scc_data();
+  const uint32_t value_len = smeta->value_len;
+  if (value_len > regions_.layout().fixed_value_size) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    return false;
+  }
+  std::string current(value_len, '\0');
+  mem_access::SharedPayloadRead(payload->data, value_len);
+  if (!star::TwoPLPashaHelper::kv_shared_read(smeta, host_id, current.data(),
+                                              value_len)) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    return false;
+  }
+  int64_t previous = 0;
+  const auto parsed =
+      std::from_chars(current.data(), current.data() + current.size(), previous);
+  if (parsed.ec != std::errc{} || parsed.ptr != current.data() + current.size() ||
+      (delta > 0 && previous > std::numeric_limits<int64_t>::max() - delta) ||
+      (delta < 0 && previous < std::numeric_limits<int64_t>::min() - delta)) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    throw std::invalid_argument("increment requires a non-overflowing int64 value");
+  }
+  const int64_t next = previous + delta;
+  const std::string encoded = std::to_string(next);
+  if (encoded.size() > regions_.layout().fixed_value_size) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    throw std::invalid_argument("increment encoded value exceeds fixed value size");
+  }
+  mem_access::SharedPayloadWrite(payload->data, encoded.size());
+  if (!star::TwoPLPashaHelper::kv_shared_write(smeta, host_id, encoded.data(),
+                                              encoded.size())) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    return false;
+  }
+  smeta->value_len = static_cast<uint32_t>(encoded.size());
+  *value = next;
+  NoteSharedAccess(smeta);
+  star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+  return true;
 }
 
 bool KVPartition::CompareExchangePrivate(std::string_view key,
@@ -398,6 +461,39 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
   *value = next;
   UnlockRow(row);
   return true;
+}
+
+StatusCode KVPartition::EnsureInShared(std::string_view key, uint32_t host_id,
+                                       bool *moved_in) {
+  EnterEbr();
+  (void)host_id;
+  if (moved_in != nullptr) *moved_in = false;
+  if (star::scc_manager == nullptr) return StatusCode::kOutOfMemory;
+  const FixedKey fixed_key = MakeKey(key);
+  star::migration_result result = star::migration_result::FAIL_OOM;
+  if (star::migration_manager != nullptr) {
+    auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
+    if (table == nullptr) return StatusCode::kOutOfMemory;
+    std::tuple<std::atomic<uint64_t> *, void *> row{nullptr, nullptr};
+    // DATA_MIGRATION_REQUEST uses move_row_in(..., inc_ref=false).
+    result = star::migration_manager->move_row_in(table, fixed_key.bytes, row, false);
+  } else {
+    void *migration_policy_meta = nullptr;
+    result = MoveInForMigrationManager(fixed_key.bytes, false, migration_policy_meta);
+  }
+  if (result == star::migration_result::SUCCESS) {
+    if (moved_in != nullptr) *moved_in = true;
+    return StatusCode::kOk;
+  }
+  if (result == star::migration_result::FAIL_ALREADY_IN_CXL)
+    return StatusCode::kOk;
+  RegionOffset row_offset = kNullOffset;
+  if (!private_tree_->lookup(fixed_key, row_offset)) return StatusCode::kNotFound;
+  auto *row = RowFromOffset(row_offset);
+  LockRow(row);
+  const bool absent = row->is_tombstone;
+  UnlockRow(row);
+  return absent ? StatusCode::kNotFound : StatusCode::kOutOfMemory;
 }
 
 bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id) {

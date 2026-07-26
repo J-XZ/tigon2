@@ -70,6 +70,8 @@ class KVEngine {
   uint32_t OwnerForPartition(uint32_t partition) const;
   Status Forward(KvMessageType type, std::string_view key, std::string_view value,
                  std::string *response_value);
+  // TwoPLPasha DATA_MIGRATION: ask owner to move_row_in, then requester CXL-accesses.
+  Status RequestMigrate(std::string_view key);
   CasResult ForwardCompareExchange(std::string_view key, std::string_view expected,
                                    std::string_view desired);
   Status AwaitResponse(uint64_t request_id, std::string *response_value);

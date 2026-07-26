@@ -11,6 +11,7 @@
 #include <thread>
 #include <chrono>
 #include <charconv>
+#include <cstring>
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -223,6 +224,15 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
       shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
       return Status::Ok();
     }
+    // Miss: DATA_MIGRATION then retry CXL write. Create-path / races still
+    // fall back to owner PutPrivate (key may not exist yet).
+    const Status migrated = RequestMigrate(key);
+    if (visible != nullptr && visible->PutShared(key, config_.node_id, value)) {
+      shared_puts_.fetch_add(1, std::memory_order_relaxed);
+      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      return Status::Ok();
+    }
+    if (migrated.code == StatusCode::kOutOfMemory) return migrated;
     return Forward(KvMessageType::kPut, key, value, nullptr);
   }
   try { partition->PutPrivate(key, value); return Status::Ok(); }
@@ -233,15 +243,23 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
 GetResult KVEngine::Get(std::string_view key) {
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
-    std::string shared;
     auto *visible = VisiblePartition(key);
-    if (visible != nullptr && visible->GetShared(key, config_.node_id, &shared)) {
-      shared_gets_.fetch_add(1, std::memory_order_relaxed);
-      return {Status::Ok(), std::move(shared)};
+    // shared-hit CXL; miss → migrate RPC then CXL retry (not owner value-Forward).
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      std::string shared;
+      if (visible != nullptr && visible->GetShared(key, config_.node_id, &shared)) {
+        shared_gets_.fetch_add(1, std::memory_order_relaxed);
+        return {Status::Ok(), std::move(shared)};
+      }
+      const Status migrated = RequestMigrate(key);
+      if (migrated.code == StatusCode::kNotFound)
+        return {Status::Error(StatusCode::kNotFound, "key not found"), {}};
+      if (!migrated.ok() && migrated.code != StatusCode::kOutOfMemory)
+        return {migrated, {}};
+      if (migrated.code == StatusCode::kOutOfMemory && attempt == 3)
+        return {migrated, {}};
     }
-    std::string value;
-    auto status = Forward(KvMessageType::kGet, key, {}, &value);
-    return {std::move(status), std::move(value)};
+    return {Status::Error(StatusCode::kNotFound, "key not found after migrate"), {}};
   }
   std::string value;
   return partition->GetPrivate(key, &value) ? GetResult{Status::Ok(), std::move(value)}
@@ -491,10 +509,13 @@ CasResult KVEngine::CompareExchange(std::string_view key,
                                     std::string_view desired) {
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
-    bool exchanged = false;
     auto *visible = VisiblePartition(key);
-    if (visible != nullptr && visible->CompareExchangeShared(
-            key, config_.node_id, expected, desired, &exchanged)) {
+    auto try_shared = [&](bool *exchanged) -> bool {
+      return visible != nullptr && visible->CompareExchangeShared(
+          key, config_.node_id, expected, desired, exchanged);
+    };
+    bool exchanged = false;
+    if (try_shared(&exchanged)) {
       if (exchanged) {
         shared_puts_.fetch_add(1, std::memory_order_relaxed);
         shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
@@ -503,6 +524,19 @@ CasResult KVEngine::CompareExchange(std::string_view key,
                          : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
               exchanged};
     }
+    const Status migrated = RequestMigrate(key);
+    exchanged = false;
+    if (try_shared(&exchanged)) {
+      if (exchanged) {
+        shared_puts_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      }
+      return {exchanged ? Status::Ok()
+                         : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
+              exchanged};
+    }
+    if (migrated.code == StatusCode::kNotFound)
+      return {Status::Error(StatusCode::kNotFound, "key not found"), false};
     return ForwardCompareExchange(key, expected, desired);
   }
   try {
@@ -522,13 +556,22 @@ CasResult KVEngine::CompareExchange(std::string_view key,
 IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
-    int64_t shared = 0;
     auto *visible = VisiblePartition(key);
+    int64_t shared = 0;
     if (visible != nullptr && visible->IncrementShared(key, config_.node_id, delta, &shared)) {
       shared_puts_.fetch_add(1, std::memory_order_relaxed);
       shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
       return {Status::Ok(), shared};
     }
+    const Status migrated = RequestMigrate(key);
+    if (visible != nullptr && visible->IncrementShared(key, config_.node_id, delta, &shared)) {
+      shared_puts_.fetch_add(1, std::memory_order_relaxed);
+      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      return {Status::Ok(), shared};
+    }
+    if (migrated.code == StatusCode::kNotFound)
+      return {Status::Error(StatusCode::kNotFound, "key not found"), 0};
+    // Create-on-increment / races: owner IncrementPrivate.
     std::string value;
     const auto status = Forward(KvMessageType::kIncrement, key,
                                 std::to_string(delta), &value);
@@ -624,6 +667,10 @@ Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_v
   const uint64_t request_id = NextRequestId(config_.node_id);
   SendTransportMessage(MakeRequest(type, config_.node_id, owner, request_id, key, value));
   return AwaitResponse(request_id, response_value);
+}
+
+Status KVEngine::RequestMigrate(std::string_view key) {
+  return Forward(KvMessageType::kMigrate, key, {}, nullptr);
 }
 
 Status KVEngine::AwaitResponse(uint64_t request_id, std::string *response_value) {
@@ -870,25 +917,54 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     if (!partition->GetPrivate(key, &result)) {
       response.status = static_cast<uint32_t>(StatusCode::kNotFound);
     } else {
-      // Reply first so Forward/Await cannot stall behind move-in / budget.
-      // Remote GET is still the move-in trigger (cxlkv-comparable), but the
-      // requester does not wait for Promote/EnforceMigrationBudget. With
-      // point-op Shared Forwarded, no post-read CXL pin is required.
+      // Residual owner GET (e.g. tests): migrate before reply so cost stays on
+      // the request path (TwoPLPasha DATA_MIGRATION timing). Soft-fail budget.
+      try {
+        bool moved_in = false;
+        const StatusCode migrated =
+            partition->EnsureInShared(key, config_.node_id, &moved_in);
+        if (migrated == StatusCode::kOk) {
+          if (moved_in) {
+            migration_in_.fetch_add(1, std::memory_order_relaxed);
+            shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+          }
+          EnforceMigrationBudget(*partition);
+        }
+      } catch (const std::exception &) {
+      } catch (...) {
+      }
       response.status = static_cast<uint32_t>(StatusCode::kOk);
       response.value_size = static_cast<uint32_t>(result.size());
       std::memcpy(response.value.data(), result.data(), result.size());
-      SendTransportMessage(response);
-      try {
-        if (partition->PromotePrivate(key, config_.node_id)) {
+    }
+  } else if (message.type == KvMessageType::kMigrate) {
+    try {
+      bool moved_in = false;
+      const StatusCode migrated =
+          partition->EnsureInShared(key, config_.node_id, &moved_in);
+      response.status = static_cast<uint32_t>(migrated);
+      if (migrated == StatusCode::kOk) {
+        if (moved_in) {
           migration_in_.fetch_add(1, std::memory_order_relaxed);
           shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
         }
-        EnforceMigrationBudget(*partition);
-      } catch (const std::exception &) {
-        // Best-effort migration after a successful read response.
-      } catch (...) {
+        // OnDemand analogue: move_row_out after successful move_in, before ack
+        // is observed by the requester (original handler order).
+        try {
+          EnforceMigrationBudget(*partition);
+        } catch (const std::exception &) {
+        } catch (...) {
+        }
       }
-      return;
+    } catch (const std::bad_alloc &) {
+      response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
+    } catch (const std::exception &error) {
+      response.status = static_cast<uint32_t>(StatusCode::kCorruption);
+      const size_t count = std::min(response.value.size(), std::strlen(error.what()));
+      std::memcpy(response.value.data(), error.what(), count);
+      response.value_size = static_cast<uint32_t>(count);
+    } catch (...) {
+      response.status = static_cast<uint32_t>(StatusCode::kCorruption);
     }
   } else if (message.type == KvMessageType::kIncrement) {
     int64_t delta = 0;

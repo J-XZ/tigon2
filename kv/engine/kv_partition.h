@@ -6,6 +6,7 @@
 #include "protocol/Pasha/MigrationManager.h"
 #include "kv/engine/kv_types_layout.h"
 #include "kv/engine/region_allocator.h"
+#include "kv/kv_store.h"
 
 #include <cstdint>
 #include <functional>
@@ -43,9 +44,8 @@ class KVPartition {
   bool CompareExchangePrivate(std::string_view key, std::string_view expected,
                               std::string_view desired, bool *exchanged);
   bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value);
-  // Non-owner APIs never touch PrivateRow. Get/Put/INCR Shared currently
-  // Forward (YCSB-A liveness). CompareExchangeShared + ScanSharedOnly use
-  // TryPinShared CXL paths.
+  // Non-owner APIs never touch PrivateRow. Point ops use TryPinShared + SCC
+  // (aligned with get_migrated_row / CompareExchangeShared / ScanSharedOnly).
   bool GetShared(std::string_view key, uint32_t host_id, std::string *value) const;
   bool PutShared(std::string_view key, uint32_t host_id, std::string_view value);
   bool CompareExchangeShared(std::string_view key, uint32_t host_id,
@@ -53,6 +53,11 @@ class KVPartition {
                              bool *exchanged);
   bool IncrementShared(std::string_view key, uint32_t host_id, int64_t delta,
                        int64_t *value);
+  // Owner DATA_MIGRATION analogue: move_row_in(inc_ref=false). Returns Ok on
+  // SUCCESS or FAIL_ALREADY_IN_CXL, NotFound if absent, OutOfMemory otherwise.
+  // When non-null, *moved_in is set true only on fresh SUCCESS.
+  StatusCode EnsureInShared(std::string_view key, uint32_t host_id,
+                            bool *moved_in = nullptr);
   bool PromotePrivate(std::string_view key, uint32_t host_id);
   // Like PromotePrivate, but when the row is already shared pins payload
   // ref_cnt (FAIL_ALREADY_IN_CXL) and returns that smeta via *pinned_existing

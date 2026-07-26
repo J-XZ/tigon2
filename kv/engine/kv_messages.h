@@ -23,6 +23,9 @@ enum class KvMessageType : uint8_t {
   kScanRequest = 8,
   kScanItem = 9,
   kScanDone = 10,
+  // Owner-only move_row_in (TwoPLPasha DATA_MIGRATION_*). No value payload;
+  // requester retries CXL Shared after a successful ack.
+  kMigrate = 11,
 };
 
 struct KvMessage {
