@@ -231,6 +231,16 @@ void RegionAllocator::FlushAllocatedRanges() const {
   }
 }
 
+void RegionAllocator::FlushOwnedRange(uint32_t owner_shard) const {
+  if (owner_shard >= header_->shard_count)
+    throw std::invalid_argument("flush owner shard outside allocator");
+  const auto &entry = header_->shards[owner_shard];
+  FlushForRemoteVisibility(&entry, sizeof(entry), !metadata_is_hwcc_);
+  if (entry.bump > entry.begin)
+    FlushForRemoteVisibility(base_ + entry.begin, entry.bump - entry.begin,
+                             !metadata_is_hwcc_);
+}
+
 void *RegionAllocator::AllocateFromShard(uint64_t bytes, uint32_t size_class,
                                          uint32_t owner_shard) {
   auto &shard = header_->shards[owner_shard];
@@ -538,11 +548,29 @@ void DualRegionAllocator::PublishReady() {
   const uint32_t state = header_->layout.state.load(std::memory_order_acquire);
   if (state != static_cast<uint32_t>(LayoutState::kInitializing))
     throw std::logic_error("dual-region layout ready published more than once");
+  // The reset coordinator created every initial private/shared tree. Publish
+  // those SWCC nodes before the HWCC Ready/Dirty release store.
+  swcc_.FlushAllocatedRanges();
+  for (uint32_t partition = 0;
+       partition < header_->layout.partition_count; ++partition) {
+    auto *arena = Arena(partition);
+    const RegionOffset arena_offset = swcc_.ToOffset(arena);
+    if (arena->bump > arena_offset)
+      FlushForRemoteVisibility(arena, arena->bump - arena_offset);
+  }
   mem_access::HwccAtomicStore(&header_->layout.state);
   header_->layout.state.store(static_cast<uint32_t>(LayoutState::kDirty),
                               std::memory_order_release);
   FlushForRemoteVisibility(&header_->layout.state, sizeof(header_->layout.state),
                            false);
+}
+
+void DualRegionAllocator::MarkDirty() {
+  uint32_t expected = static_cast<uint32_t>(LayoutState::kClean);
+  mem_access::HwccAtomicRmw(&header_->layout.state);
+  header_->layout.state.compare_exchange_strong(
+      expected, static_cast<uint32_t>(LayoutState::kDirty),
+      std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 void *DualRegionAllocator::Allocate(uint64_t bytes, AllocationDomain domain,
@@ -723,21 +751,57 @@ uint64_t DualRegionAllocator::SharedPayloadCapacityBytes() const {
   return header_->swcc_allocator_bytes - header_->owner_private_arenas_bytes;
 }
 
-void DualRegionAllocator::FlushCheckpointRanges() {
-  hwcc_.FlushAllocatedRanges();
-  swcc_.FlushAllocatedRanges();
+void DualRegionAllocator::FlushCheckpointRanges(
+    uint32_t node_id, std::chrono::milliseconds timeout) {
+  if (node_id >= header_->layout.vm_count)
+    throw std::invalid_argument("checkpoint node outside layout");
+  mem_access::HwccAtomicLoad(&header_->layout.clean_epoch);
+  const uint64_t target =
+      header_->layout.clean_epoch.load(std::memory_order_acquire) + 1;
+  swcc_.FlushOwnedRange(node_id);
   for (uint32_t partition = 0; partition < header_->layout.partition_count; ++partition) {
+    if (Arena(partition)->owner_shard != node_id) continue;
     auto *arena = Arena(partition);
     const RegionOffset arena_offset = swcc_.ToOffset(arena);
     if (arena->bump > arena_offset)
       FlushForRemoteVisibility(arena, arena->bump - arena_offset);
   }
-  mem_access::HwccAtomicRmw(&header_->layout.clean_epoch);
-  header_->layout.clean_epoch.fetch_add(1, std::memory_order_release);
-  mem_access::HwccAtomicStore(&header_->layout.state);
-  header_->layout.state.store(static_cast<uint32_t>(LayoutState::kClean),
-                              std::memory_order_release);
-  FlushForRemoteVisibility(header_, sizeof(*header_), false);
+  auto &ready = header_->layout.checkpoint_ready_epoch[node_id];
+  mem_access::HwccAtomicStore(&ready);
+  ready.store(target, std::memory_order_release);
+
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  if (node_id == 0) {
+    for (;;) {
+      bool all_ready = true;
+      for (uint32_t node = 0; node < header_->layout.vm_count; ++node) {
+        auto &peer = header_->layout.checkpoint_ready_epoch[node];
+        mem_access::HwccAtomicLoad(&peer);
+        if (peer.load(std::memory_order_acquire) < target) {
+          all_ready = false;
+          break;
+        }
+      }
+      if (all_ready) break;
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw std::runtime_error("collective checkpoint ready timeout");
+      std::this_thread::yield();
+    }
+    mem_access::HwccAtomicStore(&header_->layout.state);
+    header_->layout.state.store(static_cast<uint32_t>(LayoutState::kClean),
+                                std::memory_order_release);
+    mem_access::HwccAtomicStore(&header_->layout.clean_epoch);
+    header_->layout.clean_epoch.store(target, std::memory_order_release);
+  } else {
+    for (;;) {
+      mem_access::HwccAtomicLoad(&header_->layout.clean_epoch);
+      if (header_->layout.clean_epoch.load(std::memory_order_acquire) >= target)
+        break;
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw std::runtime_error("collective checkpoint publish timeout");
+      std::this_thread::yield();
+    }
+  }
 }
 
 DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,

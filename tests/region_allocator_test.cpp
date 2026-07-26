@@ -5,6 +5,7 @@
 #undef NDEBUG
 #endif
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -191,6 +192,20 @@ void TestDualPhysicalRegions() {
   dual.Free(reused_remote, 100, AllocationDomain::kSharedPayloadSwcc, 0, 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
              .used_bytes.load() == 0);
+  std::thread checkpoint_zero([&] {
+    dual.FlushCheckpointRanges(0, std::chrono::seconds(1));
+  });
+  std::thread checkpoint_one([&] {
+    attached.FlushCheckpointRanges(1, std::chrono::seconds(1));
+  });
+  checkpoint_zero.join();
+  checkpoint_one.join();
+  assert(dual.layout().clean_epoch.load(std::memory_order_acquire) == 1);
+  assert(dual.layout().state.load(std::memory_order_acquire) ==
+         static_cast<uint32_t>(LayoutState::kClean));
+  attached.MarkDirty();
+  assert(dual.layout().state.load(std::memory_order_acquire) ==
+         static_cast<uint32_t>(LayoutState::kDirty));
 }
 
 DualRegionConfig TestDualConfig() {

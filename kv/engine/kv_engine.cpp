@@ -291,6 +291,7 @@ KVPartition *KVEngine::VisiblePartition(std::string_view key) const {
 }
 
 Status KVEngine::Put(std::string_view key, std::string_view value) {
+  MarkLayoutDirty();
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
     auto *visible = VisiblePartition(key);
@@ -310,6 +311,7 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
 }
 
 GetResult KVEngine::Get(std::string_view key) {
+  MarkLayoutDirty();  // A remote miss may perform the original move-in.
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
     auto *visible = VisiblePartition(key);
@@ -342,6 +344,7 @@ GetResult KVEngine::Get(std::string_view key) {
 }
 
 Status KVEngine::Delete(std::string_view key) {
+  MarkLayoutDirty();
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) return Forward(KvMessageType::kDelete, key, {}, nullptr);
   return partition->DeletePrivate(key) ? Status::Ok()
@@ -611,6 +614,7 @@ ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t li
 CasResult KVEngine::CompareExchange(std::string_view key,
                                     std::string_view expected,
                                     std::string_view desired) {
+  MarkLayoutDirty();
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
     auto *visible = VisiblePartition(key);
@@ -658,6 +662,7 @@ CasResult KVEngine::CompareExchange(std::string_view key,
 }
 
 IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
+  MarkLayoutDirty();
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) {
     auto *visible = VisiblePartition(key);
@@ -733,11 +738,18 @@ Status KVEngine::Checkpoint() {
     // poll, so this only drains requests already visible to this VM.
     for (uint32_t i = 0; i < 1024; ++i) PollTransport();
     ebr_->drain_quiescent();
-    pool_->allocator().FlushCheckpointRanges();
+    pool_->allocator().FlushCheckpointRanges(
+        config_.node_id, std::chrono::seconds(config_.sync_timeout_sec));
+    layout_dirty_.store(false, std::memory_order_release);
     return Status::Ok();
   } catch (const std::exception &e) {
     return Status::Error(StatusCode::kCorruption, e.what());
   }
+}
+
+void KVEngine::MarkLayoutDirty() {
+  if (!layout_dirty_.exchange(true, std::memory_order_acq_rel))
+    pool_->allocator().MarkDirty();
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {
@@ -1121,6 +1133,12 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
   KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
                                    message.source_node, message.request_id, key);
   auto *partition = OwnedPartition(key);
+  if (message.type == KvMessageType::kPut ||
+      message.type == KvMessageType::kDelete ||
+      message.type == KvMessageType::kMigrate ||
+      message.type == KvMessageType::kIncrement ||
+      message.type == KvMessageType::kCasCommit)
+    MarkLayoutDirty();
   if (partition == nullptr) {
     response.status = static_cast<uint32_t>(StatusCode::kCorruption);
   } else if (message.type == KvMessageType::kPut) {
@@ -1286,6 +1304,7 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
 }
 
 Status KVEngine::MoveOut(std::string_view key) {
+  MarkLayoutDirty();
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) return Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding");
   if (partition->MoveOutPrivate(key, config_.node_id)) {

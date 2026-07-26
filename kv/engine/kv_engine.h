@@ -96,6 +96,7 @@ class KVEngine {
   void ServeScanRequest(const KvMessage &message);
   void SendTransportMessage(const KvMessage &message);
   void EnforceMigrationBudget(KVPartition &partition);
+  void MarkLayoutDirty();
   void StartInboundDemuxer();
   void StopInboundDemuxer();
   void InboundDemuxerLoop();
@@ -148,6 +149,7 @@ class KVEngine {
   std::unordered_map<uint64_t, PendingCas> pending_cas_;
   std::atomic<uint64_t> network_tx_bytes_{0};
   std::atomic<uint64_t> network_rx_bytes_{0};
+  std::atomic<bool> layout_dirty_{true};
   std::atomic<uint64_t> shared_gets_{0};
   std::atomic<uint64_t> shared_puts_{0};
   std::atomic<uint64_t> shared_deletes_{0};

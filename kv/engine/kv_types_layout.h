@@ -14,10 +14,10 @@ namespace tigonkv::engine {
 // process virtual addresses. Zero is reserved as the null offset.
 using RegionOffset = uint64_t;
 constexpr RegionOffset kNullOffset = 0;
-constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5636ULL;  // TIGONKV6
-// v6: SWCC remote frees publish through HWCC heads; SWCC allocator metadata
-// itself remains owner-only and never relies on cross-VM C++ atomics.
-constexpr uint32_t kSharedLayoutVersion = 6;
+constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5637ULL;  // TIGONKV7
+// v7: initialization and collective checkpoints publish SWCC visibility
+// through per-VM HWCC completion epochs.
+constexpr uint32_t kSharedLayoutVersion = 7;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -117,6 +117,8 @@ struct alignas(64) SharedLayoutHeader {
   std::array<std::atomic<RegionOffset>, kRootSlotCount> roots{};
   std::array<std::atomic<RegionOffset>, kMaxAllocatorShards>
       swcc_remote_free_heads{};
+  std::array<std::atomic<uint64_t>, kMaxAllocatorShards>
+      checkpoint_ready_epoch{};
   std::array<PartitionDirectoryEntry, kMaxPartitions> partitions{};
   std::array<DomainCounter, kAllocationDomainCount> domains{};
 

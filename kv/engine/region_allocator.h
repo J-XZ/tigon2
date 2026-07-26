@@ -3,6 +3,7 @@
 #include "kv/engine/kv_types_layout.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -85,6 +86,7 @@ class RegionAllocator {
   // Flush allocator metadata plus each shard's allocated high-water range.
   // This deliberately never sweeps an entire region.
   void FlushAllocatedRanges() const;
+  void FlushOwnedRange(uint32_t owner_shard) const;
 
  private:
   RegionAllocator(void *base, uint64_t bytes, RegionAllocatorHeader *header,
@@ -171,6 +173,7 @@ class DualRegionAllocator {
   static DualRegionAllocator Attach(void *pool, const DualRegionConfig &config);
   // Publish only after transport, EBR, and every partition root are ready.
   void PublishReady();
+  void MarkDirty();
 
   void *Allocate(uint64_t bytes, AllocationDomain domain, uint32_t owner_shard);
   void *AllocateOwnerPrivate(uint64_t bytes, uint32_t partition_id,
@@ -188,7 +191,8 @@ class DualRegionAllocator {
   uint64_t SharedPayloadCapacityBytes() const;
   // Checkpoint persistence is cacheline writeback/fence only. It is not an
   // SCC substitute and intentionally does not use page-level msync.
-  void FlushCheckpointRanges();
+  void FlushCheckpointRanges(uint32_t node_id,
+                             std::chrono::milliseconds timeout);
   const SharedLayoutHeader &layout() const { return header_->layout; }
   SharedLayoutHeader &layout() { return header_->layout; }
   const RegionAllocator &hwcc() const { return hwcc_; }
