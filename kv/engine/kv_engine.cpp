@@ -1010,7 +1010,8 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
     {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       auto it = pending_scans_.find(message.request_id);
-      if (it == pending_scans_.end()) return;
+      if (it == pending_scans_.end())
+        throw std::runtime_error("scan response has no pending request");
       pending = it->second;
     }
     bool done = false;
@@ -1157,7 +1158,7 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
       } catch (...) {
         for (auto *entry : pinned)
           star::TwoPLPashaHelper::kv_unpin_shared_ref(entry);
-        response.status = static_cast<uint32_t>(StatusCode::kCorruption);
+        throw;
       }
     }
     SendTransportMessage(response);
@@ -1172,20 +1173,13 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
       message.type == KvMessageType::kCasCommit)
     MarkLayoutDirty();
   if (partition == nullptr) {
-    response.status = static_cast<uint32_t>(StatusCode::kCorruption);
+    throw std::runtime_error("request routed to a non-owner node");
   } else if (message.type == KvMessageType::kPut) {
     try {
       partition->PutPrivate(key, value);
       response.status = static_cast<uint32_t>(StatusCode::kOk);
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
-    } catch (const std::exception &error) {
-      response.status = static_cast<uint32_t>(StatusCode::kCorruption);
-      const size_t count = std::min(response.value.size(), std::strlen(error.what()));
-      std::memcpy(response.value.data(), error.what(), count);
-      response.value_size = static_cast<uint32_t>(count);
-    } catch (...) {
-      response.status = static_cast<uint32_t>(StatusCode::kCorruption);
     }
   } else if (message.type == KvMessageType::kDelete) {
     response.status = static_cast<uint32_t>(partition->DeletePrivate(key)
@@ -1197,26 +1191,18 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     } else {
       // Residual owner GET: migrate before reply (move_in on request path).
       // Budget after Send so the requester is not blocked behind move_out.
-      try {
-        bool moved_in = false;
-        const StatusCode migrated =
-            partition->EnsureInShared(key, config_.node_id, &moved_in);
-        if (migrated == StatusCode::kOk && moved_in) {
-          migration_in_.fetch_add(1, std::memory_order_relaxed);
-          shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-        }
-      } catch (const std::exception &) {
-      } catch (...) {
+      bool moved_in = false;
+      const StatusCode migrated =
+          partition->EnsureInShared(key, config_.node_id, &moved_in);
+      if (migrated == StatusCode::kOk && moved_in) {
+        migration_in_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
       }
       response.status = static_cast<uint32_t>(StatusCode::kOk);
       response.value_size = static_cast<uint32_t>(result.size());
       std::memcpy(response.value.data(), result.data(), result.size());
       SendTransportMessage(response);
-      try {
-        EnforceMigrationBudget(*partition);
-      } catch (const std::exception &) {
-      } catch (...) {
-      }
+      EnforceMigrationBudget(*partition);
       return;
     }
   } else if (message.type == KvMessageType::kMigrate) {
@@ -1233,23 +1219,11 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
       // CXL-access without racing the same-handler eviction (liveness under
       // YCSB-A). move_in cost remains on the Migrate critical path.
       SendTransportMessage(response);
-      if (migrated == StatusCode::kOk) {
-        try {
-          EnforceMigrationBudget(*partition);
-        } catch (const std::exception &) {
-        } catch (...) {
-        }
-      }
+      if (migrated == StatusCode::kOk)
+        EnforceMigrationBudget(*partition);
       return;
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
-    } catch (const std::exception &error) {
-      response.status = static_cast<uint32_t>(StatusCode::kCorruption);
-      const size_t count = std::min(response.value.size(), std::strlen(error.what()));
-      std::memcpy(response.value.data(), error.what(), count);
-      response.value_size = static_cast<uint32_t>(count);
-    } catch (...) {
-      response.status = static_cast<uint32_t>(StatusCode::kCorruption);
     }
   } else if (message.type == KvMessageType::kIncrement) {
     int64_t delta = 0;
@@ -1269,8 +1243,6 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
         }
       } catch (const std::invalid_argument &) {
         response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
-      } catch (...) {
-        response.status = static_cast<uint32_t>(StatusCode::kCorruption);
       }
     }
   } else if (message.type == KvMessageType::kCasPrepare) {
@@ -1301,12 +1273,10 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
                                                             : StatusCode::kCompareFailed);
       } catch (const std::invalid_argument &) {
         response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
-      } catch (...) {
-        response.status = static_cast<uint32_t>(StatusCode::kCorruption);
       }
     }
   } else {
-    response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
+    throw std::runtime_error("unsupported request message type");
   }
   SendTransportMessage(response);
 }

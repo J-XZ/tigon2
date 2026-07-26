@@ -71,6 +71,41 @@ int main() {
   assert(WIFSIGNALED(corrupt_status) && WTERMSIG(corrupt_status) == SIGABRT);
   unlink(corrupt_template);
 
+  char misroute_template[] = "/tmp/tigonkv-engine-misroute-XXXXXX";
+  const int misroute_fd = mkstemp(misroute_template);
+  assert(misroute_fd >= 0);
+  close(misroute_fd);
+  const pid_t misroute_child = fork();
+  assert(misroute_child >= 0);
+  if (misroute_child == 0) {
+    const rlimit no_core{0, 0};
+    (void)setrlimit(RLIMIT_CORE, &no_core);
+    const auto config = ConfigFor(misroute_template, 2, 0);
+    auto engine = tigonkv::engine::KVEngine::Open(config, true);
+    std::string wrong_owner_key;
+    for (uint32_t i = 0; i < 1000; ++i) {
+      wrong_owner_key = "misroute-" + std::to_string(i);
+      if (engine->OwnerForKey(wrong_owner_key) == 1) break;
+    }
+    void *root = nullptr;
+    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+        star::CXLMemory::cxl_transport_root_index, &root);
+    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+    auto request = tigonkv::engine::MakeRequest(
+        tigonkv::engine::KvMessageType::kPut, 1, 0, 7,
+        wrong_owner_key, "value");
+    while (!rings[0].enqueue(
+        reinterpret_cast<char *>(&request), sizeof(request)))
+      std::this_thread::yield();
+    for (;;) engine->PollTransport();
+  }
+  int misroute_status = 0;
+  assert(waitpid(misroute_child, &misroute_status, 0) ==
+         misroute_child);
+  assert(WIFSIGNALED(misroute_status) &&
+         WTERMSIG(misroute_status) == SIGABRT);
+  unlink(misroute_template);
+
   char full_template[] = "/tmp/tigonkv-engine-full-XXXXXX";
   const int full_fd = mkstemp(full_template);
   assert(full_fd >= 0);

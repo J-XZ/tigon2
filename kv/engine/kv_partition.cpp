@@ -915,62 +915,82 @@ bool KVPartition::ScanSharedPinned(
 
 bool KVPartition::DeletePrivate(std::string_view key) {
   EnterEbr();
-  RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
-  if (!private_tree_->lookup(fixed_key, row_offset)) return false;
-  auto *row = RowFromOffset(row_offset);
-  LockRow(row);
-  row->is_tombstone = 1;
-  const uint64_t row_bytes = sizeof(PrivateRow) + regions_.layout().fixed_key_size +
-                             regions_.layout().fixed_value_size;
-  if (row->is_migrated) {
-    const RegionOffset smeta_offset = row->migrated_smeta_off;
-    RegionOffset indexed = kNullOffset;
-    if (smeta_offset == kNullOffset || !shared_tree_->lookup(fixed_key, indexed) ||
-        indexed != smeta_offset) {
-      row->is_tombstone = 0;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (;;) {
+    RegionOffset row_offset = kNullOffset;
+    if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+    auto *row = RowFromOffset(row_offset);
+    LockRow(row);
+    if (row->is_tombstone) {
       UnlockRow(row);
       return false;
     }
-    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-        regions_.hwcc().FromOffset(smeta_offset));
-    smeta->lock();
-    auto *payload = smeta->get_scc_data();
-    if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
-        smeta->is_write_locked()) {
-      smeta->unlock();
-      row->is_tombstone = 0;
-      UnlockRow(row);
-      return false;
-    }
-    smeta->set_write_locked();
-    smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
-    if (!shared_tree_->remove(fixed_key)) {
-      smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+    row->is_tombstone = 1;
+    const uint64_t row_bytes =
+        sizeof(PrivateRow) + regions_.layout().fixed_key_size +
+        regions_.layout().fixed_value_size;
+    if (row->is_migrated) {
+      const RegionOffset smeta_offset = row->migrated_smeta_off;
+      RegionOffset indexed = kNullOffset;
+      if (smeta_offset == kNullOffset ||
+          !shared_tree_->lookup(fixed_key, indexed) ||
+          indexed != smeta_offset) {
+        row->is_tombstone = 0;
+        UnlockRow(row);
+        throw std::runtime_error(
+            "migrated delete has inconsistent shared index");
+      }
+      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+          regions_.hwcc().FromOffset(smeta_offset));
+      smeta->lock();
+      auto *payload = smeta->get_scc_data();
+      if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
+          smeta->is_write_locked()) {
+        smeta->unlock();
+        row->is_tombstone = 0;
+        UnlockRow(row);
+        if (std::chrono::steady_clock::now() >= deadline)
+          throw std::runtime_error(
+              "delete timed out waiting for shared-row quiescence");
+        std::this_thread::yield();
+        continue;
+      }
+      smeta->set_write_locked();
+      smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+      if (!shared_tree_->remove(fixed_key)) {
+        smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+        smeta->clear_write_locked();
+        smeta->unlock();
+        row->is_tombstone = 0;
+        UnlockRow(row);
+        throw std::runtime_error(
+            "shared tree remove failed during delete");
+      }
+      row->is_migrated = 0;
+      row->migrated_smeta_off = kNullOffset;
       smeta->clear_write_locked();
       smeta->unlock();
-      row->is_tombstone = 0;
-      UnlockRow(row);
-      return false;
+      ebr_.add_retired_object(smeta,
+                              sizeof(star::TwoPLPashaMetadataShared),
+                              star::CXLMemory::METADATA_FREE, owner_shard_);
+      ebr_.add_retired_object(payload, regions_.layout().fixed_value_size,
+                              star::CXLMemory::DATA_FREE, owner_shard_);
     }
-    row->is_migrated = 0;
-    row->migrated_smeta_off = kNullOffset;
-    smeta->clear_write_locked();
-    smeta->unlock();
-    ebr_.add_retired_object(smeta, sizeof(star::TwoPLPashaMetadataShared),
-                            star::CXLMemory::METADATA_FREE, owner_shard_);
-    ebr_.add_retired_object(payload, regions_.layout().fixed_value_size,
-                            star::CXLMemory::DATA_FREE, owner_shard_);
-  }
-  if (!private_tree_->remove(fixed_key)) {
+    if (!private_tree_->remove(fixed_key)) {
+      // The row is already logically deleted; this is an index invariant
+      // failure, not NotFound and not a reason to leave a tombstone behind.
+      UnlockRow(row);
+      throw std::runtime_error(
+          "private tree remove failed after shared delete");
+    }
+    ebr_.add_retired_object(row, row_bytes, star::CXLMemory::MISC_FREE,
+                            owner_shard_, partition_id_);
     UnlockRow(row);
-    throw std::runtime_error("private tree remove failed after shared delete");
+    PersistRoots();
+    return true;
   }
-  ebr_.add_retired_object(row, row_bytes, star::CXLMemory::MISC_FREE,
-                          owner_shard_, partition_id_);
-  UnlockRow(row);
-  PersistRoots();
-  return true;
 }
 
 void KVPartition::NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const {

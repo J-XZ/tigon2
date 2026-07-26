@@ -195,6 +195,21 @@ int main() {
   star::TwoPLPashaHelper::kv_unpin_shared_ref(held);
   assert(partition.MoveOutPrivate("pinfail", 1));
 
+  // DELETE contention is a retry, not NotFound: a range/point pin must delay
+  // physical removal and the tombstone must not escape between attempts.
+  assert(partition.PutPrivate("delete-pinned", "present"));
+  assert(partition.PromotePrivate("delete-pinned", 1));
+  star::TwoPLPashaMetadataShared *delete_pin = nullptr;
+  assert(!partition.PromotePrivate("delete-pinned", 1, &delete_pin));
+  assert(delete_pin != nullptr);
+  std::thread release_delete_pin([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(delete_pin);
+  });
+  assert(partition.DeletePrivate("delete-pinned"));
+  release_delete_pin.join();
+  assert(!partition.GetPrivate("delete-pinned", &value));
+
   // A partition scan merges the private and shared authorities in key order,
   // without resurrecting tombstones or duplicate migrated locator rows.
   std::vector<std::pair<std::string, std::string>> scan;
