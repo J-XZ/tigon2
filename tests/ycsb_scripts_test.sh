@@ -43,6 +43,10 @@ rg -Fq 'readlink \"\$proc/exe\"' "$guest_workflow"
 rg -q 'TIGONKV_E2E_RELEASE_FILE=' "$guest_workflow"
 rg -q 'all_replayed' "$guest_workflow"
 rg -q "remote .*touch.*release_file" "$guest_workflow"
+rg -q 'TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5' "$guest_workflow"
+! rg -q 'TIGONKV_E2E_PROGRESS=1' "$guest_workflow"
+rg -Fq '"E2E_TRACE_HEARTBEAT phase="' \
+  "$root/tools/e2e_trace_runner.cpp"
 mkdir -p "$tmp/logs"
 python3 - "$tmp/logs" <<'PY'
 from pathlib import Path

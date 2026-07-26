@@ -129,9 +129,11 @@ struct ReplayResult {
 ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_64 *rng,
                          uint32_t fixed_key_size, uint32_t fixed_value_size,
                          std::atomic<uint64_t> *progress_ops = nullptr) {
+  constexpr uint64_t kProgressPublishBatch = 256;
   std::ifstream input(trace);
   if (!input) Fail("cannot open trace: " + trace);
   ReplayResult result;
+  uint64_t unpublished_progress = 0;
   std::string line;
   uint64_t line_no = 0;
   while (std::getline(input, line)) {
@@ -178,8 +180,14 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_
     }
     if (!status.ok()) Fail("operation failed at line " + std::to_string(line_no) + ": " + status.message);
     ++result.ops;
-    if (progress_ops != nullptr) progress_ops->fetch_add(1, std::memory_order_relaxed);
+    if (progress_ops != nullptr &&
+        ++unpublished_progress == kProgressPublishBatch) {
+      progress_ops->fetch_add(unpublished_progress, std::memory_order_relaxed);
+      unpublished_progress = 0;
+    }
   }
+  if (progress_ops != nullptr && unpublished_progress != 0)
+    progress_ops->fetch_add(unpublished_progress, std::memory_order_relaxed);
   return result;
 }
 
@@ -207,8 +215,14 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
                   uint64_t value_seed) {
   const bool stage_markers =
       Env("TIGONKV_E2E_STAGE_MARKERS", "CXLKV_E2E_STAGE_MARKERS", "0") == "1";
-  const bool progress =
+  const bool legacy_progress =
       Env("TIGONKV_E2E_PROGRESS", "CXLKV_E2E_PROGRESS", "0") == "1";
+  const uint64_t heartbeat_sec = ParseUnsigned(
+      Env("TIGONKV_E2E_TRACE_HEARTBEAT_SEC",
+          "CXLKV_E2E_TRACE_HEARTBEAT_SEC",
+          legacy_progress ? "5" : "0"),
+      "heartbeat seconds");
+  const bool heartbeat = heartbeat_sec != 0;
   const auto log_stage = [&](const char *stage) {
     if (stage_markers) std::cerr << "E2E_TRACE_STAGE node=" << config.node_id
                                  << " phase=" << phase << " stage=" << stage << "\n"
@@ -251,7 +265,8 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
         while (!replay_start.load(std::memory_order_acquire))
           std::this_thread::yield();
         results[worker] = ReplayTrace(*store, traces[worker], &rng, config.fixed_key_size,
-                                      config.fixed_value_size, &progress_ops);
+                                      config.fixed_value_size,
+                                      heartbeat ? &progress_ops : nullptr);
         worker_end[worker] = std::chrono::steady_clock::now();
         store->ReleaseWorker();
       } catch (...) {
@@ -277,18 +292,18 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   // dedicated heartbeat thread would be an unreported CPU resource.
   uint64_t last_progress = 0;
   auto last_print = start;
-  while (progress &&
+  while (heartbeat &&
          !replay_done.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     const auto now = std::chrono::steady_clock::now();
-    if (now - last_print < std::chrono::seconds(5)) continue;
+    if (now - last_print < std::chrono::seconds(heartbeat_sec)) continue;
     last_print = now;
     const uint64_t current =
         progress_ops.load(std::memory_order_relaxed);
     const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
         now - start).count();
-    std::cerr << "E2E_TRACE_HEARTBEAT node=" << config.node_id
-              << " phase=" << phase
+    std::cerr << "E2E_TRACE_HEARTBEAT phase=" << phase
+              << " node=" << config.node_id
               << " ops=" << (current - last_progress)
               << " total=" << current
               << " elapsed_s=" << elapsed_s << "\n"

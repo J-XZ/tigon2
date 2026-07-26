@@ -108,7 +108,6 @@ class CXL_EBR {
                 local_ebr_meta.garbage_size.clear();
                 local_ebr_meta.max_garbage_size = 0;
 
-                LOG(INFO) << "init local EBR metadata, coordinator_id = " << local_ebr_meta.coordinator_id << " thread_id = " << local_ebr_meta.thread_id;
         }
 
         void add_retired_object(void *ptr, uint64_t size, uint64_t category,
