@@ -166,6 +166,10 @@ class KVStore {
   // Owner-only logical move-out: the shared row becomes private again after
   // the caller has established that no remote references remain.
   Status MoveOut(std::string_view key);
+  // Ordered cursor scan, matching cxlkv's non-transactional Scan contract:
+  // keys are unique and strictly increasing, and migration alone is invisible.
+  // This is not a multi-key snapshot; concurrent insert/delete may appear or
+  // not according to whether it crosses the advancing cursor.
   ScanResult Scan(std::string_view start_key, uint64_t limit);
   CasResult CompareExchange(std::string_view key, std::string_view expected,
                             std::string_view desired);

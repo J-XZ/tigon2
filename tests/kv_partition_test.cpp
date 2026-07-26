@@ -240,6 +240,42 @@ int main() {
   assert(scan[0] == std::make_pair(std::string("m1"), std::string("shared-m1")));
   assert(scan[1] == std::make_pair(std::string("m2"), std::string("priv-m2")));
   assert(scan[2] == std::make_pair(std::string("m3"), std::string("priv-m3")));
+
+  // Migration is not a logical mutation: repeated owner scans must retain
+  // every stable key exactly once while rows move between private and shared.
+  std::vector<std::string> moving_keys;
+  for (uint32_t i = 0; i < 32; ++i) {
+    char key[32];
+    std::snprintf(key, sizeof(key), "scan-race-%02u", i);
+    assert(partition.PutPrivate(key, "stable"));
+    moving_keys.emplace_back(key);
+  }
+  std::atomic<bool> migration_done{false};
+  std::thread migrator([&] {
+    ebr.thread_init_ebr_meta(0, 0);
+    for (uint32_t round = 0; round < 8; ++round) {
+      for (const auto &key : moving_keys) {
+        partition.PromotePrivate(key, 1);
+        partition.MoveOutPrivate(key, 1);
+      }
+    }
+    ebr.handoff_retired_objects();
+    migration_done.store(true, std::memory_order_release);
+  });
+  uint32_t scan_rounds = 0;
+  do {
+    assert(partition.ScanOwned("scan-race-", 32, &scan));
+    assert(scan.size() == moving_keys.size());
+    for (size_t i = 0; i < scan.size(); ++i) {
+      assert(scan[i].first == moving_keys[i]);
+      assert(scan[i].second == "stable");
+      if (i != 0) assert(scan[i - 1].first < scan[i].first);
+    }
+    ++scan_rounds;
+  } while (!migration_done.load(std::memory_order_acquire) ||
+           scan_rounds < 32);
+  migrator.join();
+
   void *handed_off = regions.Allocate(
       64, tigonkv::engine::AllocationDomain::kSharedPayloadSwcc, 0);
   std::thread retiring_worker([&] {
