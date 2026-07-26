@@ -52,6 +52,14 @@ rows. Every reported VM uses `foreground=N + demuxer=1` KV threads. See
 [当前对比口径.md](当前对比口径.md).
 
 ## Claims
+
+> **Legacy/upstream boundary:** The paper claims and workflows below describe the
+> retained upstream Tigon benchmark system. They are reference material, not the
+> maintained TigonKV-vs-cxlkv comparison path, and some scripts may change host/VM
+> state. Current comparison entry points are the root `tigonkv_*` scripts,
+> `e2e_trace_runner`, the guest workflows, and
+> [当前对比口径.md](当前对比口径.md).
+
 By running the experiments, you should be able to reproduce the numbers shown in:
 * **Figure 4(a)**: TPC-C throughput of Sundial, Sundial-CXL, and Sundial+, varying percentages of multi-partition transactions
 * **Figure 4(b)**: TPC-C throughput of DS2PL, DS2PL-CXL, and DS2PL+, varying percentages of multi-partition transactions

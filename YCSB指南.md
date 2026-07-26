@@ -14,8 +14,9 @@
 ```
 
 去掉 `--skip-trace-gen` 后会调用本仓 YCSB-cpp 生成 load/run trace。默认
-workload 是 `a,b,c,d`；允许的封闭集合是 `a,b,c,d,e`。E 已通过
-Scan∥migration 与 OLC scan 专项验收，但仍需显式传 `--workloads a,b,c,d,e`。
+workload 是 `a,b,c,d`；允许的封闭集合是 `a,b,c,d,e`。旧实现有 E 专项历史
+证据，但当前 range-move-in Scan 与后续修复必须以本轮 fresh validation 为准；
+选择 E 仍需显式传 `--workloads a,b,c,d,e`。
 
 ## 实际回放
 
@@ -31,17 +32,23 @@ Scan∥migration 与 OLC scan 专项验收，但仍需显式传 `--workloads a,b
 CSV、JSON 和报告。每个 workload 的 load/run 分开执行；计时只来自 runner 输出的
 `E2E_TRACE_TIME_US`。每个 VM 还必须保留
 `E2E_THREAD_TOPOLOGY foreground=4 demuxer=1 kv_threads=5
-affinity=distinct_allowed_cpus`；demuxer 是原 Tigon IncomingDispatcher 同构
-接收线程，虽然不执行 KV 请求，仍计入 CPU 使用，不能只报告 4 个 worker。
+affinity=distinct_allowed_cpus`；demuxer 保留原 Tigon IncomingDispatcher 的
+专用接收入环线程形态，但当前 deferred FIFO 不是逐结构同构。它不执行 KV
+请求，仍计入 CPU 使用，不能只报告 4 个 worker。
 runner 编排主线程可按 `TIGONKV_E2E_TRACE_HEARTBEAT_SEC` 输出心跳；它不服务
 KV 请求，但会在 replay 期间低频读取每 256 ops 批量发布的 progress counter。
 汇总器忽略心跳行；这个并发控制线程及其受测期开销仍须披露。stage marker 由
 独立的 `TIGONKV_E2E_STAGE_MARKERS` 控制，不需要打开 verbose。
 
 正式 5M 对比须显式传入 `--record-count 5000000 --operation-count 5000000`
-和 `--shared-size-mb 65536 --no-latency`，并在 VM 授权、完整单测和所需多轮 e2e
-验收之后执行。VM 生命周期脚本的实际状态变更必须显式使用
+和 `--shared-size-mb 65536 --no-latency`，并在 topology preflight、当前 HEAD
+完整单测和所需多轮 e2e 验收之后执行。VM 生命周期脚本的实际状态变更必须显式使用
 `--allow-state-change`；默认 dry-run 不修改宿主机。
+
+汇总按 `roundN-workload[a-e]-(load|run)` 分组。每轮先求各 node 的
+`ops_sum` 与 `duration_sec_max`；同一 case 再求 `avg_ops_sum` 和
+`avg_duration_sec`，其比值输出为 `ops_per_sec_from_avg_round_max`。heartbeat
+与 stage 行都不参与解析。
 
 ## 恢复与故障排查
 

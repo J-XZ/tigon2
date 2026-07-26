@@ -31,8 +31,9 @@ TigonKV 不使用 `dependencies/cxlalloc/libcxlalloc_static.a` 作为最终共�
 | 有界性 | 每线程 size-class TLS cache（容量 32，miss 时批量 refill）有固定上限；进程 DRAM 不随 KV 数线性增长 |
 
 `region_allocator_test` 覆盖 attach、域记账、remote free、reuse、并发及跨域
-拒绝；这些场景由同一测试程序一次执行，不再用多个别名重复计入测试数量。真实
-多 VM/NUMA 实机验收仍待获得运行授权。
+拒绝；这些场景由同一测试程序一次执行，不再用多个别名重复计入测试数量。用户
+已授权真实 VM/NUMA 操作；已有历史证据不替代当前 HEAD 的 fresh validation，
+最终结论以本轮 preflight 与连续测试记录为准。
 
 固定会计不与动态 block 重复：HWCC allocator header 归
 `kHwccAllocatorMetadata`；SWCC allocator header 加实际 arena header 总和归
