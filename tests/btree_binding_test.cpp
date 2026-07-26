@@ -104,6 +104,25 @@ int main() {
       private_tree->root_for_persistence());
   assert(root_offset != tigonkv::engine::kNullOffset);
 
+  latency_sim::Config latency;
+  latency.enabled = true;
+  latency.foreground_enabled = true;
+  latency.stats_enabled = true;
+  auto &simulator = latency_sim::GlobalLatencySimulator();
+  simulator.Configure(latency);
+  uint64_t value = 0;
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  assert(private_tree->lookup(Key(250), value) && value == 250);
+  simulator.EndScopeAndDelay();
+  const auto private_stats = simulator.TakeStatsAndReset();
+  assert(private_stats.swcc_raw_line_accesses > 1);
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  assert(shared_tree->lookup(Key(250), value) && value == 1250);
+  simulator.EndScopeAndDelay();
+  const auto shared_stats = simulator.TakeStatsAndReset();
+  assert(shared_stats.hwcc_raw_line_accesses > 1);
+  simulator.Configure(latency_sim::Config{});
+
   regions.PublishReady();
   const pid_t child = fork();
   assert(child >= 0);

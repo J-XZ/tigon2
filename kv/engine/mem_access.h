@@ -34,6 +34,18 @@ inline void PrivateRead(const void *address, size_t bytes) {
 inline void PrivateWrite(const void *address, size_t bytes) {
   Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kWrite, address, bytes);
 }
+inline void PrivateAtomicLoad(const void *address) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kAtomicLoad,
+         address, 1);
+}
+inline void PrivateAtomicStore(const void *address) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kAtomicStore,
+         address, 1);
+}
+inline void PrivateAtomicRmw(const void *address) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kAtomicRmw,
+         address, 1);
+}
 inline void HwccRead(const void *address, size_t bytes) {
   Record(latency_sim::PoolKind::kHwcc, latency_sim::AccessKind::kRead, address, bytes);
 }

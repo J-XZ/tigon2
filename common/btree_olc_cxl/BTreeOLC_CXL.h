@@ -86,12 +86,51 @@ struct TreeNodeAllocation {
 	}
 };
 
+inline thread_local bool TreeAccessIsHwcc = true;
+
+inline void RecordTreeDataRead(const void *address, uint64_t bytes) {
+	if (TreeAccessIsHwcc)
+		tigonkv::engine::mem_access::HwccRead(address, bytes);
+	else
+		tigonkv::engine::mem_access::PrivateRead(address, bytes);
+}
+
+inline void RecordTreeDataWrite(const void *address, uint64_t bytes) {
+	if (TreeAccessIsHwcc)
+		tigonkv::engine::mem_access::HwccWrite(address, bytes);
+	else
+		tigonkv::engine::mem_access::PrivateWrite(address, bytes);
+}
+
+inline void RecordTreeAtomicLoad(const void *address) {
+	if (TreeAccessIsHwcc)
+		tigonkv::engine::mem_access::HwccAtomicLoad(address);
+	else
+		tigonkv::engine::mem_access::PrivateAtomicLoad(address);
+}
+
+inline void RecordTreeAtomicStore(const void *address) {
+	if (TreeAccessIsHwcc)
+		tigonkv::engine::mem_access::HwccAtomicStore(address);
+	else
+		tigonkv::engine::mem_access::PrivateAtomicStore(address);
+}
+
+inline void RecordTreeAtomicRmw(const void *address) {
+	if (TreeAccessIsHwcc)
+		tigonkv::engine::mem_access::HwccAtomicRmw(address);
+	else
+		tigonkv::engine::mem_access::PrivateAtomicRmw(address);
+}
+
 // Record the cache line containing the node latch and metadata at each node
 // actually visited.  Charging an entire 4 KiB page per operation both
 // over-counted untouched payload and missed non-root nodes.
 inline void RecordTreeAccess(const TreeNodeAllocation &allocation, const void *page,
                              bool write) {
 	if (page == nullptr) return;
+	TreeAccessIsHwcc =
+	    allocation.domain != tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc;
 	constexpr uint64_t kNodeMetadataBytes = 64;
 	if (allocation.domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc) {
 		if (write) tigonkv::engine::mem_access::PrivateWrite(page, kNodeMetadataBytes);
@@ -104,6 +143,34 @@ inline void RecordTreeAccess(const TreeNodeAllocation &allocation, const void *p
 
 struct LatchBase {
 	std::atomic<uint64_t> word{ 0 };
+
+	uint64_t load(std::memory_order order = std::memory_order_seq_cst) {
+		RecordTreeAtomicLoad(&word);
+		return word.load(order);
+	}
+	void store(uint64_t value,
+	           std::memory_order order = std::memory_order_seq_cst) {
+		RecordTreeAtomicStore(&word);
+		word.store(value, order);
+	}
+	bool compareExchangeStrong(uint64_t &expected, uint64_t desired) {
+		RecordTreeAtomicRmw(&word);
+		return word.compare_exchange_strong(expected, desired);
+	}
+	bool compareExchangeWeak(uint64_t &expected, uint64_t desired,
+	                         std::memory_order success,
+	                         std::memory_order failure) {
+		RecordTreeAtomicRmw(&word);
+		return word.compare_exchange_weak(expected, desired, success, failure);
+	}
+	uint64_t fetchAdd(uint64_t value) {
+		RecordTreeAtomicRmw(&word);
+		return word.fetch_add(value);
+	}
+	uint64_t fetchSub(uint64_t value) {
+		RecordTreeAtomicRmw(&word);
+		return word.fetch_sub(value);
+	}
 };
 
 class OLTPRWSpinLatch : public LatchBase {
@@ -142,12 +209,12 @@ class OLTPRWSpinLatch : public LatchBase {
 
 	bool tryAcquireRead()
 	{
-		uint64_t w = word.load();
+		uint64_t w = load();
 		uint64_t readerCount = getReaderCount(w);
 		uint64_t writerId = getWriterId(w);
 		if (writerId == 0) {
 			uint64_t neww = makeNewWord(readerCount + 1, 0);
-			return word.compare_exchange_strong(w, neww);
+			return compareExchangeStrong(w, neww);
 		}
 		// Locked by other writer
 		return false;
@@ -155,13 +222,13 @@ class OLTPRWSpinLatch : public LatchBase {
 
 	bool tryAcquireWrite()
 	{
-		uint64_t w = word.load();
+		uint64_t w = load();
 		uint64_t readerCount = getReaderCount(w);
 		uint64_t writerId = getWriterId(w);
 		assert(RWSpinLatchThreadId > 0);
 		if (writerId == 0 && readerCount == 0) {
 			uint64_t neww = makeNewWord(readerCount, RWSpinLatchThreadId);
-			return word.compare_exchange_strong(w, neww);
+			return compareExchangeStrong(w, neww);
 		}
 		// Locked by other writer
 		return false;
@@ -170,24 +237,24 @@ class OLTPRWSpinLatch : public LatchBase {
     private:
 	bool tryReleaseRead()
 	{
-		uint64_t w = word.load();
+		uint64_t w = load();
 		uint64_t readerCount = getReaderCount(w);
 		uint64_t writerId = getWriterId(w);
 		assert(writerId == 0);
 		assert(readerCount > 0);
 		uint64_t neww = makeNewWord(readerCount - 1, 0);
-		return word.compare_exchange_strong(w, neww);
+		return compareExchangeStrong(w, neww);
 	}
 
 	bool tryReleaseWrite()
 	{
-		uint64_t w = word.load();
+		uint64_t w = load();
 		uint64_t readerCount = getReaderCount(w);
 		uint64_t writerId = getWriterId(w);
 		assert(writerId == RWSpinLatchThreadId);
 		assert(readerCount == 0);
 		uint64_t neww = makeNewWord(0, 0);
-		return word.compare_exchange_strong(w, neww);
+		return compareExchangeStrong(w, neww);
 	}
 
 	inline uint64_t makeNewWord(uint32_t readerCount, uint32_t writerId)
@@ -257,7 +324,7 @@ class BPlusTree {
 			// if (isRWLock) {
 			//     word = 0;              // RW Spin Lock Initialzation
 			// } else {
-			word = kLockMask * 2; // Optimistic Lock Initialzation
+			store(kLockMask * 2); // Optimistic Lock Initialzation
 			//}
 		}
 
@@ -281,7 +348,7 @@ class BPlusTree {
 			//     return 0;
 			// } else {
 			uint64_t version;
-			version = word.load(std::memory_order_relaxed);
+			version = load(std::memory_order_relaxed);
 			if (isLocked(version)) {
 				// acquire read lock fail
 				needRestart = true;
@@ -297,15 +364,16 @@ class BPlusTree {
 			// unlocked. Plain fetch_add raced with writeLock and could leave the
 			// lock word with both the lock bit and a reader count set; a later
 			// mismatched iteratorLeave then permanently corrupted the version.
-			uint64_t version = word.load(std::memory_order_relaxed);
+			uint64_t version = load(std::memory_order_relaxed);
 			for (;;) {
 				if (isLocked(version) || (version & kReaderMask) == kReaderMask) {
 					needRestart = true;
 					_mm_pause();
 					return;
 				}
-				if (word.compare_exchange_weak(version, version + 1, std::memory_order_acquire,
-							       std::memory_order_relaxed))
+				if (compareExchangeWeak(version, version + 1,
+				                        std::memory_order_acquire,
+							        std::memory_order_relaxed))
 					return;
 			}
 		}
@@ -317,7 +385,7 @@ class BPlusTree {
 			//     releaseRead();
 			//     assert(getReaderCount(word.load()) < 20);
 			// } else {
-			word.fetch_sub(1);
+			fetchSub(1);
 			//}
 		}
 
@@ -352,7 +420,7 @@ class BPlusTree {
 				needRestart = true;
 				return;
 			}
-			if (word.compare_exchange_strong(version, version + kLockMask)) {
+			if (compareExchangeStrong(version, version + kLockMask)) {
 				version = version + kLockMask;
 			} else {
 				//_mm_pause();
@@ -368,7 +436,7 @@ class BPlusTree {
 			//     RWLockDowngradeToReadLock();
 			//     assert(getReaderCount(word.load()) < 20);
 			// } else {
-			version = word.fetch_add(kLockMask);
+			version = fetchAdd(kLockMask);
 			version += kLockMask;
 			//}
 		}
@@ -381,7 +449,7 @@ class BPlusTree {
 			//     releaseWrite();
 			//     assert(getReaderCount(word.load()) < 20);
 			// } else {
-			word.fetch_add(kLockMask);
+			fetchAdd(kLockMask);
 			//}
 		}
 
@@ -401,7 +469,7 @@ class BPlusTree {
 			//     releaseRead();
 			//     needRestart = false;
 			// } else {
-			needRestart = (((startRead ^ word.load()) & kVersionMask) != 0);
+			needRestart = (((startRead ^ load()) & kVersionMask) != 0);
 			//}
 		}
 
@@ -435,12 +503,12 @@ class BPlusTree {
 
 		bool tryAcquireRead()
 		{
-			uint64_t w = word.load();
+			uint64_t w = load();
 			uint64_t readerCount = getReaderCount(w);
 			uint64_t writerId = getWriterId(w);
 			if (writerId == 0) {
 				uint64_t neww = makeNewWord(readerCount + 1, 0);
-				return word.compare_exchange_strong(w, neww);
+				return compareExchangeStrong(w, neww);
 			}
 			// Locked by other writer
 			return false;
@@ -448,14 +516,14 @@ class BPlusTree {
 
 		bool RWLockUpgradeToWriteLock()
 		{
-			assert(getReaderCount(word.load()) < 20);
+			assert(getReaderCount(load()) < 20);
 			// Only works if we are the only reader
 			return tryUpgradeToWriteLock();
 		}
 
 		bool tryUpgradeToWriteLock()
 		{
-			uint64_t w = word.load();
+			uint64_t w = load();
 			uint64_t readerCount = getReaderCount(w);
 			uint64_t writerId = getWriterId(w);
 			assert(writerId == 0); // Not locked
@@ -464,7 +532,7 @@ class BPlusTree {
 				return false;
 			assert(readerCount == 1);
 			uint64_t neww = makeNewWord(0, RWSpinLatchThreadId);
-			return word.compare_exchange_strong(w, neww); // Try acquire write lock when we are the last reader
+			return compareExchangeStrong(w, neww); // Try acquire write lock when we are the last reader
 		}
 
 		void RWLockDowngradeToReadLock()
@@ -476,7 +544,7 @@ class BPlusTree {
 
 		bool tryDowngradeToReadLock()
 		{
-			uint64_t w = word.load();
+			uint64_t w = load();
 			uint64_t readerCount = getReaderCount(w);
 			uint64_t writerId = getWriterId(w);
 			assert(writerId == RWSpinLatchThreadId); // Only write-locked by me
@@ -484,18 +552,18 @@ class BPlusTree {
 			uint64_t neww = makeNewWord(1, 0);
 			// word.store(neww);
 			// return true;
-			return word.compare_exchange_strong(w, neww); // Try acquire write lock when we are the last reader
+			return compareExchangeStrong(w, neww); // Try acquire write lock when we are the last reader
 		}
 
 		bool tryAcqurieWrite()
 		{
-			uint64_t w = word.load();
+			uint64_t w = load();
 			uint64_t readerCount = getReaderCount(w);
 			uint64_t writerId = getWriterId(w);
 			assert(RWSpinLatchThreadId > 0);
 			if (writerId == 0 && readerCount == 0) {
 				uint64_t neww = makeNewWord(readerCount, RWSpinLatchThreadId);
-				return word.compare_exchange_strong(w, neww);
+				return compareExchangeStrong(w, neww);
 			}
 			// Locked by other writer
 			return false;
@@ -503,7 +571,7 @@ class BPlusTree {
 
 		bool tryReleaseRead()
 		{
-			uint64_t w = word.load();
+			uint64_t w = load();
 			uint64_t readerCount = getReaderCount(w);
 			uint64_t writerId = getWriterId(w);
 			assert(writerId == 0);
@@ -511,12 +579,12 @@ class BPlusTree {
 			uint64_t neww = makeNewWord(readerCount - 1, 0);
 			// word.fetch_sub(1);
 			// return true;
-			return word.compare_exchange_strong(w, neww);
+			return compareExchangeStrong(w, neww);
 		}
 
 		bool tryReleaseWrite()
 		{
-			uint64_t w = word.load();
+			uint64_t w = load();
 			uint64_t readerCount = getReaderCount(w);
 			uint64_t writerId = getWriterId(w);
 			assert(writerId == RWSpinLatchThreadId);
@@ -524,7 +592,7 @@ class BPlusTree {
 			uint64_t neww = makeNewWord(0, 0);
 			// word.store(0);
 			// return true;
-			return word.compare_exchange_strong(w, neww);
+			return compareExchangeStrong(w, neww);
 		}
 
 		inline uint64_t makeNewWord(uint32_t readerCount, uint32_t writerId)
@@ -781,13 +849,17 @@ class BPlusTree {
 		{
 			if (this->getCount() < 128) {
 				int left = 0;
-				while (left < this->getCount() && keyComp_(this->keys_[left], k) < 0)
+				while (left < this->getCount()) {
+					RecordTreeDataRead(&this->keys_[left], sizeof(KeyType));
+					if (keyComp_(this->keys_[left], k) >= 0) break;
 					++left;
+				}
 				return left;
 			} else {
 				int left = 0, right = this->getCount() - 1;
 				while (left <= right) {
 					int mid = left + (right - left) / 2;
+					RecordTreeDataRead(&keys_[mid], sizeof(KeyType));
 					int comp = keyComp_(keys_[mid], k);
 					if (comp == 0)
 						return mid;
@@ -972,12 +1044,21 @@ class BPlusTree {
 
 		KeyType &keyAt(size_t i)
 		{
-			return *reinterpret_cast<KeyType *>(reinterpret_cast<intptr_t>(data_) + i * sizeof(KeyType));
+			auto *key = reinterpret_cast<KeyType *>(
+			    reinterpret_cast<intptr_t>(data_) + i * sizeof(KeyType));
+			RecordTreeDataRead(key, sizeof(KeyType));
+			return *key;
 		}
 
 		boost::interprocess::offset_ptr<NodeBase> &childAt(size_t i)
 		{
-			return *reinterpret_cast<boost::interprocess::offset_ptr<NodeBase> *>(reinterpret_cast<intptr_t>(data_) + childOffset + i * sizeof(boost::interprocess::offset_ptr<NodeBase>));
+			auto *child =
+			    reinterpret_cast<boost::interprocess::offset_ptr<NodeBase> *>(
+			        reinterpret_cast<intptr_t>(data_) + childOffset +
+			        i * sizeof(boost::interprocess::offset_ptr<NodeBase>));
+			RecordTreeDataRead(
+			    child, sizeof(boost::interprocess::offset_ptr<NodeBase>));
+			return *child;
 		}
 
 		void newKey(const size_t pos, const KeyType &key)
@@ -1295,11 +1376,13 @@ class BPlusTree {
 
 		const KeyType &key() const
 		{
+			RecordTreeDataRead(&curNode_->keys_[curPos_], sizeof(KeyType));
 			return curNode_->keys_[curPos_];
 		}
 
 		const ValueType &value() const
 		{
+			RecordTreeDataRead(&curNode_->values_[curPos_], sizeof(ValueType));
 			return curNode_->values_[curPos_];
 		}
 
@@ -2409,6 +2492,8 @@ restart:
 		BTreeLeaf *nextLeaf = leaf->next_.get();
 		for (unsigned p = pos; p < leaf->getCount(); ++p) {
 			bool lastItem = nextLeaf == nullptr && p + 1 == leaf->getCount();
+			RecordTreeDataRead(&leaf->keys_[p], sizeof(KeyType));
+			RecordTreeDataRead(&leaf->values_[p], sizeof(ValueType));
                         CHECK(keyComp_(leaf->keys_[p], lowKey) >= 0);
 			bool end = processor(leaf->keys_[p], leaf->values_[p], lastItem);
 			if (end) {
@@ -3241,6 +3326,8 @@ restart:
 		bool success = false;
 		if ((pos < leaf->getCount()) && keyComp_(leaf->keys_[pos], key) == 0) {
 			success = true;
+			RecordTreeDataRead(&leaf->keys_[pos], sizeof(KeyType));
+			RecordTreeDataWrite(&leaf->values_[pos], sizeof(ValueType));
 			update_processor(leaf->keys_[pos], leaf->values_[pos]);
 		}
 
@@ -3298,7 +3385,10 @@ restart:
 		auto leaf = static_cast<BTreeLeaf *>(node);
 		unsigned pos = leaf->lowerBound(element.first, keyComp_);
 		bool success = false;
+		if (pos < leaf->getCount())
+			RecordTreeDataRead(&leaf->keys_[pos], sizeof(KeyType));
 		if ((pos < leaf->getCount()) && keyComp_(leaf->keys_[pos], element.first) == 0) {
+			RecordTreeDataRead(&leaf->values_[pos], sizeof(ValueType));
 			if (flag) {
 				success = true;
 				result = leaf->values_[pos];
