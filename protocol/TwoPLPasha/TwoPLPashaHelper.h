@@ -9,6 +9,7 @@
 #include <list>
 #include <tuple>
 #include <memory>
+#include <thread>
 
 #include "common/CCSet.h"
 #include "common/CCHashTable.h"
