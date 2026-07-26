@@ -56,7 +56,9 @@ class TwoPLPashaSCCWriteThrough : public SCCManager {
                 }
         }
 
-        void finish_write(void *scc_meta, std::size_t cur_host_id, void *scc_data, uint64_t size) override
+        // Caller must hold smeta->lock(): clear_all_scc_bits/set_scc_bit are
+        // full-word RMW and will clear a concurrent latch if unlocked.
+        void finish_write_bits(void *scc_meta, std::size_t cur_host_id) override
         {
                 TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(scc_meta);
                 std::size_t cur_host_bit_index = cur_host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
@@ -67,7 +69,11 @@ class TwoPLPashaSCCWriteThrough : public SCCManager {
                 // clear all the bits except the current host
                 smeta->clear_all_scc_bits();
                 smeta->set_scc_bit(cur_host_id);
+        }
 
+        void finish_write(void *scc_meta, std::size_t cur_host_id, void *scc_data, uint64_t size) override
+        {
+                finish_write_bits(scc_meta, cur_host_id);
                 clwb(scc_data, size);
         }
 };

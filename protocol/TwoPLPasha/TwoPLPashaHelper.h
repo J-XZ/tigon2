@@ -343,9 +343,19 @@ class TwoPLPashaHelper {
                 }
                 smeta->increase_reader_count();
                 smeta->ref_cnt++;
+                const auto host_bit =
+                    host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
+                const bool need_fill = !smeta->is_bit_set(host_bit);
                 smeta->unlock();
-                scc_manager->prepare_read(smeta, host_id, scc_data,
-                                          size);
+                // clflush without latch; set_bit only under latch (same rule as
+                // finish_write_bits — unlocked RMW can clear a peer's latch).
+                if (need_fill) {
+                        scc_manager->invalidate_scc_data(scc_data, size);
+                        smeta->lock();
+                        if (!smeta->is_bit_set(host_bit))
+                                smeta->set_bit(host_bit);
+                        smeta->unlock();
+                }
                 const bool valid = smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
                 if (valid)
                         scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
@@ -383,19 +393,23 @@ class TwoPLPashaHelper {
                         // cache-valid bit before finish_write invalidates all peers.
                         const auto host_bit =
                             host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
-                        if (!smeta->is_bit_set(host_bit)) {
-                                scc_manager->prepare_read(smeta, host_id, scc_data, size);
-                        }
+                        // clflush without latch; set_bit only under latch (RMW).
+                        if (!smeta->is_bit_set(host_bit))
+                                scc_manager->invalidate_scc_data(scc_data, size);
                         scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
-                        // HWCC smeta latch is cross-VM: never hold it across
-                        // finish_write's clwb (multi-VM livelock on hot keys).
+                        // atomic_word bit RMWs require the latch; clwb does not.
+                        // Holding the latch across clwb livelocks hot keys across
+                        // VMs — so: bits under latch, unlock, clwb, then release
+                        // the write lock. Never call finish_write unlocked (its
+                        // clear_all_scc_bits can drop another thread's latch bit).
                         smeta->lock();
                         if (!smeta->is_bit_set(host_bit))
                                 smeta->set_bit(host_bit);
                         smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
                         smeta->value_len = static_cast<uint32_t>(size);
+                        scc_manager->finish_write_bits(smeta, host_id);
                         smeta->unlock();
-                        scc_manager->finish_write(smeta, host_id, scc_data, size);
+                        scc_manager->flush_scc_data(scc_data, size);
                         smeta->lock();
                         DCHECK(smeta->ref_cnt > 0);
                         smeta->ref_cnt--;

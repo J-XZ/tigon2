@@ -23,8 +23,15 @@ class RecordingScc final : public star::SCCManager {
     ++writes; std::memcpy(dst, src, bytes);
   }
   void prepare_read(void *, std::size_t, void *, uint64_t) override { ++prepares; }
+  void finish_write_bits(void *meta, std::size_t host) override {
+    ++finish_bits;
+    // Mirror WriteThrough: keep writer SCC bit under the caller's latch.
+    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(meta);
+    smeta->clear_all_scc_bits();
+    smeta->set_scc_bit(host);
+  }
   void finish_write(void *, std::size_t, void *, uint64_t) override { ++finishes; }
-  uint64_t reads = 0, writes = 0, prepares = 0, finishes = 0;
+  uint64_t reads = 0, writes = 0, prepares = 0, finishes = 0, finish_bits = 0;
 };
 
 tigonkv::engine::DualRegionConfig Config(size_t bytes) {
@@ -58,7 +65,8 @@ int main() {
   assert(star::TwoPLPashaHelper::kv_shared_read(meta, 1, out, 12));
   assert(std::string(out, 12) == "shared-value");
   assert(meta->ref_cnt == 0);
-  assert(fake.writes == 1 && fake.finishes == 1 && fake.prepares == 1 && fake.reads == 1);
+  assert(fake.writes == 1 && fake.finish_bits == 1 && fake.finishes == 0 &&
+         fake.prepares == 0 && fake.reads == 1);
   assert(meta->get_reader_count() == 0 && !meta->is_write_locked());
   assert(star::TwoPLPashaHelper::kv_pin_shared_ref(meta));
   assert(meta->ref_cnt == 1);

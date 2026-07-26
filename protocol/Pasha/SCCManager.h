@@ -34,7 +34,20 @@ class SCCManager {
         virtual void do_read(void *scc_meta, std::size_t cur_host_id, void *dst, const void *src, uint64_t size) = 0;
         virtual void do_write(void *scc_meta, std::size_t cur_host_id, void *dst, const void *src, uint64_t size) = 0;
         virtual void prepare_read(void *scc_meta, std::size_t cur_host_id, void *scc_data, uint64_t size) {}
-        virtual void finish_write(void *scc_meta, std::size_t cur_host_id, void *scc_data, uint64_t size) {}
+        // Bit invalidation only; caller must hold the HWCC smeta latch.
+        virtual void finish_write_bits(void *scc_meta, std::size_t cur_host_id) {}
+        // Default: bits (latch required) + clwb. Prefer finish_write_bits +
+        // flush_scc_data when the latch must not be held across clwb.
+        virtual void finish_write(void *scc_meta, std::size_t cur_host_id, void *scc_data, uint64_t size) {
+                finish_write_bits(scc_meta, cur_host_id);
+                clwb(scc_data, size);
+        }
+
+        // clwb/clflush only: safe without the HWCC smeta latch. atomic_word
+        // bit updates in prepare_read/finish_write_bits still require the latch
+        // (load/store RMW is not latch-preserving under concurrency).
+        void flush_scc_data(const void *addr, uint64_t len) { clwb(addr, len); }
+        void invalidate_scc_data(const void *addr, uint64_t len) { clflush(addr, len); }
 
         void print_stats()
         {
