@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -33,27 +34,29 @@ class KvPartitionTable final : public star::ITable {
   void *search_value(const void *) override { return nullptr; }
   MetaDataType *search_metadata(const void *) override { return nullptr; }
   void scan(const void *,
-            std::function<bool(const void *, MetaDataType *, void *, bool)>) override {}
+            std::function<bool(const void *, MetaDataType *, void *, bool)>) override {
+    throw std::logic_error("KV migration adapter has no adjacency-complete scan");
+  }
   bool insert(const void *, const void *, bool = false) override { return false; }
   bool insert_lock_next_key(
       const void *, const void *,
       std::function<bool(const void *, MetaDataType *, void *)>,
       bool = false) override {
-    return false;
+    throw std::logic_error("KV migration adapter does not maintain next-key state");
   }
   bool insert_and_process_adjacent_tuples(
       const void *, const void *,
       std::function<bool(const void *, MetaDataType *, void *, const void *,
                          MetaDataType *, void *)>,
       bool = false) override {
-    return false;
+    throw std::logic_error("KV migration adapter does not maintain adjacency state");
   }
   bool remove(const void *) override { return false; }
   bool remove_and_process_adjacent_tuples(
       const void *,
       std::function<bool(const void *, void *, void *, const void *, void *,
                          void *, const void *, void *, void *)>) override {
-    return false;
+    throw std::logic_error("KV migration adapter does not maintain adjacency state");
   }
   void update(const void *, const void *,
               std::function<void(const void *, const void *)> = {}) override {}
@@ -61,7 +64,7 @@ class KvPartitionTable final : public star::ITable {
       const void *,
       std::function<void(const void *, void *, void *, const void *, void *,
                          void *, const void *, void *, void *)>) override {
-    return false;
+    throw std::logic_error("KV migration adapter does not maintain next-key state");
   }
   void deserialize_value(const void *, star::StringPiece) override {}
   void serialize_value(star::Encoder &, const void *) override {}

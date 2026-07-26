@@ -14,6 +14,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <queue>
 #include <fstream>
@@ -290,7 +291,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     size_t next = 0;
   };
   std::vector<Source> sources;
-  sources.reserve(config_.vm_count * 2);
+  sources.reserve(config_.vm_count);
 
   auto load_page = [&](Source *source, std::vector<ScanItem> raw) -> Status {
     source->items.clear();
@@ -314,27 +315,17 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   load_page(&local, std::move(local_page.items));
   sources.push_back(std::move(local));
 
-  // CXL-first: seed remote-owned partitions from local shared trees before RPC
-  // (TwoPLPasha remote CXL table scan). Owner RPC remains authoritative for
-  // private rows; heap merge dedups overlapping migrated keys.
-  for (const auto &partition : partitions_) {
-    if (OwnerForPartition(partition->partition_id()) == config_.node_id) continue;
-    std::vector<std::pair<std::string, std::string>> shared_items;
-    if (!partition->ScanSharedOnly(start_key, request_limit, &shared_items,
-                                   config_.node_id))
-      continue;
-    if (shared_items.empty()) continue;
-    Source cxl;
-    cxl.node = OwnerForPartition(partition->partition_id());
-    std::vector<ScanItem> raw;
-    raw.reserve(shared_items.size());
-    for (auto &item : shared_items)
-      raw.push_back({std::move(item.first), std::move(item.second)});
-    load_page(&cxl, std::move(raw));
-    if (!cxl.items.empty()) sources.push_back(std::move(cxl));
-  }
-
-  auto acquire_scan_rpc = [this] {
+  // A partial non-owner CXL walk is not a complete range unless the original
+  // TwoPLPasha next/prev-key protocol proves adjacency.  KV does not yet expose
+  // migrate-for-scan, so use exactly one authoritative stream per owner.  Do
+  // not merge partial CXL rows with owner rows or continue a CXL cursor by RPC.
+  auto try_acquire_scan_rpc = [this] {
+    std::lock_guard<std::mutex> lock(scan_rpc_mutex_);
+    if (inflight_scan_rpcs_ >= kMaxInflightScanRpcs) return false;
+    ++inflight_scan_rpcs_;
+    return true;
+  };
+  auto wait_acquire_scan_rpc = [this] {
     std::unique_lock<std::mutex> lock(scan_rpc_mutex_);
     scan_rpc_cv_.wait(lock, [&] { return inflight_scan_rpcs_ < kMaxInflightScanRpcs; });
     ++inflight_scan_rpcs_;
@@ -347,47 +338,86 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     scan_rpc_cv_.notify_one();
   };
 
-  // Fan-out ScanRPCs (processor-style): register + send all, then await.
+  // Fan out owner ScanRPCs through a bounded sliding window.
   struct RemoteInflights {
     uint32_t node = 0;
     uint64_t request_id = 0;
   };
-  std::vector<RemoteInflights> inflight;
-  inflight.reserve(config_.vm_count);
-  for (uint32_t node = 0; node < config_.vm_count; ++node) {
-    if (node == config_.node_id) continue;
-    const uint64_t request_id = NextRequestId(config_.node_id);
-    {
-      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      pending_scans_.emplace(request_id, PendingScan{});
-    }
-    acquire_scan_rpc();
-    try {
-      SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id, node,
-                                       request_id, start_key, EncodeU64(request_limit)));
-    } catch (const std::exception &e) {
-      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
-      pending_scans_.erase(request_id);
+  std::deque<RemoteInflights> inflight;
+  auto cancel_inflight = [&] {
+    for (const auto &slot : inflight) {
+      {
+        std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+        pending_scans_.erase(slot.request_id);
+      }
       release_scan_rpc();
-      return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
     }
-    inflight.push_back({node, request_id});
-  }
-  for (const auto &slot : inflight) {
+    inflight.clear();
+  };
+  auto await_one = [&]() -> Status {
+    const RemoteInflights slot = inflight.front();
+    inflight.pop_front();
     std::vector<ScanItem> remote;
     Status status = Status::Ok();
     try {
       status = AwaitScan(slot.request_id, &remote);
     } catch (const std::exception &e) {
+      {
+        std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+        pending_scans_.erase(slot.request_id);
+      }
       release_scan_rpc();
-      return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
+      return Status::Error(StatusCode::kInvalidArgument, e.what());
     }
     release_scan_rpc();
-    if (!status.ok()) return {status, {}};
+    if (!status.ok()) return status;
     Source source;
     source.node = slot.node;
     load_page(&source, std::move(remote));
     sources.push_back(std::move(source));
+    return Status::Ok();
+  };
+  for (uint32_t node = 0; node < config_.vm_count; ++node) {
+    if (node == config_.node_id) continue;
+    // Never wait for another token while retaining all of this Scan's tokens.
+    // Draining our oldest request first gives every concurrent caller a path
+    // to release the global backpressure window.
+    while (!try_acquire_scan_rpc()) {
+      if (inflight.empty()) {
+        wait_acquire_scan_rpc();
+        break;
+      }
+      const Status status = await_one();
+      if (!status.ok()) {
+        cancel_inflight();
+        return {status, {}};
+      }
+    }
+    const uint64_t request_id = NextRequestId(config_.node_id);
+    {
+      std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+      pending_scans_.emplace(request_id, PendingScan{});
+    }
+    try {
+      SendTransportMessage(MakeRequest(KvMessageType::kScanRequest, config_.node_id, node,
+                                       request_id, start_key, EncodeU64(request_limit)));
+    } catch (const std::exception &e) {
+      {
+        std::lock_guard<std::mutex> lock(pending_scan_mutex_);
+        pending_scans_.erase(request_id);
+      }
+      release_scan_rpc();
+      cancel_inflight();
+      return {Status::Error(StatusCode::kInvalidArgument, e.what()), {}};
+    }
+    inflight.push_back({node, request_id});
+  }
+  while (!inflight.empty()) {
+    const Status status = await_one();
+    if (!status.ok()) {
+      cancel_inflight();
+      return {status, {}};
+    }
   }
 
   auto refill = [&](Source *source) -> Status {
@@ -397,7 +427,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       std::lock_guard<std::mutex> lock(pending_scan_mutex_);
       pending_scans_.emplace(request_id, PendingScan{});
     }
-    acquire_scan_rpc();
+    wait_acquire_scan_rpc();
     Status status = Status::Ok();
     std::vector<ScanItem> raw;
     try {

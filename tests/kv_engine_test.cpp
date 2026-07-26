@@ -4,8 +4,11 @@
 #undef NDEBUG
 #endif
 #include <cassert>
+#include <atomic>
 #include <cstdio>
 #include <string>
+#include <thread>
+#include <vector>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -75,7 +78,10 @@ int main() {
   assert(routed_fd >= 0);
   close(routed_fd);
   const std::string routed_path(routed_template);
-  const auto node_zero = ConfigFor(routed_path, 2, 0);
+  auto node_zero = ConfigFor(routed_path, 2, 0);
+  node_zero.foreground_worker_count_per_vm = 4;
+  auto node_one_config = ConfigFor(routed_path, 2, 1);
+  node_one_config.foreground_worker_count_per_vm = 4;
   {
     auto engine = tigonkv::engine::KVEngine::Open(node_zero, true);
     for (uint32_t i = 0; i < 100; ++i) {
@@ -106,11 +112,61 @@ int main() {
       assert(engine->Put(key, "bulk").ok());
       ++remote_scan_rows;
     }
+    // Populate one remote partition past a Scan page boundary. The requester
+    // will promote every row before scanning, so an accidental non-owner CXL
+    // seed would create a second source for the same owner.
+    std::vector<std::string> promoted_scan_keys;
+    uint32_t promoted_partition = UINT32_MAX;
+    for (uint32_t i = 0; promoted_scan_keys.size() < 130; ++i) {
+      char key[32];
+      std::snprintf(key, sizeof(key), "hybrid-%08u", i);
+      if (engine->OwnerForKey(key) != 0) continue;
+      const uint32_t partition = engine->PartitionForKey(key);
+      if (promoted_partition == UINT32_MAX) promoted_partition = partition;
+      if (partition != promoted_partition) continue;
+      assert(engine->Put(key, "owner-authority").ok());
+      promoted_scan_keys.emplace_back(key);
+    }
     const pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
-      auto node_one = tigonkv::engine::KVEngine::Open(ConfigFor(routed_path, 2, 1), false);
+      auto node_one = tigonkv::engine::KVEngine::Open(node_one_config, false);
       if (!node_one->Put(owner_one_key, "owner-one").ok()) _exit(1);
+      for (const auto &key : promoted_scan_keys) {
+        const auto promoted = node_one->Get(key);
+        if (!promoted.status.ok() || promoted.value != "owner-authority") _exit(14);
+      }
+      const uint64_t tx_before_authoritative_scan = node_one->NetworkTxBytes();
+      const auto authoritative_scan = node_one->Scan("hybrid-", 100);
+      const uint64_t authoritative_scan_tx =
+          node_one->NetworkTxBytes() - tx_before_authoritative_scan;
+      if (!authoritative_scan.status.ok() || authoritative_scan.items.size() != 100)
+        _exit(15);
+      for (const auto &item : authoritative_scan.items) {
+        if (item.key.rfind("hybrid-", 0) != 0 || item.value != "owner-authority")
+          _exit(16);
+      }
+      // One initial owner page plus one cursor refill. A partial CXL seed used
+      // to refill as a second owner RPC and produced a third request frame.
+      if (authoritative_scan_tx != 2 * sizeof(tigonkv::engine::KvMessage)) _exit(17);
+
+      std::atomic<bool> start_concurrent_scans{false};
+      std::atomic<bool> concurrent_scan_failed{false};
+      std::vector<std::thread> scan_threads;
+      for (uint32_t worker = 0; worker < 4; ++worker) {
+        scan_threads.emplace_back([&, worker] {
+          node_one->BindWorker(worker);
+          while (!start_concurrent_scans.load(std::memory_order_acquire))
+            std::this_thread::yield();
+          const auto scan = node_one->Scan("hybrid-", 100);
+          if (!scan.status.ok() || scan.items.size() != 100)
+            concurrent_scan_failed.store(true, std::memory_order_release);
+        });
+      }
+      start_concurrent_scans.store(true, std::memory_order_release);
+      for (auto &thread : scan_threads) thread.join();
+      if (concurrent_scan_failed.load(std::memory_order_acquire)) _exit(18);
+
       const auto distributed_scan = node_one->Scan("", 0);
       const auto limited_scan = node_one->Scan("", 17);
       bool saw_owner_zero = false;

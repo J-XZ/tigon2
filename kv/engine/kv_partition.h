@@ -45,7 +45,7 @@ class KVPartition {
                               std::string_view desired, bool *exchanged);
   bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value);
   // Non-owner APIs never touch PrivateRow. Point ops use TryPinShared + SCC
-  // (aligned with get_migrated_row / CompareExchangeShared / ScanSharedOnly).
+  // (aligned with get_migrated_row / CompareExchangeShared).
   // True iff shared_tree_ currently indexes the key (no pin / SCC). Used by
   // Get to distinguish tree-miss (migrate) from SCC contention (retry).
   bool HasShared(std::string_view key) const;
@@ -73,11 +73,6 @@ class KVPartition {
   bool ScanOwned(std::string_view start_key, uint64_t limit,
                  std::vector<std::pair<std::string, std::string>> *items,
                  const std::function<void()> *progress = nullptr) const;
-  // Non-owner-safe CXL shared-tree scan (no PrivateRow). Used as CXL-first
-  // probe before owner Scan RPC, matching TwoPLPasha remote CXL table scan.
-  bool ScanSharedOnly(std::string_view start_key, uint64_t limit,
-                      std::vector<std::pair<std::string, std::string>> *items,
-                      uint32_t host_id) const;
   // Invokes PolicyClock::move_row_out for this partition.
   bool MoveOutClockVictim(uint32_t host_id);
   // Rebuild DRAM Clock tracker entries from the shared tree after attach.

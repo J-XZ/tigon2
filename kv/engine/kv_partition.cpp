@@ -1055,68 +1055,6 @@ uint64_t KVPartition::migrated_key_count() const {
 }
 
 
-bool KVPartition::ScanSharedOnly(
-    std::string_view start_key, uint64_t limit,
-    std::vector<std::pair<std::string, std::string>> *items,
-    uint32_t host_id) const {
-  EnterEbr();
-  if (items == nullptr) throw std::invalid_argument("null shared scan output");
-  items->clear();
-  FixedKey high{};
-  std::memset(high.bytes, 0xff, sizeof(high.bytes));
-  FixedKey low = MakeKey(start_key);
-  bool left_inclusive = true;
-  const bool unlimited = limit == 0;
-  for (uint32_t batches = 0; batches < 1048576u; ++batches) {
-    if (!unlimited && items->size() >= limit) break;
-    const uint64_t remaining =
-        unlimited ? 0 : static_cast<uint64_t>(limit - items->size());
-    const uint32_t fetch =
-        unlimited ? 0
-                  : (remaining > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
-                         ? 0
-                         : static_cast<uint32_t>(remaining));
-    std::vector<SharedTree::KeyValuePair> shared_rows;
-    shared_tree_->scan(low, high, left_inclusive, true, fetch, shared_rows);
-    if (shared_rows.empty()) break;
-    FixedKey last_raw{};
-    bool have_last = false;
-    for (const auto &entry : shared_rows) {
-      if (!unlimited && items->size() >= limit) break;
-      last_raw = entry.first;
-      have_last = true;
-      if (entry.second == kNullOffset) continue;
-      star::TwoPLPashaMetadataShared *smeta = nullptr;
-      RegionOffset pinned_off = kNullOffset;
-      if (!TryPinShared(entry.first, &smeta, &pinned_off) || pinned_off != entry.second)
-        continue;
-      auto *payload = smeta->get_scc_data();
-      const uint32_t value_len = smeta->value_len;
-      if (value_len > regions_.layout().fixed_value_size) {
-        star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
-        continue;
-      }
-      std::string value(value_len, '\0');
-      mem_access::SharedPayloadRead(payload->data, value.size());
-      if (!star::TwoPLPashaHelper::kv_shared_read(smeta, host_id, value.data(),
-                                                  value.size())) {
-        star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
-        continue;
-      }
-      NoteSharedAccess(smeta);
-      star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
-      items->emplace_back(KeyString(entry.first), std::move(value));
-    }
-    if (unlimited) break;
-    if (!unlimited && items->size() >= limit) break;
-    if (shared_rows.size() < fetch) break;
-    if (!have_last) break;
-    low = last_raw;
-    left_inclusive = false;
-  }
-  return true;
-}
-
 void KVPartition::PersistRoots() {
   directory_.private_root = regions_.swcc().ToOffset(
       private_tree_->root_for_persistence());
