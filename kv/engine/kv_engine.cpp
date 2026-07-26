@@ -14,6 +14,8 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <queue>
@@ -65,6 +67,35 @@ struct RequestServeDepthGuard {
   RequestServeDepthGuard(const RequestServeDepthGuard &) = delete;
   RequestServeDepthGuard &operator=(const RequestServeDepthGuard &) = delete;
 };
+
+[[noreturn]] void TransportFatal(uint32_t node_id, const char *stage,
+                                 const char *detail,
+                                 const KvMessage *message = nullptr) {
+  std::fprintf(stderr,
+      "TIGONKV_TRANSPORT_FATAL node=%u stage=%s detail=%s",
+      node_id, stage, detail);
+  if (message != nullptr) {
+    std::fprintf(stderr,
+        " type=%u source=%u destination=%u request_id=%llu key_size=%u value_size=%u",
+        static_cast<unsigned>(message->type), message->source_node,
+        message->destination_node,
+        static_cast<unsigned long long>(message->request_id),
+        message->key_size, message->value_size);
+  }
+  std::fputc('\n', stderr);
+  std::fflush(stderr);
+  std::abort();
+}
+
+bool ValidMessageType(KvMessageType type) {
+  const uint8_t raw = static_cast<uint8_t>(type);
+  return raw >= static_cast<uint8_t>(KvMessageType::kPut) &&
+         raw <= static_cast<uint8_t>(KvMessageType::kMigrate);
+}
+
+bool ValidStatusCode(uint32_t status) {
+  return status <= static_cast<uint32_t>(StatusCode::kOwnerViolation);
+}
 
 std::string EncodeU64(uint64_t value) {
   std::string encoded(sizeof(value), '\0');
@@ -667,11 +698,28 @@ Status KVEngine::Checkpoint() {
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {
-  if (rings_ == nullptr || message.destination_node >= config_.vm_count)
-    throw std::runtime_error("KV transport destination out of range");
+  if (rings_ == nullptr || !ValidMessageType(message.type) ||
+      message.source_node >= config_.vm_count ||
+      message.destination_node >= config_.vm_count ||
+      message.key_size > message.key.size() ||
+      message.value_size > message.value.size() ||
+      !ValidStatusCode(message.status))
+    TransportFatal(config_.node_id, "send_validate",
+                   "invalid outgoing KV transport message", &message);
   unsigned spins = 0;
-  while (!rings_[message.destination_node].enqueue(
-      const_cast<char *>(reinterpret_cast<const char *>(&message)), sizeof(message))) {
+  for (;;) {
+    bool enqueued = false;
+    try {
+      enqueued = rings_[message.destination_node].enqueue(
+          const_cast<char *>(reinterpret_cast<const char *>(&message)),
+          sizeof(message));
+    } catch (const std::exception &error) {
+      TransportFatal(config_.node_id, "ring_enqueue", error.what(), &message);
+    } catch (...) {
+      TransportFatal(config_.node_id, "ring_enqueue", "non-std exception",
+                     &message);
+    }
+    if (enqueued) break;
     // Peer demuxers free ring slots. When called from nested Serve (depth>0)
     // we must not ServeDeferred, but top-level Send during Await may briefly
     // help demux by yielding; sleeping avoids tight livelock on full rings.
@@ -780,32 +828,45 @@ void KVEngine::InboundDemuxerLoop() {
   star::global_ebr_meta = ebr_;
   while (!inbound_demuxer_stop_.load(std::memory_order_acquire)) {
     bool progressed = false;
-    try {
-      if (rings_ != nullptr) {
-        for (int drained = 0; drained < 64; ++drained) {
-          alignas(64) char bytes[sizeof(KvMessage)];
-          const uint64_t received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
-          if (received == 0) break;
-          if (received != sizeof(KvMessage))
-            throw std::runtime_error("malformed KV transport entry");
-          KvMessage message{};
-          std::memcpy(&message, bytes, sizeof(message));
-          network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
-          DemuxTransportMessage(message);
-          progressed = true;
+    if (rings_ != nullptr) {
+      for (int drained = 0; drained < 64; ++drained) {
+        alignas(64) char bytes[sizeof(KvMessage)];
+        uint64_t received = 0;
+        try {
+          received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
+        } catch (const std::exception &error) {
+          TransportFatal(config_.node_id, "ring_recv", error.what());
+        } catch (...) {
+          TransportFatal(config_.node_id, "ring_recv", "non-std exception");
         }
+        if (received == 0) break;
+        if (received != sizeof(KvMessage))
+          TransportFatal(config_.node_id, "ring_recv",
+                         "malformed KV transport entry");
+        KvMessage message{};
+        std::memcpy(&message, bytes, sizeof(message));
+        network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
+        try {
+          DemuxTransportMessage(message);
+        } catch (const std::exception &error) {
+          TransportFatal(config_.node_id, "demux", error.what(), &message);
+        } catch (...) {
+          TransportFatal(config_.node_id, "demux", "non-std exception", &message);
+        }
+        progressed = true;
       }
-    } catch (...) {
-      // Keep demuxing; FG paths surface hard failures to callers.
     }
     if (!progressed) std::this_thread::sleep_for(std::chrono::microseconds(20));
   }
 }
 
 void KVEngine::DemuxTransportMessage(const KvMessage &message) {
-  if (message.destination_node != config_.node_id ||
+  if (!ValidMessageType(message.type) ||
+      message.destination_node != config_.node_id ||
       message.source_node >= config_.vm_count ||
-      message.key_size > message.key.size() || message.value_size > message.value.size())
+      message.key_size > message.key.size() ||
+      message.value_size > message.value.size() ||
+      !ValidStatusCode(message.status))
     throw std::runtime_error("invalid KV transport message");
   if (message.type == KvMessageType::kResponse) {
     std::lock_guard<std::mutex> lock(response_mutex_);
@@ -844,10 +905,10 @@ void KVEngine::ServeDeferredRequests(int max_count) {
     }
     try {
       ServeTransportRequest(deferred);
-    } catch (const std::exception &) {
-      // Never poison AwaitResponse/PollTransport: a failed serve must not
-      // abort the waiting FG worker. Prefer dropping the bad request.
+    } catch (const std::exception &error) {
+      TransportFatal(config_.node_id, "serve", error.what(), &deferred);
     } catch (...) {
+      TransportFatal(config_.node_id, "serve", "non-std exception", &deferred);
     }
   }
 }

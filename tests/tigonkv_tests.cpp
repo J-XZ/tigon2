@@ -44,6 +44,7 @@ int main() {
   config.partition_count = 8;
   config.fixed_key_size = 32;
   config.fixed_value_size = 128;
+  config.foreground_worker_count_per_vm = 4;
   config.transport_ring_total_mb = 1;
   config.latency_enabled = true;
   config.latency_foreground_enabled = true;
@@ -58,6 +59,26 @@ int main() {
   assert(store->CompareExchange("alpha", "one", "three").exchanged);
   assert(store->Increment("counter", 3).value == 3);
   assert(store->Get("alpha").value == "three");
+  std::vector<std::thread> workers;
+  for (uint32_t worker = 0; worker < 4; ++worker) {
+    workers.emplace_back([&, worker] {
+      store->BindWorker(worker);
+      for (uint32_t i = 0; i < 50; ++i) {
+        const std::string key =
+            "worker-" + std::to_string(worker) + "-" + std::to_string(i);
+        assert(store->Put(key, "value").ok());
+        const auto found = store->Get(key);
+        assert(found.status.ok() && found.value == "value");
+      }
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  const RuntimeStats runtime = store->Runtime();
+  assert(runtime.logical_ops == 406);
+  assert(runtime.commits == 406);
+  assert(runtime.aborts == 0);
+  assert(runtime.private_puts == 204);
+  assert(runtime.private_gets == 201);
   assert(store->Checkpoint().ok());
   assert(store->Memory().physical_region_split);
   const std::string stats = store->DumpStats();

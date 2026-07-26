@@ -1,15 +1,22 @@
 #include "kv/engine/kv_engine.h"
+#include "common/CXLMemory.h"
+#include "common/MPSCRingBuffer.h"
+#include "kv/engine/kv_messages.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
+#include <array>
 #include <cassert>
 #include <atomic>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <string>
 #include <thread>
 #include <vector>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 namespace {
@@ -37,6 +44,33 @@ tigonkv::Config ConfigFor(const std::string &path, uint32_t vm_count = 1,
 }  // namespace
 
 int main() {
+  char corrupt_template[] = "/tmp/tigonkv-engine-corrupt-XXXXXX";
+  const int corrupt_fd = mkstemp(corrupt_template);
+  assert(corrupt_fd >= 0);
+  close(corrupt_fd);
+  const pid_t corrupt_child = fork();
+  assert(corrupt_child >= 0);
+  if (corrupt_child == 0) {
+    const rlimit no_core{0, 0};
+    (void)setrlimit(RLIMIT_CORE, &no_core);
+    const auto corrupt_config = ConfigFor(corrupt_template);
+    auto engine = tigonkv::engine::KVEngine::Open(corrupt_config, true);
+    void *root = nullptr;
+    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+        star::CXLMemory::cxl_transport_root_index, &root);
+    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+    std::array<char, sizeof(tigonkv::engine::KvMessage) + 1> malformed{};
+    while (!rings[0].enqueue(
+        malformed.data(), malformed.size()))
+      std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    _exit(90);
+  }
+  int corrupt_status = 0;
+  assert(waitpid(corrupt_child, &corrupt_status, 0) == corrupt_child);
+  assert(WIFSIGNALED(corrupt_status) && WTERMSIG(corrupt_status) == SIGABRT);
+  unlink(corrupt_template);
+
   char path_template[] = "/tmp/tigonkv-engine-XXXXXX";
   const int fd = mkstemp(path_template);
   assert(fd >= 0);

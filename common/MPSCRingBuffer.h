@@ -137,14 +137,26 @@ class MPSCRingBuffer {
                 /* wait for the entry to be ready */
                 while (entry->is_ready.load(std::memory_order_acquire) != 1);
 
-                /* only dequeue part of the data if the buffer is not large enough */
-                if (buffer_size < entry->remaining_size)
-                        dequeue_size = buffer_size;
-                else
-                        dequeue_size = entry->remaining_size;
-
-                /* partial dequeue is not supported for now */
-                CHECK(dequeue_size == entry->remaining_size);
+                /* Partial dequeue is not supported. Metadata or wire-size
+                 * violations are protocol corruption, not an empty/full
+                 * backpressure condition; let the caller hard-fail with node
+                 * and request diagnostics instead of hiding this as a stall. */
+                if (entry->remaining_size == 0 ||
+                    entry->dequeue_offset > entry_data_size ||
+                    entry->remaining_size > entry_data_size - entry->dequeue_offset) {
+                        LOG(ERROR) << "MPSCRingBuffer corrupt dequeue metadata: remaining_size="
+                                   << entry->remaining_size
+                                   << " dequeue_offset=" << entry->dequeue_offset
+                                   << " entry_data_size=" << entry_data_size;
+                        throw std::runtime_error("corrupt MPSCRingBuffer dequeue metadata");
+                }
+                if (buffer_size < entry->remaining_size) {
+                        LOG(ERROR) << "MPSCRingBuffer receive buffer too small: buffer_size="
+                                   << buffer_size
+                                   << " remaining_size=" << entry->remaining_size;
+                        throw std::runtime_error("MPSCRingBuffer receive buffer too small");
+                }
+                dequeue_size = entry->remaining_size;
 
                 /* memcpy the data to the user-provided buffer and update the metadata */
                 clflush(entry->data, dequeue_size);

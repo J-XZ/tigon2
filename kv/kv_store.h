@@ -183,10 +183,18 @@ class KVStore {
   void Open(bool reset);
   void Close();
   void ValidateKeyValue(std::string_view key, std::string_view value) const;
+  RuntimeStats &ThreadRuntime();
   struct Impl;
+  struct alignas(64) WorkerRuntime {
+    RuntimeStats stats;
+  };
   std::unique_ptr<Impl> impl_;
   Config config_;
-  RuntimeStats runtime_;
+  // PLAN §1.8: one cache-line-isolated counter set per foreground worker.
+  // BindWorker selects the calling thread's slot, so hot operations never
+  // update a shared counter or execute an atomic RMW.
+  std::vector<WorkerRuntime> worker_runtime_;
+  WorkerRuntime unbound_runtime_;
 };
 
 }  // namespace tigonkv

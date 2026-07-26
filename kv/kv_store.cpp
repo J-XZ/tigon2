@@ -27,6 +27,28 @@ namespace {
 
 constexpr size_t kMaxKey = 256;
 constexpr size_t kMaxValue = 4096;
+thread_local KVStore *TlsRuntimeOwner = nullptr;
+thread_local RuntimeStats *TlsRuntimeStats = nullptr;
+
+void AddRuntimeStats(RuntimeStats *total, const RuntimeStats &part) {
+  total->logical_ops += part.logical_ops;
+  total->commits += part.commits;
+  total->aborts += part.aborts;
+  total->retries += part.retries;
+  total->private_gets += part.private_gets;
+  total->private_puts += part.private_puts;
+  total->private_deletes += part.private_deletes;
+  total->checkpoint_swcc_flushes += part.checkpoint_swcc_flushes;
+  total->private_swcc_flushes += part.private_swcc_flushes;
+  total->shared_gets += part.shared_gets;
+  total->shared_puts += part.shared_puts;
+  total->shared_deletes += part.shared_deletes;
+  total->shared_swcc_flushes += part.shared_swcc_flushes;
+  total->migration_in += part.migration_in;
+  total->migration_out += part.migration_out;
+  total->network_tx_bytes += part.network_tx_bytes;
+  total->network_rx_bytes += part.network_rx_bytes;
+}
 
 std::string StripComments(std::string text) {
   text = std::regex_replace(text, std::regex(R"(//[^\n\r]*)"), "");
@@ -272,7 +294,9 @@ std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
   return store;
 }
 
-KVStore::KVStore(const Config &config) : impl_(new Impl()), config_(config) {
+KVStore::KVStore(const Config &config)
+    : impl_(new Impl()), config_(config),
+      worker_runtime_(config.foreground_worker_count_per_vm) {
   config_.Validate();
   latency_sim::Config latency;
   latency.enabled = config_.latency_enabled;
@@ -297,7 +321,13 @@ KVStore::KVStore(const Config &config) : impl_(new Impl()), config_(config) {
   latency_sim::GlobalLatencySimulator().Configure(latency);
 }
 
-KVStore::~KVStore() { Close(); }
+KVStore::~KVStore() {
+  if (TlsRuntimeOwner == this) {
+    TlsRuntimeOwner = nullptr;
+    TlsRuntimeStats = nullptr;
+  }
+  Close();
+}
 
 void KVStore::Open(bool reset) {
   constexpr uint32_t kAttachAttempts = 100;
@@ -337,15 +367,23 @@ void KVStore::ValidateKeyValue(std::string_view key, std::string_view value) con
     throw std::invalid_argument("key/value exceeds configured fixed size");
 }
 
+RuntimeStats &KVStore::ThreadRuntime() {
+  if (TlsRuntimeOwner == this && TlsRuntimeStats != nullptr) return *TlsRuntimeStats;
+  // Single-threaded API users are not required to call BindWorker. Multi-worker
+  // harnesses bind every worker and therefore never share this fallback slot.
+  return unbound_runtime_.stats;
+}
+
 Status KVStore::Put(std::string_view key, std::string_view value) {
   ForegroundLatencyScope latency_scope;
   impl_->engine->PollTransport();
   try { ValidateKeyValue(key, value); }
   catch (const std::exception &e) { return Status::Error(StatusCode::kInvalidArgument, e.what()); }
-  ++runtime_.logical_ops;
+  RuntimeStats &runtime = ThreadRuntime();
+  ++runtime.logical_ops;
   Status status = impl_->engine->Put(key, value);
-  if (status.ok()) { ++runtime_.commits; ++runtime_.private_puts; }
-  else ++runtime_.aborts;
+  if (status.ok()) { ++runtime.commits; ++runtime.private_puts; }
+  else ++runtime.aborts;
   return status;
 }
 
@@ -354,10 +392,11 @@ GetResult KVStore::Get(std::string_view key) {
   impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
-  ++runtime_.logical_ops;
+  RuntimeStats &runtime = ThreadRuntime();
+  ++runtime.logical_ops;
   GetResult result = impl_->engine->Get(key);
-  if (result.status.ok()) { ++runtime_.commits; ++runtime_.private_gets; }
-  else if (result.status.code != StatusCode::kNotFound) ++runtime_.aborts;
+  if (result.status.ok()) { ++runtime.commits; ++runtime.private_gets; }
+  else if (result.status.code != StatusCode::kNotFound) ++runtime.aborts;
   return result;
 }
 
@@ -366,19 +405,21 @@ Status KVStore::Delete(std::string_view key) {
   impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return Status::Error(StatusCode::kInvalidArgument, "invalid key");
-  ++runtime_.logical_ops;
+  RuntimeStats &runtime = ThreadRuntime();
+  ++runtime.logical_ops;
   Status status = impl_->engine->Delete(key);
-  if (status.ok()) { ++runtime_.commits; ++runtime_.private_deletes; }
-  else if (status.code != StatusCode::kNotFound) ++runtime_.aborts;
+  if (status.ok()) { ++runtime.commits; ++runtime.private_deletes; }
+  else if (status.code != StatusCode::kNotFound) ++runtime.aborts;
   return status;
 }
 
 Status KVStore::MoveOut(std::string_view key) {
   ForegroundLatencyScope latency_scope;
   impl_->engine->PollTransport();
-  ++runtime_.logical_ops;
+  RuntimeStats &runtime = ThreadRuntime();
+  ++runtime.logical_ops;
   Status status = impl_->engine->MoveOut(key);
-  if (status.ok()) { ++runtime_.commits; ++runtime_.migration_out; }
+  if (status.ok()) { ++runtime.commits; ++runtime.migration_out; }
   return status;
 }
 
@@ -387,10 +428,11 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
   impl_->engine->PollTransport();
   if (!config_.enable_scan)
     return {Status::Error(StatusCode::kInvalidArgument, "SCAN disabled"), {}};
-  ++runtime_.logical_ops;
+  RuntimeStats &runtime = ThreadRuntime();
+  ++runtime.logical_ops;
   ScanResult result = impl_->engine->Scan(start_key, limit);
-  if (result.status.ok()) ++runtime_.commits;
-  else ++runtime_.aborts;
+  if (result.status.ok()) ++runtime.commits;
+  else ++runtime.aborts;
   return result;
 }
 
@@ -400,10 +442,11 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
   impl_->engine->PollTransport();
   try { ValidateKeyValue(key, desired); }
   catch (const std::exception &e) { return {Status::Error(StatusCode::kInvalidArgument, e.what()), false}; }
-  ++runtime_.logical_ops;
+  RuntimeStats &runtime = ThreadRuntime();
+  ++runtime.logical_ops;
   CasResult result = impl_->engine->CompareExchange(key, expected, desired);
-  if (result.status.ok()) { ++runtime_.commits; ++runtime_.private_puts; }
-  else if (result.status.code == StatusCode::kCompareFailed) ++runtime_.aborts;
+  if (result.status.ok()) { ++runtime.commits; ++runtime.private_puts; }
+  else if (result.status.code == StatusCode::kCompareFailed) ++runtime.aborts;
   return result;
 }
 
@@ -412,10 +455,11 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   impl_->engine->PollTransport();
   if (key.empty() || key.size() > config_.fixed_key_size)
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), 0};
-  ++runtime_.logical_ops;
+  RuntimeStats &runtime = ThreadRuntime();
+  ++runtime.logical_ops;
   IncrementResult result = impl_->engine->Increment(key, delta);
-  if (result.status.ok()) { ++runtime_.commits; ++runtime_.private_puts; }
-  else ++runtime_.aborts;
+  if (result.status.ok()) { ++runtime.commits; ++runtime.private_puts; }
+  else ++runtime.aborts;
   return result;
 }
 
@@ -429,20 +473,27 @@ Status KVStore::PollTransport() {
 void KVStore::BindWorker(uint32_t worker_id) {
   if (impl_ == nullptr || impl_->engine == nullptr)
     throw std::runtime_error("BindWorker requires an open KVStore");
+  if (worker_id >= worker_runtime_.size())
+    throw std::invalid_argument("BindWorker worker_id exceeds foreground worker count");
   impl_->engine->BindWorker(worker_id);
+  TlsRuntimeOwner = this;
+  TlsRuntimeStats = &worker_runtime_[worker_id].stats;
 }
 
 Status KVStore::Checkpoint() {
   ForegroundLatencyScope latency_scope;
   Status status = impl_->engine->Checkpoint();
-  if (status.ok()) ++runtime_.checkpoint_swcc_flushes;
+  if (status.ok()) ++ThreadRuntime().checkpoint_swcc_flushes;
   return status;
 }
 
 MemoryStats KVStore::Memory() const { return impl_->engine->Memory(); }
 
 RuntimeStats KVStore::Runtime() const {
-  RuntimeStats stats = runtime_;
+  RuntimeStats stats;
+  AddRuntimeStats(&stats, unbound_runtime_.stats);
+  for (const WorkerRuntime &worker : worker_runtime_)
+    AddRuntimeStats(&stats, worker.stats);
   if (impl_ != nullptr && impl_->engine != nullptr) {
     const RuntimeStats engine = impl_->engine->EngineRuntime();
     stats.shared_gets += engine.shared_gets;
