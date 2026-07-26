@@ -6,8 +6,11 @@ zero; `SCAN` uses `LEN` as its limit. `e2e_trace_runner` reads one file per work
 through `TIGONKV_E2E_TRACE_FILE` and accepts the `TIGONKV_*` variables before the
 corresponding `CXLKV_*` compatibility variables.
 
-`prepare_ycsb_traces.sh` and `run_ycsb_workflows.sh` cover A/B/C/D and E by default;
-set `TIGONKV_YCSB_WORKLOADS="A B C D"` to omit E. The local workflow assigns worker
+`prepare_ycsb_traces.sh` generates A/B/C/D by default; set
+`TIGONKV_YCSB_WORKLOADS="A B C D E"` to generate E as well.
+`run_ycsb_workflows.sh` accepts A/B/C/D/E by default and therefore expects those
+directories to exist; set the same variable explicitly when using a smaller generated
+set. The local workflow assigns worker
 traces to logical node IDs round-robin and performs reset/load/clean attach/run in
 separate process invocations. It is a sequential shared-backing smoke, not a substitute
 for concurrent VM replay. Set `TIGONKV_E2E_CONCURRENT=1` to run worker processes in
@@ -64,7 +67,3 @@ TIGONKV_VM_COUNT=4 TIGONKV_E2E_THREADS=4 \
   /mnt/xz_vm_storage/tigon2-formal-20260718/multivm-e2e-rel-5rounds \
   5 '08 09'
 ```
-
-The explicit batch mode defers sorted SCAN-index construction until `rebuild`; this
-avoids O(n²) online insertion during bulk fill while preserving the sorted index
-before the read phase.

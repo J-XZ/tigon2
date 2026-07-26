@@ -13,8 +13,8 @@
   --record-count 10000 --operation-count 10000 --workloads a
 ```
 
-去掉 `--skip-trace-gen` 后会调用本仓 YCSB-cpp 生成 load/run trace。默认接受
-默认 workload 是 `a,b,c,d`；允许的封闭集合是 `a,b,c,d,e`。E 已通过
+去掉 `--skip-trace-gen` 后会调用本仓 YCSB-cpp 生成 load/run trace。默认
+workload 是 `a,b,c,d`；允许的封闭集合是 `a,b,c,d,e`。E 已通过
 Scan∥migration 与 OLC scan 专项验收，但仍需显式传 `--workloads a,b,c,d,e`。
 
 ## 实际回放
@@ -33,6 +33,10 @@ CSV、JSON 和报告。每个 workload 的 load/run 分开执行；计时只来�
 `E2E_THREAD_TOPOLOGY foreground=4 demuxer=1 kv_threads=5
 affinity=distinct_allowed_cpus`；demuxer 是原 Tigon IncomingDispatcher 同构
 接收线程，虽然不执行 KV 请求，仍计入 CPU 使用，不能只报告 4 个 worker。
+runner 编排主线程可按 `TIGONKV_E2E_TRACE_HEARTBEAT_SEC` 输出心跳；它不服务
+KV 请求，但会在 replay 期间低频读取每 256 ops 批量发布的 progress counter。
+汇总器忽略心跳行；这个并发控制线程及其受测期开销仍须披露。stage marker 由
+独立的 `TIGONKV_E2E_STAGE_MARKERS` 控制，不需要打开 verbose。
 
 正式 5M 对比须显式传入 `--record-count 5000000 --operation-count 5000000`
 和 `--shared-size-mb 65536 --no-latency`，并在 VM 授权、完整单测和所需多轮 e2e

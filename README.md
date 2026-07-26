@@ -46,7 +46,10 @@ ctest --test-dir build-relwithdebinfo --output-on-failure
 The maintained comparison targets are `tigonkv`, `e2e_trace_runner`, the focused
 unit-test binaries, and the guest E2E scripts. The legacy transaction benchmark
 sources remain as upstream reference material but are intentionally not linked
-into the TigonKV comparison build. See [当前对比口径.md](当前对比口径.md).
+into the TigonKV comparison build. Distributed Scan follows an owner range move-in
+then CXL-read path for remote owners rather than merging partial CXL and owner-RPC
+rows. Every reported VM uses `foreground=N + demuxer=1` KV threads. See
+[当前对比口径.md](当前对比口径.md).
 
 ## Claims
 By running the experiments, you should be able to reproduce the numbers shown in:

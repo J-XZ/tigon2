@@ -936,7 +936,7 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
 | 安全回收 | `CXL_EBR` 临界区 + retire 列表 | 原框架 + §4.1 free 接线 |
 | 分配器 | per-thread cache 无锁快路径 + shard 短自旋 | 4.1 |
 | 迁移策略元数据 | tracker 持锁（原 Policy* 内部锁），每 partition 独立 | 原实现 |
-| 统计 | per-thread TLS 计数，`DumpStats`/心跳时求和（唯一方案；**禁止**热路径对共享计数器 `fetch_add`，与延迟模拟器同纪律） | 新写 |
+| 统计 | KV runtime 统计按 worker 独占槽累加、`DumpStats` 时求和；心跳另用每 256 ops 批量发布的 progress atomic（禁止每 op 共享 `fetch_add`） | 新写 |
 
 **EBR 读侧（硬性；缺则回收不安全或永久泄漏）**：
 
@@ -1040,8 +1040,9 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
   每环 entry 数 = 环字节数/2048。禁止按"每对 1MB"另开 N² 环除非修改
   本节并重算预算。
 - 新消息编码 `kv/engine/kv_messages.h`（借用 `common/Message.h` 帧格式）：
-  `PUT_FWD / GET_MISS / DELETE_FWD / CAS_FWD / INCR_FWD / SCAN_REQ` 及响应、
-  `MOVEIN_DONE`。payload 定长 key + 可选 value。
+  `PUT_FWD / GET_MISS / DELETE_FWD / CAS_FWD / INCR_FWD /
+  SCAN_MIGRATE` 及统一响应。payload 定长 key + 可选 value/limit；
+  点查 move-in 通过统一响应状态表达。
 - 每 VM 一个原 Tigon `IncomingDispatcher` 同构 demuxer 独占本机入环
   `recv`，只发布 response/scan 通知或把请求批量入共享 deferred FIFO；
   `foreground_worker_count_per_vm` 个 worker 在操作间隙批量 pop 并执行请求。
@@ -1091,22 +1092,21 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
   **禁止**留永久 tombstone 壳驻留私有树/arena）；若未迁移：从私有树摘除并
   arena 回收。非 owner：**始终 `DELETE_FWD`**，即使 shared 命中（§3.3）。
   删除完成后该 key 回到 EMPTY（可被重新 PUT）。
-- **SCAN(start, limit)**（§1.5.3；抗迁移竞态）：
-  1. 请求方向全部 partition owner 发 `SCAN_REQ(start, limit)`（唯一交付
-     实现；**不实现**"本地 shared 就地收集"优化分支——删除该活口以控制
-     新增代码与测试面）。
-  2. owner **抗漏键算法（规范）**：记录 `(migration_in_seq, migration_out_seq)`
-     → scan 私有树（跳过 `is_migrated`/tombstone，私有值直接读）→ scan
-     shared 树（每行 `prepare_read`/`do_read`，跳过 invalid/tombstone）→
-     本地归并去重 → 若扫描期间 migration 计数变化则**整段重试**（≤ **8**
-     次，超限 hard fail）。保证并发 move-in/out 下，结果是某一线性化点上的键
-     序前缀，**不得漏键**；去重只防双发。
-  3. 请求方 k 路归并取全局前 `limit`：**流式堆归并、凑满 `limit` 即早
-     停**（`SCAN_REQ` 携带 `limit`，owner 每 partition 也最多返回
-     `limit` 条），不物化各 owner 全量结果；`limit==0` 语义与 cxlkv 相同
-     =**不限制**；另加**本仓安全上限** 1,048,576 条（超出 hard fail；
-     **非** cxlkv 合同——正式 Scan/E 公平对比须用 trace 内显式非零
-     `limit`，或在报告声明此分歧），禁止无限缓冲。
+- **SCAN(start, limit)**（§1.5.3；恢复原 TwoPLPasha range move-in 形态）：
+  1. 本地 owner 扫描 private locator tree。locator 在 move-in 后仍保留；
+     每行持 PrivateRow 锁判 `is_migrated`，未迁移值从 private SWCC 读取，
+     已迁移值跟随 `migrated_smeta_off` 并按 SCC 读取。这样只有一个 owner
+     locator 流，不需要把 private/shared 两棵树作为并列权威源归并。
+  2. 每个远端 owner 收到 `SCAN_MIGRATE(start, page_limit)` 后，从同一 owner
+     locator 流选出请求前缀，将其中未迁移行 move-in，并对前缀内 shared
+     metadata 持 pin；owner 只回复状态，不传回行。requester 收到成功响应后，
+     从该 owner 的 shared CXL tree 执行 `ScanSharedPinned`，按 SCC 读取并逐行
+     unpin。禁止在一次结果中混合不完整 CXL seed 与 owner RPC 行。
+  3. requester 对本地 owner 流和各远端 CXL 流做分页 k 路堆归并；每页最多
+     64 条，续页从上一 key 重新执行对应的 owner range move-in/CXL read，
+     凑满全局 `limit` 即早停。`limit==0` 与 cxlkv 相同表示不限制，但本仓仍有
+     **1,048,576** 条安全上限（非 cxlkv 合同；正式对比应使用 trace 中显式
+     非零 limit 或声明差异）。
   4. 正确性优先；若 Scan 验收未通过，按 §1.5.2 标记 `ycsb_e=unsupported`
      （脚本对含 `e` 硬失败），**不得假跑**；但 §6.1 Scan∥migration 单测仍
      为强制（与是否宣称 E 支持解耦）。
@@ -1635,7 +1635,7 @@ HWCC=1024MB；共享池按正式覆盖 64G；随 `ops_per_sec` 并列报告
 | Put 合同 | load/run 均为 upsert（与 cxlkv 相同；禁止 load 重复 key hard fail） |
 | 内存归类 | `unclassified_shared_bytes==0`；无未计预算的 DRAM 全量镜像 |
 | 根配置互换 | cxlkv-only 键 ignore；Tigon 专用键在 `tigon_kv`（§1.6.1 全集） |
-| CPU 预算 | 报告 foreground workers；对照 cxlkv 前台 + merge 池（e2e_08 leader 另有 4 aux 线程）；本系统默认无专职 merge/转发线程，轮询计入同一 worker 预算并声明 |
+| CPU 预算 | 每 VM 报告 `foreground=N + demuxer=1` 并分核绑定；对照 cxlkv 前台 + merge 池（e2e_08 leader 另有 4 aux 线程）；本系统无专职 merge/转发 service，deferred service 计入 foreground；runner 编排主线程不执行 KV，但启用低频心跳时在 replay 期间并发运行，也必须披露 |
 | host tuning / check | host tuning 默认应用（与 cxlkv 同款；`--skip-host-tuning` 可只检查）；`check_vms`+`numa_maps` 为本仓增强 |
 | 独立仓 | §0.3 |
 
