@@ -403,6 +403,15 @@ void LatencySimulator::BeginIsolatedScope(ScopeKind scope) {
   state.pending_delay_ns = 0;
 }
 
+void LatencySimulator::DelayActiveScopeNow() {
+  if (!g_instrumentation_enabled.load(std::memory_order_relaxed)) return;
+  ThreadState &state = StateFor(this, config_, generation_);
+  if (state.active != this) return;
+  const uint64_t delay_ns = state.pending_delay_ns;
+  state.pending_delay_ns = 0;
+  DelaySpinNs(delay_ns);
+}
+
 void LatencySimulator::DelayIsolatedScopeNow() {
   if (!g_instrumentation_enabled.load(std::memory_order_relaxed)) return;
   ThreadState &state = StateFor(this, config_, generation_);

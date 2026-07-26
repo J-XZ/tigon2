@@ -45,6 +45,11 @@ inline void DelayIsolatedScopeNow() {
     latency_sim::GlobalLatencySimulator().DelayIsolatedScopeNow();
 }
 
+inline void DelayActiveScopeNow() {
+  if (latency_sim::InstrumentationEnabledFast())
+    latency_sim::GlobalLatencySimulator().DelayActiveScopeNow();
+}
+
 inline void Record(latency_sim::PoolKind pool, latency_sim::AccessKind kind,
                    const void *address, size_t bytes) {
   if (latency_sim::InstrumentationEnabledFast())

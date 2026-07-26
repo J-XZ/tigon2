@@ -64,6 +64,21 @@ int main() {
 
   simulator.Configure(BaseConfig());
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  simulator.RecordLine(latency_sim::PoolKind::kHwcc,
+                       latency_sim::AccessKind::kWrite,
+                       reinterpret_cast<void *>(0x2100));
+  assert(simulator.PendingDelayNsForTest() == 50);
+  simulator.DelayActiveScopeNow();
+  assert(simulator.PendingDelayNsForTest() == 0);
+  simulator.RecordLine(latency_sim::PoolKind::kHwcc,
+                       latency_sim::AccessKind::kAtomicStore,
+                       reinterpret_cast<void *>(0x2100));
+  assert(simulator.PendingDelayNsForTest() == 70);
+  simulator.EndScopeAndDelay();
+  simulator.TakeStatsAndReset();
+
+  simulator.Configure(BaseConfig());
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   simulator.RecordLine(latency_sim::PoolKind::kSwcc,
                        latency_sim::AccessKind::kRead,
                        reinterpret_cast<void *>(0x5000));

@@ -134,6 +134,9 @@ class MPSCRingBuffer {
 
                 /* mark the entry as ready */
                 tigonkv::engine::mem_access::HwccAtomicStore(&entry->is_ready);
+                // All prior ring/data access latency must be causal: settle it
+                // before the release store makes this frame visible.
+                tigonkv::engine::mem_access::DelayActiveScopeNow();
                 entry->is_ready.store(1, std::memory_order_release);
 
                 return true;

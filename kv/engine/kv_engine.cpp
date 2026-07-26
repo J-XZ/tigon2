@@ -955,6 +955,9 @@ void KVEngine::InboundDemuxerLoop() {
           } catch (...) {
             TransportFatal(config_.node_id, "ring_recv", "non-std exception");
           }
+          // recv has already recorded all inbound HWCC accesses. Pay them
+          // before publishing a response notification or deferred request.
+          mem_access::DelayActiveScopeNow();
           if (received == 0) break;
           if (received != sizeof(KvMessage))
             TransportFatal(config_.node_id, "ring_recv",
