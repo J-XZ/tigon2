@@ -687,12 +687,22 @@ MemoryStats KVEngine::Memory() const {
   for (size_t domain = 0; domain < static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc);
        ++domain)
     stats.logical_hwcc_used_bytes += layout.domains[domain].used_bytes.load(std::memory_order_relaxed);
+  stats.physical_hwcc_used_bytes = stats.logical_hwcc_used_bytes;
   stats.owner_private_swcc_used_bytes = layout.domains[static_cast<size_t>(
       AllocationDomain::kOwnerPrivateSwcc)].used_bytes.load(std::memory_order_relaxed);
   stats.shared_payload_swcc_used_bytes = layout.domains[static_cast<size_t>(
       AllocationDomain::kSharedPayloadSwcc)].used_bytes.load(std::memory_order_relaxed);
-  stats.allocator_shared_overhead_bytes = layout.domains[static_cast<size_t>(
-      AllocationDomain::kAllocatorMetadata)].used_bytes.load(std::memory_order_relaxed);
+  stats.allocator_hwcc_metadata_bytes = layout.domains[static_cast<size_t>(
+      AllocationDomain::kHwccAllocatorMetadata)].used_bytes.load(std::memory_order_relaxed);
+  stats.allocator_swcc_metadata_bytes = layout.domains[static_cast<size_t>(
+      AllocationDomain::kSwccAllocatorMetadata)].used_bytes.load(std::memory_order_relaxed);
+  stats.allocator_shared_overhead_bytes =
+      stats.allocator_hwcc_metadata_bytes +
+      stats.allocator_swcc_metadata_bytes;
+  stats.physical_swcc_used_bytes =
+      stats.owner_private_swcc_used_bytes +
+      stats.shared_payload_swcc_used_bytes +
+      stats.allocator_swcc_metadata_bytes;
   for (const auto &partition : partitions_)
     stats.active_shared_rows += partition->migrated_key_count();
   stats.rss_kb = CurrentRssKb();

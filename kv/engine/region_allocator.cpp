@@ -404,9 +404,13 @@ bool DualRegionAllocator::IsHwccDomain(AllocationDomain domain) {
       return true;
     case AllocationDomain::kOwnerPrivateSwcc:
     case AllocationDomain::kSharedPayloadSwcc:
-    case AllocationDomain::kAllocatorMetadata:
-    case AllocationDomain::kCount:
       return false;
+    // Fixed accounting labels: allocator headers are initialized in place and
+    // must never be requested through the dynamic allocation API.
+    case AllocationDomain::kHwccAllocatorMetadata:
+    case AllocationDomain::kSwccAllocatorMetadata:
+    case AllocationDomain::kCount:
+      throw std::invalid_argument("non-allocatable allocation domain");
   }
   throw std::invalid_argument("invalid allocation domain");
 }
@@ -498,9 +502,10 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   const uint64_t arena_header_bytes =
       ((sizeof(OwnerPrivateArenaHeader) + RegionAllocator::kAlignment - 1) &
        ~(RegionAllocator::kAlignment - 1)) * config.partition_count;
-  set_fixed_domain(AllocationDomain::kAllocatorMetadata,
-                   hwcc.metadata_bytes() + swcc.metadata_bytes() +
-                       arena_header_bytes);
+  set_fixed_domain(AllocationDomain::kHwccAllocatorMetadata,
+                   hwcc.metadata_bytes());
+  set_fixed_domain(AllocationDomain::kSwccAllocatorMetadata,
+                   swcc.metadata_bytes() + arena_header_bytes);
   // Remain kInitializing until KVEngine publishes transport, EBR and all
   // partition roots.  Publishing here allowed peers to attach to half-built
   // state.

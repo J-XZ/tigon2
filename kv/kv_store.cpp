@@ -571,8 +571,12 @@ std::string KVStore::DumpStats() const {
   out += "logical_hwcc_capacity_bytes=" + std::to_string(memory.logical_hwcc_capacity_bytes) + "\n";
   out += "logical_swcc_capacity_bytes=" + std::to_string(memory.logical_swcc_capacity_bytes) + "\n";
   out += "logical_hwcc_used_bytes=" + std::to_string(memory.logical_hwcc_used_bytes) + "\n";
+  out += "physical_hwcc_used_bytes=" + std::to_string(memory.physical_hwcc_used_bytes) + "\n";
+  out += "physical_swcc_used_bytes=" + std::to_string(memory.physical_swcc_used_bytes) + "\n";
   out += "owner_private_swcc_used_bytes=" + std::to_string(memory.owner_private_swcc_used_bytes) + "\n";
   out += "shared_payload_swcc_used_bytes=" + std::to_string(memory.shared_payload_swcc_used_bytes) + "\n";
+  out += "allocator_hwcc_metadata_bytes=" + std::to_string(memory.allocator_hwcc_metadata_bytes) + "\n";
+  out += "allocator_swcc_metadata_bytes=" + std::to_string(memory.allocator_swcc_metadata_bytes) + "\n";
   out += "allocator_shared_overhead_bytes=" + std::to_string(memory.allocator_shared_overhead_bytes) + "\n";
   out += "allocator_local_dram_bytes=" + std::to_string(memory.allocator_local_dram_bytes) + "\n";
   out += "unclassified_shared_bytes=" + std::to_string(memory.unclassified_shared_bytes) + "\n";

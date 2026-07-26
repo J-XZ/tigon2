@@ -79,8 +79,12 @@ struct MemoryStats {
   uint64_t logical_hwcc_capacity_bytes = 0;
   uint64_t logical_swcc_capacity_bytes = 0;
   uint64_t logical_hwcc_used_bytes = 0;
+  uint64_t physical_hwcc_used_bytes = 0;
+  uint64_t physical_swcc_used_bytes = 0;
   uint64_t owner_private_swcc_used_bytes = 0;
   uint64_t shared_payload_swcc_used_bytes = 0;
+  uint64_t allocator_hwcc_metadata_bytes = 0;
+  uint64_t allocator_swcc_metadata_bytes = 0;
   uint64_t allocator_shared_overhead_bytes = 0;
   uint64_t allocator_local_dram_bytes = 0;
   uint64_t unclassified_shared_bytes = 0;

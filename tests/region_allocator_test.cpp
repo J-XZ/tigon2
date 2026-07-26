@@ -176,13 +176,37 @@ void TestDualPhysicalRegions() {
   assert(dual.layout().owner_migration_hwcc[1].used_bytes.load() > 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccLayout)]
              .used_bytes.load() > 0);
-  assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kAllocatorMetadata)]
-             .used_bytes.load() > 0);
+  const uint64_t hwcc_allocator_metadata =
+      dual.layout().domains[static_cast<size_t>(
+          AllocationDomain::kHwccAllocatorMetadata)].used_bytes.load();
+  const uint64_t swcc_allocator_metadata =
+      dual.layout().domains[static_cast<size_t>(
+          AllocationDomain::kSwccAllocatorMetadata)].used_bytes.load();
+  assert(hwcc_allocator_metadata == dual.hwcc().metadata_bytes());
+  const uint64_t arena_header_bytes =
+      ((sizeof(OwnerPrivateArenaHeader) + RegionAllocator::kAlignment - 1) &
+       ~(RegionAllocator::kAlignment - 1)) * config.partition_count;
+  assert(swcc_allocator_metadata ==
+         dual.swcc().metadata_bytes() + arena_header_bytes);
   dual.PublishReady();
   assert(dual.layout().state.load(std::memory_order_acquire) ==
          static_cast<uint32_t>(LayoutState::kDirty));
   auto attached = DualRegionAllocator::Attach(mapping.base, config);
   assert(attached.IsHwccAddress(index) && attached.IsSwccAddress(payload));
+  assert(attached.layout().domains[static_cast<size_t>(
+             AllocationDomain::kHwccAllocatorMetadata)].used_bytes.load() ==
+         hwcc_allocator_metadata);
+  assert(attached.layout().domains[static_cast<size_t>(
+             AllocationDomain::kSwccAllocatorMetadata)].used_bytes.load() ==
+         swcc_allocator_metadata);
+  bool fixed_domain_rejected = false;
+  try {
+    (void)attached.Allocate(
+        64, AllocationDomain::kHwccAllocatorMetadata, 0);
+  } catch (const std::invalid_argument &) {
+    fixed_domain_rejected = true;
+  }
+  assert(fixed_domain_rejected);
   attached.Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 1);
   void *reused_remote =
       dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 0);

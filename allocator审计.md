@@ -25,7 +25,7 @@ TigonKV 不使用 `dependencies/cxlalloc/libcxlalloc_static.a` 作为最终共�
 | 能力 | 验证目标 |
 |---|---|
 | attach | 同一 mmap 文件在独立进程重新映射后 offset 可恢复 |
-| 分域 | HWCC、owner-private SWCC、shared-payload SWCC 均有独立 used/peak 统计 |
+| 分域 | HWCC 动态域、owner-private/shared-payload SWCC 及两池 allocator metadata 均独立记账 |
 | 回收 | 本地及 remote free 可复用，owner-shard 不匹配 hard fail |
 | 可见性 | SWCC 链发布在 flush/fence 后对远端可见 |
 | 有界性 | 每线程 size-class TLS cache（容量 32，miss 时批量 refill）有固定上限；进程 DRAM 不随 KV 数线性增长 |
@@ -33,3 +33,8 @@ TigonKV 不使用 `dependencies/cxlalloc/libcxlalloc_static.a` 作为最终共�
 `region_allocator_test` 与 allocator 能力测试覆盖 attach、域记账、remote free、
 reuse、并发及跨域拒绝；最近一次 RelWithDebInfo 全量 CTest 为 27/27 通过。真实多
 VM/NUMA 实机验收仍待获得运行授权。
+
+固定会计不与动态 block 重复：HWCC allocator header 归
+`kHwccAllocatorMetadata`；SWCC allocator header 加实际 arena header 总和归
+`kSwccAllocatorMetadata`。物理池 used 分别是该池固定域与动态域之和，组合
+allocator overhead 仅为二者相加，`unclassified_shared_bytes` 保持为零。

@@ -142,7 +142,21 @@ int main() {
   assert(runtime.private_puts == 204);
   assert(runtime.private_gets == 201);
   assert(store->Checkpoint().ok());
-  assert(store->Memory().physical_region_split);
+  const MemoryStats memory = store->Memory();
+  assert(memory.physical_region_split);
+  assert(memory.physical_hwcc_used_bytes == memory.logical_hwcc_used_bytes);
+  assert(memory.physical_swcc_used_bytes ==
+         memory.owner_private_swcc_used_bytes +
+             memory.shared_payload_swcc_used_bytes +
+             memory.allocator_swcc_metadata_bytes);
+  assert(memory.allocator_shared_overhead_bytes ==
+         memory.allocator_hwcc_metadata_bytes +
+             memory.allocator_swcc_metadata_bytes);
+  assert(memory.physical_hwcc_used_bytes <=
+         memory.logical_hwcc_capacity_bytes);
+  assert(memory.physical_swcc_used_bytes <=
+         memory.logical_swcc_capacity_bytes);
+  assert(memory.unclassified_shared_bytes == 0);
   const std::string stats = store->DumpStats();
   assert(stats.find("allocator_shared_overhead_bytes=") != std::string::npos);
   assert(stats.find("reclaimed_total_bytes=") != std::string::npos);
