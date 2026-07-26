@@ -12,6 +12,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <fcntl.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -234,8 +235,9 @@ int main() {
       assert(engine->Put(key, "bulk").ok());
       ++remote_scan_rows;
     }
-    // Populate one remote partition past a Scan page boundary. The owner pins
-    // each authoritative prefix; the requester reads it only through CXL.
+    // Populate one remote partition past a Scan page boundary. The owner
+    // moves each authoritative prefix in without a persistent pin; the
+    // requester reads it only through CXL.
     std::vector<std::string> promoted_scan_keys;
     uint32_t promoted_partition = UINT32_MAX;
     for (uint32_t i = 0; promoted_scan_keys.size() < 130; ++i) {
@@ -248,9 +250,12 @@ int main() {
       assert(engine->Put(key, "owner-authority").ok());
       promoted_scan_keys.emplace_back(key);
     }
+    int scan_ready[2];
+    assert(pipe2(scan_ready, O_CLOEXEC | O_NONBLOCK) == 0);
     const pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
+      close(scan_ready[0]);
       auto node_one = tigonkv::engine::KVEngine::Open(node_one_config, false);
       if (!node_one->Put(owner_one_key, "owner-one").ok()) _exit(1);
       for (const auto &key : promoted_scan_keys) {
@@ -270,6 +275,7 @@ int main() {
       // One range-migrate request plus one cursor range-migrate request. Values
       // travel through CXL, so the requester sends only range-migration frames.
       if (authoritative_scan_tx != 2 * sizeof(tigonkv::engine::KvMessage)) _exit(17);
+      if (write(scan_ready[1], "s", 1) != 1) _exit(28);
 
       std::atomic<bool> start_concurrent_scans{false};
       std::atomic<bool> concurrent_scan_failed{false};
@@ -375,16 +381,33 @@ int main() {
       if (cas_winners.load() != 1 || cas_protocol_failed.load()) _exit(27);
       if (!node_one->Delete(owner_zero_key).ok()) _exit(9);
       if (node_one->Get(owner_zero_key).status.code != tigonkv::StatusCode::kNotFound) _exit(10);
+      close(scan_ready[1]);
       _exit(0);
     }
+    close(scan_ready[1]);
     int status = 0;
+    bool concurrent_scan_started = false;
+    uint32_t removals_during_scan = 0;
+    size_t removal_key = 0;
     for (;;) {
       engine->PollTransport();
+      if (!concurrent_scan_started) {
+        char marker = 0;
+        concurrent_scan_started = read(scan_ready[0], &marker, 1) == 1;
+      }
+      if (concurrent_scan_started && removals_during_scan < 4) {
+        const auto moved =
+            engine->MoveOut(promoted_scan_keys[removal_key]);
+        removal_key = (removal_key + 1) % promoted_scan_keys.size();
+        if (moved.ok()) ++removals_during_scan;
+      }
       const pid_t done = waitpid(child, &status, WNOHANG);
       if (done == child) break;
       assert(done == 0);
     }
+    close(scan_ready[0]);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(removals_during_scan > 0);
     assert(engine->NetworkTxBytes() > 0 && engine->NetworkRxBytes() > 0);
     const auto engine_runtime = engine->EngineRuntime();
     assert(engine_runtime.migration_in > 0);

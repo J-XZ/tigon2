@@ -23,8 +23,8 @@ enum class KvMessageType : uint8_t {
   // Owner-only move_row_in (TwoPLPasha DATA_MIGRATION_*). No value payload;
   // requester retries CXL Shared after a successful ack.
   kMigrate = 11,
-  // Owner promotes and pins a complete range prefix; requester reads it only
-  // through the shared CXL tree.
+  // Owner moves a complete range prefix into CXL without returning values;
+  // response carries the owner shared-removal snapshot for validation.
   kScanMigrate = 12,
 };
 

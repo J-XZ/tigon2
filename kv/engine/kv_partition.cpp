@@ -4,9 +4,11 @@
 
 #include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -759,6 +761,8 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
     UnlockRow(row);
     return false;
   }
+  // Keep removal state active until the row and root changes are published.
+  SharedRemovalGuard removal(*this);
   star::scc_manager->prepare_read(smeta, host_id, payload, value_len);
   if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index)) {
     smeta->clear_write_locked();
@@ -800,8 +804,6 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
                           star::CXLMemory::DATA_FREE, owner_shard_);
   UnlockRow(row);
   PersistRoots();
-  mem_access::HwccAtomicRmw(&directory_.migration_out_seq);
-  directory_.migration_out_seq.fetch_add(1, std::memory_order_relaxed);
   star::num_data_move_out.fetch_add(1, std::memory_order_relaxed);
   KvMigrationRuntime::SyncHwCcUsage(*this);
   return true;
@@ -877,33 +879,45 @@ bool KVPartition::ScanOwned(
   return true;
 }
 
-StatusCode KVPartition::PrepareSharedScan(
-    std::string_view start_key, uint64_t limit, uint32_t host_id,
-    std::vector<star::TwoPLPashaMetadataShared *> *pinned,
-    const std::function<void()> *progress) {
-  if (pinned == nullptr) return StatusCode::kInvalidArgument;
-  std::vector<std::pair<std::string, std::string>> rows;
-  if (!ScanOwned(start_key, limit, &rows, progress)) {
-    for (auto *entry : *pinned)
-      star::TwoPLPashaHelper::kv_unpin_shared_ref(entry);
-    pinned->clear();
-    return StatusCode::kCorruption;
-  }
-  for (const auto &row : rows) {
-    star::TwoPLPashaMetadataShared *smeta = nullptr;
-    PromotePrivate(row.first, host_id, &smeta);
-    if (smeta == nullptr) {
-      for (auto *entry : *pinned)
-        star::TwoPLPashaHelper::kv_unpin_shared_ref(entry);
-      pinned->clear();
-      return StatusCode::kOutOfMemory;
+bool KVPartition::ScanOwnedKeys(
+    std::string_view start_key, uint64_t limit,
+    std::vector<std::string> *keys,
+    const std::function<void()> *progress) const {
+  EnterEbr();
+  if (keys == nullptr) throw std::invalid_argument("null partition key scan output");
+  FixedKey high{};
+  std::memset(high.bytes, 0xff, sizeof(high.bytes));
+  keys->clear();
+  FixedKey low = MakeKey(start_key);
+  bool left_inclusive = true;
+  for (;;) {
+    if (limit != 0 && keys->size() >= limit) break;
+    const uint64_t remaining =
+        limit == 0 ? 0 : static_cast<uint64_t>(limit - keys->size());
+    const uint32_t fetch =
+        remaining > std::numeric_limits<uint32_t>::max()
+            ? 0
+            : static_cast<uint32_t>(remaining);
+    std::vector<PrivateTree::KeyValuePair> rows;
+    private_tree_->scan(low, high, left_inclusive, true, fetch, rows);
+    if (rows.empty()) break;
+    for (const auto &entry : rows) {
+      auto *row = RowFromOffset(entry.second);
+      LockRow(row);
+      RecordPrivateRowStateRead(row);
+      if (!row->is_tombstone) keys->push_back(KeyString(entry.first));
+      UnlockRow(row);
+      if (limit != 0 && keys->size() >= limit) break;
     }
-    pinned->push_back(smeta);
+    if (progress != nullptr) (*progress)();
+    if (limit == 0 || keys->size() >= limit || rows.size() < fetch) break;
+    low = rows.back().first;
+    left_inclusive = false;
   }
-  return StatusCode::kOk;
+  return true;
 }
 
-bool KVPartition::ScanSharedPinned(
+bool KVPartition::ScanShared(
     std::string_view start_key, uint64_t limit,
     std::vector<std::pair<std::string, std::string>> *items) const {
   EnterEbr();
@@ -930,8 +944,6 @@ bool KVPartition::ScanSharedPinned(
           smeta, owner_shard_, value.data(), value.size(), &value_len);
       if (!read) std::this_thread::yield();
     }
-    // PrepareSharedScan owns one pin for every row in this exact prefix.
-    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     if (!read) {
       complete = false;
       continue;
@@ -940,6 +952,27 @@ bool KVPartition::ScanSharedPinned(
     items->emplace_back(KeyString(entry.first), std::move(value));
   }
   return complete;
+}
+
+uint64_t KVPartition::SharedRemovalState() const {
+  mem_access::HwccAtomicLoad(&directory_.shared_removal_state);
+  return directory_.shared_removal_state.load(std::memory_order_acquire);
+}
+
+void KVPartition::BeginSharedRemoval() {
+  mem_access::HwccAtomicRmw(&directory_.shared_removal_state);
+  const uint64_t previous =
+      directory_.shared_removal_state.fetch_add(1, std::memory_order_acq_rel);
+  if (static_cast<uint32_t>(previous) == std::numeric_limits<uint32_t>::max())
+    std::abort();
+}
+
+void KVPartition::EndSharedRemoval() {
+  constexpr uint64_t kCompleteOneRemoval = (uint64_t{1} << 32) - 1;
+  mem_access::HwccAtomicRmw(&directory_.shared_removal_state);
+  const uint64_t previous = directory_.shared_removal_state.fetch_add(
+      kCompleteOneRemoval, std::memory_order_release);
+  if (static_cast<uint32_t>(previous) == 0) std::abort();
 }
 
 bool KVPartition::DeletePrivate(std::string_view key) {
@@ -961,6 +994,7 @@ bool KVPartition::DeletePrivate(std::string_view key) {
     const uint64_t row_bytes =
         sizeof(PrivateRow) + regions_.layout().fixed_key_size +
         regions_.layout().fixed_value_size;
+    std::optional<SharedRemovalGuard> removal;
     if (row->is_migrated) {
       const RegionOffset smeta_offset = row->migrated_smeta_off;
       RegionOffset indexed = kNullOffset;
@@ -989,6 +1023,7 @@ bool KVPartition::DeletePrivate(std::string_view key) {
         std::this_thread::yield();
         continue;
       }
+      removal.emplace(*this);
       smeta->set_write_locked();
       smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
       if (!shared_tree_->remove(fixed_key)) {

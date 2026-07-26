@@ -118,6 +118,10 @@ int main() {
   std::vector<std::pair<std::string, std::string>> latency_scan;
   assert(partition.ScanOwned("latency-only", 1, &latency_scan));
   assert(latency_scan.size() == 1 && latency_scan[0].second == "payload");
+  std::vector<std::string> latency_scan_keys;
+  assert(partition.ScanOwnedKeys("latency-only", 1, &latency_scan_keys));
+  assert(latency_scan_keys.size() == 1 &&
+         latency_scan_keys[0] == "latency-only");
   simulator.EndScopeAndDelay();
   auto latency_stats = simulator.TakeStatsAndReset();
   assert(latency_stats.swcc_raw_line_accesses > 0);
@@ -127,12 +131,13 @@ int main() {
   simulator.EndScopeAndDelay();
   latency_stats = simulator.TakeStatsAndReset();
   assert(latency_stats.swcc_raw_line_accesses > 0);
+  assert(latency_stats.hwcc_raw_line_accesses > 0);
   simulator.Configure(latency_sim::Config{});
   assert(partition.DeletePrivate("latency-only"));
   const uint64_t migration_in_before_alpha =
       regions.layout().partitions[5].migration_in_seq.load();
-  const uint64_t migration_out_before_alpha =
-      regions.layout().partitions[5].migration_out_seq.load();
+  const uint64_t removal_before_alpha =
+      regions.layout().partitions[5].shared_removal_state.load();
   assert(partition.PromotePrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   // Once migrated, PUT must update the shared SCC authority rather than the
@@ -147,13 +152,20 @@ int main() {
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load();
   assert(partition.MoveOutPrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
-  assert(regions.layout().partitions[5].migration_out_seq.load() ==
-         migration_out_before_alpha + 1);
+  assert(regions.layout().partitions[5].shared_removal_state.load() ==
+         removal_before_alpha + (uint64_t{1} << 32));
   assert(ebr.drain_quiescent() > 0);
   assert(regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load() < hwcc_before_moveout);
   assert(regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load() < swcc_before_moveout);
+  assert(partition.PutPrivate("delete-shared", "value"));
+  assert(partition.PromotePrivate("delete-shared", 1));
+  const uint64_t removal_before_delete =
+      regions.layout().partitions[5].shared_removal_state.load();
+  assert(partition.DeletePrivate("delete-shared"));
+  assert(regions.layout().partitions[5].shared_removal_state.load() ==
+         removal_before_delete + (uint64_t{1} << 32));
   star::scc_manager = nullptr;
   assert(partition.DeletePrivate("beta"));
   assert(!partition.GetPrivate("beta", &value));
@@ -257,15 +269,16 @@ int main() {
   assert(scan.size() == 2);
   assert(scan[0].first == "alpha" && scan[1].first == "clock");
 
-  // Range migration pins the exact authoritative prefix until the requester
-  // consumes the same prefix from CXL, matching TwoPLPasha scan move-in.
-  std::vector<star::TwoPLPashaMetadataShared *> scan_pins;
-  assert(partition.PrepareSharedScan("alpha", 2, 1, &scan_pins) ==
-         tigonkv::StatusCode::kOk);
-  assert(scan_pins.size() == 2);
-  assert(!partition.MoveOutPrivate("alpha", 1));
+  // Original TwoPLPasha range migration first walks owner locators without
+  // reading values, then move_row_in(..., inc_ref=false). The requester reads
+  // values only from CXL.
+  std::vector<std::string> scan_keys;
+  assert(partition.ScanOwnedKeys("alpha", 2, &scan_keys));
+  assert(scan_keys.size() == 2);
+  for (const auto &key : scan_keys)
+    assert(partition.EnsureInShared(key, 1) == tigonkv::StatusCode::kOk);
   std::vector<std::pair<std::string, std::string>> shared_scan;
-  assert(partition.ScanSharedPinned("alpha", 2, &shared_scan));
+  assert(partition.ScanShared("alpha", 2, &shared_scan));
   assert(shared_scan == scan);
   assert(partition.MoveOutPrivate("alpha", 1));
 

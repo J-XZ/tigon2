@@ -75,16 +75,16 @@ class KVPartition {
   bool ScanOwned(std::string_view start_key, uint64_t limit,
                  std::vector<std::pair<std::string, std::string>> *items,
                  const std::function<void()> *progress = nullptr) const;
-  // Original TwoPLPasha range-migration analogue. The owner promotes and pins
-  // the requested private prefix; the requester subsequently consumes that
-  // single authoritative prefix through ScanSharedPinned.
-  StatusCode PrepareSharedScan(
-      std::string_view start_key, uint64_t limit, uint32_t host_id,
-      std::vector<star::TwoPLPashaMetadataShared *> *pinned,
-      const std::function<void()> *progress = nullptr);
-  bool ScanSharedPinned(
+  // Key-only owner locator walk used by TwoPLPasha-style range move-in. It
+  // deliberately avoids reading values that the requester will read via CXL.
+  bool ScanOwnedKeys(
+      std::string_view start_key, uint64_t limit,
+      std::vector<std::string> *keys,
+      const std::function<void()> *progress = nullptr) const;
+  bool ScanShared(
       std::string_view start_key, uint64_t limit,
       std::vector<std::pair<std::string, std::string>> *items) const;
+  uint64_t SharedRemovalState() const;
   // Invokes PolicyClock::move_row_out for this partition.
   bool MoveOutClockVictim(uint32_t host_id);
   // Rebuild DRAM Clock tracker entries from the shared tree after attach.
@@ -120,6 +120,21 @@ class KVPartition {
   // access (replaces the old non-owner PrivateRow LockRow quiescence window).
   bool TryPinShared(const FixedKey &key, star::TwoPLPashaMetadataShared **smeta,
                     RegionOffset *smeta_offset) const;
+  void BeginSharedRemoval();
+  void EndSharedRemoval();
+  class SharedRemovalGuard {
+   public:
+    explicit SharedRemovalGuard(KVPartition &partition)
+        : partition_(partition) {
+      partition_.BeginSharedRemoval();
+    }
+    ~SharedRemovalGuard() { partition_.EndSharedRemoval(); }
+    SharedRemovalGuard(const SharedRemovalGuard &) = delete;
+    SharedRemovalGuard &operator=(const SharedRemovalGuard &) = delete;
+
+   private:
+    KVPartition &partition_;
+  };
 
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;

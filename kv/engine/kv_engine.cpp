@@ -56,6 +56,10 @@ uint64_t CurrentRssKb() {
   return page_size > 0 ? resident * static_cast<uint64_t>(page_size) / 1024 : 0;
 }
 
+bool SharedRemovalSnapshotIdle(uint64_t state) {
+  return static_cast<uint32_t>(state) == 0;
+}
+
 // While serving a request (or walking owned trees for a local Scan), nested
 // PollTransport must not pop/serve deferred requests. Handling another
 // Put/Get request here mutates the same B+trees under OLC and livelocks
@@ -427,16 +431,35 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
         start_key, EncodeU64(request_limit)));
     range_moves.push_back({node, request_id, std::move(pending)});
   }
+  auto scan_remote_page =
+      [&](uint32_t node, std::string_view cursor) -> ScanResult {
+    for (uint32_t attempt = 0; attempt < 8; ++attempt) {
+      std::string snapshot;
+      const Status migrated =
+          RequestScanMigrate(node, cursor, request_limit, &snapshot);
+      if (!migrated.ok()) return {migrated, {}};
+      ScanResult page =
+          ScanSharedPartitions(node, cursor, request_limit);
+      if (page.status.ok() && ScanSnapshotValid(node, snapshot)) return page;
+    }
+    return {Status::Error(
+                StatusCode::kCorruption,
+                "scan range changed during repeated CXL reads"),
+            {}};
+  };
   Status first_error = Status::Ok();
   for (const auto &move : range_moves) {
+    std::string snapshot;
     const Status migrated =
-        AwaitResponse(move.request_id, move.pending, nullptr);
+        AwaitResponse(move.request_id, move.pending, &snapshot);
     if (!migrated.ok()) {
       if (first_error.ok()) first_error = migrated;
       continue;
     }
     ScanResult page =
         ScanSharedPartitions(move.node, start_key, request_limit);
+    if (!page.status.ok() || !ScanSnapshotValid(move.node, snapshot))
+      page = scan_remote_page(move.node, start_key);
     if (!page.status.ok()) {
       if (first_error.ok()) first_error = page.status;
       continue;
@@ -454,10 +477,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     if (source->local) {
       page = ScanOwnedPartitions(source->cursor, request_limit);
     } else {
-      const Status migrated =
-          RequestScanMigrate(source->node, source->cursor, request_limit);
-      if (!migrated.ok()) return migrated;
-      page = ScanSharedPartitions(source->node, source->cursor, request_limit);
+      page = scan_remote_page(source->node, source->cursor);
     }
     if (!page.status.ok()) return page.status;
     return load_page(source, std::move(page.items));
@@ -560,7 +580,7 @@ ScanResult KVEngine::ScanSharedPartitions(uint32_t owner,
     for (const auto &partition : partitions_) {
       if (OwnerForPartition(partition->partition_id()) != owner) continue;
       std::vector<std::pair<std::string, std::string>> items;
-      if (!partition->ScanSharedPinned(start_key, limit, &items))
+      if (!partition->ScanShared(start_key, limit, &items))
         complete = false;
       std::vector<ScanItem> page;
       page.reserve(items.size());
@@ -573,7 +593,7 @@ ScanResult KVEngine::ScanSharedPartitions(uint32_t owner,
   }
   if (!complete)
     return {Status::Error(StatusCode::kCorruption,
-                          "pinned CXL scan could not read a promoted row"), {}};
+                          "CXL scan could not read a promoted row"), {}};
   struct HeapItem {
     std::string_view key;
     size_t part = 0;
@@ -595,6 +615,126 @@ ScanResult KVEngine::ScanSharedPartitions(uint32_t owner,
       heap.push({parts[top.part][next].key, top.part, next});
   }
   return result;
+}
+
+Status KVEngine::PrepareSharedScan(std::string_view start_key, uint64_t limit,
+                                   uint32_t requester,
+                                   std::string *migration_snapshot) {
+  if (migration_snapshot == nullptr)
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "null scan migration snapshot");
+  const std::function<void()> progress = [this] { PollTransport(); };
+  struct HeapItem {
+    std::string_view key;
+    size_t part = 0;
+    size_t index = 0;
+  };
+  auto compare = [](const HeapItem &left, const HeapItem &right) {
+    return left.key > right.key;
+  };
+  for (uint32_t attempt = 0; attempt < 8; ++attempt) {
+    bool preparation_unstable = false;
+    std::vector<uint64_t> before;
+    std::vector<std::vector<std::string>> parts;
+    before.reserve(partitions_.size());
+    parts.reserve(partitions_.size());
+    for (const auto &partition : partitions_) {
+      if (OwnerForPartition(partition->partition_id()) != config_.node_id)
+        continue;
+      const uint64_t state = partition->SharedRemovalState();
+      if (!SharedRemovalSnapshotIdle(state)) {
+        preparation_unstable = true;
+        break;
+      }
+      before.push_back(state);
+      std::vector<std::string> keys;
+      if (!partition->ScanOwnedKeys(start_key, limit, &keys, &progress))
+        return Status::Error(StatusCode::kCorruption,
+                             "owner key-only range scan failed");
+      parts.push_back(std::move(keys));
+    }
+
+    if (preparation_unstable) {
+      PollTransport();
+      continue;
+    }
+    std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(compare)>
+        heap(compare);
+    for (size_t part = 0; part < parts.size(); ++part)
+      if (!parts[part].empty()) heap.push({parts[part][0], part, 0});
+
+    uint64_t promoted = 0;
+    bool range_changed = false;
+    while (!heap.empty() && (limit == 0 || promoted < limit)) {
+      const HeapItem top = heap.top();
+      heap.pop();
+      const std::string &key = parts[top.part][top.index];
+      auto *partition = OwnedPartition(key);
+      if (partition == nullptr)
+        return Status::Error(StatusCode::kOwnerViolation,
+                             "owner scan key routed to non-owner");
+      bool moved_in = false;
+      const StatusCode code =
+          partition->EnsureInShared(key, requester, &moved_in);
+      if (code == StatusCode::kNotFound) {
+        range_changed = true;
+        break;
+      }
+      if (code != StatusCode::kOk)
+        return Status::Error(code, "scan range move-in failed");
+      if (moved_in) {
+        migration_in_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      }
+      ++promoted;
+      const size_t next = top.index + 1;
+      if (next < parts[top.part].size())
+        heap.push({parts[top.part][next], top.part, next});
+    }
+
+    if (range_changed) {
+      PollTransport();
+      continue;
+    }
+    migration_snapshot->clear();
+    size_t sequence = 0;
+    bool stable = true;
+    for (const auto &partition : partitions_) {
+      if (OwnerForPartition(partition->partition_id()) != config_.node_id)
+        continue;
+      const uint64_t after = partition->SharedRemovalState();
+      stable = stable && sequence < before.size() &&
+               before[sequence] == after &&
+               SharedRemovalSnapshotIdle(after);
+      ++sequence;
+      migration_snapshot->append(EncodeU64(after));
+    }
+    if (migration_snapshot->size() > KvMessage{}.value.size())
+      return Status::Error(StatusCode::kInvalidArgument,
+                           "scan migration snapshot exceeds wire capacity");
+    if (stable && sequence == before.size()) return Status::Ok();
+  }
+  return Status::Error(StatusCode::kCorruption,
+                       "owner scan range changed during move-in");
+}
+
+bool KVEngine::ScanSnapshotValid(
+    uint32_t owner, std::string_view migration_snapshot) const {
+  size_t position = 0;
+  for (const auto &partition : partitions_) {
+    if (OwnerForPartition(partition->partition_id()) != owner) continue;
+    if (position + sizeof(uint64_t) > migration_snapshot.size())
+      return false;
+    uint64_t expected = 0;
+    if (!DecodeU64(migration_snapshot.substr(position, sizeof(uint64_t)),
+                   &expected))
+      return false;
+    const uint64_t current = partition->SharedRemovalState();
+    if (!SharedRemovalSnapshotIdle(current) || current != expected)
+      return false;
+    position += sizeof(uint64_t);
+  }
+  return position == migration_snapshot.size();
 }
 
 CasResult KVEngine::CompareExchange(std::string_view key,
@@ -824,7 +964,8 @@ Status KVEngine::RequestMigrate(std::string_view key) {
 
 Status KVEngine::RequestScanMigrate(uint32_t owner,
                                     std::string_view start_key,
-                                    uint64_t limit) {
+                                    uint64_t limit,
+                                    std::string *migration_snapshot) {
   const uint64_t request_id = NextRequestId(config_.node_id);
   auto pending = RegisterPendingResponse(request_id);
   try {
@@ -835,7 +976,7 @@ Status KVEngine::RequestScanMigrate(uint32_t owner,
     RemovePendingResponse(request_id);
     throw;
   }
-  return AwaitResponse(request_id, pending, nullptr);
+  return AwaitResponse(request_id, pending, migration_snapshot);
 }
 
 std::shared_ptr<KVEngine::PendingResponse>
@@ -1114,28 +1255,20 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
   if (message.type == KvMessageType::kScanMigrate) {
     MarkLayoutDirty();
     uint64_t limit = 0;
-    std::vector<star::TwoPLPashaMetadataShared *> pinned;
     if (!DecodeU64(value, &limit)) {
       response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
     } else {
       try {
-        StatusCode status = StatusCode::kOk;
-        for (const auto &entry : partitions_) {
-          if (OwnerForPartition(entry->partition_id()) != config_.node_id)
-            continue;
-          status = entry->PrepareSharedScan(key, limit, config_.node_id,
-                                            &pinned);
-          if (status != StatusCode::kOk) break;
+        std::string snapshot;
+        const Status status =
+            PrepareSharedScan(key, limit, message.source_node, &snapshot);
+        response.status = static_cast<uint32_t>(status.code);
+        if (status.ok()) {
+          response.value_size = static_cast<uint32_t>(snapshot.size());
+          std::memcpy(response.value.data(), snapshot.data(), snapshot.size());
         }
-        response.status = static_cast<uint32_t>(status);
       } catch (const std::bad_alloc &) {
-        for (auto *entry : pinned)
-          star::TwoPLPashaHelper::kv_unpin_shared_ref(entry);
         response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
-      } catch (...) {
-        for (auto *entry : pinned)
-          star::TwoPLPashaHelper::kv_unpin_shared_ref(entry);
-        throw;
       }
     }
     SendTransportMessage(response);
