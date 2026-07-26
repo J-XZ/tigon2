@@ -104,6 +104,7 @@ int main() {
       private_tree->root_for_persistence());
   assert(root_offset != tigonkv::engine::kNullOffset);
 
+  regions.PublishReady();
   const pid_t child = fork();
   assert(child >= 0);
   if (child == 0) {

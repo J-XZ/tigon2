@@ -230,6 +230,7 @@ int main() {
   assert(scan[2] == std::make_pair(std::string("m3"), std::string("priv-m3")));
   star::scc_manager = nullptr;
 
+  regions.PublishReady();
   const pid_t child = fork();
   assert(child >= 0);
   if (child == 0) {

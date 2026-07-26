@@ -16,7 +16,8 @@ namespace tigonkv::engine {
 
 // Thin ITable adapter so the original PolicyClock can address one KV partition
 // without rewriting the Clock tracker.  Only partitionID/key_size/value_size
-// are exercised by PolicyClock; other methods are unsupported stubs.
+// are exercised by PolicyClock. Unsupported ITable operations hard-fail so a
+// future caller cannot silently mistake this adapter for a complete table.
 class KvPartitionTable final : public star::ITable {
  public:
   KvPartitionTable(KVPartition *partition, uint32_t key_size, uint32_t value_size)
@@ -24,20 +25,28 @@ class KvPartitionTable final : public star::ITable {
 
   KVPartition *partition() const { return partition_; }
 
-  uint64_t get_plain_key(const void *) override { return 0; }
+  uint64_t get_plain_key(const void *) override {
+    throw std::logic_error("KV migration adapter has no integral plain key");
+  }
   int compare_key(const void *a, const void *b) override {
     return std::memcmp(a, b, key_size_);
   }
   std::tuple<MetaDataType *, void *> search(const void *) override {
-    return {nullptr, nullptr};
+    throw std::logic_error("KV migration adapter does not expose table search");
   }
-  void *search_value(const void *) override { return nullptr; }
-  MetaDataType *search_metadata(const void *) override { return nullptr; }
+  void *search_value(const void *) override {
+    throw std::logic_error("KV migration adapter does not expose table values");
+  }
+  MetaDataType *search_metadata(const void *) override {
+    throw std::logic_error("KV migration adapter does not expose table metadata");
+  }
   void scan(const void *,
             std::function<bool(const void *, MetaDataType *, void *, bool)>) override {
     throw std::logic_error("KV migration adapter has no adjacency-complete scan");
   }
-  bool insert(const void *, const void *, bool = false) override { return false; }
+  bool insert(const void *, const void *, bool = false) override {
+    throw std::logic_error("KV migration adapter does not implement insert");
+  }
   bool insert_lock_next_key(
       const void *, const void *,
       std::function<bool(const void *, MetaDataType *, void *)>,
@@ -51,7 +60,9 @@ class KvPartitionTable final : public star::ITable {
       bool = false) override {
     throw std::logic_error("KV migration adapter does not maintain adjacency state");
   }
-  bool remove(const void *) override { return false; }
+  bool remove(const void *) override {
+    throw std::logic_error("KV migration adapter does not implement remove");
+  }
   bool remove_and_process_adjacent_tuples(
       const void *,
       std::function<bool(const void *, void *, void *, const void *, void *,
@@ -59,15 +70,21 @@ class KvPartitionTable final : public star::ITable {
     throw std::logic_error("KV migration adapter does not maintain adjacency state");
   }
   void update(const void *, const void *,
-              std::function<void(const void *, const void *)> = {}) override {}
+              std::function<void(const void *, const void *)> = {}) override {
+    throw std::logic_error("KV migration adapter does not implement update");
+  }
   bool search_and_update_next_key_info(
       const void *,
       std::function<void(const void *, void *, void *, const void *, void *,
                          void *, const void *, void *, void *)>) override {
     throw std::logic_error("KV migration adapter does not maintain next-key state");
   }
-  void deserialize_value(const void *, star::StringPiece) override {}
-  void serialize_value(star::Encoder &, const void *) override {}
+  void deserialize_value(const void *, star::StringPiece) override {
+    throw std::logic_error("KV migration adapter does not deserialize values");
+  }
+  void serialize_value(star::Encoder &, const void *) override {
+    throw std::logic_error("KV migration adapter does not serialize values");
+  }
   std::size_t key_size() override { return key_size_; }
   std::size_t value_size() override { return value_size_; }
   std::size_t field_size() override { return value_size_; }

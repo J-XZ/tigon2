@@ -158,6 +158,8 @@ void TestDualPhysicalRegions() {
   config.fixed_key_size = 32;
   config.fixed_value_size = 128;
   auto dual = DualRegionAllocator::Initialize(mapping.base, config);
+  assert(dual.layout().state.load(std::memory_order_acquire) ==
+         static_cast<uint32_t>(LayoutState::kInitializing));
   void *index = dual.Allocate(100, AllocationDomain::kHwccIndex, 0);
   void *metadata = dual.Allocate(64, AllocationDomain::kHwccMetadata, 1);
   void *owner = dual.Allocate(80, AllocationDomain::kOwnerPrivateSwcc, 0);
@@ -167,6 +169,13 @@ void TestDualPhysicalRegions() {
   assert(!dual.IsHwccAddress(owner) && !dual.IsSwccAddress(index));
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
              .used_bytes.load() > 0);
+  assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccLayout)]
+             .used_bytes.load() > 0);
+  assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kAllocatorMetadata)]
+             .used_bytes.load() > 0);
+  dual.PublishReady();
+  assert(dual.layout().state.load(std::memory_order_acquire) ==
+         static_cast<uint32_t>(LayoutState::kDirty));
   auto attached = DualRegionAllocator::Attach(mapping.base, config);
   assert(attached.IsHwccAddress(index) && attached.IsSwccAddress(payload));
   dual.Free(index, 100, AllocationDomain::kHwccIndex, 0, 0);
@@ -203,6 +212,7 @@ void TestMappedPoolAttach() {
       64, AllocationDomain::kSharedPayloadSwcc, 0));
   std::memcpy(payload, "mapped-payload", 15);
   const RegionOffset payload_offset = parent.allocator().swcc().ToOffset(payload);
+  parent.allocator().PublishReady();
   const pid_t child = fork();
   assert(child >= 0);
   if (child == 0) {

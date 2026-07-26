@@ -116,14 +116,14 @@ run_fixed() {
   # The phase orchestrator consumes stage=opened to release peer VMs.  This
   # control-plane marker is outside the timed replay window and must not rely
   # on a caller remembering to enable verbose output.
-  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_VERBOSE=1 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $zeroed '$remote_runner'"
+  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_PROGRESS=1 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $zeroed '$remote_runner'"
   # Pre-create the log so the host wait loop never races rg against ENOENT.
   : >"$log"
   timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$command" >>"$log" 2>&1
 }
 
 # Fail fast when guests sit at barrier_ready with zero op progress (livelock).
-# YCSB-E SCAN-heavy runs normally emit E2E_TRACE_PROGRESS every ~5s.
+# YCSB-E SCAN-heavy runs normally emit E2E_TRACE_HEARTBEAT every ~5s.
 watch_phase_progress() {
   local phase_log=$1 round=$2 workload=$3 phase=$4
   local stall_sec=${TIGONKV_E2E_STALL_SEC:-90}
@@ -161,8 +161,8 @@ watch_phase_progress() {
     for ((vm = 0; vm < vm_count; vm++)); do
       local cur=""
       # rg exits 1 on no match; with pipefail that must not abort the watcher.
-      cur=$(rg -o 'E2E_TRACE_PROGRESS.*ops=[0-9]+' "$phase_log/vm${vm}.log" 2>/dev/null \
-        | tail -1 | sed -n 's/.*ops=\([0-9]*\).*/\1/p' || true)
+      cur=$(rg -o 'E2E_TRACE_HEARTBEAT.*total=[0-9]+' "$phase_log/vm${vm}.log" 2>/dev/null \
+        | tail -1 | sed -n 's/.*total=\([0-9]*\).*/\1/p' || true)
       [[ -n "$cur" ]] && ops=$((ops + cur))
     done
     if (( ops != last_ops )); then
@@ -170,7 +170,7 @@ watch_phase_progress() {
       last_change=$SECONDS
     elif (( SECONDS - last_change >= stall_sec )); then
       if rg -q 'stage=barrier_ready' "$phase_log"/vm*.log 2>/dev/null; then
-        echo "stall: no E2E_TRACE_PROGRESS growth for ${stall_sec}s (ops=$ops) in $phase_log" >&2
+        echo "stall: no E2E_TRACE_HEARTBEAT growth for ${stall_sec}s (ops=$ops) in $phase_log" >&2
         return 1
       fi
       last_change=$SECONDS  # avoid spinning the same stall message before barrier_ready

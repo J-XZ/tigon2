@@ -55,8 +55,10 @@ class RegionAllocator {
 
   static RegionAllocator Initialize(void *region, uint64_t region_bytes,
                                     uint32_t shard_count,
-                                    uint64_t reserved_prefix_bytes = 0);
-  static RegionAllocator Attach(void *region, uint64_t region_bytes);
+                                    uint64_t reserved_prefix_bytes = 0,
+                                    bool metadata_is_hwcc = false);
+  static RegionAllocator Attach(void *region, uint64_t region_bytes,
+                                bool metadata_is_hwcc = false);
 
   // Hot path: per-thread size-class cache (see region_allocator.cpp) then
   // shard freelist / bump under a short spin lock.
@@ -74,6 +76,7 @@ class RegionAllocator {
   void *FromOffset(RegionOffset offset) const;
   bool Contains(const void *pointer) const;
   uint64_t capacity() const { return bytes_; }
+  uint64_t metadata_bytes() const { return header_->metadata_bytes; }
   uint64_t allocated() const {
     return header_->allocated_bytes.load(std::memory_order_acquire);
   }
@@ -83,8 +86,10 @@ class RegionAllocator {
   void FlushAllocatedRanges() const;
 
  private:
-  RegionAllocator(void *base, uint64_t bytes, RegionAllocatorHeader *header)
-      : base_(static_cast<std::byte *>(base)), bytes_(bytes), header_(header) {}
+  RegionAllocator(void *base, uint64_t bytes, RegionAllocatorHeader *header,
+                  bool metadata_is_hwcc)
+      : base_(static_cast<std::byte *>(base)), bytes_(bytes), header_(header),
+        metadata_is_hwcc_(metadata_is_hwcc) {}
   static uint64_t Align(uint64_t bytes) {
     if (bytes > UINT64_MAX - (kAlignment - 1)) throw std::bad_alloc();
     return (bytes + kAlignment - 1) & ~(kAlignment - 1);
@@ -99,10 +104,14 @@ class RegionAllocator {
   void FreeLocal(RegionOffset offset, uint32_t size_class, uint32_t owner_shard);
   void AccountAllocate(uint64_t bytes, DomainCounter *counter);
   void AccountFree(uint64_t bytes, DomainCounter *counter);
+  void RecordAtomicLoad(const void *address) const;
+  void RecordAtomicStore(const void *address) const;
+  void RecordAtomicRmw(const void *address) const;
 
   std::byte *base_;
   uint64_t bytes_;
   RegionAllocatorHeader *header_;
+  bool metadata_is_hwcc_;
 };
 
 // The pool is mapped once, but allocations are physically constrained to one
@@ -155,6 +164,8 @@ class DualRegionAllocator {
  public:
   static DualRegionAllocator Initialize(void *pool, const DualRegionConfig &config);
   static DualRegionAllocator Attach(void *pool, const DualRegionConfig &config);
+  // Publish only after transport, EBR, and every partition root are ready.
+  void PublishReady();
 
   void *Allocate(uint64_t bytes, AllocationDomain domain, uint32_t owner_shard);
   void *AllocateOwnerPrivate(uint64_t bytes, uint32_t partition_id,

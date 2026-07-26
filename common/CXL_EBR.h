@@ -9,6 +9,7 @@
 #include <boost/interprocess/offset_ptr.hpp>
 
 #include "common/CXLMemory.h"
+#include "kv/engine/mem_access.h"
 #include "kv/engine/region_allocator.h"
 
 namespace star
@@ -116,6 +117,7 @@ class CXL_EBR {
                 uint64_t thread_id = local_ebr_meta.thread_id;
 
                 EBRMetaCXL &cxl_ebr_meta = cxl_ebr_meta_vec[coordinator_id][thread_id];
+                tigonkv::engine::mem_access::HwccAtomicLoad(&cxl_ebr_meta.local_epoch);
                 uint64_t cur_local_epoch = cxl_ebr_meta.local_epoch.load(std::memory_order_acquire);
 
                 // add the object to the list of the current local epoch
@@ -131,9 +133,11 @@ class CXL_EBR {
                 uint64_t thread_id = local_ebr_meta.thread_id;
 
                 EBRMetaCXL &cxl_ebr_meta = cxl_ebr_meta_vec[coordinator_id][thread_id];
+                tigonkv::engine::mem_access::HwccAtomicLoad(&cxl_ebr_meta.local_epoch);
                 uint64_t cur_local_epoch = cxl_ebr_meta.local_epoch.load(std::memory_order_acquire);
 
                 // load global epoch
+                tigonkv::engine::mem_access::HwccAtomicLoad(&global_epoch);
                 uint64_t cur_global_epoch = global_epoch.load(std::memory_order_acquire);
 
                 if (cur_global_epoch == cur_local_epoch) {
@@ -146,6 +150,8 @@ class CXL_EBR {
                                 // check if all other threads have entered the current epoch
                                 for (uint64_t i = 0; i < coordinator_num; i++) {
                                         for (uint64_t j = 0; j < thread_num; j++) {
+                                                tigonkv::engine::mem_access::HwccAtomicLoad(
+                                                    &cxl_ebr_meta_vec[i][j].local_epoch);
                                                 uint64_t local_epoch = cxl_ebr_meta_vec[i][j].local_epoch.load(std::memory_order_acquire);
                                                 if (local_epoch < cur_global_epoch) {   // local epoch might be larger than 'cur_global_epoch' because of race conditions
                                                         advance_global_ebr = false;
@@ -157,6 +163,7 @@ class CXL_EBR {
                                 // advance the global epoch
                                 if (advance_global_ebr == true) {
                                         uint64_t new_global_epoch = cur_global_epoch + 1;
+                                        tigonkv::engine::mem_access::HwccAtomicRmw(&global_epoch);
                                         global_epoch.compare_exchange_strong(cur_global_epoch, new_global_epoch, std::memory_order_acq_rel);
                                 }
                         }
@@ -165,11 +172,14 @@ class CXL_EBR {
                 }
 
                 // reload global epoch
+                tigonkv::engine::mem_access::HwccAtomicLoad(&global_epoch);
                 cur_global_epoch = global_epoch.load(std::memory_order_acquire);
 
                 // update local epoch if necessary
                 if (cur_local_epoch < cur_global_epoch) {
                         CHECK(cur_local_epoch == cur_global_epoch - 1);
+                        tigonkv::engine::mem_access::HwccAtomicStore(
+                            &cxl_ebr_meta.local_epoch);
                         cxl_ebr_meta.local_epoch.store(cur_global_epoch, std::memory_order_release);
                 }
 
@@ -209,6 +219,8 @@ class CXL_EBR {
 
         // Upstream Tigon marks leave unused (CHECK(0)); callers may pair Enter/Leave
         // for readability. Epoch advance still happens inside enter/retire paths.
+        // Upstream-compatible no-op: exit_critical_section() performs the
+        // actual epoch transition; legacy callers still name this hook.
         void leave_critical_section() {}
 
         // Checkpoint/move-out callers invoke this only after their quiescence

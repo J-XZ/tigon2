@@ -76,11 +76,13 @@ bool KvDeleteAndUpdateNextKeyInfo(star::ITable *table, const void *key,
   (void)table;
   (void)key;
   (void)is_delete_local;
-  need_move_out = false;
-  migration_policy_meta = nullptr;
-  // KV deletes go through DeletePrivate directly; Clock only needs a no-op
-  // next-key update matching PolicyClock::delete_specific_row_and_move_out.
-  return true;
+  (void)need_move_out;
+  (void)migration_policy_meta;
+  // KV deletes deliberately bypass PolicyClock because this adapter has no
+  // next/previous-key metadata. Reaching the Clock delete hook is a protocol
+  // misuse, not a successful no-op.
+  throw std::logic_error(
+      "KV migration adapter does not implement Clock-managed delete");
 }
 
 }  // namespace tigonkv::engine

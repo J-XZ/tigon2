@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "core/Context.h"
+#include "kv/engine/mem_access.h"
 #include "kv/engine/region_allocator.h"
 
 #include <glog/logging.h>
@@ -214,6 +215,8 @@ class CXLMemory {
                         throw std::runtime_error("tigonkv: dual-region root table is unavailable");
                 if (!dual_regions_->IsHwccAddress(shared_data))
                         throw std::invalid_argument("tigonkv: root must be in HWCC");
+                tigonkv::engine::mem_access::HwccAtomicStore(
+                        &dual_regions_->layout().roots[root_index]);
                 dual_regions_->layout().roots[root_index].store(
                         dual_regions_->hwcc().ToOffset(shared_data), std::memory_order_release);
         }
@@ -223,6 +226,8 @@ class CXLMemory {
                 if (shared_data == nullptr || dual_regions_ == nullptr ||
                     root_index >= tigonkv::engine::kRootSlotCount)
                         throw std::runtime_error("tigonkv: dual-region root table is unavailable");
+                tigonkv::engine::mem_access::HwccAtomicLoad(
+                        &dual_regions_->layout().roots[root_index]);
                 const auto offset = dual_regions_->layout().roots[root_index].load(
                         std::memory_order_acquire);
                 if (offset == tigonkv::engine::kNullOffset)

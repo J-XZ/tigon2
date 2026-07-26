@@ -1625,7 +1625,6 @@ out_unlock_lmeta:
                         // release the CXL latch
                         smeta->unlock();
 
-                        // LOG(INFO) << "moved in a row with key " << key << " from table " << table->tableID();
 
                         res = migration_result::SUCCESS;
                 } else {
@@ -1871,7 +1870,6 @@ out_unlock_lmeta:
 
                 // statistics
                 if (res == migration_result::SUCCESS) {
-                        // LOG(INFO) << "moved in a row with key " << table->get_plain_key(key) << " from table " << table->tableID();
                         num_data_move_in.fetch_add(1);
                 }
 
@@ -2083,7 +2081,6 @@ out_unlock_lmeta:
 
                 // statistics
                 if (move_out_success == true) {
-                        // LOG(INFO) << "moved out a row with key " << table->get_plain_key(key) << " from table " << table->tableID();
                         num_data_move_out.fetch_add(1);
                 }
 

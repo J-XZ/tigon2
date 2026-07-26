@@ -1,5 +1,9 @@
 # TigonKV 公平对比改造计划
 
+> 当前 `my-work` 的已实现数据路径、线程/CPU 计数和实验声明以
+> [当前对比口径.md](当前对比口径.md) 为准。本文件保留设计依据、施工历史和
+> 验收矩阵；其中以“HEAD/现版”描述的旧问题不表示当前实现仍有该缺陷。
+
 本文档（`PLAN.md`）是唯一有效的完整改造计划。核心立场：**不追求与原实现隔离
 的独立 TigonKV 分支，允许直接修改原始 Tigon 源码；最终只要求扩展后的系统
 可以运行，不保证旧 bench 等原有入口仍可运行**。不采用"可选钩子 + 默认旧行为
@@ -1150,7 +1154,7 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
 到本仓库 `kv/latency_simulator.{h,cpp}`，保留 `latency_sim` 命名空间与全部
 实现细节。** 记入 `搬运清单.md` / `THIRD_PARTY_NOTICES.md`。
 
-废弃理由（现实现与 cxlkv 的具体差距，已核对源码）：现版无 TSC 校准（延迟
+废弃理由（当时旧实现与 cxlkv 的具体差距，已核对源码）：旧版无 TSC 校准（延迟
 兜底走 `sleep_for`，微秒级粒度不可用于百 ns 级注入）；`Record` 热路径对
 **共享** `std::atomic` 计数器 fetch_add（多线程伪共享，本身即扰动被测系统）；
 LRU 用 `std::deque` 线性查找（O(容量)）；无 BeginScope/generation/scope 语义；

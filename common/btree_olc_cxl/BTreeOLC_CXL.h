@@ -12,10 +12,8 @@
 #include <cassert>
 #include <cstring>
 #include <functional>
-#include <iostream>
 #include <utility>
 #include <vector>
-#include <queue>
 #include <thread>
 #include <random>
 #include <type_traits> // std::{enable_if,is_trivial}
@@ -595,7 +593,6 @@ class BPlusTree {
 		{
 			meta_.count_ = count;
 		}
-		// virtual int display(std::queue<NodeBase *> &nodeQueue) {}
 	};
 
 	/**
@@ -646,25 +643,6 @@ class BPlusTree {
 			, pre_(nullptr)
 			, next_(nullptr)
 		{
-		}
-
-		/**
-		 * NOTE: used by tests
-		 */
-		int display(std::queue<NodeBase *> &nodeQueue)
-		{
-			assert(false);
-			std::cout << "(";
-			for (int i = 0; i < this->getCount(); i++) {
-				// assert(data_[i].second != nullptr);
-				// auto itr = data_[i].second->begin();
-				// std::cout << data_[i].first.getValue();
-				if (i != this->getCount() - 1) {
-					std::cout << ",";
-				}
-			}
-			std::cout << ") ";
-			return 0;
 		}
 
 		/**
@@ -1226,29 +1204,6 @@ class BPlusTree {
 			this->setCount(this->getCount() + 1);
 		}
 
-		/**
-		 * NOTE: used by tests
-		 */
-		int display(std::queue<NodeBase *> &nodeQueue)
-		{
-			std::cout << "[";
-			for (int i = 0; i < this->getCount(); i++) {
-				std::cout << keyAt(i).getValue();
-				if (i != this->getCount() - 1) {
-					std::cout << '|';
-				}
-			}
-			std::cout << "] ";
-
-			if (this->getCount()) {
-				for (int i = 0; i <= this->getCount(); i++) {
-					nodeQueue.push(childAt(i).get());
-				}
-				return this->getCount() + 1;
-			} else {
-				return 0;
-			}
-		}
 	};
 	static_assert(InnerPageSize > sizeof(BTreeInner), "InnerPageSize too small");
 
@@ -1460,43 +1415,6 @@ class BPlusTree {
 		const TreeNodeAllocation *allocation_{ nullptr };
 	};
 
-	/**
-	 * NOTE: used by tests
-	 */
-	void display()
-	{
-		NodeBase *node = load_root();
-		// std::cout << node->getCount() << std::endl;
-		std::queue<NodeBase *> nodeQueue;
-
-		std::cout << "++++++\n";
-		int p_sum;
-		if (node->getType() == NodeType::BTreeLeaf) {
-			p_sum = reinterpret_cast<BTreeLeaf *>(node)->display(nodeQueue);
-		} else {
-			p_sum = reinterpret_cast<BTreeInner *>(node)->display(nodeQueue);
-		}
-
-		std::cout << std::endl;
-		int sum = 0;
-		while (nodeQueue.empty() == false) {
-			for (int i = 0; i < p_sum; i++) {
-				node = nodeQueue.front();
-				nodeQueue.pop();
-
-				if (node->getType() == NodeType::BTreeLeaf) {
-					sum += reinterpret_cast<BTreeLeaf *>(node)->display(nodeQueue);
-				} else {
-					sum += reinterpret_cast<BTreeInner *>(node)->display(nodeQueue);
-				}
-			}
-			std::cout << std::endl;
-			p_sum = sum;
-			sum = 0;
-		}
-		std::cout << "------\n";
-	}
-
 	BPlusTree(const TreeNodeAllocation &allocation, bool isUnique = false, const KeyComparator &keyComp = KeyComparator{}, const ValueComparator &valueComp = ValueComparator{})
 		: keyComp_(keyComp)
 		, valueComp_(valueComp)
@@ -1506,8 +1424,6 @@ class BPlusTree {
 		char *base = reinterpret_cast<char *>(allocation_.Allocate(LeafPageSize));
 		store_root(new (base) BTreeLeaf()); // Placement new
 		stats_.leaf_nodes++;
-		// std::cout << "BTreeLeaf::maxEntries = " << BTreeLeaf::maxEntries << ", "
-		//           << "BTreeInner::maxEntries = " << BTreeInner::maxEntries << ".\n";
 	}
 
 	// Attach from a previously published root pointer (private trees) or bind

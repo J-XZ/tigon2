@@ -43,7 +43,10 @@ cmake --build build-relwithdebinfo -j2
 ctest --test-dir build-relwithdebinfo --output-on-failure
 ```
 
-The repository's original `bench_ycsb` and `bench_tpcc` targets remain available.
+The maintained comparison targets are `tigonkv`, `e2e_trace_runner`, the focused
+unit-test binaries, and the guest E2E scripts. The legacy transaction benchmark
+sources remain as upstream reference material but are intentionally not linked
+into the TigonKV comparison build. See [当前对比口径.md](当前对比口径.md).
 
 ## Claims
 By running the experiments, you should be able to reproduce the numbers shown in:

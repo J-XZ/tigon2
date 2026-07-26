@@ -44,8 +44,6 @@ target_compile_definitions(tigonkv PUBLIC
 
 add_executable(unit_tests tests/tigonkv_tests.cpp)
 target_link_libraries(unit_tests PRIVATE tigonkv)
-add_executable(allocator_tests tests/tigonkv_tests.cpp)
-target_link_libraries(allocator_tests PRIVATE tigonkv)
 set(ALLOCATOR_TEST_TARGETS
   allocator_capability_test allocator_multi_process_test allocator_multi_vm_test
   allocator_restart_attach_test allocator_global_pool_test allocator_concurrency_test
@@ -55,9 +53,7 @@ foreach(test_target IN LISTS ALLOCATOR_TEST_TARGETS)
   add_executable(${test_target} tests/region_allocator_test.cpp)
   target_link_libraries(${test_target} PRIVATE tigonkv)
 endforeach()
-add_executable(e2e_tests tests/tigonkv_tests.cpp)
-target_link_libraries(e2e_tests PRIVATE tigonkv)
-set(TIGONKV_CONFIG_TEST_TARGETS unit_tests allocator_tests e2e_tests ${ALLOCATOR_TEST_TARGETS})
+set(TIGONKV_CONFIG_TEST_TARGETS unit_tests ${ALLOCATOR_TEST_TARGETS})
 foreach(test_target IN LISTS TIGONKV_CONFIG_TEST_TARGETS)
   target_compile_definitions(${test_target} PRIVATE TIGONKV_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 endforeach()
@@ -65,8 +61,6 @@ add_executable(e2e_08 tests/e2e_08.cpp)
 target_link_libraries(e2e_08 PRIVATE tigonkv)
 add_executable(e2e_09 tests/e2e_09.cpp)
 target_link_libraries(e2e_09 PRIVATE tigonkv)
-add_executable(e2e_trace tools/e2e_trace_runner.cpp)
-target_link_libraries(e2e_trace PRIVATE tigonkv)
 add_executable(e2e_trace_runner tools/e2e_trace_runner.cpp)
 target_link_libraries(e2e_trace_runner PRIVATE tigonkv)
 add_executable(latency_modes_test tests/latency_modes_test.cpp)
@@ -101,13 +95,10 @@ add_test(NAME allocator_reclaim_test COMMAND allocator_reclaim_test)
 add_test(NAME allocator_accounting_test COMMAND allocator_accounting_test)
 add_test(NAME allocator_domain_budget_test COMMAND allocator_domain_budget_test)
 add_test(NAME allocator_local_dram_test COMMAND allocator_local_dram_test)
-add_test(NAME e2e_tests COMMAND e2e_tests)
 # Multi-VM × multi-thread guest e2e (cxlkv-aligned: 4 VM × 4 workers via SSH).
 add_test(NAME e2e_08_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_08_test.sh)
 add_test(NAME e2e_09_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_09_test.sh)
-# Temporarily disabled: YCSB guest path has known bugs (do not block e2e_08/09).
 add_test(NAME e2e_ycsb_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_ycsb_test.sh)
-set_tests_properties(e2e_ycsb_test PROPERTIES DISABLED FALSE)
 add_test(NAME e2e_ycsb_entrypoints_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_ycsb_entrypoints_test.sh)
 set_tests_properties(e2e_08_test e2e_09_test PROPERTIES
   TIMEOUT 3600

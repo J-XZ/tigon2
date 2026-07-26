@@ -241,6 +241,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
     // shared-tree fast path after promotion.  Only the owner is allowed to
     // invoke private-row operations; binding the partition to its stable owner
     // keeps its private arena and tree nodes in the correct allocation shard.
+    mem_access::HwccAtomicLoad(&directory.shared_root);
     const bool attach = directory.private_root != kNullOffset &&
                         directory.shared_root.load(std::memory_order_acquire) !=
                             kNullOffset;
@@ -261,6 +262,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
       partition->RebuildClockTracker();
   }
   engine->StartInboundDemuxer();
+  if (reset) engine->pool_->allocator().PublishReady();
   return engine;
 }
 

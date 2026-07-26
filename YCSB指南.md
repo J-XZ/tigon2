@@ -14,8 +14,8 @@
 ```
 
 去掉 `--skip-trace-gen` 后会调用本仓 YCSB-cpp 生成 load/run trace。默认接受
-`a,b,c,d,e`（Scan∥migration 与 OLC scan 修复后 YCSB-E 已验收）；若需省略 E，
-显式传 `--workloads a,b,c,d`。
+默认 workload 是 `a,b,c,d`；允许的封闭集合是 `a,b,c,d,e`。E 已通过
+Scan∥migration 与 OLC scan 专项验收，但仍需显式传 `--workloads a,b,c,d,e`。
 
 ## 实际回放
 

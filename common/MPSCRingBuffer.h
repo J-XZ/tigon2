@@ -59,7 +59,9 @@ class MPSCRingBuffer {
         {
                 uint64_t cur_head = 0, cur_tail = 0;
 
+                tigonkv::engine::mem_access::HwccAtomicLoad(&head);
                 cur_head = head.load(std::memory_order_acquire);
+                tigonkv::engine::mem_access::HwccAtomicLoad(&tail);
                 cur_tail = tail.load(std::memory_order_acquire);
 
                 return cur_tail - cur_head;
@@ -87,14 +89,17 @@ class MPSCRingBuffer {
                 }
 
                 /* try to gain access to the queue */
+                tigonkv::engine::mem_access::HwccAtomicRmw(&count);
                 cur_count = std::atomic_fetch_add_explicit(&count, 1, std::memory_order_acquire);
                 if(cur_count >= entry_num) {
                         /* back off since queue is full */
+                        tigonkv::engine::mem_access::HwccAtomicRmw(&count);
                         std::atomic_fetch_sub_explicit(&count, 1, std::memory_order_release);
                         return false;
                 }
 
                 /* gain exclusive access to the entry */
+                tigonkv::engine::mem_access::HwccAtomicRmw(&tail);
                 cur_tail = std::atomic_fetch_add_explicit(&tail, 1, std::memory_order_release);
                 cur_tail %= entry_num;
 
@@ -106,10 +111,14 @@ class MPSCRingBuffer {
                 memcpy(entry->data, data, data_size);
                 clwb(entry->data, data_size);
 
+                tigonkv::engine::mem_access::TransportWrite(
+                    &entry->remaining_size,
+                    sizeof(entry->remaining_size) + sizeof(entry->dequeue_offset));
                 entry->remaining_size = data_size;
                 entry->dequeue_offset = 0;
 
                 /* mark the entry as ready */
+                tigonkv::engine::mem_access::HwccAtomicStore(&entry->is_ready);
                 entry->is_ready.store(1, std::memory_order_release);
 
                 return true;
@@ -128,6 +137,7 @@ class MPSCRingBuffer {
                 if (size() == 0)
                         return 0;
 
+                tigonkv::engine::mem_access::HwccAtomicLoad(&head);
                 cur_head = head.load(std::memory_order_acquire);
                 entry_index = cur_head % entry_num;
 
@@ -135,12 +145,17 @@ class MPSCRingBuffer {
                 entry = reinterpret_cast<Entry *>(entries_buffer.get() + entry_index * entry_struct_size);
 
                 /* wait for the entry to be ready */
-                while (entry->is_ready.load(std::memory_order_acquire) != 1);
+                do {
+                        tigonkv::engine::mem_access::HwccAtomicLoad(&entry->is_ready);
+                } while (entry->is_ready.load(std::memory_order_acquire) != 1);
 
                 /* Partial dequeue is not supported. Metadata or wire-size
                  * violations are protocol corruption, not an empty/full
                  * backpressure condition; let the caller hard-fail with node
                  * and request diagnostics instead of hiding this as a stall. */
+                tigonkv::engine::mem_access::TransportRead(
+                    &entry->remaining_size,
+                    sizeof(entry->remaining_size) + sizeof(entry->dequeue_offset));
                 if (entry->remaining_size == 0 ||
                     entry->dequeue_offset > entry_data_size ||
                     entry->remaining_size > entry_data_size - entry->dequeue_offset) {
@@ -162,6 +177,9 @@ class MPSCRingBuffer {
                 clflush(entry->data, dequeue_size);
                 tigonkv::engine::mem_access::TransportRead(entry->data, dequeue_size);
                 memcpy(data_buffer, entry->data, dequeue_size);
+                tigonkv::engine::mem_access::TransportWrite(
+                    &entry->remaining_size,
+                    sizeof(entry->remaining_size) + sizeof(entry->dequeue_offset));
                 entry->dequeue_offset += dequeue_size;
                 entry->remaining_size -= dequeue_size;
 
@@ -170,12 +188,15 @@ class MPSCRingBuffer {
                         entry->dequeue_offset = 0;
 
                         /* mark it as not ready */
+                        tigonkv::engine::mem_access::HwccAtomicStore(&entry->is_ready);
                         entry->is_ready.store(0, std::memory_order_relaxed);
 
                         /* increase head by 1 */
+                        tigonkv::engine::mem_access::HwccAtomicStore(&head);
                         head.store(cur_head + 1, std::memory_order_release);
 
                         /* reduce count by 1 */
+                        tigonkv::engine::mem_access::HwccAtomicRmw(&count);
                         std::atomic_fetch_sub_explicit(&count, 1, std::memory_order_release);
                 }
 

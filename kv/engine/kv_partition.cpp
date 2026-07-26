@@ -26,11 +26,13 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
   if (partition_id >= regions.layout().partition_count)
     throw std::invalid_argument("partition id outside persistent layout");
   if (attach) {
+    mem_access::HwccAtomicLoad(&directory_.shared_root);
     if (directory_.private_root == kNullOffset ||
         directory_.shared_root.load(std::memory_order_acquire) == kNullOffset)
       throw std::runtime_error("partition attach missing tree root");
     private_tree_ = new PrivateTree(
         private_binding_, regions_.swcc().FromOffset(directory_.private_root));
+    mem_access::HwccAtomicLoad(&directory_.shared_root);
     shared_tree_ = new SharedTree(
         shared_binding_,
         regions_.hwcc().FromOffset(
@@ -683,6 +685,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   smeta->unlock();
   UnlockRow(row);
   PersistRoots();
+  mem_access::HwccAtomicRmw(&directory_.migration_in_seq);
   directory_.migration_in_seq.fetch_add(1, std::memory_order_relaxed);
   star::num_data_move_in.fetch_add(1, std::memory_order_relaxed);
   return star::migration_result::SUCCESS;
@@ -760,6 +763,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
                           star::CXLMemory::DATA_FREE, owner_shard_);
   UnlockRow(row);
   PersistRoots();
+  mem_access::HwccAtomicRmw(&directory_.migration_out_seq);
   directory_.migration_out_seq.fetch_add(1, std::memory_order_relaxed);
   star::num_data_move_out.fetch_add(1, std::memory_order_relaxed);
   KvMigrationRuntime::SyncHwCcUsage(*this);
@@ -787,7 +791,9 @@ bool KVPartition::ScanOwned(
   std::memset(high.bytes, 0xff, sizeof(high.bytes));
   const FixedKeyComparator key_cmp;
   for (uint32_t attempt = 0; attempt < 8; ++attempt) {
+    mem_access::HwccAtomicLoad(&directory_.migration_in_seq);
     const uint64_t in_before = directory_.migration_in_seq.load(std::memory_order_acquire);
+    mem_access::HwccAtomicLoad(&directory_.migration_out_seq);
     const uint64_t out_before = directory_.migration_out_seq.load(std::memory_order_acquire);
     items->clear();
     FixedKey low = MakeKey(start_key);
@@ -900,7 +906,9 @@ bool KVPartition::ScanOwned(
       low = last_raw;
       left_inclusive = false;
     }
+    mem_access::HwccAtomicLoad(&directory_.migration_in_seq);
     const uint64_t in_after = directory_.migration_in_seq.load(std::memory_order_acquire);
+    mem_access::HwccAtomicLoad(&directory_.migration_out_seq);
     const uint64_t out_after = directory_.migration_out_seq.load(std::memory_order_acquire);
     if (in_before != in_after || out_before != out_after) continue;
     return true;
@@ -1063,6 +1071,7 @@ void KVPartition::PersistRoots() {
       private_tree_->root_for_persistence());
   // Shared live root is published on every store_root via the HWCC atomic slot;
   // keep the slot coherent after owner-local mirror updates.
+  mem_access::HwccAtomicStore(&directory_.shared_root);
   directory_.shared_root.store(
       regions_.hwcc().ToOffset(shared_tree_->root_for_persistence()),
       std::memory_order_release);

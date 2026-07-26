@@ -204,10 +204,14 @@ void PrintThreadTopology(uint32_t node, uint64_t foreground,
 int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
                   const std::string &trace_dir, uint64_t workers, uint32_t batch_ops,
                   uint64_t value_seed) {
-  const bool verbose = Env("TIGONKV_E2E_VERBOSE", "CXLKV_E2E_VERBOSE", "0") == "1";
+  const bool stage_markers =
+      Env("TIGONKV_E2E_STAGE_MARKERS", "CXLKV_E2E_STAGE_MARKERS", "0") == "1";
+  const bool progress =
+      Env("TIGONKV_E2E_PROGRESS", "CXLKV_E2E_PROGRESS", "0") == "1";
   const auto log_stage = [&](const char *stage) {
-    if (verbose) std::cerr << "E2E_TRACE_STAGE node=" << config.node_id
-                           << " phase=" << phase << " stage=" << stage << "\n" << std::flush;
+    if (stage_markers) std::cerr << "E2E_TRACE_STAGE node=" << config.node_id
+                                 << " phase=" << phase << " stage=" << stage << "\n"
+                                 << std::flush;
   };
   const uint32_t trace_first = static_cast<uint32_t>(ParseUnsigned(
       Env("TIGONKV_E2E_TRACE_FIRST", "CXLKV_E2E_TRACE_FIRST",
@@ -233,9 +237,10 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   // Heartbeat so host orchestration can fail-fast on livelock instead of
   // mistaking a long SCAN-heavy run for a hang (YCSB-E ~55s/node is normal).
   std::thread progress_thread;
-  if (verbose) {
+  if (progress) {
     progress_thread = std::thread([&] {
       uint64_t last = 0;
+      const auto heartbeat_start = std::chrono::steady_clock::now();
       auto last_print = std::chrono::steady_clock::now();
       while (!replay_done.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -243,8 +248,11 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
         if (now - last_print < std::chrono::seconds(5)) continue;
         last_print = now;
         const uint64_t cur = progress_ops.load(std::memory_order_relaxed);
-        std::cerr << "E2E_TRACE_PROGRESS node=" << config.node_id << " phase=" << phase
-                  << " ops=" << cur << " delta=" << (cur - last) << "\n"
+        const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+            now - heartbeat_start).count();
+        std::cerr << "E2E_TRACE_HEARTBEAT node=" << config.node_id << " phase=" << phase
+                  << " ops=" << (cur - last) << " total=" << cur
+                  << " elapsed_s=" << elapsed_s << "\n"
                   << std::flush;
         last = cur;
       }
