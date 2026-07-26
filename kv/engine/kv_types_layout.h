@@ -18,7 +18,9 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // v9: allocator metadata accounting is split by its physical HWCC/SWCC pool.
 // v10: remote Scan validates concurrent shared removals without persistent pins.
 // v11: the Scan generation also covers logical-key insertion/deletion.
-constexpr uint32_t kSharedLayoutVersion = 11;
+// v12: original TwoPLPasha next/prev adjacency bits make shared visibility
+// changes self-validating; the generation now certifies logical EOF only.
+constexpr uint32_t kSharedLayoutVersion = 12;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -96,9 +98,9 @@ struct alignas(64) PartitionDirectoryEntry {
   std::atomic<RegionOffset> shared_root{kNullOffset};
   RegionOffset private_arena = kNullOffset;
   std::atomic<uint64_t> migration_in_seq{0};
-  // High 32 bits count completed logical-key/shared-visibility mutations; low
-  // 32 bits count mutations in flight. Remote CXL range readers only accept
-  // an unchanged idle snapshot.
+  // High 32 bits count completed logical-key mutations; low 32 bits count
+  // mutations in flight. Remote CXL range readers use this only to certify an
+  // exhausted private-tree tail; shared move-in/out uses next/prev bits.
   std::atomic<uint64_t> shared_mutation_state{0};
 };
 

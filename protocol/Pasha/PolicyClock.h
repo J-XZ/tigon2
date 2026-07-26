@@ -74,6 +74,8 @@ class PolicyClock : public MigrationManager {
                 // remove from the list
                 void untrack(ClockTrackerNode *node)
                 {
+                        if (cursor == node)
+                                cursor = node->prev;
                         if (head == nullptr && tail == nullptr) {
                                 CHECK(0);
                         } else if (head == tail) {
@@ -100,6 +102,28 @@ class PolicyClock : public MigrationManager {
 
                         node->prev = nullptr;
                         node->next = nullptr;
+                }
+
+                ClockTrackerNode *find_by_migration_meta(void *meta)
+                {
+                        for (ClockTrackerNode *node = head; node != nullptr;
+                             node = node->next) {
+                                if (node->row_entity.migration_manager_meta == meta)
+                                        return node;
+                        }
+                        return nullptr;
+                }
+
+                ClockTrackerNode *find(ITable *table, const void *key)
+                {
+                        for (ClockTrackerNode *node = head; node != nullptr;
+                             node = node->next) {
+                                if (node->row_entity.table == table &&
+                                    table->compare_key(
+                                        node->row_entity.key, key) == 0)
+                                        return node;
+                        }
+                        return nullptr;
                 }
 
                 // head is the victim
@@ -176,6 +200,28 @@ class PolicyClock : public MigrationManager {
                 (void)partition_id;
         }
 
+        // TigonKV's explicit MoveOut must use the same tracker discipline as
+        // the original Clock victim path; otherwise the DRAM node retains a
+        // pointer to retired HWCC migration metadata.
+        bool move_specific_row_out(ITable *table, const void *key)
+        {
+                ClockTracker &clock_tracker =
+                    clock_trackers[table->partitionID()];
+                clock_tracker.lock();
+                ClockTrackerNode *node = clock_tracker.find(table, key);
+                if (node == nullptr) {
+                        clock_tracker.unlock();
+                        return false;
+                }
+                const bool moved = move_from_shared_region_to_partition(
+                    node->row_entity.table, node->row_entity.key,
+                    node->row_entity.local_row);
+                if (moved)
+                        clock_tracker.untrack(node);
+                clock_tracker.unlock();
+                return moved;
+        }
+
         migration_result move_row_in(ITable *table, const void *key, const std::tuple<MetaDataType *, void *> &row, bool inc_ref_cnt) override
         {
                 ClockTracker &clock_tracker = clock_trackers[table->partitionID()];
@@ -248,8 +294,13 @@ class PolicyClock : public MigrationManager {
 
                 // delete and update next key information
                 ret = delete_and_update_next_key_info(table, key, is_delete_local, need_move_out, migration_policy_meta);
-                CHECK(ret == true);
-                CHECK(need_move_out == false);
+                if (ret == true && need_move_out == true) {
+                        ClockTrackerNode *node =
+                            clock_tracker.find_by_migration_meta(
+                                migration_policy_meta);
+                        CHECK(node != nullptr);
+                        clock_tracker.untrack(node);
+                }
 
                 clock_tracker.unlock();
 

@@ -1105,20 +1105,25 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
   2. 每个远端 owner 收到 `SCAN_MIGRATE(start, page_limit)` 后，从各 owned
      partition 的 key-only locator 流做 owner 级归并，选出全局请求前缀并以
      原路径 `move_row_in(..., inc_ref=false)` move-in；owner 不预读/返回 value，
-     只回 shared-mutation snapshot（逻辑 key/shared 可见性变更的完成代际 +
-     in-flight 计数）。requester 从
-     该 owner 的 shared CXL tree 按 SCC 读取，并在读后核对 snapshot；期间发生
-     并发 insert/delete/move-out 就整页重试（≤8 次，超限 hard fail）。禁止按
-     “再次扫描的位置”交接 persistent pin，
+     并额外 move-in 每 partition 的左邻居与 cutoff 后首行作为边界。响应只回
+     cutoff、边界状态及逻辑 EOF 代际证书；requester 从该 owner 的 shared CXL
+     tree 按 SCC 读取，并用原 `TwoPLPashaMetadataShared` next/prev real bits
+     验证逐 partition 邻接。并发 insert/delete/move-out 会保守清除相邻 bit，
+     令该 owner 页重新执行 range move-in+CXL read；这是正常并发重试，不按
+     固定次数伪报 corruption。证书中的 per-partition selected-count 锚定
+     首尾端点；仅无右边界的真实 EOF 使用 per-partition logical-mutation
+     generation 在读后线性化，二者都不替代内部 next/prev 邻接。禁止按
+     “再次扫描的位置”交接
+     persistent pin，
      也禁止混合不完整 CXL seed 与 owner RPC 行。
   3. requester 对本地 owner 流和各远端 CXL 流做分页 k 路堆归并；每页最多
      64 条，续页从上一 key 重新执行对应的 owner range move-in/CXL read，
      凑满全局 `limit` 即早停。`limit==0` 与 cxlkv 相同表示不限制，但本仓仍有
      **1,048,576** 条安全上限（非 cxlkv 合同；正式对比应使用 trace 中显式
      非零 limit 或声明差异）。
-     当前 KV adapter 不复制原表的 next/prev adjacency bits；完整性证书改用
-     每 partition 的 HWCC mutation generation + in-flight count，覆盖新 key、
-     delete 与 shared move-out。它保留原“owner range move-in 后 CXL-only”
+     KV adapter 直接复用原表 smeta 的 next/prev adjacency bits，并在逻辑
+     insert/delete 及 move-in/out 的局部相邻行锁临界区维护；generation 只
+     补充证明逻辑 EOF 与 CXL 端点稳定。它保留原“owner range move-in 后 CXL-only”
      数据流，而不是把不完整 CXL 与 owner value 合并。
   4. 正确性优先；若 Scan 验收未通过，按 §1.5.2 标记 `ycsb_e=unsupported`
      （脚本对含 `e` 硬失败），**不得假跑**；但 §6.1 Scan∥migration 单测仍

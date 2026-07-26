@@ -17,6 +17,9 @@ enum class StatusCode {
   kOutOfMemory,
   kCorruption,
   kOwnerViolation,
+  // Transient concurrency conflict. Callers may retry without treating it as
+  // protocol corruption or changing worker concurrency.
+  kBusy,
 };
 
 struct Status {

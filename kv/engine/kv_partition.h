@@ -41,6 +41,10 @@ class KVPartition {
   // Owner read: follows is_migrated to the shared SCC payload when present.
   bool GetPrivate(std::string_view key, std::string *value) const;
   bool DeletePrivate(std::string_view key);
+  // PolicyClock callback. The caller holds this partition's Clock tracker.
+  bool DeletePrivateForMigrationManager(
+      std::string_view key, bool *need_untrack,
+      void **migration_policy_meta);
   bool CompareExchangePrivate(std::string_view key, std::string_view expected,
                               std::string_view desired, bool *exchanged,
                               bool *inserted = nullptr);
@@ -84,6 +88,16 @@ class KVPartition {
   bool ScanShared(
       std::string_view start_key, uint64_t limit,
       std::vector<std::pair<std::string, std::string>> *items) const;
+  // TwoPLPasha range proof: rows through cutoff plus one right boundary must
+  // form the logical private-tree adjacency chain.  For an exhausted range,
+  // expected_count anchors both endpoints; expected_generation linearizes
+  // logical EOF where adjacency has no right boundary.
+  bool ScanSharedComplete(
+      std::string_view start_key, const FixedKey &cutoff, bool exhausted,
+      bool no_predecessor, uint32_t expected_count,
+      uint32_t expected_generation,
+      std::vector<std::pair<std::string, std::string>> *items) const;
+  bool PrivatePredecessorKey(std::string_view key, std::string *predecessor) const;
   uint64_t SharedMutationState() const;
   // Invokes PolicyClock::move_row_out for this partition.
   bool MoveOutClockVictim(uint32_t host_id);
@@ -113,6 +127,7 @@ class KVPartition {
   PrivateRow *RowFromOffset(RegionOffset offset) const;
   PrivateRow *AllocateRow(const FixedKey &key, std::string_view value);
   static void LockRow(PrivateRow *row);
+  static bool TryLockRow(PrivateRow *row);
   static void UnlockRow(PrivateRow *row);
   std::string KeyString(const FixedKey &key) const;
   void NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const;
@@ -120,6 +135,31 @@ class KVPartition {
   // access (replaces the old non-owner PrivateRow LockRow quiescence window).
   bool TryPinShared(const FixedKey &key, star::TwoPLPashaMetadataShared **smeta,
                     RegionOffset *smeta_offset) const;
+  bool TryPinSharedEntry(
+      const FixedKey &key, RegionOffset expected_offset,
+      star::TwoPLPashaMetadataShared **smeta) const;
+  struct RowRef {
+    FixedKey key{};
+    RegionOffset offset = kNullOffset;
+    PrivateRow *row = nullptr;
+  };
+  struct Neighborhood {
+    bool has_prev = false;
+    bool has_current = false;
+    bool has_next = false;
+    RowRef prev;
+    RowRef current;
+    RowRef next;
+  };
+  void LockNeighborhood(const FixedKey &key, Neighborhood *neighborhood) const;
+  static void UnlockNeighborhood(Neighborhood *neighborhood);
+  bool SameNeighborhood(const Neighborhood &left,
+                        const Neighborhood &right) const;
+  void SetNextReal(const RowRef &row, bool real);
+  void SetPrevReal(const RowRef &row, bool real);
+  void RefreshAdjacencyLocked(const Neighborhood &neighborhood);
+  void BreakAdjacencyLocked(const Neighborhood &neighborhood);
+  bool InsertPrivateRow(const FixedKey &key, PrivateRow *row);
   void BeginSharedMutation();
   void EndSharedMutation();
   class SharedMutationGuard {
@@ -135,7 +175,6 @@ class KVPartition {
    private:
     KVPartition &partition_;
   };
-
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;
   uint32_t partition_id_;

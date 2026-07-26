@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 #include <thread>
@@ -303,6 +304,12 @@ class BPlusTree {
     public:
 	/** this is the element type of the leaf node */
 	using KeyValuePair = std::pair<KeyType, ValueType>;
+
+	struct AdjacentResult {
+		std::optional<KeyValuePair> prev;
+		std::optional<KeyValuePair> equal;
+		std::optional<KeyValuePair> next;
+	};
 
 	/**
 	 * enum class NodeType - B+ Tree node type
@@ -2834,6 +2841,170 @@ restart:
 	bool lookup(const KeyType &key, ValueType &result)
 	{
 		return _lookup(key, result);
+	}
+
+	/**
+	 * Find the tuple equal to key and its immediate tree neighbours.
+	 *
+	 * The returned neighbours describe one stable leaf-chain view.  This is a
+	 * read-only primitive for callers which need the original Tigon
+	 * next/previous-key bookkeeping; it does not lock rows or values.
+	 *
+	 * @return true iff an equal tuple exists
+	 */
+	bool lookupAdjacent(const KeyType &key, AdjacentResult &result)
+	{
+		int restartCount = 0;
+		for (;;) {
+			if (restartCount++)
+				yield(restartCount);
+			bool needRestart = false;
+
+			NodeBase *node = load_root();
+			RecordTreeAccess(allocation_, node, false);
+			uint64_t versionNode = node->readLockOrRestart(needRestart);
+			if (needRestart || node != load_root()) {
+				node->readUnlockOrRestart(versionNode, needRestart);
+				continue;
+			}
+
+			BTreeInner *parent = nullptr;
+			uint64_t versionParent = 0;
+			while (node->getType() == NodeType::BTreeInner) {
+				auto *inner = static_cast<BTreeInner *>(node);
+				if (parent) {
+					parent->readUnlockOrRestart(versionParent, needRestart);
+					if (needRestart)
+						break;
+				}
+
+				parent = inner;
+				versionParent = versionNode;
+				node = inner->childAt(inner->lowerBound(key, keyComp_)).get();
+				RecordTreeAccess(allocation_, node, false);
+				inner->checkOrRestart(versionNode, needRestart);
+				if (needRestart)
+					break;
+				versionNode = node->readLockOrRestart(needRestart);
+				if (needRestart)
+					break;
+			}
+			if (needRestart)
+				continue;
+
+			auto *leaf = static_cast<BTreeLeaf *>(node);
+			// Pin the leaf before following pre_/next_.  The reader count
+			// prevents a split/merge from changing its entries or links while
+			// the adjacent view is copied.
+			leaf->iteratorEnter(needRestart);
+			if (needRestart)
+				continue;
+			leaf->checkOrRestart(versionNode, needRestart);
+			if (!needRestart && parent)
+				parent->checkOrRestart(versionParent, needRestart);
+			if (needRestart) {
+				leaf->iteratorLeave();
+				continue;
+			}
+
+			const unsigned pos = leaf->lowerBound(key, keyComp_);
+			const unsigned count = leaf->getCount();
+			const bool found =
+			    pos < count && keyComp_(leaf->keys_[pos], key) == 0;
+
+			BTreeLeaf *prevLeaf = nullptr;
+			BTreeLeaf *nextLeaf = nullptr;
+			if (pos == 0) {
+				RecordTreeDataRead(&leaf->pre_, sizeof(leaf->pre_));
+				prevLeaf = leaf->pre_.get();
+			}
+			const unsigned nextPos = found ? pos + 1 : pos;
+			if (nextPos >= count) {
+				RecordTreeDataRead(&leaf->next_, sizeof(leaf->next_));
+				nextLeaf = leaf->next_.get();
+			}
+
+			bool prevPinned = false;
+			bool nextPinned = false;
+			if (prevLeaf != nullptr && prevLeaf != leaf) {
+				// A historical split can leave pre_ pointing farther left;
+				// next_ is the authoritative forward chain.  Walk it under
+				// short reader pins until the leaf immediately preceding the
+				// pinned current leaf is found.
+				BTreeLeaf *candidate = prevLeaf;
+				prevLeaf = nullptr;
+				while (candidate != nullptr) {
+					RecordTreeAccess(allocation_, candidate, false);
+					candidate->iteratorEnter(needRestart);
+					if (needRestart)
+						break;
+					RecordTreeDataRead(&candidate->next_,
+					                   sizeof(candidate->next_));
+					BTreeLeaf *successor = candidate->next_.get();
+					if (successor == leaf) {
+						prevLeaf = candidate;
+						prevPinned = true;
+						break;
+					}
+					candidate->iteratorLeave();
+					if (successor == nullptr || successor == candidate) {
+						needRestart = true;
+						break;
+					}
+					candidate = successor;
+				}
+			}
+			if (!needRestart && nextLeaf != nullptr && nextLeaf != leaf &&
+			    nextLeaf != prevLeaf) {
+				RecordTreeAccess(allocation_, nextLeaf, false);
+				nextLeaf->iteratorEnter(needRestart);
+				if (!needRestart)
+					nextPinned = true;
+			}
+			if (needRestart) {
+				if (nextPinned)
+					nextLeaf->iteratorLeave();
+				if (prevPinned)
+					prevLeaf->iteratorLeave();
+				leaf->iteratorLeave();
+				continue;
+			}
+
+			AdjacentResult candidate;
+			if (pos > 0) {
+				leaf->recordEntriesRead(pos - 1, 1);
+				candidate.prev.emplace(leaf->keys_[pos - 1],
+				                       leaf->values_[pos - 1]);
+			} else if (prevLeaf != nullptr && prevLeaf->getCount() != 0) {
+				const unsigned prevPos = prevLeaf->getCount() - 1;
+				prevLeaf->recordEntriesRead(prevPos, 1);
+				candidate.prev.emplace(prevLeaf->keys_[prevPos],
+				                       prevLeaf->values_[prevPos]);
+			}
+
+			if (found) {
+				leaf->recordEntriesRead(pos, 1);
+				candidate.equal.emplace(leaf->keys_[pos], leaf->values_[pos]);
+			}
+
+			if (nextPos < count) {
+				leaf->recordEntriesRead(nextPos, 1);
+				candidate.next.emplace(leaf->keys_[nextPos],
+				                       leaf->values_[nextPos]);
+			} else if (nextLeaf != nullptr && nextLeaf->getCount() != 0) {
+				nextLeaf->recordEntriesRead(0, 1);
+				candidate.next.emplace(nextLeaf->keys_[0],
+				                       nextLeaf->values_[0]);
+			}
+
+			if (nextPinned)
+				nextLeaf->iteratorLeave();
+			if (prevPinned)
+				prevLeaf->iteratorLeave();
+			leaf->iteratorLeave();
+			result = std::move(candidate);
+			return found;
+		}
 	}
 
 	/**

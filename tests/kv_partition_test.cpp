@@ -126,6 +126,7 @@ int main() {
   latency_sim::Config tree_write_latency;
   tree_write_latency.enabled = true;
   tree_write_latency.foreground_enabled = true;
+  tree_write_latency.stats_enabled = true;
   tree_write_latency.swcc_write_ns_per_line = 1;
   simulator.Configure(tree_write_latency);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
@@ -134,8 +135,11 @@ int main() {
   simulator.EndScopeAndDelay();
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   assert(partition.PutPrivate("tree-write", "value"));
-  assert(simulator.PendingDelayNsForTest() > 0);
+  // Logical-generation release is a remote Scan publication boundary, so the
+  // write latency is already settled before the generation becomes idle.
+  assert(simulator.PendingDelayNsForTest() == 0);
   simulator.EndScopeAndDelay();
+  assert(simulator.TakeStatsAndReset().swcc_delayed_ns > 0);
   simulator.Configure(latency_sim::Config{});
   assert(partition.DeletePrivate("tree-write"));
   latency_sim::Config latency;
@@ -183,8 +187,10 @@ int main() {
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load();
   assert(partition.MoveOutPrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
+  // Shared visibility changes are proven by next/prev bits; the generation is
+  // reserved for logical insertion/deletion and EOF certificates.
   assert(regions.layout().partitions[5].shared_mutation_state.load() ==
-         mutation_before_alpha + (uint64_t{1} << 32));
+         mutation_before_alpha);
   assert(ebr.drain_quiescent() > 0);
   assert(regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load() < hwcc_before_moveout);
@@ -324,6 +330,58 @@ int main() {
   assert(partition.ScanShared("alpha", 2, &shared_scan));
   assert(shared_scan == scan);
   assert(partition.MoveOutPrivate("alpha", 1));
+
+  // A partial CXL row set is not an authoritative range. Original
+  // TwoPLPasha completeness comes from logical next/prev adjacency.
+  assert(partition.PutPrivate("adj-a", "a"));
+  assert(partition.PutPrivate("adj-b", "b"));
+  assert(partition.PutPrivate("adj-c", "c"));
+  assert(partition.PromotePrivate("adj-a", 1));
+  assert(partition.PromotePrivate("adj-c", 1));
+  const auto adjacency_generation = [&] {
+    return static_cast<uint32_t>(partition.SharedMutationState() >> 32);
+  };
+  std::vector<std::pair<std::string, std::string>> complete_shared;
+  const auto adj_c =
+      tigonkv::engine::FixedKey::From(
+          "adj-c", regions.layout().fixed_key_size);
+  assert(!partition.ScanSharedComplete(
+      "adj-a", adj_c, true, false, 3, adjacency_generation(),
+      &complete_shared));
+  assert(partition.PromotePrivate("adj-b", 1));
+  assert(partition.ScanSharedComplete(
+      "adj-a", adj_c, true, false, 3, adjacency_generation(),
+      &complete_shared));
+  assert((complete_shared ==
+          std::vector<std::pair<std::string, std::string>>{
+              {"adj-a", "a"}, {"adj-b", "b"}, {"adj-c", "c"}}));
+  assert(partition.MoveOutPrivate("adj-b", 1));
+  assert(!partition.ScanSharedComplete(
+      "adj-a", adj_c, true, false, 3, adjacency_generation(),
+      &complete_shared));
+  assert(partition.PromotePrivate("adj-b", 1));
+  assert(partition.DeletePrivate("adj-b"));
+  assert(partition.ScanSharedComplete(
+      "adj-a", adj_c, true, false, 2, adjacency_generation(),
+      &complete_shared));
+  assert((complete_shared ==
+          std::vector<std::pair<std::string, std::string>>{
+              {"adj-a", "a"}, {"adj-c", "c"}}));
+
+  // Adjacency has no row on an empty tail, so its endpoint certificate must
+  // still reject a tail row evicted after the owner prepared the range.
+  assert(partition.PutPrivate("zz-endpoint", "tail"));
+  assert(partition.PromotePrivate("zz-endpoint", 1));
+  const auto endpoint_cutoff = tigonkv::engine::FixedKey::From(
+      "zz-endpoint", regions.layout().fixed_key_size);
+  const uint32_t endpoint_mutation = adjacency_generation();
+  assert(partition.ScanSharedComplete(
+      "zz-endpoint", endpoint_cutoff, true, false, 1, endpoint_mutation,
+      &complete_shared));
+  assert(partition.MoveOutPrivate("zz-endpoint", 1));
+  assert(!partition.ScanSharedComplete(
+      "zz-endpoint", endpoint_cutoff, true, false, 1, endpoint_mutation,
+      &complete_shared));
 
   // Bounded dual-tree merge: migrated shared authority + later private rows,
   // without collecting the full remaining keyspace before applying limit.

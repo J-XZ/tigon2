@@ -315,13 +315,28 @@ int main() {
           node_one->NetworkTxBytes() - tx_before_authoritative_scan;
       if (!authoritative_scan.status.ok() || authoritative_scan.items.size() != 100)
         _exit(15);
-      for (const auto &item : authoritative_scan.items) {
-        if (item.key.rfind("hybrid-", 0) != 0 || item.value != "owner-authority")
+      for (size_t i = 0; i < authoritative_scan.items.size(); ++i) {
+        const auto &item = authoritative_scan.items[i];
+        if (item.key != promoted_scan_keys[i] ||
+            item.value != "owner-authority")
           _exit(16);
       }
       // One range-migrate request plus one cursor range-migrate request. Values
       // travel through CXL, so the requester sends only range-migration frames.
       if (authoritative_scan_tx != 2 * sizeof(tigonkv::engine::KvMessage)) _exit(17);
+      const auto boundary_scan = node_one->Scan(promoted_scan_keys[63], 3);
+      if (!boundary_scan.status.ok() || boundary_scan.items.size() != 3)
+        _exit(29);
+      for (size_t i = 0; i < boundary_scan.items.size(); ++i)
+        if (boundary_scan.items[i].key != promoted_scan_keys[63 + i])
+          _exit(30);
+      const auto complete_hybrid_scan = node_one->Scan("hybrid-", 130);
+      if (!complete_hybrid_scan.status.ok() ||
+          complete_hybrid_scan.items.size() != promoted_scan_keys.size())
+        _exit(31);
+      for (size_t i = 0; i < complete_hybrid_scan.items.size(); ++i)
+        if (complete_hybrid_scan.items[i].key != promoted_scan_keys[i])
+          _exit(32);
       if (write(scan_ready[1], "s", 1) != 1) _exit(28);
 
       std::atomic<bool> start_concurrent_scans{false};
@@ -333,8 +348,14 @@ int main() {
           while (!start_concurrent_scans.load(std::memory_order_acquire))
             std::this_thread::yield();
           const auto scan = node_one->Scan("hybrid-", 100);
-          if (!scan.status.ok() || scan.items.size() != 100)
+          if (!scan.status.ok() || scan.items.size() != 100) {
             concurrent_scan_failed.store(true, std::memory_order_release);
+          } else {
+            for (size_t i = 1; i < scan.items.size(); ++i)
+              if (scan.items[i - 1].key >= scan.items[i].key)
+                concurrent_scan_failed.store(true,
+                                             std::memory_order_release);
+          }
           node_one->ReleaseWorker();
         });
       }

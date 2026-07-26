@@ -73,16 +73,13 @@ bool KvMoveFromSharedToPartition(
 bool KvDeleteAndUpdateNextKeyInfo(star::ITable *table, const void *key,
                                   bool is_delete_local, bool &need_move_out,
                                   void *&migration_policy_meta) {
-  (void)table;
-  (void)key;
-  (void)is_delete_local;
-  (void)need_move_out;
-  (void)migration_policy_meta;
-  // KV deletes deliberately bypass PolicyClock because this adapter has no
-  // next/previous-key metadata. Reaching the Clock delete hook is a protocol
-  // misuse, not a successful no-op.
-  throw std::logic_error(
-      "KV migration adapter does not implement Clock-managed delete");
+  auto *kv_table = dynamic_cast<KvPartitionTable *>(table);
+  if (kv_table == nullptr || kv_table->partition() == nullptr ||
+      !is_delete_local)
+    return false;
+  return kv_table->partition()->DeletePrivateForMigrationManager(
+      std::string_view(static_cast<const char *>(key), table->key_size()),
+      &need_move_out, &migration_policy_meta);
 }
 
 }  // namespace tigonkv::engine

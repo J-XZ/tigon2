@@ -60,6 +60,121 @@ bool SharedMutationSnapshotIdle(uint64_t state) {
   return static_cast<uint32_t>(state) == 0;
 }
 
+constexpr uint8_t kScanCertificateVersion = 1;
+constexpr size_t kScanCertificateHeaderBytes =
+    sizeof(uint8_t) * 2 + sizeof(uint16_t) + sizeof(FixedKey);
+
+struct ScanPartitionCertificate {
+  uint32_t partition_id = 0;
+  bool exhausted = false;
+  bool no_predecessor = false;
+  uint32_t selected_count = 0;
+  uint32_t mutation_generation = 0;
+};
+
+struct ScanCertificate {
+  bool has_cutoff = false;
+  FixedKey cutoff{};
+  std::vector<ScanPartitionCertificate> partitions;
+};
+
+void AppendBytes(std::string *output, const void *data, size_t bytes) {
+  output->append(static_cast<const char *>(data), bytes);
+}
+
+bool ConsumeBytes(std::string_view *input, void *output, size_t bytes) {
+  if (input->size() < bytes) return false;
+  std::memcpy(output, input->data(), bytes);
+  input->remove_prefix(bytes);
+  return true;
+}
+
+std::string EncodeScanCertificate(const ScanCertificate &certificate) {
+  if (certificate.partitions.size() > std::numeric_limits<uint16_t>::max())
+    throw std::invalid_argument("scan certificate has too many partitions");
+  const uint16_t count =
+      static_cast<uint16_t>(certificate.partitions.size());
+  const size_t bitmap_bytes = (count + 7) / 8;
+  std::string encoded;
+  encoded.reserve(kScanCertificateHeaderBytes + 2 * bitmap_bytes +
+                  count * 2 * sizeof(uint32_t));
+  const uint8_t flags = certificate.has_cutoff ? 1 : 0;
+  AppendBytes(&encoded, &kScanCertificateVersion,
+              sizeof(kScanCertificateVersion));
+  AppendBytes(&encoded, &flags, sizeof(flags));
+  AppendBytes(&encoded, &count, sizeof(count));
+  AppendBytes(&encoded, &certificate.cutoff, sizeof(certificate.cutoff));
+  const size_t bitmap_offset = encoded.size();
+  const size_t predecessor_bitmap_offset = bitmap_offset + bitmap_bytes;
+  encoded.resize(bitmap_offset + 2 * bitmap_bytes, '\0');
+  for (size_t i = 0; i < certificate.partitions.size(); ++i) {
+    const auto &partition = certificate.partitions[i];
+    if (partition.exhausted) {
+      encoded[bitmap_offset + i / 8] = static_cast<char>(
+          static_cast<uint8_t>(encoded[bitmap_offset + i / 8]) |
+          static_cast<uint8_t>(1u << (i % 8)));
+    }
+    if (partition.no_predecessor)
+      encoded[predecessor_bitmap_offset + i / 8] = static_cast<char>(
+          static_cast<uint8_t>(
+              encoded[predecessor_bitmap_offset + i / 8]) |
+          static_cast<uint8_t>(1u << (i % 8)));
+    AppendBytes(&encoded, &partition.selected_count,
+                sizeof(partition.selected_count));
+    if (partition.exhausted || partition.no_predecessor)
+      AppendBytes(&encoded, &partition.mutation_generation,
+                  sizeof(partition.mutation_generation));
+  }
+  return encoded;
+}
+
+bool DecodeScanCertificate(
+    uint32_t owner, uint32_t vm_count, uint32_t partition_count,
+    std::string_view encoded, ScanCertificate *certificate) {
+  if (certificate == nullptr) return false;
+  uint8_t version = 0;
+  uint8_t flags = 0;
+  uint16_t count = 0;
+  if (!ConsumeBytes(&encoded, &version, sizeof(version)) ||
+      !ConsumeBytes(&encoded, &flags, sizeof(flags)) ||
+      !ConsumeBytes(&encoded, &count, sizeof(count)) ||
+      !ConsumeBytes(&encoded, &certificate->cutoff,
+                    sizeof(certificate->cutoff)) ||
+      version != kScanCertificateVersion || (flags & ~uint8_t{1}) != 0)
+    return false;
+  std::vector<uint32_t> owned;
+  for (uint32_t partition = 0; partition < partition_count; ++partition)
+    if (partition % vm_count == owner) owned.push_back(partition);
+  if (count != owned.size()) return false;
+  const size_t bitmap_bytes = (count + 7) / 8;
+  if (encoded.size() < 2 * bitmap_bytes) return false;
+  const std::string_view bitmap = encoded.substr(0, bitmap_bytes);
+  const std::string_view predecessor_bitmap =
+      encoded.substr(bitmap_bytes, bitmap_bytes);
+  encoded.remove_prefix(2 * bitmap_bytes);
+  certificate->has_cutoff = (flags & 1) != 0;
+  certificate->partitions.clear();
+  certificate->partitions.reserve(count);
+  for (size_t i = 0; i < owned.size(); ++i) {
+    ScanPartitionCertificate partition;
+    partition.partition_id = owned[i];
+    partition.exhausted =
+        (static_cast<uint8_t>(bitmap[i / 8]) & (1u << (i % 8))) != 0;
+    partition.no_predecessor =
+        (static_cast<uint8_t>(predecessor_bitmap[i / 8]) &
+         (1u << (i % 8))) != 0;
+    if (!ConsumeBytes(&encoded, &partition.selected_count,
+                      sizeof(partition.selected_count)))
+      return false;
+    if ((partition.exhausted || partition.no_predecessor) &&
+        !ConsumeBytes(&encoded, &partition.mutation_generation,
+                      sizeof(partition.mutation_generation)))
+      return false;
+    certificate->partitions.push_back(partition);
+  }
+  return encoded.empty();
+}
+
 // While serving a request (or walking owned trees for a local Scan), nested
 // PollTransport must not pop/serve deferred requests. Handling another
 // Put/Get request here mutates the same B+trees under OLC and livelocks
@@ -111,7 +226,7 @@ bool ValidMessageType(KvMessageType type) {
 }
 
 bool ValidStatusCode(uint32_t status) {
-  return status <= static_cast<uint32_t>(StatusCode::kOwnerViolation);
+  return status <= static_cast<uint32_t>(StatusCode::kBusy);
 }
 
 std::string EncodeU64(uint64_t value) {
@@ -380,6 +495,8 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   constexpr uint64_t kPageSize = 64;
   const uint64_t target = limit == 0 ? kScanSafetyLimit : limit;
   const uint64_t request_limit = kPageSize + 1;  // one cursor duplicate + one page
+  const auto scan_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
   struct Source {
     uint32_t node = 0;
@@ -436,19 +553,28 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   }
   auto scan_remote_page =
       [&](uint32_t node, std::string_view cursor) -> ScanResult {
-    for (uint32_t attempt = 0; attempt < 8; ++attempt) {
+    for (;;) {
+      if (std::chrono::steady_clock::now() >= scan_deadline)
+        return {Status::Error(
+                    StatusCode::kBusy,
+                    "CXL scan retry deadline exceeded"),
+                {}};
       std::string snapshot;
       const Status migrated =
           RequestScanMigrate(node, cursor, request_limit, &snapshot);
-      if (!migrated.ok()) return {migrated, {}};
+      if (!migrated.ok()) {
+        if (migrated.code != StatusCode::kBusy) return {migrated, {}};
+        PollTransport();
+        std::this_thread::yield();
+        continue;
+      }
       ScanResult page =
-          ScanSharedPartitions(node, cursor, request_limit);
-      if (page.status.ok() && ScanSnapshotValid(node, snapshot)) return page;
+          ScanSharedPartitions(node, cursor, request_limit, snapshot);
+      if (page.status.ok()) return page;
+      if (page.status.code != StatusCode::kBusy) return page;
+      PollTransport();
+      std::this_thread::yield();
     }
-    return {Status::Error(
-                StatusCode::kCorruption,
-                "scan range changed during repeated CXL reads"),
-            {}};
   };
   Status first_error = Status::Ok();
   for (const auto &move : range_moves) {
@@ -456,12 +582,24 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     const Status migrated =
         AwaitResponse(move.request_id, move.pending, &snapshot);
     if (!migrated.ok()) {
-      if (first_error.ok()) first_error = migrated;
+      if (migrated.code != StatusCode::kBusy) {
+        if (first_error.ok()) first_error = migrated;
+        continue;
+      }
+      ScanResult page = scan_remote_page(move.node, start_key);
+      if (!page.status.ok()) {
+        if (first_error.ok()) first_error = page.status;
+        continue;
+      }
+      Source source;
+      source.node = move.node;
+      load_page(&source, std::move(page.items));
+      sources.push_back(std::move(source));
       continue;
     }
     ScanResult page =
-        ScanSharedPartitions(move.node, start_key, request_limit);
-    if (!page.status.ok() || !ScanSnapshotValid(move.node, snapshot))
+        ScanSharedPartitions(move.node, start_key, request_limit, snapshot);
+    if (!page.status.ok())
       page = scan_remote_page(move.node, start_key);
     if (!page.status.ok()) {
       if (first_error.ok()) first_error = page.status;
@@ -576,15 +714,33 @@ ScanResult KVEngine::ScanOwnedPartitions(std::string_view start_key, uint64_t li
 
 ScanResult KVEngine::ScanSharedPartitions(uint32_t owner,
                                           std::string_view start_key,
-                                          uint64_t limit) {
+                                          uint64_t limit,
+                                          std::string_view migration_certificate) {
+  ScanCertificate certificate;
+  if (!DecodeScanCertificate(owner, config_.vm_count, config_.partition_count,
+                             migration_certificate, &certificate))
+    return {Status::Error(StatusCode::kCorruption,
+                          "malformed scan migration certificate"), {}};
   std::vector<std::vector<ScanItem>> parts;
-  bool complete = true;
   try {
-    for (const auto &partition : partitions_) {
-      if (OwnerForPartition(partition->partition_id()) != owner) continue;
+    for (const auto &proof : certificate.partitions) {
+      auto *partition = partitions_.at(proof.partition_id).get();
       std::vector<std::pair<std::string, std::string>> items;
-      if (!partition->ScanShared(start_key, limit, &items))
-        complete = false;
+      if (!certificate.has_cutoff) {
+        const uint64_t state = partition->SharedMutationState();
+        if (!proof.exhausted || proof.selected_count != 0 ||
+            !SharedMutationSnapshotIdle(state) ||
+            static_cast<uint32_t>(state >> 32) !=
+                proof.mutation_generation)
+          return {Status::Error(StatusCode::kBusy,
+                                "empty CXL scan certificate changed"), {}};
+      } else if (!partition->ScanSharedComplete(
+                     start_key, certificate.cutoff, proof.exhausted,
+                     proof.no_predecessor, proof.selected_count,
+                     proof.mutation_generation, &items)) {
+        return {Status::Error(StatusCode::kBusy,
+                              "CXL scan adjacency changed"), {}};
+      }
       std::vector<ScanItem> page;
       page.reserve(items.size());
       for (auto &item : items)
@@ -594,9 +750,6 @@ ScanResult KVEngine::ScanSharedPartitions(uint32_t owner,
   } catch (const std::exception &error) {
     return {Status::Error(StatusCode::kCorruption, error.what()), {}};
   }
-  if (!complete)
-    return {Status::Error(StatusCode::kCorruption,
-                          "CXL scan could not read a promoted row"), {}};
   struct HeapItem {
     std::string_view key;
     size_t part = 0;
@@ -622,11 +775,17 @@ ScanResult KVEngine::ScanSharedPartitions(uint32_t owner,
 
 Status KVEngine::PrepareSharedScan(std::string_view start_key, uint64_t limit,
                                    uint32_t requester,
-                                   std::string *migration_snapshot) {
-  if (migration_snapshot == nullptr)
+                                   std::string *migration_certificate) {
+  if (migration_certificate == nullptr)
     return Status::Error(StatusCode::kInvalidArgument,
-                         "null scan migration snapshot");
+                         "null scan migration certificate");
   const std::function<void()> progress = [this] { PollTransport(); };
+  struct PartitionRange {
+    KVPartition *partition = nullptr;
+    uint64_t before = 0;
+    bool no_predecessor = false;
+    std::vector<std::string> keys;
+  };
   struct HeapItem {
     std::string_view key;
     size_t part = 0;
@@ -635,109 +794,144 @@ Status KVEngine::PrepareSharedScan(std::string_view start_key, uint64_t limit,
   auto compare = [](const HeapItem &left, const HeapItem &right) {
     return left.key > right.key;
   };
-  for (uint32_t attempt = 0; attempt < 8; ++attempt) {
-    bool preparation_unstable = false;
-    std::vector<uint64_t> before;
-    std::vector<std::vector<std::string>> parts;
-    before.reserve(partitions_.size());
-    parts.reserve(partitions_.size());
+  const auto preparation_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (;;) {
+    std::vector<PartitionRange> ranges;
+    ranges.reserve(partitions_.size());
     for (const auto &partition : partitions_) {
       if (OwnerForPartition(partition->partition_id()) != config_.node_id)
         continue;
-      const uint64_t state = partition->SharedMutationState();
-      if (!SharedMutationSnapshotIdle(state)) {
-        preparation_unstable = true;
-        break;
-      }
-      before.push_back(state);
-      std::vector<std::string> keys;
-      if (!partition->ScanOwnedKeys(start_key, limit, &keys, &progress))
+      PartitionRange range;
+      range.partition = partition.get();
+      range.before = partition->SharedMutationState();
+      const uint64_t per_partition_limit =
+          limit == 0 ? 0 : limit + 1;
+      if (!partition->ScanOwnedKeys(
+              start_key, per_partition_limit, &range.keys, &progress))
         return Status::Error(StatusCode::kCorruption,
                              "owner key-only range scan failed");
-      parts.push_back(std::move(keys));
+      ranges.push_back(std::move(range));
     }
 
-    if (preparation_unstable) {
-      PollTransport();
-      continue;
-    }
     std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(compare)>
         heap(compare);
-    for (size_t part = 0; part < parts.size(); ++part)
-      if (!parts[part].empty()) heap.push({parts[part][0], part, 0});
+    for (size_t part = 0; part < ranges.size(); ++part)
+      if (!ranges[part].keys.empty())
+        heap.push({ranges[part].keys[0], part, 0});
 
-    uint64_t promoted = 0;
-    bool range_changed = false;
-    while (!heap.empty() && (limit == 0 || promoted < limit)) {
+    uint64_t selected = 0;
+    FixedKey cutoff{};
+    bool has_cutoff = false;
+    while (!heap.empty() && (limit == 0 || selected < limit)) {
       const HeapItem top = heap.top();
       heap.pop();
-      const std::string &key = parts[top.part][top.index];
-      auto *partition = OwnedPartition(key);
-      if (partition == nullptr)
-        return Status::Error(StatusCode::kOwnerViolation,
-                             "owner scan key routed to non-owner");
-      bool moved_in = false;
-      const StatusCode code =
-          partition->EnsureInShared(key, requester, &moved_in);
-      if (code == StatusCode::kNotFound) {
-        range_changed = true;
-        break;
-      }
-      if (code != StatusCode::kOk)
-        return Status::Error(code, "scan range move-in failed");
-      if (moved_in) {
-        migration_in_.fetch_add(1, std::memory_order_relaxed);
-        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-      }
-      ++promoted;
+      cutoff = FixedKey::From(
+          ranges[top.part].keys[top.index], config_.fixed_key_size);
+      has_cutoff = true;
+      ++selected;
       const size_t next = top.index + 1;
-      if (next < parts[top.part].size())
-        heap.push({parts[top.part][next], top.part, next});
+      if (next < ranges[top.part].keys.size())
+        heap.push({ranges[top.part].keys[next], top.part, next});
     }
 
-    if (range_changed) {
+    ScanCertificate certificate;
+    certificate.has_cutoff = has_cutoff;
+    certificate.cutoff = cutoff;
+    bool retry = false;
+    for (auto &range : ranges) {
+      auto first_after_cutoff = range.keys.end();
+      if (has_cutoff) {
+        first_after_cutoff = std::find_if(
+            range.keys.begin(), range.keys.end(), [&](const std::string &key) {
+              return FixedKey::From(key, config_.fixed_key_size)
+                         .Compare(cutoff) > 0;
+            });
+        std::string predecessor;
+        if (!range.keys.empty() &&
+            FixedKey::From(range.keys.front(), config_.fixed_key_size)
+                    .Compare(FixedKey::From(
+                        start_key, config_.fixed_key_size)) != 0 &&
+            !range.partition->PrivatePredecessorKey(
+                start_key, &predecessor)) {
+          range.no_predecessor = true;
+        } else if (!predecessor.empty()) {
+            bool moved_in = false;
+            const StatusCode code = range.partition->EnsureInShared(
+                predecessor, requester, &moved_in);
+            if (code == StatusCode::kNotFound) {
+              retry = true;
+              break;
+            }
+            if (code != StatusCode::kOk)
+              return Status::Error(code, "scan left-boundary move-in failed");
+            if (moved_in) {
+              migration_in_.fetch_add(1, std::memory_order_relaxed);
+              shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        const auto last = first_after_cutoff == range.keys.end()
+                              ? range.keys.end()
+                              : std::next(first_after_cutoff);
+        for (auto key = range.keys.begin(); key != last; ++key) {
+          bool moved_in = false;
+          const StatusCode code =
+              range.partition->EnsureInShared(*key, requester, &moved_in);
+          if (code == StatusCode::kNotFound) {
+            retry = true;
+            break;
+          }
+          if (code != StatusCode::kOk)
+            return Status::Error(code, "scan range move-in failed");
+          if (moved_in) {
+            migration_in_.fetch_add(1, std::memory_order_relaxed);
+            shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+        if (retry) break;
+        // Match TwoPLPasha DATA_MIGRATION_REQUEST_FOR_SCAN: after a range
+        // batch, let the original on-demand Clock policy enforce its budget.
+        KvMigrationRuntime::SyncHwCcUsage(*range.partition);
+        range.partition->MoveOutClockVictim(config_.node_id);
+      }
+      ScanPartitionCertificate proof;
+      proof.partition_id = range.partition->partition_id();
+      proof.no_predecessor = range.no_predecessor;
+      proof.exhausted =
+          !has_cutoff || first_after_cutoff == range.keys.end();
+      proof.selected_count = has_cutoff
+                                 ? static_cast<uint32_t>(std::distance(
+                                       range.keys.begin(),
+                                       first_after_cutoff))
+                                 : 0;
+      if (proof.exhausted || proof.no_predecessor) {
+        const uint64_t after = range.partition->SharedMutationState();
+        if (!SharedMutationSnapshotIdle(range.before) ||
+            !SharedMutationSnapshotIdle(after) ||
+            after != range.before) {
+          retry = true;
+          break;
+        }
+        proof.mutation_generation =
+            static_cast<uint32_t>(after >> 32);
+      }
+      certificate.partitions.push_back(proof);
+    }
+    if (retry) {
+      if (std::chrono::steady_clock::now() >= preparation_deadline)
+        return Status::Error(
+            StatusCode::kBusy,
+            "owner scan preparation retry deadline exceeded");
       PollTransport();
+      std::this_thread::yield();
       continue;
     }
-    migration_snapshot->clear();
-    size_t sequence = 0;
-    bool stable = true;
-    for (const auto &partition : partitions_) {
-      if (OwnerForPartition(partition->partition_id()) != config_.node_id)
-        continue;
-      const uint64_t after = partition->SharedMutationState();
-      stable = stable && sequence < before.size() &&
-               before[sequence] == after &&
-               SharedMutationSnapshotIdle(after);
-      ++sequence;
-      migration_snapshot->append(EncodeU64(after));
-    }
-    if (migration_snapshot->size() > KvMessage{}.value.size())
+    *migration_certificate = EncodeScanCertificate(certificate);
+    if (migration_certificate->size() > KvMessage{}.value.size())
       return Status::Error(StatusCode::kInvalidArgument,
-                           "scan migration snapshot exceeds wire capacity");
-    if (stable && sequence == before.size()) return Status::Ok();
+                           "scan migration certificate exceeds wire capacity");
+    return Status::Ok();
   }
-  return Status::Error(StatusCode::kCorruption,
-                       "owner scan range changed during move-in");
-}
-
-bool KVEngine::ScanSnapshotValid(
-    uint32_t owner, std::string_view migration_snapshot) const {
-  size_t position = 0;
-  for (const auto &partition : partitions_) {
-    if (OwnerForPartition(partition->partition_id()) != owner) continue;
-    if (position + sizeof(uint64_t) > migration_snapshot.size())
-      return false;
-    uint64_t expected = 0;
-    if (!DecodeU64(migration_snapshot.substr(position, sizeof(uint64_t)),
-                   &expected))
-      return false;
-    const uint64_t current = partition->SharedMutationState();
-    if (!SharedMutationSnapshotIdle(current) || current != expected)
-      return false;
-    position += sizeof(uint64_t);
-  }
-  return position == migration_snapshot.size();
 }
 
 CasResult KVEngine::CompareExchange(std::string_view key,
@@ -971,7 +1165,7 @@ Status KVEngine::RequestMigrate(std::string_view key) {
 Status KVEngine::RequestScanMigrate(uint32_t owner,
                                     std::string_view start_key,
                                     uint64_t limit,
-                                    std::string *migration_snapshot) {
+                                    std::string *migration_certificate) {
   const uint64_t request_id = NextRequestId(config_.node_id);
   auto pending = RegisterPendingResponse(request_id);
   try {
@@ -982,7 +1176,7 @@ Status KVEngine::RequestScanMigrate(uint32_t owner,
     RemovePendingResponse(request_id);
     throw;
   }
-  return AwaitResponse(request_id, pending, migration_snapshot);
+  return AwaitResponse(request_id, pending, migration_certificate);
 }
 
 std::shared_ptr<KVEngine::PendingResponse>
@@ -1265,13 +1459,19 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
       response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
     } else {
       try {
-        std::string snapshot;
+        std::string certificate;
         const Status status =
-            PrepareSharedScan(key, limit, message.source_node, &snapshot);
+            PrepareSharedScan(key, limit, message.source_node, &certificate);
         response.status = static_cast<uint32_t>(status.code);
         if (status.ok()) {
-          response.value_size = static_cast<uint32_t>(snapshot.size());
-          std::memcpy(response.value.data(), snapshot.data(), snapshot.size());
+          response.value_size = static_cast<uint32_t>(certificate.size());
+          std::memcpy(response.value.data(), certificate.data(),
+                      certificate.size());
+        } else {
+          response.value_size = static_cast<uint32_t>(
+              std::min(status.message.size(), response.value.size()));
+          std::memcpy(response.value.data(), status.message.data(),
+                      response.value_size);
         }
       } catch (const std::bad_alloc &) {
         response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
@@ -1458,7 +1658,13 @@ Status KVEngine::MoveOut(std::string_view key) {
   MarkLayoutDirty();
   auto *partition = OwnedPartition(key);
   if (partition == nullptr) return Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding");
-  if (partition->MoveOutPrivate(key, config_.node_id)) {
+  auto *clock = KvMigrationRuntime::Instance().clock();
+  auto *table =
+      KvMigrationRuntime::Instance().TableFor(partition->partition_id());
+  const FixedKey fixed_key =
+      FixedKey::From(key, config_.fixed_key_size);
+  if (clock != nullptr && table != nullptr &&
+      clock->move_specific_row_out(table, fixed_key.bytes)) {
     migration_out_.fetch_add(1, std::memory_order_relaxed);
     return Status::Ok();
   }

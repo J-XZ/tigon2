@@ -165,6 +165,33 @@ retry:
                 }
 	}
 
+        // Use when dropping the latch publishes metadata prepared under it.
+        // The raw CAS is intentionally preceded by the simulator settlement:
+        // peers cannot observe the new state until its HWCC load/RMW latency
+        // has been paid. Disabled mode adds only the existing fast gates.
+        void unlock_for_publication()
+        {
+                for (;;) {
+                        tigonkv::engine::mem_access::HwccAtomicLoad(
+                            &atomic_word);
+                        uint64_t expected =
+                            atomic_word.load(std::memory_order_acquire);
+                        DCHECK((expected &
+                                (LATCH_BIT_MASK << LATCH_BIT_OFFSET)) != 0);
+                        const uint64_t desired =
+                            expected &
+                            ~(LATCH_BIT_MASK << LATCH_BIT_OFFSET);
+                        tigonkv::engine::mem_access::HwccAtomicRmw(
+                            &atomic_word);
+                        tigonkv::engine::mem_access::DelayActiveScopeNow();
+                        if (atomic_word.compare_exchange_weak(
+                                expected, desired,
+                                std::memory_order_acq_rel,
+                                std::memory_order_acquire))
+                                return;
+                }
+        }
+
         TwoPLPashaSharedDataSCC *get_scc_data()
         {
                 uint64_t scc_data_cxl_offset =
@@ -519,7 +546,8 @@ class TwoPLPashaHelper {
         static bool kv_shared_read_value(TwoPLPashaMetadataShared *smeta,
                                          std::size_t host_id, void *dest,
                                          std::size_t capacity,
-                                         uint32_t *value_size)
+                                         uint32_t *value_size,
+                                         bool ref_already_pinned = false)
         {
                 if (smeta == nullptr || scc_manager == nullptr ||
                     value_size == nullptr) return false;
@@ -529,12 +557,14 @@ class TwoPLPashaHelper {
                 if (size > capacity || smeta->is_write_locked() ||
                     smeta->get_writer_waiting() != 0 ||
                     smeta->get_reader_count() == smeta->get_reader_count_max() ||
-                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+                    (!ref_already_pinned &&
+                     smeta->get_ref_cnt() ==
+                         std::numeric_limits<uint8_t>::max())) {
                         smeta->unlock();
                         return false;
                 }
                 smeta->increase_reader_count();
-                smeta->increment_ref_cnt();
+                if (!ref_already_pinned) smeta->increment_ref_cnt();
                 const auto host_bit =
                     host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
                 const bool need_fill = !smeta->is_bit_set(host_bit);
@@ -554,8 +584,10 @@ class TwoPLPashaHelper {
                 }
                 tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
-                DCHECK(smeta->get_ref_cnt() > 0);
-                smeta->decrement_ref_cnt();
+                if (!ref_already_pinned) {
+                        DCHECK(smeta->get_ref_cnt() > 0);
+                        smeta->decrement_ref_cnt();
+                }
                 smeta->decrease_reader_count();
                 smeta->unlock();
                 if (valid) *value_size = size;

@@ -42,7 +42,8 @@ class KvPartitionTable final : public star::ITable {
   }
   void scan(const void *,
             std::function<bool(const void *, MetaDataType *, void *, bool)>) override {
-    throw std::logic_error("KV migration adapter has no adjacency-complete scan");
+    throw std::logic_error(
+        "KVPartition, not the migration adapter, owns adjacency-complete scan");
   }
   bool insert(const void *, const void *, bool = false) override {
     throw std::logic_error("KV migration adapter does not implement insert");
@@ -51,14 +52,16 @@ class KvPartitionTable final : public star::ITable {
       const void *, const void *,
       std::function<bool(const void *, MetaDataType *, void *)>,
       bool = false) override {
-    throw std::logic_error("KV migration adapter does not maintain next-key state");
+    throw std::logic_error(
+        "KVPartition, not the migration adapter, maintains next-key state");
   }
   bool insert_and_process_adjacent_tuples(
       const void *, const void *,
       std::function<bool(const void *, MetaDataType *, void *, const void *,
                          MetaDataType *, void *)>,
       bool = false) override {
-    throw std::logic_error("KV migration adapter does not maintain adjacency state");
+    throw std::logic_error(
+        "KVPartition, not the migration adapter, maintains adjacency state");
   }
   bool remove(const void *) override {
     throw std::logic_error("KV migration adapter does not implement remove");
@@ -67,7 +70,8 @@ class KvPartitionTable final : public star::ITable {
       const void *,
       std::function<bool(const void *, void *, void *, const void *, void *,
                          void *, const void *, void *, void *)>) override {
-    throw std::logic_error("KV migration adapter does not maintain adjacency state");
+    throw std::logic_error(
+        "KVPartition, not the migration adapter, maintains adjacency state");
   }
   void update(const void *, const void *,
               std::function<void(const void *, const void *)> = {}) override {
@@ -77,7 +81,8 @@ class KvPartitionTable final : public star::ITable {
       const void *,
       std::function<void(const void *, void *, void *, const void *, void *,
                          void *, const void *, void *, void *)>) override {
-    throw std::logic_error("KV migration adapter does not maintain next-key state");
+    throw std::logic_error(
+        "KVPartition, not the migration adapter, maintains next-key state");
   }
   void deserialize_value(const void *, star::StringPiece) override {
     throw std::logic_error("KV migration adapter does not deserialize values");
