@@ -1307,14 +1307,18 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
     star::cxl_memory.set_total_hw_cc_usage(hw_budget);
   else
     KvMigrationRuntime::SyncHwCcUsage(partition);
-  for (uint32_t attempt = 0; attempt < 16; ++attempt) {
-    if (partition.MoveOutClockVictim(config_.node_id)) {
-      migration_out_.fetch_add(1, std::memory_order_relaxed);
-      return;
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    for (auto &candidate : partitions_) {
+      if (OwnerForPartition(candidate->partition_id()) != config_.node_id)
+        continue;
+      if (candidate->MoveOutClockVictim(config_.node_id)) {
+        migration_out_.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
     }
   }
-  // Soft-fail: callers on the serve path must still deliver responses. Hard
-  // throwing here caused "forwarded owner response timed out" under YCSB-A.
+  throw std::runtime_error(
+      "migration budget exceeded without an eligible owner Clock victim");
 }
 
 Status KVEngine::MoveOut(std::string_view key) {

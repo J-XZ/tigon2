@@ -1056,10 +1056,9 @@ uint64_t KVPartition::shared_payload_capacity_bytes() const {
 }
 
 uint64_t KVPartition::hwcc_used_bytes() const {
-  uint64_t total = 0;
-  for (size_t i = 0; i < static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc); ++i)
-    total += regions_.layout().domains[i].used_bytes.load(std::memory_order_relaxed);
-  return total;
+  const auto &counter = regions_.layout().owner_migration_hwcc[owner_shard_];
+  mem_access::HwccAtomicLoad(&counter.used_bytes);
+  return counter.used_bytes.load(std::memory_order_relaxed);
 }
 
 uint64_t KVPartition::migrated_key_count() const {

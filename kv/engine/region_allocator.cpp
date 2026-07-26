@@ -79,6 +79,14 @@ uint32_t RegionAllocator::SizeClass(uint64_t bytes) {
   return kAllocatorSizeClasses;  // large allocation: aligned bump chunk
 }
 
+uint64_t RegionAllocator::AccountedBytes(uint64_t bytes) {
+  if (bytes == 0) throw std::invalid_argument("zero-sized allocation");
+  const uint64_t requested = Align(bytes + Align(sizeof(RegionFreeBlock)));
+  const uint32_t size_class = SizeClass(requested);
+  return size_class < kAllocatorSizeClasses ? ClassBytes(size_class)
+                                            : requested;
+}
+
 RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
                                             uint32_t shard_count,
                                             uint64_t reserved_prefix_bytes,
@@ -576,9 +584,27 @@ void DualRegionAllocator::MarkDirty() {
 void *DualRegionAllocator::Allocate(uint64_t bytes, AllocationDomain domain,
                                     uint32_t owner_shard) {
   DomainCounter &counter = header_->layout.domains[static_cast<size_t>(domain)];
-  return IsHwccDomain(domain)
-             ? hwcc_.Allocate(bytes, domain, &counter, owner_shard)
-             : swcc_.Allocate(bytes, domain, &counter, owner_shard);
+  void *result = IsHwccDomain(domain)
+                     ? hwcc_.Allocate(bytes, domain, &counter, owner_shard)
+                     : swcc_.Allocate(bytes, domain, &counter, owner_shard);
+  if (domain == AllocationDomain::kHwccIndex ||
+      domain == AllocationDomain::kHwccMetadata) {
+    auto &owner = header_->layout.owner_migration_hwcc[owner_shard];
+    const uint64_t accounted = RegionAllocator::AccountedBytes(bytes);
+    mem_access::HwccAtomicRmw(&owner.used_bytes);
+    const uint64_t used =
+        owner.used_bytes.fetch_add(accounted, std::memory_order_relaxed) +
+        accounted;
+    mem_access::HwccAtomicLoad(&owner.peak_bytes);
+    uint64_t peak = owner.peak_bytes.load(std::memory_order_relaxed);
+    while (peak < used) {
+      mem_access::HwccAtomicRmw(&owner.peak_bytes);
+      if (owner.peak_bytes.compare_exchange_weak(
+              peak, used, std::memory_order_relaxed))
+        break;
+    }
+  }
+  return result;
 }
 
 OwnerPrivateArenaHeader *DualRegionAllocator::Arena(uint32_t partition_id) const {
@@ -704,6 +730,16 @@ void DualRegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain d
   if (IsHwccDomain(domain)) {
     if (!hwcc_.Contains(pointer)) throw std::runtime_error("HWCC free outside HWCC region");
     hwcc_.Free(pointer, bytes, domain, &counter, owner_shard, current_shard);
+    if (domain == AllocationDomain::kHwccIndex ||
+        domain == AllocationDomain::kHwccMetadata) {
+      auto &owner = header_->layout.owner_migration_hwcc[owner_shard];
+      const uint64_t accounted = RegionAllocator::AccountedBytes(bytes);
+      mem_access::HwccAtomicRmw(&owner.used_bytes);
+      const uint64_t before =
+          owner.used_bytes.fetch_sub(accounted, std::memory_order_relaxed);
+      if (before < accounted)
+        throw std::runtime_error("owner HWCC accounting underflow");
+    }
   } else {
     if (!swcc_.Contains(pointer)) throw std::runtime_error("SWCC free outside SWCC region");
     swcc_.Free(pointer, bytes, domain, &counter, owner_shard, current_shard);

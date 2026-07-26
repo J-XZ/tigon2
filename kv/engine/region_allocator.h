@@ -52,6 +52,7 @@ struct alignas(64) RegionAllocatorHeader {
 class RegionAllocator {
  public:
   static constexpr uint64_t kAlignment = 64;
+  static uint64_t AccountedBytes(uint64_t bytes);
 
   static RegionAllocator Initialize(void *region, uint64_t region_bytes,
                                     uint32_t shard_count,

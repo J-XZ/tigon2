@@ -172,6 +172,8 @@ void TestDualPhysicalRegions() {
   assert(!dual.IsHwccAddress(owner) && !dual.IsSwccAddress(index));
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
              .used_bytes.load() > 0);
+  assert(dual.layout().owner_migration_hwcc[0].used_bytes.load() > 0);
+  assert(dual.layout().owner_migration_hwcc[1].used_bytes.load() > 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccLayout)]
              .used_bytes.load() > 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kAllocatorMetadata)]
@@ -192,6 +194,8 @@ void TestDualPhysicalRegions() {
   dual.Free(reused_remote, 100, AllocationDomain::kSharedPayloadSwcc, 0, 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
              .used_bytes.load() == 0);
+  assert(dual.layout().owner_migration_hwcc[0].used_bytes.load() == 0);
+  assert(dual.layout().owner_migration_hwcc[1].used_bytes.load() == 0);
   std::thread checkpoint_zero([&] {
     dual.FlushCheckpointRanges(0, std::chrono::seconds(1));
   });
