@@ -387,13 +387,16 @@ class TwoPLPashaHelper {
                                 scc_manager->prepare_read(smeta, host_id, scc_data, size);
                         }
                         scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
-                        // Re-take latch for bit repair + finish_write (see changelog).
+                        // HWCC smeta latch is cross-VM: never hold it across
+                        // finish_write's clwb (multi-VM livelock on hot keys).
                         smeta->lock();
                         if (!smeta->is_bit_set(host_bit))
                                 smeta->set_bit(host_bit);
                         smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
                         smeta->value_len = static_cast<uint32_t>(size);
+                        smeta->unlock();
                         scc_manager->finish_write(smeta, host_id, scc_data, size);
+                        smeta->lock();
                         DCHECK(smeta->ref_cnt > 0);
                         smeta->ref_cnt--;
                         smeta->clear_write_locked();
