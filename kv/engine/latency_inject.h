@@ -13,7 +13,8 @@ enum class AccessKind : uint8_t {
   kAtomicLoad = 2,
   kAtomicStore = 3,
   kAtomicRmw = 4,
-  kFlush = 5,
+  kWriteback = 5,
+  kInvalidate = 6,
 };
 enum class CacheModel : uint8_t {
   kNone = 0,

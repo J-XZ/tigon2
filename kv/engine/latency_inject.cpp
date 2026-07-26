@@ -142,7 +142,8 @@ uint64_t LineDelayNs(const Config &cfg, PoolKind pool, AccessKind kind) {
     case AccessKind::kAtomicStore:
     case AccessKind::kAtomicRmw:
       return RoundNs(cfg.swcc_write_ns_per_line);
-    case AccessKind::kFlush:
+    case AccessKind::kWriteback:
+    case AccessKind::kInvalidate:
       return RoundNs(cfg.swcc_flush_ns_per_line);
     }
   }
@@ -157,7 +158,8 @@ uint64_t LineDelayNs(const Config &cfg, PoolKind pool, AccessKind kind) {
     return RoundNs(cfg.hwcc_atomic_store_ns);
   case AccessKind::kAtomicRmw:
     return RoundNs(cfg.hwcc_atomic_rmw_ns);
-  case AccessKind::kFlush:
+  case AccessKind::kWriteback:
+  case AccessKind::kInvalidate:
     return RoundNs(cfg.hwcc_write_ns_per_line);
   }
   return 0;
@@ -221,6 +223,22 @@ struct CacheState {
     inserted.valid = true;
     set_entries[0] = inserted;
     return false;
+  }
+
+  void Invalidate(uint64_t tag) {
+    if (entries.empty()) return;
+    const uint64_t set = set_mask != 0 ? (tag & set_mask) : (tag % set_count);
+    CacheLineEntry *set_entries =
+        entries.data() + static_cast<size_t>(set * associativity);
+    for (uint64_t i = 0; i < associativity; ++i) {
+      auto &entry = set_entries[static_cast<size_t>(i)];
+      if (!entry.valid || entry.tag != tag) continue;
+      for (uint64_t j = i; j + 1 < associativity; ++j)
+        set_entries[static_cast<size_t>(j)] =
+            set_entries[static_cast<size_t>(j + 1)];
+      set_entries[static_cast<size_t>(associativity - 1)] = {};
+      return;
+    }
   }
 };
 
@@ -466,6 +484,26 @@ void LatencySimulator::RecordRange(PoolKind pool, AccessKind kind,
   const uint64_t raw_count = last_line - first_line + 1;
   const uint64_t miss_delay_ns = LineDelayNs(cfg, pool, kind);
   const uint64_t hit_delay_ns = RoundNs(cfg.cache_hit_extra_ns);
+  const bool writeback = kind == AccessKind::kWriteback;
+  const bool invalidate = kind == AccessKind::kInvalidate;
+
+  // Cache-maintenance instructions are mandatory protocol operations, not
+  // cacheable data accesses. Both pay the full configured flush cost and
+  // never consume the fixed-hit RNG. CLFLUSH additionally evicts an existing
+  // per-thread LRU tag; CLWB preserves a present tag and never installs one.
+  if (writeback || invalidate) {
+    if (invalidate && cfg.cache_model == CacheModel::kPerThreadLru) {
+      for (uint64_t line = first_line; line <= last_line; ++line)
+        state.cache.Invalidate(MakeTag(pool, line));
+    }
+    const uint64_t delayed_ns = raw_count * miss_delay_ns;
+    state.pending_delay_ns += delayed_ns;
+    if (cfg.stats_enabled) {
+      std::lock_guard<std::mutex> lock(StatsMutex());
+      AddStats(&stats_, pool, raw_count, 0, raw_count, delayed_ns);
+    }
+    return;
+  }
 
   if (cfg.cache_model == CacheModel::kNone) {
     const uint64_t delayed_ns = raw_count * miss_delay_ns;

@@ -98,8 +98,13 @@ inline void TransportRead(const void *address, size_t bytes) {
 inline void TransportWrite(const void *address, size_t bytes) {
   HwccWrite(address, bytes);
 }
-inline void SwccFlush(const void *address, size_t bytes) {
-  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kFlush, address, bytes);
+inline void SwccWriteback(const void *address, size_t bytes) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kWriteback,
+         address, bytes);
+}
+inline void SwccInvalidate(const void *address, size_t bytes) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kInvalidate,
+         address, bytes);
 }
 inline void SharedPayloadRead(const void *address, size_t bytes) {
   Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kRead, address, bytes);

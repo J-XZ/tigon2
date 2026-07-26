@@ -48,12 +48,15 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
   if (partition_id >= regions.layout().partition_count)
     throw std::invalid_argument("partition id outside persistent layout");
   if (attach) {
+    mem_access::HwccRead(&directory_.private_root,
+                         sizeof(directory_.private_root));
+    const RegionOffset private_root = directory_.private_root;
     mem_access::HwccAtomicLoad(&directory_.shared_root);
-    if (directory_.private_root == kNullOffset ||
+    if (private_root == kNullOffset ||
         directory_.shared_root.load(std::memory_order_acquire) == kNullOffset)
       throw std::runtime_error("partition attach missing tree root");
     private_tree_ = new PrivateTree(
-        private_binding_, regions_.swcc().FromOffset(directory_.private_root));
+        private_binding_, regions_.swcc().FromOffset(private_root));
     mem_access::HwccAtomicLoad(&directory_.shared_root);
     shared_tree_ = new SharedTree(
         shared_binding_,
@@ -1145,6 +1148,8 @@ uint64_t KVPartition::migrated_key_count() const {
 
 
 void KVPartition::PersistRoots() {
+  mem_access::HwccWrite(&directory_.private_root,
+                        sizeof(directory_.private_root));
   directory_.private_root = regions_.swcc().ToOffset(
       private_tree_->root_for_persistence());
   // Shared live root is published on every store_root via the HWCC atomic slot;

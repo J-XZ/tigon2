@@ -110,6 +110,8 @@ class RegionAllocator {
   void FreeLocal(RegionOffset offset, uint32_t size_class, uint32_t owner_shard);
   void AccountAllocate(uint64_t bytes, DomainCounter *counter);
   void AccountFree(uint64_t bytes, DomainCounter *counter);
+  void RecordMetadataRead(const void *address, uint64_t bytes) const;
+  void RecordMetadataWrite(const void *address, uint64_t bytes) const;
   void RecordAtomicLoad(const void *address) const;
   void RecordAtomicStore(const void *address) const;
   void RecordAtomicRmw(const void *address) const;

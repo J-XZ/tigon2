@@ -1,4 +1,5 @@
 #include "kv/engine/region_allocator.h"
+#include "kv/engine/latency_inject.h"
 
 #include <array>
 #ifdef NDEBUG
@@ -285,6 +286,64 @@ void TestMappedPoolAttach() {
   unlink(path);
 }
 
+void TestAllocatorLatencyAccounting() {
+  Mapping hwcc_mapping(true);
+  Mapping swcc_mapping(true);
+  Mapping dual_mapping(true);
+  auto hwcc_allocator =
+      RegionAllocator::Initialize(hwcc_mapping.base, kBytes, 2, 0, true);
+  auto swcc_allocator =
+      RegionAllocator::Initialize(swcc_mapping.base, kBytes, 2, 0, false);
+  const DualRegionConfig config = TestDualConfig();
+  auto dual = DualRegionAllocator::Initialize(dual_mapping.base, config);
+
+  latency_sim::Config latency;
+  latency.enabled = true;
+  latency.foreground_enabled = true;
+  latency.stats_enabled = true;
+  auto &simulator = latency_sim::GlobalLatencySimulator();
+  simulator.Configure(latency);
+
+  DomainCounter hwcc_counter;
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  void *hwcc =
+      hwcc_allocator.Allocate(80, AllocationDomain::kHwccMetadata,
+                              &hwcc_counter, 0);
+  hwcc_allocator.Free(hwcc, 80, AllocationDomain::kHwccMetadata,
+                      &hwcc_counter, 0, 0);
+  simulator.EndScopeAndDelay();
+  auto stats = simulator.TakeStatsAndReset();
+  assert(stats.hwcc_raw_line_accesses > 0);
+  assert(stats.swcc_raw_line_accesses == 0);
+
+  DomainCounter swcc_counter;
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  void *swcc =
+      swcc_allocator.Allocate(80, AllocationDomain::kSharedPayloadSwcc,
+                              &swcc_counter, 0);
+  swcc_allocator.Free(swcc, 80, AllocationDomain::kSharedPayloadSwcc,
+                      &swcc_counter, 0, 0);
+  simulator.EndScopeAndDelay();
+  stats = simulator.TakeStatsAndReset();
+  // SWCC allocator metadata remains private, while the domain counter is
+  // deliberately published in the HWCC layout.
+  assert(stats.swcc_raw_line_accesses > 0);
+  assert(stats.hwcc_raw_line_accesses > 0);
+
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  void *owner = dual.AllocateOwnerPrivate(80, 0, 0);
+  dual.FreeOwnerPrivate(owner, 80, 0, 0);
+  assert(dual.SharedPayloadCapacityBytes() > 0);
+  simulator.EndScopeAndDelay();
+  stats = simulator.TakeStatsAndReset();
+  // Owner arena metadata/data is SWCC; its persistent directory and aggregate
+  // accounting live in HWCC.
+  assert(stats.swcc_raw_line_accesses > 0);
+  assert(stats.hwcc_raw_line_accesses > 0);
+
+  simulator.Configure(latency_sim::Config{});
+}
+
 }  // namespace
 
 int main() {
@@ -294,5 +353,6 @@ int main() {
   TestInvalidAttachment();
   TestDualPhysicalRegions();
   TestMappedPoolAttach();
+  TestAllocatorLatencyAccounting();
   return 0;
 }

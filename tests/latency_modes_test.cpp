@@ -135,6 +135,61 @@ int main() {
   assert(simulator.TakeStatsAndReset().swcc_raw_line_accesses == 3);
   assert(simulator.SnapshotStats().swcc_raw_line_accesses == 0);
 
+  simulator.Configure(lru);
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kRead,
+                       reinterpret_cast<void *>(0x4800));
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kRead,
+                       reinterpret_cast<void *>(0x4800));
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kInvalidate,
+                       reinterpret_cast<void *>(0x4800));
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kRead,
+                       reinterpret_cast<void *>(0x4800));
+  stats = simulator.SnapshotStats();
+  assert(stats.swcc_raw_line_accesses == 4);
+  assert(stats.swcc_cache_hits == 1 && stats.swcc_cache_misses == 3);
+  assert(simulator.PendingDelayNsForTest() == 51);
+  simulator.EndScopeAndDelay();
+  simulator.TakeStatsAndReset();
+
+  simulator.Configure(lru);
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kRead,
+                       reinterpret_cast<void *>(0x4c00));
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kWriteback,
+                       reinterpret_cast<void *>(0x4c00));
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kRead,
+                       reinterpret_cast<void *>(0x4c00));
+  stats = simulator.SnapshotStats();
+  assert(stats.swcc_cache_hits == 1 && stats.swcc_cache_misses == 2);
+  assert(simulator.PendingDelayNsForTest() == 41);
+  simulator.EndScopeAndDelay();
+  simulator.TakeStatsAndReset();
+
+  simulator.Configure(fixed);
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kRead,
+                       reinterpret_cast<void *>(0x5000));
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kInvalidate,
+                       reinterpret_cast<void *>(0x5000));
+  simulator.RecordLine(latency_sim::PoolKind::kSwcc,
+                       latency_sim::AccessKind::kRead,
+                       reinterpret_cast<void *>(0x5000));
+  stats = simulator.SnapshotStats();
+  assert(stats.swcc_cache_hits == 2 && stats.swcc_cache_misses == 1);
+  assert(simulator.PendingDelayNsForTest() == 34);
+  simulator.EndScopeAndDelay();
+  simulator.TakeStatsAndReset();
+
   lru.cache_hits_enabled = false;
   simulator.Configure(lru);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
