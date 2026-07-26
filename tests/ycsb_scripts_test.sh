@@ -30,5 +30,12 @@ tigonkv_load_vm_config "$tmp/out/configs/experiment_config_ycsb_4vm.jsonc"
 [[ "$TIGONKV_E2E_WORKERS" == 4 ]]
 [[ "$TIGONKV_VM_NUMA_PRIMARY" == 0 ]]
 [[ "$TIGONKV_SHARED_NUMA_PRIMARY" == 1 ]]
+# Guest images need not ship killall, and e2e_trace_runner exceeds Linux's
+# 15-byte COMM limit.  The workflow must clean by exact /proc executable path.
+guest_workflow="$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh"
+! rg -q 'killall .*e2e_trace_runner' "$guest_workflow"
+rg -q 'kill_guest_runners' "$guest_workflow"
+rg -Fq 'for proc in /proc/[0-9]*' "$guest_workflow"
+rg -Fq 'readlink \"\$proc/exe\"' "$guest_workflow"
 python3 "$root/scripts/summarize_ycsb_experiment.py" --log-root "$tmp/logs" --out-dir "$tmp/summary"
 test -s "$tmp/summary/ycsb_summary.json"

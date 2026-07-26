@@ -42,12 +42,35 @@ remote() {
   ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$@"
 }
 
+kill_guest_runners() {
+  local vm=$1 quoted_runner
+  printf -v quoted_runner '%q' "$remote_runner"
+  # The guest image does not provide killall, and Linux truncates the
+  # 16-byte e2e_trace_runner basename to e2e_trace_runne in COMM.  Match the
+  # exact executable through /proc instead.  Include "(deleted)" because the
+  # runtime sync below atomically replaces the binary between phases.
+  remote "$vm" "runner=$quoted_runner; \
+for proc in /proc/[0-9]*; do \
+  exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); \
+  case \"\$exe\" in \
+    \"\$runner\"|\"\$runner (deleted)\") kill -9 \"\${proc##*/}\" 2>/dev/null || true ;; \
+  esac; \
+done; \
+for proc in /proc/[0-9]*; do \
+  exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); \
+  case \"\$exe\" in \
+    \"\$runner\"|\"\$runner (deleted)\") \
+      echo \"failed to stop stale guest runner pid=\${proc##*/} exe=\$exe\" >&2; exit 1 ;; \
+  esac; \
+done"
+}
+
 sync_guest_runtime() {
   local vm
   for ((vm = 0; vm < vm_count; vm++)); do
     # Never attach a new runner while a previous livelocked process still owns
     # the shared MPSC rings.
-    remote "$vm" "killall -9 e2e_trace_runner 2>/dev/null; true"
+    kill_guest_runners "$vm"
     remote "$vm" "mkdir -p '$remote_root/build'"
     scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$runner" "root@127.0.0.1:$remote_runner.next" >/dev/null
     remote "$vm" "mv -f '$remote_runner.next' '$remote_runner'"
@@ -146,7 +169,7 @@ for ((round = 1; round <= rounds; round++)); do
     for phase in load run; do
       # Ensure no orphaned guest runner from a prior stalled phase.
       for ((vm = 0; vm < vm_count; vm++)); do
-        remote "$vm" "killall -9 e2e_trace_runner 2>/dev/null; true" >/dev/null 2>&1 || true
+        kill_guest_runners "$vm" >/dev/null 2>&1
       done
       sync_traces "$round" "$wl" "$phase"
       phase_log="$log_root/round${round}-workload${wl}-${phase}"
@@ -193,7 +216,7 @@ for ((round = 1; round <= rounds; round++)); do
       if (( fail != 0 )); then
         for pid in "${pids[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
         for ((vm_kill = 0; vm_kill < vm_count; vm_kill++)); do
-          remote "$vm_kill" "killall -9 e2e_trace_runner 2>/dev/null; true" >/dev/null 2>&1 || true
+          kill_guest_runners "$vm_kill" >/dev/null 2>&1 || true
         done
         echo "guest stall/timeout: round=$round workload=$wl phase=$phase" >&2
         exit 1
