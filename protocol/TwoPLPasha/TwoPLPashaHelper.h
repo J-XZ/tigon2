@@ -301,6 +301,9 @@ retry:
         uint8_t flags{ 0 };
         // multi-host accessors pin this; move-out requires ref_cnt == 0
         uint8_t ref_cnt{ 0 };
+        // KV writer preference: readers refuse to enter while a writer waits so
+        // CXL GetShared cannot starve shared Put under YCSB-A.
+        uint8_t writer_waiting{ 0 };
         uint32_t value_len{ 0 };
         char migration_policy_meta[MigrationManager::migration_policy_meta_size]{};
 };
@@ -330,7 +333,8 @@ class TwoPLPashaHelper {
                 smeta->lock();
                 auto *scc_data = smeta->get_scc_data();
                 // ref_cnt is uint8_t; refuse saturation instead of wrapping.
-                if (smeta->is_write_locked() ||
+                // writer_waiting: prefer draining writers over admitting more readers.
+                if (smeta->is_write_locked() || smeta->writer_waiting != 0 ||
                     smeta->get_reader_count() == smeta->get_reader_count_max() ||
                     smeta->ref_cnt == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
@@ -356,45 +360,45 @@ class TwoPLPashaHelper {
                                     const void *src, std::size_t size)
         {
                 if (smeta == nullptr || scc_manager == nullptr) return false;
-                smeta->lock();
-                auto *scc_data = smeta->get_scc_data();
-                if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
-                    smeta->ref_cnt == std::numeric_limits<uint8_t>::max()) {
+                for (;;) {
+                        smeta->lock();
+                        auto *scc_data = smeta->get_scc_data();
+                        if (smeta->is_write_locked() ||
+                            smeta->ref_cnt == std::numeric_limits<uint8_t>::max()) {
+                                smeta->unlock();
+                                return false;
+                        }
+                        if (smeta->get_reader_count() != 0) {
+                                smeta->writer_waiting = 1;
+                                smeta->unlock();
+                                std::this_thread::yield();
+                                continue;
+                        }
+                        smeta->writer_waiting = 0;
+                        smeta->set_write_locked();
+                        smeta->ref_cnt++;
                         smeta->unlock();
-                        return false;
+                        // The write-through SCC protocol requires the writer's
+                        // cache-valid bit before finish_write invalidates all peers.
+                        const auto host_bit =
+                            host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
+                        if (!smeta->is_bit_set(host_bit)) {
+                                scc_manager->prepare_read(smeta, host_id, scc_data, size);
+                        }
+                        scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
+                        // Re-take latch for bit repair + finish_write (see changelog).
+                        smeta->lock();
+                        if (!smeta->is_bit_set(host_bit))
+                                smeta->set_bit(host_bit);
+                        smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
+                        smeta->value_len = static_cast<uint32_t>(size);
+                        scc_manager->finish_write(smeta, host_id, scc_data, size);
+                        DCHECK(smeta->ref_cnt > 0);
+                        smeta->ref_cnt--;
+                        smeta->clear_write_locked();
+                        smeta->unlock();
+                        return true;
                 }
-                smeta->set_write_locked();
-                smeta->ref_cnt++;
-                smeta->unlock();
-                // The write-through SCC protocol requires the writer's
-                // cache-valid bit before finish_write invalidates all peers.
-                // Transactional callers normally establish it on their read
-                // path; only establish it here when this host is not already
-                // a valid reader.  Avoiding a redundant prepare is important
-                // for the hot owner write path and preserves SCC accounting.
-                const auto host_bit = host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
-                if (!smeta->is_bit_set(host_bit)) {
-                        scc_manager->prepare_read(smeta, host_id, scc_data,
-                                                  size);
-                }
-                scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
-                // valid + logical length are HWCC; publish before peer invalidate.
-                // Re-take the latch for bit repair + finish_write: a concurrent
-                // reader's prepare_read / another finish_write can clear host
-                // bits via clear_all_scc_bits while we were unlocked for memcpy,
-                // which trips WriteThrough's CHECK and aborts the guest under
-                // YCSB-A (CXL Get/Put).
-                smeta->lock();
-                if (!smeta->is_bit_set(host_bit))
-                        smeta->set_bit(host_bit);
-                smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                smeta->value_len = static_cast<uint32_t>(size);
-                scc_manager->finish_write(smeta, host_id, scc_data, size);
-                DCHECK(smeta->ref_cnt > 0);
-                smeta->ref_cnt--;
-                smeta->clear_write_locked();
-                smeta->unlock();
-                return true;
         }
 
         // Explicit migration-style pin used when a requester observes an

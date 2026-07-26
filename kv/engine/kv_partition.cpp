@@ -3,6 +3,7 @@
 #include "kv/engine/mem_access.h"
 
 #include <charconv>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -104,19 +105,22 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       // remove the shared authority between lookup and the SCC write.
       if (payload != nullptr) mem_access::SharedPayloadWrite(payload->data, value.size());
       bool written = false;
-      for (uint32_t spin = 0; spin < 100000u && smeta != nullptr; ++spin) {
+      // Exclusive SCC write must wait for reader_count==0. Under YCSB-A the
+      // CXL Get path keeps readers arriving; bounded yield counts starve and
+      // throw. Spin until a short deadline instead (2PL write-lock wait analogue).
+      const auto write_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (smeta != nullptr &&
+             std::chrono::steady_clock::now() < write_deadline) {
         written = star::TwoPLPashaHelper::kv_shared_write(
             smeta, owner_shard_, value.data(), value.size());
         if (written) break;
-        // Drop PrivateRow latch so concurrent GetShared readers / move-out
-        // checks can progress; re-validate after reacquire.
         UnlockRow(row);
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
         LockRow(row);
         if (row->is_tombstone || !row->is_migrated ||
             row->migrated_smeta_off != smeta_offset) {
           UnlockRow(row);
-          // Row left shared authority; retry as a fresh private put.
           return PutPrivate(key, value);
         }
       }
@@ -228,12 +232,14 @@ bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
   auto *payload = smeta->get_scc_data();
   mem_access::SharedPayloadWrite(payload->data, value.size());
   bool written = false;
-  for (uint32_t spin = 0; spin < 100000u; ++spin) {
+  const auto write_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < write_deadline) {
     written = star::TwoPLPashaHelper::kv_shared_write(
         smeta, host_id, value.data(), value.size());
     if (written) break;
-    // Pin keeps move-out out; yield so concurrent readers can drop reader_count.
-    std::this_thread::yield();
+    // Pin keeps move-out out; sleep so concurrent readers can drop reader_count.
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
   }
   if (written) {
     smeta->value_len = static_cast<uint32_t>(value.size());
