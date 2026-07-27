@@ -65,13 +65,22 @@ class KVEngine {
   RuntimeStats EngineRuntime() const;
 
  private:
+  struct KeyRoute {
+    uint32_t partition_id = 0;
+    uint32_t owner = 0;
+    KVPartition *partition = nullptr;
+    bool owned_by_this_node = false;
+  };
   KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> pool,
            star::CXL_EBR *ebr, std::unique_ptr<star::SCCManager> scc);
+  KeyRoute RouteForKey(std::string_view key) const;
   KVPartition *OwnedPartition(std::string_view key) const;
   KVPartition *VisiblePartition(std::string_view key) const;
   uint32_t OwnerForPartition(uint32_t partition) const;
   Status Forward(KvMessageType type, std::string_view key, std::string_view value,
                  std::string *response_value);
+  Status Forward(KvMessageType type, std::string_view key, std::string_view value,
+                 std::string *response_value, uint32_t owner);
   // TwoPLPasha DATA_MIGRATION: ask owner to move_row_in, then requester CXL-accesses.
   Status RequestMigrate(std::string_view key);
   Status RequestScanMigrate(uint32_t owner, std::string_view start_key,

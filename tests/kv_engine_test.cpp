@@ -280,6 +280,14 @@ int main() {
   {
     auto engine = tigonkv::engine::KVEngine::Open(single_owner, true);
     assert(star::CXLMemory::bound_owner_shard() == single_owner.node_id);
+    // §14.7 / §11.5: hash partition routing is stable and index-aligned.
+    for (uint32_t i = 0; i < 4096; ++i) {
+      const std::string key = "route-oracle-" + std::to_string(i);
+      const uint32_t partition = engine->PartitionForKey(key);
+      assert(partition < single_owner.partition_count);
+      assert(engine->OwnerForKey(key) ==
+             partition % single_owner.vm_count);
+    }
     assert(engine->Put("alpha", "one").ok());
     assert(engine->Put("alpha", "updated").ok());
     const auto found = engine->Get("alpha");

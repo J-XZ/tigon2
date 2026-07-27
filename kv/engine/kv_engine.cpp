@@ -388,6 +388,13 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   if (star::CXLMemory::bound_owner_shard() != config.node_id)
     throw std::runtime_error(
         "tigonkv: process allocator owner rebound after partition construct");
+  for (uint32_t partition = 0; partition < engine->partitions_.size();
+       ++partition) {
+    if (engine->partitions_[partition]->partition_id() != partition)
+      throw std::runtime_error(
+          "tigonkv: partitions_ vector index must equal partition_id");
+  }
+  static_assert(kSingleTableId == 0, "single-table contract");
   std::vector<KVPartition *> partition_ptrs;
   partition_ptrs.reserve(engine->partitions_.size());
   for (auto &partition : engine->partitions_) partition_ptrs.push_back(partition.get());
@@ -406,36 +413,43 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
 }
 
 uint32_t KVEngine::PartitionForKey(std::string_view key) const {
-  return static_cast<uint32_t>(Hash(key) % config_.partition_count);
+  return RouteForKey(key).partition_id;
 }
 
 uint32_t KVEngine::OwnerForKey(std::string_view key) const {
-  return OwnerForPartition(PartitionForKey(key));
+  return RouteForKey(key).owner;
 }
 
 uint32_t KVEngine::OwnerForPartition(uint32_t partition) const {
   return partition % config_.vm_count;
 }
 
+KVEngine::KeyRoute KVEngine::RouteForKey(std::string_view key) const {
+  KeyRoute route;
+  route.partition_id =
+      static_cast<uint32_t>(Hash(key) % config_.partition_count);
+  route.owner = route.partition_id % config_.vm_count;
+  route.owned_by_this_node = (route.owner == config_.node_id);
+  if (route.partition_id < partitions_.size())
+    route.partition = partitions_[route.partition_id].get();
+  return route;
+}
+
 KVPartition *KVEngine::OwnedPartition(std::string_view key) const {
-  const uint32_t owner = OwnerForKey(key);
-  if (owner != config_.node_id) return nullptr;
-  return VisiblePartition(key);
+  const KeyRoute route = RouteForKey(key);
+  return route.owned_by_this_node ? route.partition : nullptr;
 }
 
 KVPartition *KVEngine::VisiblePartition(std::string_view key) const {
-  const uint32_t partition = PartitionForKey(key);
-  for (const auto &entry : partitions_)
-    if (entry->partition_id() == partition) return entry.get();
-  return nullptr;
+  return RouteForKey(key).partition;
 }
 
 Status KVEngine::Put(std::string_view key, std::string_view value) {
   MarkLayoutDirty();
-  auto *partition = OwnedPartition(key);
-  if (partition == nullptr) {
-    auto *visible = VisiblePartition(key);
-    if (visible != nullptr && visible->PutShared(key, config_.node_id, value)) {
+  const KeyRoute route = RouteForKey(key);
+  if (!route.owned_by_this_node) {
+    if (route.partition != nullptr &&
+        route.partition->PutShared(key, config_.node_id, value)) {
       shared_puts_.fetch_add(1, std::memory_order_relaxed);
       shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
       return Status::Ok();
@@ -443,18 +457,23 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
     // Put miss: do not DATA_MIGRATION first. Load/create paths would issue a
     // NotFound migrate+Put pair per key and fill MPSC rings until nested
     // Serve/Send deadlocks. Owner PutPrivate creates/updates; Get migrates.
-    return Forward(KvMessageType::kPut, key, value, nullptr);
+    return Forward(KvMessageType::kPut, key, value, nullptr, route.owner);
   }
-  try { partition->PutPrivate(key, value); return Status::Ok(); }
-  catch (const std::bad_alloc &) { return Status::Error(StatusCode::kOutOfMemory, "private arena exhausted"); }
-  catch (const std::exception &e) { return Status::Error(StatusCode::kCorruption, e.what()); }
+  try {
+    route.partition->PutPrivate(key, value);
+    return Status::Ok();
+  } catch (const std::bad_alloc &) {
+    return Status::Error(StatusCode::kOutOfMemory, "private arena exhausted");
+  } catch (const std::exception &e) {
+    return Status::Error(StatusCode::kCorruption, e.what());
+  }
 }
 
 GetResult KVEngine::Get(std::string_view key) {
   MarkLayoutDirty();  // A remote miss may perform the original move-in.
-  auto *partition = OwnedPartition(key);
-  if (partition == nullptr) {
-    auto *visible = VisiblePartition(key);
+  const KeyRoute route = RouteForKey(key);
+  if (!route.owned_by_this_node) {
+    auto *visible = route.partition;
     // shared-hit CXL; tree-miss → migrate RPC then CXL retry (not value-Forward).
     // SCC contention (writer_waiting) is NOT a miss: retry GetShared / HasShared
     // without Migrate, or rings fill and nested Serve/Send deadlocks under YCSB-A.
@@ -468,7 +487,8 @@ GetResult KVEngine::Get(std::string_view key) {
         std::this_thread::yield();
         continue;
       }
-      const Status migrated = RequestMigrate(key);
+      const Status migrated =
+          Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
       if (migrated.code == StatusCode::kNotFound)
         return {Status::Error(StatusCode::kNotFound, "key not found"), {}};
       if (!migrated.ok() && migrated.code != StatusCode::kOutOfMemory)
@@ -479,16 +499,19 @@ GetResult KVEngine::Get(std::string_view key) {
     return {Status::Error(StatusCode::kNotFound, "key not found after migrate"), {}};
   }
   std::string value;
-  return partition->GetPrivate(key, &value) ? GetResult{Status::Ok(), std::move(value)}
-                                            : GetResult{Status::Error(StatusCode::kNotFound, "key not found"), {}};
+  return route.partition->GetPrivate(key, &value)
+             ? GetResult{Status::Ok(), std::move(value)}
+             : GetResult{Status::Error(StatusCode::kNotFound, "key not found"), {}};
 }
 
 Status KVEngine::Delete(std::string_view key) {
   MarkLayoutDirty();
-  auto *partition = OwnedPartition(key);
-  if (partition == nullptr) return Forward(KvMessageType::kDelete, key, {}, nullptr);
-  return partition->DeletePrivate(key) ? Status::Ok()
-                                       : Status::Error(StatusCode::kNotFound, "key not found");
+  const KeyRoute route = RouteForKey(key);
+  if (!route.owned_by_this_node)
+    return Forward(KvMessageType::kDelete, key, {}, nullptr, route.owner);
+  return route.partition->DeletePrivate(key)
+             ? Status::Ok()
+             : Status::Error(StatusCode::kNotFound, "key not found");
 }
 
 ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
@@ -941,9 +964,9 @@ CasResult KVEngine::CompareExchange(std::string_view key,
                                     std::string_view expected,
                                     std::string_view desired) {
   MarkLayoutDirty();
-  auto *partition = OwnedPartition(key);
-  if (partition == nullptr) {
-    auto *visible = VisiblePartition(key);
+  const KeyRoute route = RouteForKey(key);
+  if (!route.owned_by_this_node) {
+    auto *visible = route.partition;
     auto try_shared = [&](bool *exchanged) -> bool {
       return visible != nullptr && visible->CompareExchangeShared(
           key, config_.node_id, expected, desired, exchanged);
@@ -958,7 +981,8 @@ CasResult KVEngine::CompareExchange(std::string_view key,
                          : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
               exchanged};
     }
-    const Status migrated = RequestMigrate(key);
+    const Status migrated =
+        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
     exchanged = false;
     if (try_shared(&exchanged)) {
       if (exchanged) {
@@ -979,7 +1003,7 @@ CasResult KVEngine::CompareExchange(std::string_view key,
   }
   try {
     bool exchanged = false;
-    if (!partition->CompareExchangePrivate(key, expected, desired, &exchanged))
+    if (!route.partition->CompareExchangePrivate(key, expected, desired, &exchanged))
       return {Status::Error(StatusCode::kNotFound, "key not found"), false};
     return {exchanged ? Status::Ok()
                       : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
@@ -993,9 +1017,9 @@ CasResult KVEngine::CompareExchange(std::string_view key,
 
 IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   MarkLayoutDirty();
-  auto *partition = OwnedPartition(key);
-  if (partition == nullptr) {
-    auto *visible = VisiblePartition(key);
+  const KeyRoute route = RouteForKey(key);
+  if (!route.owned_by_this_node) {
+    auto *visible = route.partition;
     int64_t shared = 0;
     if (visible != nullptr && visible->IncrementShared(key, config_.node_id, delta, &shared)) {
       shared_puts_.fetch_add(1, std::memory_order_relaxed);
@@ -1005,7 +1029,7 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
     // Same as Put: avoid migrate-before-create storms; owner IncrementPrivate.
     std::string value;
     const auto status = Forward(KvMessageType::kIncrement, key,
-                                std::to_string(delta), &value);
+                                std::to_string(delta), &value, route.owner);
     if (!status.ok()) return {status, 0};
     int64_t result = 0;
     const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
@@ -1015,7 +1039,7 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   }
   try {
     int64_t value = 0;
-    if (!partition->IncrementPrivate(key, delta, &value))
+    if (!route.partition->IncrementPrivate(key, delta, &value))
       return {Status::Error(StatusCode::kNotFound, "key not found"), 0};
     return {Status::Ok(), value};
   } catch (const std::invalid_argument &e) {
@@ -1150,7 +1174,11 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
 
 Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_view value,
                          std::string *response_value) {
-  const uint32_t owner = OwnerForKey(key);
+  return Forward(type, key, value, response_value, OwnerForKey(key));
+}
+
+Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_view value,
+                         std::string *response_value, uint32_t owner) {
   const uint64_t request_id = NextRequestId(config_.node_id);
   auto pending = RegisterPendingResponse(request_id);
   try {
@@ -1164,7 +1192,8 @@ Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_v
 }
 
 Status KVEngine::RequestMigrate(std::string_view key) {
-  return Forward(KvMessageType::kMigrate, key, {}, nullptr);
+  const KeyRoute route = RouteForKey(key);
+  return Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
 }
 
 Status KVEngine::RequestScanMigrate(uint32_t owner,
@@ -1273,7 +1302,7 @@ Status KVEngine::AwaitResponse(
 CasResult KVEngine::ForwardCompareExchange(std::string_view key,
                                            std::string_view expected,
                                            std::string_view desired) {
-  const uint32_t owner = OwnerForKey(key);
+  const uint32_t owner = RouteForKey(key).owner;
   const uint64_t request_id = NextRequestId(config_.node_id);
   auto prepare = RegisterPendingResponse(request_id);
   try {
@@ -1697,8 +1726,10 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
 
 Status KVEngine::MoveOut(std::string_view key) {
   MarkLayoutDirty();
-  auto *partition = OwnedPartition(key);
-  if (partition == nullptr) return Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding");
+  const KeyRoute route = RouteForKey(key);
+  if (!route.owned_by_this_node)
+    return Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding");
+  auto *partition = route.partition;
   auto *clock = KvMigrationRuntime::Instance().clock();
   auto *table =
       KvMigrationRuntime::Instance().TableFor(partition->partition_id());
