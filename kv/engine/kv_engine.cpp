@@ -93,17 +93,19 @@ struct RequestServeDepthGuard {
 bool ValidMessageType(KvMessageType type) {
   switch (type) {
     case KvMessageType::kPut:
-    case KvMessageType::kGet:
     case KvMessageType::kDelete:
     case KvMessageType::kIncrement:
-    case KvMessageType::kCasPrepare:
-    case KvMessageType::kCasCommit:
+    case KvMessageType::kCas:
     case KvMessageType::kResponse:
     case KvMessageType::kMigrate:
     case KvMessageType::kScanMigrate:
       return true;
+    case KvMessageType::kGet:  // reserved; owner-value GET deleted (§10.4)
+    case KvMessageType::kCasCommitReserved:
+      return false;
+    default:
+      return false;
   }
-  return false;
 }
 
 bool ValidStatusCode(uint32_t status) {
@@ -312,15 +314,21 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
   MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
-    if (route.partition != nullptr &&
-        route.partition->PutShared(key, config_.node_id, value)) {
-      shared_puts_.fetch_add(1, std::memory_order_relaxed);
-      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-      return Status::Ok();
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      if (route.partition == nullptr) break;
+      const SharedAccessState state =
+          route.partition->PutShared(key, config_.node_id, value);
+      if (state == SharedAccessState::kDone) {
+        shared_puts_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+        return Status::Ok();
+      }
+      if (state == SharedAccessState::kRetry) {
+        std::this_thread::yield();
+        continue;
+      }
+      break;  // kMissing → Forward
     }
-    // Put miss: do not DATA_MIGRATION first. Load/create paths would issue a
-    // NotFound migrate+Put pair per key and fill MPSC rings until nested
-    // Serve/Send deadlocks. Owner PutPrivate creates/updates; Get migrates.
     return Forward(KvMessageType::kPut, key, value, nullptr, route.owner);
   }
   try {
@@ -328,6 +336,10 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
     return Status::Ok();
   } catch (const std::bad_alloc &) {
     return Status::Error(StatusCode::kOutOfMemory, "private arena exhausted");
+  } catch (const std::runtime_error &e) {
+    if (std::string_view(e.what()).find("busy") != std::string_view::npos)
+      return Status::Error(StatusCode::kBusy, e.what());
+    return Status::Error(StatusCode::kCorruption, e.what());
   } catch (const std::exception &e) {
     return Status::Error(StatusCode::kCorruption, e.what());
   }
@@ -338,19 +350,20 @@ GetResult KVEngine::Get(std::string_view key) {
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     auto *visible = route.partition;
-    // shared-hit CXL; tree-miss → migrate RPC then CXL retry (not value-Forward).
-    // SCC contention (writer_waiting) is NOT a miss: retry GetShared / HasShared
-    // without Migrate, or rings fill and nested Serve/Send deadlocks under YCSB-A.
     for (int attempt = 0; attempt < 8; ++attempt) {
       std::string shared;
-      if (visible != nullptr && visible->GetShared(key, config_.node_id, &shared)) {
+      if (visible == nullptr) break;
+      const SharedAccessState state =
+          visible->GetShared(key, config_.node_id, &shared);
+      if (state == SharedAccessState::kDone) {
         shared_gets_.fetch_add(1, std::memory_order_relaxed);
         return {Status::Ok(), std::move(shared)};
       }
-      if (visible != nullptr && visible->HasShared(key)) {
+      if (state == SharedAccessState::kRetry) {
         std::this_thread::yield();
         continue;
       }
+      // kMissing → migrate then retry shared.
       const Status migrated =
           Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
       if (migrated.code == StatusCode::kNotFound)
@@ -360,12 +373,20 @@ GetResult KVEngine::Get(std::string_view key) {
       if (migrated.code == StatusCode::kOutOfMemory && attempt == 7)
         return {migrated, {}};
     }
-    return {Status::Error(StatusCode::kNotFound, "key not found after migrate"), {}};
+    return {Status::Error(StatusCode::kBusy, "shared get retry budget exceeded"),
+            {}};
   }
-  std::string value;
-  return route.partition->GetPrivate(key, &value)
-             ? GetResult{Status::Ok(), std::move(value)}
-             : GetResult{Status::Error(StatusCode::kNotFound, "key not found"), {}};
+  try {
+    std::string value;
+    return route.partition->GetPrivate(key, &value)
+               ? GetResult{Status::Ok(), std::move(value)}
+               : GetResult{Status::Error(StatusCode::kNotFound, "key not found"),
+                           {}};
+  } catch (const std::runtime_error &e) {
+    if (std::string_view(e.what()).find("busy") != std::string_view::npos)
+      return {Status::Error(StatusCode::kBusy, e.what()), {}};
+    return {Status::Error(StatusCode::kCorruption, e.what()), {}};
+  }
 }
 
 Status KVEngine::Delete(std::string_view key) {
@@ -373,9 +394,15 @@ Status KVEngine::Delete(std::string_view key) {
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node)
     return Forward(KvMessageType::kDelete, key, {}, nullptr, route.owner);
-  return route.partition->DeletePrivate(key)
-             ? Status::Ok()
-             : Status::Error(StatusCode::kNotFound, "key not found");
+  try {
+    return route.partition->DeletePrivate(key)
+               ? Status::Ok()
+               : Status::Error(StatusCode::kNotFound, "key not found");
+  } catch (const std::runtime_error &e) {
+    if (std::string_view(e.what()).find("busy") != std::string_view::npos)
+      return Status::Error(StatusCode::kBusy, e.what());
+    return Status::Error(StatusCode::kCorruption, e.what());
+  }
 }
 
 ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
@@ -643,38 +670,28 @@ CasResult KVEngine::CompareExchange(std::string_view key,
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     auto *visible = route.partition;
-    auto try_shared = [&](bool *exchanged) -> bool {
-      return visible != nullptr && visible->CompareExchangeShared(
-          key, config_.node_id, expected, desired, exchanged);
-    };
-    bool exchanged = false;
-    if (try_shared(&exchanged)) {
-      if (exchanged) {
-        shared_puts_.fetch_add(1, std::memory_order_relaxed);
-        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      bool exchanged = false;
+      if (visible == nullptr) break;
+      const SharedAccessState state = visible->CompareExchangeShared(
+          key, config_.node_id, expected, desired, &exchanged);
+      if (state == SharedAccessState::kDone) {
+        if (exchanged) {
+          shared_puts_.fetch_add(1, std::memory_order_relaxed);
+          shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return {exchanged ? Status::Ok()
+                          : Status::Error(StatusCode::kCompareFailed,
+                                          "expected value differs"),
+                exchanged};
       }
-      return {exchanged ? Status::Ok()
-                         : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
-              exchanged};
-    }
-    const Status migrated =
-        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
-    exchanged = false;
-    if (try_shared(&exchanged)) {
-      if (exchanged) {
-        shared_puts_.fetch_add(1, std::memory_order_relaxed);
-        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      if (state == SharedAccessState::kRetry) {
+        std::this_thread::yield();
+        continue;
       }
-      return {exchanged ? Status::Ok()
-                         : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
-              exchanged};
+      break;  // kMissing
     }
-    // A remote CAS with empty expected is allowed to create, like the local
-    // path. DATA_MIGRATION returns NotFound for that case, so owner CAS remains
-    // the authority instead of turning creation into a false miss.
-    if (!migrated.ok() && migrated.code != StatusCode::kNotFound &&
-        migrated.code != StatusCode::kOutOfMemory)
-      return {migrated, false};
+    // Shared miss: single CAS_FWD with combined payload (§10.5).
     return ForwardCompareExchange(key, expected, desired);
   }
   try {
@@ -686,6 +703,10 @@ CasResult KVEngine::CompareExchange(std::string_view key,
             exchanged};
   } catch (const std::bad_alloc &) {
     return {Status::Error(StatusCode::kOutOfMemory, "allocator exhausted"), false};
+  } catch (const std::runtime_error &e) {
+    if (std::string_view(e.what()).find("busy") != std::string_view::npos)
+      return {Status::Error(StatusCode::kBusy, e.what()), false};
+    return {Status::Error(StatusCode::kInvalidArgument, e.what()), false};
   } catch (const std::exception &e) {
     return {Status::Error(StatusCode::kInvalidArgument, e.what()), false};
   }
@@ -696,13 +717,22 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     auto *visible = route.partition;
-    int64_t shared = 0;
-    if (visible != nullptr && visible->IncrementShared(key, config_.node_id, delta, &shared)) {
-      shared_puts_.fetch_add(1, std::memory_order_relaxed);
-      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-      return {Status::Ok(), shared};
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      int64_t shared = 0;
+      if (visible == nullptr) break;
+      const SharedAccessState state =
+          visible->IncrementShared(key, config_.node_id, delta, &shared);
+      if (state == SharedAccessState::kDone) {
+        shared_puts_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+        return {Status::Ok(), shared};
+      }
+      if (state == SharedAccessState::kRetry) {
+        std::this_thread::yield();
+        continue;
+      }
+      break;
     }
-    // Same as Put: avoid migrate-before-create storms; owner IncrementPrivate.
     std::string value;
     const auto status = Forward(KvMessageType::kIncrement, key,
                                 std::to_string(delta), &value, route.owner);
@@ -720,6 +750,10 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
     return {Status::Ok(), value};
   } catch (const std::invalid_argument &e) {
     return {Status::Error(StatusCode::kInvalidArgument, e.what()), 0};
+  } catch (const std::runtime_error &e) {
+    if (std::string_view(e.what()).find("busy") != std::string_view::npos)
+      return {Status::Error(StatusCode::kBusy, e.what()), 0};
+    return {Status::Error(StatusCode::kCorruption, e.what()), 0};
   } catch (const std::exception &e) {
     return {Status::Error(StatusCode::kCorruption, e.what()), 0};
   }
@@ -963,26 +997,21 @@ CasResult KVEngine::ForwardCompareExchange(std::string_view key,
                                            std::string_view expected,
                                            std::string_view desired) {
   const uint32_t owner = RouteForKey(key).owner;
+  std::string payload;
+  if (!EncodeCasRequest(expected, desired, &payload))
+    return {Status::Error(StatusCode::kInvalidArgument,
+                          "CAS payload exceeds single-packet capacity"),
+            false};
   const uint64_t request_id = NextRequestId(config_.node_id);
-  auto prepare = RegisterPendingResponse(request_id);
+  auto pending = RegisterPendingResponse(request_id);
   try {
-    SendTransportMessage(MakeRequest(KvMessageType::kCasPrepare, config_.node_id,
-                                     owner, request_id, key, expected));
+    SendTransportMessage(MakeRequest(KvMessageType::kCas, config_.node_id, owner,
+                                     request_id, key, payload));
   } catch (...) {
     RemovePendingResponse(request_id);
     throw;
   }
-  Status status = AwaitResponse(request_id, prepare, nullptr);
-  if (!status.ok()) return {std::move(status), false};
-  auto commit = RegisterPendingResponse(request_id);
-  try {
-    SendTransportMessage(MakeRequest(KvMessageType::kCasCommit, config_.node_id,
-                                     owner, request_id, key, desired));
-  } catch (...) {
-    RemovePendingResponse(request_id);
-    throw;
-  }
-  status = AwaitResponse(request_id, commit, nullptr);
+  const Status status = AwaitResponse(request_id, pending, nullptr);
   return {status, status.ok()};
 }
 
@@ -1225,7 +1254,7 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
       message.type == KvMessageType::kMigrate ||
       message.type == KvMessageType::kScanMigrate ||
       message.type == KvMessageType::kIncrement ||
-      message.type == KvMessageType::kCasCommit)
+      message.type == KvMessageType::kCas)
     MarkLayoutDirty();
   if (partition == nullptr) {
     throw std::runtime_error("request routed to a non-owner node");
@@ -1253,30 +1282,21 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
       response.status = static_cast<uint32_t>(StatusCode::kOk);
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
+    } catch (const std::runtime_error &e) {
+      response.status = static_cast<uint32_t>(
+          std::string_view(e.what()).find("busy") != std::string_view::npos
+              ? StatusCode::kBusy
+              : StatusCode::kCorruption);
     }
   } else if (message.type == KvMessageType::kDelete) {
-    response.status = static_cast<uint32_t>(partition->DeletePrivate(key)
-        ? StatusCode::kOk : StatusCode::kNotFound);
-  } else if (message.type == KvMessageType::kGet) {
-    std::string result;
-    if (!partition->GetPrivate(key, &result)) {
-      response.status = static_cast<uint32_t>(StatusCode::kNotFound);
-    } else {
-      // Residual owner GET: migrate before reply (move_in on request path).
-      // Budget after Send so the requester is not blocked behind move_out.
-      bool moved_in = false;
-      const StatusCode migrated =
-          partition->EnsureInShared(key, config_.node_id, &moved_in);
-      if (migrated == StatusCode::kOk && moved_in) {
-        migration_in_.fetch_add(1, std::memory_order_relaxed);
-        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-      }
-      response.status = static_cast<uint32_t>(StatusCode::kOk);
-      response.value_size = static_cast<uint32_t>(result.size());
-      std::memcpy(response.value.data(), result.data(), result.size());
-      SendTransportMessage(response);
-      EnforceMigrationBudget(*partition);
-      return;
+    try {
+      response.status = static_cast<uint32_t>(partition->DeletePrivate(key)
+          ? StatusCode::kOk : StatusCode::kNotFound);
+    } catch (const std::runtime_error &e) {
+      response.status = static_cast<uint32_t>(
+          std::string_view(e.what()).find("busy") != std::string_view::npos
+              ? StatusCode::kBusy
+              : StatusCode::kCorruption);
     }
   } else if (message.type == KvMessageType::kMigrate) {
     try {
@@ -1320,42 +1340,30 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
         response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
       }
     }
-  } else if (message.type == KvMessageType::kCasPrepare) {
-    std::lock_guard<std::mutex> lock(pending_cas_mutex_);
-    if (!pending_cas_.emplace(
-            message.request_id,
-            PendingCas{message.source_node, std::string(key),
-                       std::string(value)}).second)
-      throw std::runtime_error("duplicate CAS prepare request id");
-    response.status = static_cast<uint32_t>(StatusCode::kOk);
-  } else if (message.type == KvMessageType::kCasCommit) {
-    PendingCas pending;
-    bool found = false;
-    {
-      std::lock_guard<std::mutex> lock(pending_cas_mutex_);
-      auto it = pending_cas_.find(message.request_id);
-      if (it != pending_cas_.end()) {
-        pending = std::move(it->second);
-        pending_cas_.erase(it);
-        found = pending.source_node == message.source_node && pending.key == key;
-      }
-    }
-    if (!found) {
+  } else if (message.type == KvMessageType::kCas) {
+    std::string_view expected;
+    std::string_view desired;
+    if (!DecodeCasRequest(value, &expected, &desired)) {
       response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
     } else {
       try {
         bool exchanged = false;
         bool inserted = false;
-        if (!partition->CompareExchangePrivate(
-                key, pending.expected, value, &exchanged, &inserted))
+        if (!partition->CompareExchangePrivate(key, expected, desired, &exchanged,
+                                               &inserted))
           response.status = static_cast<uint32_t>(StatusCode::kNotFound);
         else {
           if (!inserted) promote_updated_row();
-          response.status = static_cast<uint32_t>(exchanged ? StatusCode::kOk
-                                                            : StatusCode::kCompareFailed);
+          response.status = static_cast<uint32_t>(
+              exchanged ? StatusCode::kOk : StatusCode::kCompareFailed);
         }
       } catch (const std::invalid_argument &) {
         response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
+      } catch (const std::runtime_error &e) {
+        response.status = static_cast<uint32_t>(
+            std::string_view(e.what()).find("busy") != std::string_view::npos
+                ? StatusCode::kBusy
+                : StatusCode::kCorruption);
       }
     }
   } else {

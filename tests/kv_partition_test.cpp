@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <atomic>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -157,8 +158,9 @@ int main() {
   }
   const uint64_t mutation_before_insert = partition.SharedMutationState();
   assert(partition.PutPrivate("beta", "two"));
-  assert(partition.SharedMutationState() ==
-         mutation_before_insert + (uint64_t{1} << 32));
+  // Certificate-era shared_mutation_state RMW removed (§10.6); inserts no
+  // longer bump the HWCC generation counter.
+  assert(partition.SharedMutationState() == mutation_before_insert);
   const uint64_t mutation_before_update = partition.SharedMutationState();
   assert(!partition.PutPrivate("alpha", "updated"));
   assert(partition.SharedMutationState() == mutation_before_update);
@@ -192,9 +194,9 @@ int main() {
   simulator.EndScopeAndDelay();
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   assert(partition.PutPrivate("tree-write", "value"));
-  // Logical-generation release is a remote Scan publication boundary, so the
-  // write latency is already settled before the generation becomes idle.
-  assert(simulator.PendingDelayNsForTest() == 0);
+  // Certificate-era EndSharedMutation mid-Put settle is gone (§10.6); delay
+  // remains pending until the outer scope ends.
+  assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
   assert(simulator.TakeStatsAndReset().swcc_delayed_ns > 0);
   simulator.Configure(latency_sim::Config{});
@@ -258,8 +260,9 @@ int main() {
   const uint64_t mutation_before_delete =
       regions.layout().partitions[5].shared_mutation_state.load();
   assert(partition.DeletePrivate("delete-shared"));
+  // Logical-delete no longer bumps shared_mutation_state (§10.6).
   assert(regions.layout().partitions[5].shared_mutation_state.load() ==
-         mutation_before_delete + (uint64_t{1} << 32));
+         mutation_before_delete);
   star::scc_manager = nullptr;
   assert(partition.DeletePrivate("beta"));
   assert(!partition.GetPrivate("beta", &value));
@@ -343,8 +346,8 @@ int main() {
   star::TwoPLPashaHelper::kv_unpin_shared_ref(held);
   assert(partition.MoveOutPrivate("pinfail", 1));
 
-  // DELETE contention is a retry, not NotFound: a range/point pin must delay
-  // physical removal and the tombstone must not escape between attempts.
+  // DELETE under a range/point pin returns Busy (no 5s spin under Clock lock
+  // §10.2b); callers retry until the pin is released.
   assert(partition.PutPrivate("delete-pinned", "present"));
   assert(partition.PromotePrivate("delete-pinned", 1));
   star::TwoPLPashaMetadataShared *delete_pin = nullptr;
@@ -354,7 +357,20 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     star::TwoPLPashaHelper::kv_unpin_shared_ref(delete_pin);
   });
-  assert(partition.DeletePrivate("delete-pinned"));
+  bool deleted = false;
+  bool saw_busy = false;
+  for (int attempt = 0; attempt < 10000; ++attempt) {
+    try {
+      deleted = partition.DeletePrivate("delete-pinned");
+      break;
+    } catch (const std::runtime_error &error) {
+      assert(std::string(error.what()).find("busy") != std::string::npos);
+      saw_busy = true;
+      std::this_thread::yield();
+    }
+  }
+  assert(saw_busy);
+  assert(deleted);
   release_delete_pin.join();
   assert(!partition.GetPrivate("delete-pinned", &value));
 

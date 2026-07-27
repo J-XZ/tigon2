@@ -152,13 +152,6 @@ class KVEngine {
   // under YCSB). Affinity is by cooperative steal-from-front FIFO.
   std::mutex deferred_request_mutex_;
   std::deque<KvMessage> deferred_transport_requests_;
-  struct PendingCas {
-    uint32_t source_node = 0;
-    std::string key;
-    std::string expected;
-  };
-  std::mutex pending_cas_mutex_;
-  std::unordered_map<uint64_t, PendingCas> pending_cas_;
   std::atomic<uint64_t> network_tx_bytes_{0};
   std::atomic<uint64_t> network_rx_bytes_{0};
   std::atomic<bool> layout_dirty_{true};

@@ -325,45 +325,27 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
     }
     if (row->is_migrated) {
       const RegionOffset smeta_offset = row->migrated_smeta_off;
-      RegionOffset indexed = kNullOffset;
-      const bool shared_present = smeta_offset != kNullOffset &&
-          shared_tree_->lookup(fixed_key, indexed) && indexed == smeta_offset;
-      auto *smeta = shared_present
-          ? static_cast<star::TwoPLPashaMetadataShared *>(regions_.hwcc().FromOffset(smeta_offset))
-          : nullptr;
-      // Keep the private latch through the shared operation so move-out cannot
-      // remove the shared authority between lookup and the SCC write.
-      bool written = false;
-      // Exclusive SCC write must wait for reader_count==0. Under YCSB-A the
-      // CXL Get path keeps readers arriving; bounded yield counts starve and
-      // throw. Spin until a short deadline instead (2PL write-lock wait analogue).
-      const auto write_deadline =
-          std::chrono::steady_clock::now() + std::chrono::seconds(5);
-      while (smeta != nullptr &&
-             std::chrono::steady_clock::now() < write_deadline) {
-        written = star::TwoPLPashaHelper::kv_shared_write(
-            smeta, owner_shard_, value.data(), value.size());
-        if (written) break;
+      if (smeta_offset == kNullOffset ||
+          !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
         UnlockRow(row);
-        std::this_thread::sleep_for(std::chrono::microseconds(20));
-        LockRow(row);
-        if (row->is_tombstone || !row->is_migrated ||
-            row->migrated_smeta_off != smeta_offset) {
-          UnlockRow(row);
-          return PutPrivate(key, value);
-        }
+        return false;
       }
+      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+          regions_.hwcc().FromOffset(smeta_offset));
+      // Follow PrivateRow offset under latch (§10.3); one helper attempt (§10.2).
+      const bool written = star::TwoPLPashaHelper::kv_shared_write(
+          smeta, owner_shard_, value.data(), value.size());
       if (written) {
         RecordPrivateRowStateWrite(row);
         row->value_len = static_cast<uint32_t>(value.size());
         ++row->version;
-        // Length for non-owner CXL lookups lives in SCC, not the shared tree.
-        if (smeta != nullptr) smeta->set_value_len(row->value_len);
+        smeta->set_value_len(row->value_len);
         NoteSharedAccess(smeta);
+        UnlockRow(row);
+        return false;
       }
       UnlockRow(row);
-      if (!written) throw std::runtime_error("migrated row shared write rejected");
-      return false;
+      throw std::runtime_error("migrated row shared write busy");
     }
     RecordPrivateRowStateWrite(row);
     row->value_len = static_cast<uint32_t>(value.size());
@@ -373,7 +355,6 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
     UnlockRow(row);
     return false;
   }
-  SharedMutationGuard mutation(*this);
   auto *row = AllocateRow(fixed_key, value);
   row_offset = regions_.swcc().ToOffset(row);
   if (!InsertPrivateRow(fixed_key, row)) {
@@ -403,120 +384,80 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
     return true;
   }
   const RegionOffset smeta_offset = row->migrated_smeta_off;
-  if (smeta_offset == kNullOffset) {
-    UnlockRow(row);
-    return false;
-  }
-  RegionOffset shared_ref = kNullOffset;
-  if (!shared_tree_->lookup(MakeKey(key), shared_ref) || shared_ref != smeta_offset) {
+  if (smeta_offset == kNullOffset ||
+      !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
     UnlockRow(row);
     return false;
   }
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(smeta_offset));
   std::string shared(fixed_value_size_, '\0');
-  // Row is migrated: treat SCC refusal (writer_waiting / write lock) as
-  // contention, not NotFound. Spin like PutPrivate's shared write wait.
-  bool read = false;
-  const auto read_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (std::chrono::steady_clock::now() < read_deadline) {
-    uint32_t value_len = 0;
-    read = star::TwoPLPashaHelper::kv_shared_read_value(
-        smeta, owner_shard_, shared.data(), shared.size(), &value_len);
-    if (read) {
-      shared.resize(value_len);
-    }
-    if (read) break;
-    UnlockRow(row);
-    std::this_thread::sleep_for(std::chrono::microseconds(20));
-    LockRow(row);
-    if (row->is_tombstone || !row->is_migrated ||
-        row->migrated_smeta_off != smeta_offset) {
-      UnlockRow(row);
-      return GetPrivate(key, value);
-    }
-  }
+  uint32_t value_len = 0;
+  const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
+      smeta, owner_shard_, shared.data(), shared.size(), &value_len);
   if (read) {
+    shared.resize(value_len);
     NoteSharedAccess(smeta);
+    UnlockRow(row);
+    *value = std::move(shared);
+    return true;
   }
   UnlockRow(row);
-  if (!read)
-    return false;
-  *value = std::move(shared);
-  return true;
+  // Contention under latch: surface Busy rather than NotFound (§10.1/§10.2).
+  throw std::runtime_error("migrated row shared read busy");
 }
 
-bool KVPartition::HasShared(std::string_view key) const {
-  EnterEbr();
-  RegionOffset offset = kNullOffset;
-  return shared_tree_->lookup(MakeKey(key), offset) && offset != kNullOffset;
-}
-
-bool KVPartition::GetShared(std::string_view key, uint32_t host_id,
-                            std::string *value) const {
+SharedAccessState KVPartition::GetShared(std::string_view key, uint32_t host_id,
+                                           std::string *value) const {
   EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared GET output");
-  // CXL-first: shared_tree_ only (original get_migrated_row). Never PrivateRow.
   const FixedKey fixed_key = MakeKey(key);
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   RegionOffset smeta_offset = kNullOffset;
-  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
+  const SharedAccessState pin = TryPinShared(fixed_key, &smeta, &smeta_offset);
+  if (pin != SharedAccessState::kDone) return pin;
   std::string shared(fixed_value_size_, '\0');
-  // Pin proves the row is in CXL. kv_shared_read may refuse while a writer
-  // waits; retry instead of returning miss (which would Migrate-storm).
-  bool read = false;
-  const auto read_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (std::chrono::steady_clock::now() < read_deadline) {
-    uint32_t value_len = 0;
-    read = star::TwoPLPashaHelper::kv_shared_read_value(
-        smeta, host_id, shared.data(), shared.size(), &value_len);
-    if (read) {
-      shared.resize(value_len);
-    }
-    if (read) break;
-    if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index))
-      break;
-    std::this_thread::sleep_for(std::chrono::microseconds(20));
+  uint32_t value_len = 0;
+  const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
+      smeta, host_id, shared.data(), shared.size(), &value_len);
+  const bool still_valid =
+      smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+  if (read) {
+    shared.resize(value_len);
+    NoteSharedAccess(smeta);
   }
-  if (read) NoteSharedAccess(smeta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
-  if (!read) return false;
+  if (!read) {
+    if (!still_valid) return SharedAccessState::kMissing;
+    return SharedAccessState::kRetry;
+  }
   *value = std::move(shared);
-  return true;
+  return SharedAccessState::kDone;
 }
 
-bool KVPartition::PutShared(std::string_view key, uint32_t host_id,
-                            std::string_view value) {
+SharedAccessState KVPartition::PutShared(std::string_view key, uint32_t host_id,
+                                         std::string_view value) {
   EnterEbr();
   if (value.size() > fixed_value_size_)
     throw std::invalid_argument("shared value exceeds fixed value size");
   const FixedKey fixed_key = MakeKey(key);
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   RegionOffset smeta_offset = kNullOffset;
-  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
-  bool written = false;
-  const auto write_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (std::chrono::steady_clock::now() < write_deadline) {
-    written = star::TwoPLPashaHelper::kv_shared_write(
-        smeta, host_id, value.data(), value.size());
-    if (written) break;
-    // Pin keeps move-out out; sleep so concurrent readers can drop reader_count.
-    std::this_thread::sleep_for(std::chrono::microseconds(20));
-  }
+  const SharedAccessState pin = TryPinShared(fixed_key, &smeta, &smeta_offset);
+  if (pin != SharedAccessState::kDone) return pin;
+  const bool written = star::TwoPLPashaHelper::kv_shared_write(
+      smeta, host_id, value.data(), value.size());
   if (written) {
     smeta->set_value_len(static_cast<uint32_t>(value.size()));
     NoteSharedAccess(smeta);
   }
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
-  return written;
+  return written ? SharedAccessState::kDone : SharedAccessState::kRetry;
 }
 
-bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
-                                        std::string_view expected,
-                                        std::string_view desired, bool *exchanged) {
+SharedAccessState KVPartition::CompareExchangeShared(
+    std::string_view key, uint32_t host_id, std::string_view expected,
+    std::string_view desired, bool *exchanged) {
   EnterEbr();
   if (exchanged == nullptr) throw std::invalid_argument("null shared CAS result");
   if (desired.size() > fixed_value_size_)
@@ -525,7 +466,8 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
   const FixedKey fixed_key = MakeKey(key);
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   RegionOffset smeta_offset = kNullOffset;
-  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
+  const SharedAccessState pin = TryPinShared(fixed_key, &smeta, &smeta_offset);
+  if (pin != SharedAccessState::kDone) return pin;
   bool changed = false;
   const bool updated = star::TwoPLPashaHelper::kv_shared_update(
       smeta, host_id, fixed_value_size_,
@@ -537,24 +479,27 @@ bool KVPartition::CompareExchangeShared(std::string_view key, uint32_t host_id,
       &changed);
   if (!updated) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
-    return false;
+    return SharedAccessState::kRetry;
   }
   *exchanged = changed;
   NoteSharedAccess(smeta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
-  return true;
+  return SharedAccessState::kDone;
 }
 
-bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
-                                  int64_t delta, int64_t *value) {
+SharedAccessState KVPartition::IncrementShared(std::string_view key,
+                                               uint32_t host_id, int64_t delta,
+                                               int64_t *value) {
   EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared increment output");
   const FixedKey fixed_key = MakeKey(key);
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   RegionOffset smeta_offset = kNullOffset;
-  if (!TryPinShared(fixed_key, &smeta, &smeta_offset)) return false;
+  const SharedAccessState pin = TryPinShared(fixed_key, &smeta, &smeta_offset);
+  if (pin != SharedAccessState::kDone) return pin;
   int64_t next = 0;
   bool changed = false;
+  bool invalid = false;
   const bool updated = star::TwoPLPashaHelper::kv_shared_update(
       smeta, host_id, fixed_value_size_,
       [&](const std::string &current, std::string *replacement) {
@@ -564,23 +509,29 @@ bool KVPartition::IncrementShared(std::string_view key, uint32_t host_id,
         if (parsed.ec != std::errc{} ||
             parsed.ptr != current.data() + current.size() ||
             (delta > 0 && previous > std::numeric_limits<int64_t>::max() - delta) ||
-            (delta < 0 && previous < std::numeric_limits<int64_t>::min() - delta))
-          throw std::invalid_argument(
-              "increment requires a non-overflowing int64 value");
+            (delta < 0 && previous < std::numeric_limits<int64_t>::min() - delta)) {
+          invalid = true;
+          return false;
+        }
         next = previous + delta;
         *replacement = std::to_string(next);
         return true;
       },
       &changed);
+  if (invalid) {
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    throw std::invalid_argument(
+        "increment requires a non-overflowing int64 value");
+  }
   if (!updated) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
-    return false;
+    return SharedAccessState::kRetry;
   }
   DCHECK(changed);
   *value = next;
   NoteSharedAccess(smeta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
-  return true;
+  return SharedAccessState::kDone;
 }
 
 bool KVPartition::CompareExchangePrivate(std::string_view key,
@@ -599,8 +550,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   if (!private_tree_->lookup(fixed_key, row_offset)) {
     if (!expected.empty()) return false;
     {
-      SharedMutationGuard mutation(*this);
-      auto *row = AllocateRow(fixed_key, desired);
+          auto *row = AllocateRow(fixed_key, desired);
       if (InsertPrivateRow(fixed_key, row)) {
         PersistPrivateRootIfChanged();
         *exchanged = true;
@@ -633,9 +583,8 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
     return true;
   }
   const RegionOffset smeta_offset = row->migrated_smeta_off;
-  RegionOffset indexed = kNullOffset;
-  if (smeta_offset == kNullOffset || !shared_tree_->lookup(fixed_key, indexed) ||
-      indexed != smeta_offset) {
+  if (smeta_offset == kNullOffset ||
+      !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
     UnlockRow(row);
     return false;
   }
@@ -650,7 +599,11 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
         return true;
       },
       &changed);
-  if (read && changed) {
+  if (!read) {
+    UnlockRow(row);
+    throw std::runtime_error("migrated row shared CAS busy");
+  }
+  if (changed) {
     RecordPrivateRowStateWrite(row);
     row->value_len = static_cast<uint32_t>(desired.size());
     ++row->version;
@@ -658,7 +611,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
     *exchanged = true;
   }
   UnlockRow(row);
-  return read;
+  return true;
 }
 
 bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
@@ -671,8 +624,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
   if (!private_tree_->lookup(fixed_key, row_offset)) {
     const std::string encoded = std::to_string(delta);
     {
-      SharedMutationGuard mutation(*this);
-      auto *row = AllocateRow(fixed_key, encoded);
+          auto *row = AllocateRow(fixed_key, encoded);
       if (InsertPrivateRow(fixed_key, row)) {
         PersistPrivateRootIfChanged();
         *value = delta;
@@ -697,9 +649,8 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
     mem_access::PrivateRead(row->kv + row->key_len, row->value_len);
   } else {
     const RegionOffset smeta_offset = row->migrated_smeta_off;
-    RegionOffset indexed = kNullOffset;
-    if (smeta_offset == kNullOffset || !shared_tree_->lookup(fixed_key, indexed) ||
-        indexed != smeta_offset) {
+    if (smeta_offset == kNullOffset ||
+        !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
       UnlockRow(row);
       return false;
     }
@@ -1521,34 +1472,11 @@ uint64_t KVPartition::SharedMutationState() const {
   return directory_.shared_mutation_state.load(std::memory_order_acquire);
 }
 
-void KVPartition::BeginSharedMutation() {
-  mem_access::HwccAtomicRmw(&directory_.shared_mutation_state);
-  const uint64_t previous =
-      directory_.shared_mutation_state.fetch_add(1, std::memory_order_acq_rel);
-  if (static_cast<uint32_t>(previous) == std::numeric_limits<uint32_t>::max())
-    std::abort();
-}
-
-void KVPartition::EndSharedMutation() {
-  constexpr uint64_t kCompleteOneMutation = (uint64_t{1} << 32) - 1;
-  mem_access::HwccAtomicRmw(&directory_.shared_mutation_state);
-  // The idle generation is a remote Scan publication point. Pay its HWCC RMW
-  // before peers can accept the certificate as quiescent.
-  mem_access::DelayActiveScopeNow();
-  const uint64_t previous = directory_.shared_mutation_state.fetch_add(
-      kCompleteOneMutation, std::memory_order_release);
-  if (static_cast<uint32_t>(previous) == 0) std::abort();
-}
-
 bool KVPartition::DeletePrivate(std::string_view key) {
   EnterEbr();
-  if (star::migration_manager != nullptr) {
-    auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
-    if (table == nullptr) return false;
-    const FixedKey fixed_key = MakeKey(key);
-    return star::migration_manager->delete_specific_row_and_move_out(
-        table, fixed_key.bytes, true);
-  }
+  // Call the partition delete path directly so Busy throws propagate to the
+  // engine. PolicyClock::delete_specific_row_and_move_out is only a thin
+  // trampoline that would otherwise mask failures as false (§10.2b).
   bool need_untrack = false;
   void *migration_policy_meta = nullptr;
   return DeletePrivateForMigrationManager(
@@ -1564,114 +1492,100 @@ bool KVPartition::DeletePrivateForMigrationManager(
   *need_untrack = false;
   *migration_policy_meta = nullptr;
   const FixedKey fixed_key = MakeKey(key);
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  for (;;) {
-    star::TwoPLPashaMetadataShared *retired_smeta = nullptr;
-    star::TwoPLPashaSharedDataSCC *retired_payload = nullptr;
-    Neighborhood neighborhood;
-    LockNeighborhood(fixed_key, &neighborhood);
-    if (!neighborhood.has_current) {
-      UnlockNeighborhood(&neighborhood);
-      return false;
-    }
-    auto *row = neighborhood.current.row;
-    if (row->is_tombstone) {
-      UnlockNeighborhood(&neighborhood);
-      return false;
-    }
-    SharedMutationGuard mutation(*this);
-    BreakAdjacencyLocked(neighborhood);
-    RecordPrivateRowStateWrite(row);
-    row->is_tombstone = 1;
-    const uint64_t row_bytes =
-        sizeof(PrivateRow) + fixed_key_size_ + fixed_value_size_;
-    if (row->is_migrated) {
-      const RegionOffset smeta_offset = row->migrated_smeta_off;
-      RegionOffset indexed = kNullOffset;
-      if (smeta_offset == kNullOffset ||
-          !shared_tree_->lookup(fixed_key, indexed) ||
-          indexed != smeta_offset) {
-        RecordPrivateRowStateWrite(row);
-        row->is_tombstone = 0;
-        RefreshAdjacencyLocked(neighborhood);
-        UnlockNeighborhood(&neighborhood);
-        throw std::runtime_error(
-            "migrated delete has inconsistent shared index");
-      }
-      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-          regions_.hwcc().FromOffset(smeta_offset));
-      smeta->lock();
-      auto *payload = smeta->get_scc_data();
-      if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
-          smeta->is_write_locked()) {
-        smeta->unlock();
-        RecordPrivateRowStateWrite(row);
-        row->is_tombstone = 0;
-        RefreshAdjacencyLocked(neighborhood);
-        UnlockNeighborhood(&neighborhood);
-        if (std::chrono::steady_clock::now() >= deadline)
-          throw std::runtime_error(
-              "delete timed out waiting for shared-row quiescence");
-        std::this_thread::yield();
-        continue;
-      }
-      smeta->set_write_locked();
-      smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
-      if (!shared_tree_->remove(fixed_key)) {
-        smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
-        smeta->clear_write_locked();
-        smeta->unlock();
-        RecordPrivateRowStateWrite(row);
-        row->is_tombstone = 0;
-        RefreshAdjacencyLocked(neighborhood);
-        UnlockNeighborhood(&neighborhood);
-        throw std::runtime_error(
-            "shared tree remove failed during delete");
-      }
-      smeta->unlock();
+  star::TwoPLPashaMetadataShared *retired_smeta = nullptr;
+  star::TwoPLPashaSharedDataSCC *retired_payload = nullptr;
+  Neighborhood neighborhood;
+  LockNeighborhood(fixed_key, &neighborhood);
+  if (!neighborhood.has_current) {
+    UnlockNeighborhood(&neighborhood);
+    return false;
+  }
+  auto *row = neighborhood.current.row;
+  if (row->is_tombstone) {
+    UnlockNeighborhood(&neighborhood);
+    return false;
+  }
+  BreakAdjacencyLocked(neighborhood);
+  RecordPrivateRowStateWrite(row);
+  row->is_tombstone = 1;
+  const uint64_t row_bytes =
+      sizeof(PrivateRow) + fixed_key_size_ + fixed_value_size_;
+  if (row->is_migrated) {
+    const RegionOffset smeta_offset = row->migrated_smeta_off;
+    if (smeta_offset == kNullOffset ||
+        !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
       RecordPrivateRowStateWrite(row);
-      row->is_migrated = 0;
-      row->migrated_smeta_off = kNullOffset;
-      // Unlink before the PrivateRow is EBR-retired (§11.14).
-      ClockLock();
-      ClockUntrackRowOffset(neighborhood.current.offset);
-      ClockUnlock();
-      *need_untrack = false;  // already untracked by offset
-      *migration_policy_meta = &smeta->migration_policy_meta;
-      retired_smeta = smeta;
-      retired_payload = payload;
-    }
-    if (!private_tree_->remove(fixed_key)) {
-      // The row is already logically deleted; this is an index invariant
-      // failure, not NotFound and not a reason to leave a tombstone behind.
+      row->is_tombstone = 0;
+      RefreshAdjacencyLocked(neighborhood);
       UnlockNeighborhood(&neighborhood);
       throw std::runtime_error(
-          "private tree remove failed after shared delete");
+          "migrated delete has inconsistent shared offset");
     }
-    Neighborhood remaining = neighborhood;
-    remaining.has_current = false;
-    RefreshAdjacencyLocked(remaining);
-    ebr_.add_retired_object(row, row_bytes, star::CXLMemory::MISC_FREE,
-                            owner_shard_, partition_id_);
-    UnlockNeighborhood(&neighborhood);
-    PersistPrivateRootIfChanged();
-    if (retired_smeta != nullptr) {
-      // The invalid, unindexed smeta remains write-locked as the publication
-      // gate while synthetic CXL latency is paid. No private-row latch is held.
-      mem_access::DelayActiveScopeNow();
-      retired_smeta->lock();
-      retired_smeta->clear_write_locked();
-      retired_smeta->unlock();
-      ebr_.add_retired_object(
-          retired_smeta, sizeof(star::TwoPLPashaMetadataShared),
-          star::CXLMemory::METADATA_FREE, owner_shard_);
-      ebr_.add_retired_object(
-          retired_payload, fixed_value_size_,
-          star::CXLMemory::DATA_FREE, owner_shard_);
+    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+        regions_.hwcc().FromOffset(smeta_offset));
+    smeta->lock();
+    auto *payload = smeta->get_scc_data();
+    if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
+        smeta->is_write_locked()) {
+      smeta->unlock();
+      RecordPrivateRowStateWrite(row);
+      row->is_tombstone = 0;
+      RefreshAdjacencyLocked(neighborhood);
+      UnlockNeighborhood(&neighborhood);
+      // Do not spin under Clock tracker lock (§10.2b); caller sees Busy.
+      throw std::runtime_error("delete shared-row busy");
     }
-    return true;
+    smeta->set_write_locked();
+    smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+    if (!shared_tree_->remove(fixed_key)) {
+      smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+      smeta->clear_write_locked();
+      smeta->unlock();
+      RecordPrivateRowStateWrite(row);
+      row->is_tombstone = 0;
+      RefreshAdjacencyLocked(neighborhood);
+      UnlockNeighborhood(&neighborhood);
+      throw std::runtime_error(
+          "shared tree remove failed during delete");
+    }
+    smeta->unlock();
+    RecordPrivateRowStateWrite(row);
+    row->is_migrated = 0;
+    row->migrated_smeta_off = kNullOffset;
+    // Unlink before the PrivateRow is EBR-retired (§11.14).
+    ClockLock();
+    ClockUntrackRowOffset(neighborhood.current.offset);
+    ClockUnlock();
+    *need_untrack = false;  // already untracked by offset
+    *migration_policy_meta = &smeta->migration_policy_meta;
+    retired_smeta = smeta;
+    retired_payload = payload;
   }
+  if (!private_tree_->remove(fixed_key)) {
+    UnlockNeighborhood(&neighborhood);
+    throw std::runtime_error(
+        "private tree remove failed after shared delete");
+  }
+  Neighborhood remaining = neighborhood;
+  remaining.has_current = false;
+  RefreshAdjacencyLocked(remaining);
+  ebr_.add_retired_object(row, row_bytes, star::CXLMemory::MISC_FREE,
+                          owner_shard_, partition_id_);
+  UnlockNeighborhood(&neighborhood);
+  PersistPrivateRootIfChanged();
+  if (retired_smeta != nullptr) {
+    mem_access::DelayActiveScopeNow();
+    retired_smeta->lock();
+    retired_smeta->clear_write_locked();
+    retired_smeta->unlock();
+    ebr_.add_retired_object(
+        retired_smeta, sizeof(star::TwoPLPashaMetadataShared),
+        star::CXLMemory::METADATA_FREE, owner_shard_);
+    ebr_.add_retired_object(
+        retired_payload, fixed_value_size_,
+        star::CXLMemory::DATA_FREE, owner_shard_);
+  }
+  return true;
 }
 
 void KVPartition::NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const {
@@ -1680,26 +1594,29 @@ void KVPartition::NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const 
     star::migration_manager->access_row(&smeta->migration_policy_meta, partition_id_);
 }
 
-bool KVPartition::TryPinShared(const FixedKey &key,
-                               star::TwoPLPashaMetadataShared **smeta,
-                               RegionOffset *smeta_offset) const {
-  if (smeta == nullptr || smeta_offset == nullptr) return false;
+SharedAccessState KVPartition::TryPinShared(
+    const FixedKey &key, star::TwoPLPashaMetadataShared **smeta,
+    RegionOffset *smeta_offset) const {
+  if (smeta == nullptr || smeta_offset == nullptr)
+    throw std::invalid_argument("null TryPinShared output");
   *smeta = nullptr;
   *smeta_offset = kNullOffset;
   RegionOffset offset = kNullOffset;
-  if (!shared_tree_->lookup(key, offset) || offset == kNullOffset) return false;
+  if (!shared_tree_->lookup(key, offset) || offset == kNullOffset)
+    return SharedAccessState::kMissing;
   auto *candidate = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(offset));
   // Move-out may race between lookup and pin; refuse invalid / saturated rows.
-  if (!star::TwoPLPashaHelper::kv_pin_shared_ref(candidate)) return false;
+  if (!star::TwoPLPashaHelper::kv_pin_shared_ref(candidate))
+    return SharedAccessState::kRetry;
   RegionOffset again = kNullOffset;
   if (!shared_tree_->lookup(key, again) || again != offset) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(candidate);
-    return false;
+    return SharedAccessState::kRetry;
   }
   *smeta = candidate;
   *smeta_offset = offset;
-  return true;
+  return SharedAccessState::kDone;
 }
 
 bool KVPartition::TryPinSharedEntry(

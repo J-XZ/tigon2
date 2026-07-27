@@ -18,6 +18,14 @@
 
 namespace tigonkv::engine {
 
+// One shared-tree probe result (§10.1). kRetry is contention; only kMissing may
+// trigger migrate/Forward.
+enum class SharedAccessState : uint8_t {
+  kDone = 0,
+  kMissing = 1,
+  kRetry = 2,
+};
+
 // Owns the process-local handles for one persistent partition.  The B+tree
 // nodes and rows themselves stay in the mapped dual-region pool; this class
 // only reconstructs handles from PartitionDirectoryEntry during attach.
@@ -51,18 +59,18 @@ class KVPartition {
                               bool *inserted = nullptr);
   bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value,
                         bool *inserted = nullptr);
-  // Non-owner APIs never touch PrivateRow. Point ops use TryPinShared + SCC
-  // (aligned with get_migrated_row / CompareExchangeShared).
-  // True iff shared_tree_ currently indexes the key (no pin / SCC). Used by
-  // Get to distinguish tree-miss (migrate) from SCC contention (retry).
-  bool HasShared(std::string_view key) const;
-  bool GetShared(std::string_view key, uint32_t host_id, std::string *value) const;
-  bool PutShared(std::string_view key, uint32_t host_id, std::string_view value);
-  bool CompareExchangeShared(std::string_view key, uint32_t host_id,
-                             std::string_view expected, std::string_view desired,
-                             bool *exchanged);
-  bool IncrementShared(std::string_view key, uint32_t host_id, int64_t delta,
-                       int64_t *value);
+  // Non-owner APIs never touch PrivateRow. Point ops use TryPinShared + SCC.
+  // SharedAccessState distinguishes miss vs contention (§10.1); HasShared gone.
+  SharedAccessState GetShared(std::string_view key, uint32_t host_id,
+                              std::string *value) const;
+  SharedAccessState PutShared(std::string_view key, uint32_t host_id,
+                              std::string_view value);
+  SharedAccessState CompareExchangeShared(std::string_view key, uint32_t host_id,
+                                          std::string_view expected,
+                                          std::string_view desired,
+                                          bool *exchanged);
+  SharedAccessState IncrementShared(std::string_view key, uint32_t host_id,
+                                    int64_t delta, int64_t *value);
   // Owner DATA_MIGRATION analogue: move_row_in(inc_ref=false). Returns Ok on
   // SUCCESS or FAIL_ALREADY_IN_CXL, NotFound if absent, OutOfMemory otherwise.
   // When non-null, *moved_in is set true only on fresh SUCCESS.
@@ -162,8 +170,9 @@ class KVPartition {
   void NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const;
   // Pin shared smeta so MoveOut cannot retire it between tree lookup and SCC
   // access (replaces the old non-owner PrivateRow LockRow quiescence window).
-  bool TryPinShared(const FixedKey &key, star::TwoPLPashaMetadataShared **smeta,
-                    RegionOffset *smeta_offset) const;
+  SharedAccessState TryPinShared(const FixedKey &key,
+                                 star::TwoPLPashaMetadataShared **smeta,
+                                 RegionOffset *smeta_offset) const;
   bool TryPinSharedEntry(
       const FixedKey &key, RegionOffset expected_offset,
       star::TwoPLPashaMetadataShared **smeta) const;
@@ -195,21 +204,6 @@ class KVPartition {
   void BreakAdjacencyLocked(const Neighborhood &neighborhood);
   bool InsertPrivateRow(const FixedKey &key, PrivateRow *row);
   void FreeUnpublishedPrivateRow(PrivateRow *row);
-  void BeginSharedMutation();
-  void EndSharedMutation();
-  class SharedMutationGuard {
-   public:
-    explicit SharedMutationGuard(KVPartition &partition)
-        : partition_(partition) {
-      partition_.BeginSharedMutation();
-    }
-    ~SharedMutationGuard() { partition_.EndSharedMutation(); }
-    SharedMutationGuard(const SharedMutationGuard &) = delete;
-    SharedMutationGuard &operator=(const SharedMutationGuard &) = delete;
-
-   private:
-    KVPartition &partition_;
-  };
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;
   uint32_t partition_id_;
