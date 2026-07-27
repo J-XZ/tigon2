@@ -467,6 +467,54 @@ int main() {
   }
   unlink(path.c_str());
 
+  // §5.2 PreparePartitionSharedScan: cold / already-shared / EOF / bad args.
+  {
+    char pscan_template[] = "/tmp/tigonkv-engine-pscan-XXXXXX";
+    const int pscan_fd = mkstemp(pscan_template);
+    assert(pscan_fd >= 0);
+    close(pscan_fd);
+    auto pscan_config = ConfigFor(pscan_template);
+    auto engine = tigonkv::engine::KVEngine::Open(pscan_config, true);
+    uint32_t part = 0;
+    std::vector<std::string> owned;
+    for (int i = 0; i < 64; ++i) {
+      const std::string k = "pscan-" + std::to_string(i);
+      assert(engine->Put(k, "v").ok());
+    }
+    part = engine->PartitionForKey("pscan-0");
+    for (int i = 0; i < 64; ++i) {
+      const std::string k = "pscan-" + std::to_string(i);
+      if (engine->PartitionForKey(k) == part) owned.push_back(k);
+    }
+    assert(!owned.empty());
+    std::sort(owned.begin(), owned.end());
+    bool exhausted = false;
+    assert(engine
+               ->PreparePartitionSharedScan(part, owned.front(), false, 2,
+                                            pscan_config.node_id, &exhausted)
+               .ok());
+    bool exhausted2 = true;
+    assert(engine
+               ->PreparePartitionSharedScan(part, owned.front(), false, 2,
+                                            pscan_config.node_id, &exhausted2)
+               .ok());
+    bool exhausted3 = false;
+    assert(engine
+               ->PreparePartitionSharedScan(part, owned.front(), false, 64,
+                                            pscan_config.node_id, &exhausted3)
+               .ok());
+    assert(exhausted3);
+    assert(engine
+               ->PreparePartitionSharedScan(999, "x", false, 2,
+                                            pscan_config.node_id, &exhausted)
+               .code == tigonkv::StatusCode::kInvalidArgument);
+    assert(engine
+               ->PreparePartitionSharedScan(part, "x", false, 0,
+                                            pscan_config.node_id, &exhausted)
+               .code == tigonkv::StatusCode::kInvalidArgument);
+    unlink(pscan_template);
+  }
+
   // §11.12 / §15.1: single-VM Scan oracle — exact key set vs start/limit.
   {
     char oracle_template[] = "/tmp/tigonkv-engine-scan-oracle-XXXXXX";

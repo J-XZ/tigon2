@@ -32,6 +32,26 @@ int main() {
     assert(WireSize(maxv) == sizeof(KvMessage));
     assert(ValidWireFrame(WireSize(maxv), maxv));
   }
+  // §5.1 ScanMigrate codec round-trip and reject unknown flags / wrong size.
+  {
+    const auto req = EncodeScanMigrateRequest(7, kScanMigrateFlagCursorDuplicate, 17);
+    assert(req.size() == kScanMigrateRequestBytes);
+    uint32_t pid = 0, flags = 0;
+    uint64_t limit = 0;
+    assert(DecodeScanMigrateRequest(req, &pid, &flags, &limit));
+    assert(pid == 7 && flags == kScanMigrateFlagCursorDuplicate && limit == 17);
+    assert(!DecodeScanMigrateRequest(req + "x", &pid, &flags, &limit));
+    const auto bad_flags = EncodeScanMigrateRequest(0, 2u, 1);
+    assert(!DecodeScanMigrateRequest(bad_flags, &pid, &flags, &limit));
+    const auto resp = EncodeScanMigrateResponse(7, true);
+    assert(resp.size() == kScanMigrateResponseBytes);
+    bool exhausted = false;
+    assert(DecodeScanMigrateResponse(resp, &pid, &exhausted));
+    assert(pid == 7 && exhausted);
+    assert(DecodeScanMigrateResponse(EncodeScanMigrateResponse(3, false), &pid,
+                                     &exhausted));
+    assert(pid == 3 && !exhausted);
+  }
   const FixedKey alpha = FixedKey::From("alpha", 8);
   const FixedKey beta = FixedKey::From("beta", 8);
   assert(alpha.Compare(alpha) == 0);

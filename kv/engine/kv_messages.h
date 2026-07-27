@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace tigonkv::engine {
@@ -88,6 +89,83 @@ inline KvMessage MakeResponse(uint32_t source, uint32_t destination, uint64_t re
                                   request_id, {}, value);
   message.status = static_cast<uint32_t>(status);
   return message;
+}
+
+// Single-partition ScanMigrate value payloads (§5.1). Key carries start/cursor.
+constexpr uint32_t kScanMigrateFlagCursorDuplicate = 1u;
+constexpr uint32_t kScanMigrateKnownFlags = kScanMigrateFlagCursorDuplicate;
+constexpr size_t kScanMigrateRequestBytes = 16;  // partition_id + flags + limit
+constexpr size_t kScanMigrateResponseBytes = 5;  // partition_id + exhausted
+
+inline void AppendLe32(std::string *out, uint32_t value) {
+  const char bytes[4] = {
+      static_cast<char>(value & 0xff),
+      static_cast<char>((value >> 8) & 0xff),
+      static_cast<char>((value >> 16) & 0xff),
+      static_cast<char>((value >> 24) & 0xff)};
+  out->append(bytes, 4);
+}
+
+inline void AppendLe64(std::string *out, uint64_t value) {
+  AppendLe32(out, static_cast<uint32_t>(value & 0xffffffffu));
+  AppendLe32(out, static_cast<uint32_t>((value >> 32) & 0xffffffffu));
+}
+
+inline bool ConsumeLe32(std::string_view *in, uint32_t *value) {
+  if (in == nullptr || value == nullptr || in->size() < 4) return false;
+  const auto *p = reinterpret_cast<const unsigned char *>(in->data());
+  *value = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+  in->remove_prefix(4);
+  return true;
+}
+
+inline bool ConsumeLe64(std::string_view *in, uint64_t *value) {
+  uint32_t lo = 0;
+  uint32_t hi = 0;
+  if (!ConsumeLe32(in, &lo) || !ConsumeLe32(in, &hi)) return false;
+  *value = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+  return true;
+}
+
+inline std::string EncodeScanMigrateRequest(uint32_t partition_id, uint32_t flags,
+                                            uint64_t output_limit) {
+  std::string out;
+  out.reserve(kScanMigrateRequestBytes);
+  AppendLe32(&out, partition_id);
+  AppendLe32(&out, flags);
+  AppendLe64(&out, output_limit);
+  return out;
+}
+
+inline bool DecodeScanMigrateRequest(std::string_view value, uint32_t *partition_id,
+                                     uint32_t *flags, uint64_t *output_limit) {
+  if (partition_id == nullptr || flags == nullptr || output_limit == nullptr)
+    return false;
+  if (value.size() != kScanMigrateRequestBytes) return false;
+  if (!ConsumeLe32(&value, partition_id) || !ConsumeLe32(&value, flags) ||
+      !ConsumeLe64(&value, output_limit) || !value.empty())
+    return false;
+  if ((*flags & ~kScanMigrateKnownFlags) != 0) return false;
+  return true;
+}
+
+inline std::string EncodeScanMigrateResponse(uint32_t partition_id, bool exhausted) {
+  std::string out;
+  out.reserve(kScanMigrateResponseBytes);
+  AppendLe32(&out, partition_id);
+  out.push_back(exhausted ? '\1' : '\0');
+  return out;
+}
+
+inline bool DecodeScanMigrateResponse(std::string_view value, uint32_t *partition_id,
+                                      bool *exhausted) {
+  if (partition_id == nullptr || exhausted == nullptr) return false;
+  if (value.size() != kScanMigrateResponseBytes) return false;
+  if (!ConsumeLe32(&value, partition_id) || value.size() != 1) return false;
+  *exhausted = value[0] != 0;
+  return true;
 }
 
 }  // namespace tigonkv::engine

@@ -63,6 +63,12 @@ class KVEngine {
   uint64_t NetworkTxBytes() const { return network_tx_bytes_.load(std::memory_order_relaxed); }
   uint64_t NetworkRxBytes() const { return network_rx_bytes_.load(std::memory_order_relaxed); }
   RuntimeStats EngineRuntime() const;
+  // Single-partition owner range move-in (§5.2). Does not return values.
+  Status PreparePartitionSharedScan(uint32_t partition_id,
+                                    std::string_view start_key,
+                                    bool cursor_is_duplicate,
+                                    uint64_t output_limit, uint32_t requester,
+                                    bool *exhausted_out);
 
  private:
   struct KeyRoute {

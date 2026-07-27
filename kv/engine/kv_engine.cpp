@@ -958,6 +958,50 @@ Status KVEngine::PrepareSharedScan(std::string_view start_key, uint64_t limit,
   }
 }
 
+Status KVEngine::PreparePartitionSharedScan(
+    uint32_t partition_id, std::string_view start_key, bool cursor_is_duplicate,
+    uint64_t output_limit, uint32_t requester, bool *exhausted_out) {
+  if (exhausted_out == nullptr)
+    return Status::Error(StatusCode::kInvalidArgument, "null exhausted_out");
+  *exhausted_out = false;
+  constexpr uint64_t kPageSize = 64;
+  if (partition_id >= partitions_.size() ||
+      partition_id >= config_.partition_count)
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "scan migrate partition_id out of range");
+  if (OwnerForPartition(partition_id) != config_.node_id)
+    return Status::Error(StatusCode::kOwnerViolation,
+                         "scan migrate routed to non-owner");
+  if (output_limit == 0 || output_limit > kPageSize)
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "scan migrate output_limit out of range");
+  auto *partition = partitions_[partition_id].get();
+  const uint64_t fetch =
+      output_limit + (cursor_is_duplicate ? 1 : 0) + 1;  // +1 right boundary
+  std::vector<std::string> keys;
+  if (!partition->ScanOwnedKeys(start_key, fetch, &keys))
+    return Status::Error(StatusCode::kCorruption,
+                         "owner key-only range scan failed");
+  *exhausted_out = keys.size() < fetch;
+  for (const auto &key : keys) {
+    bool moved_in = false;
+    const StatusCode code =
+        partition->EnsureInShared(key, requester, &moved_in);
+    // Original TwoPLPashaMessage.h:353-361: NotFound is a race, skip the key.
+    if (code == StatusCode::kNotFound) continue;
+    if (code != StatusCode::kOk)
+      return Status::Error(code, "partition scan range move-in failed");
+    if (moved_in) {
+      migration_in_.fetch_add(1, std::memory_order_relaxed);
+      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  // One OnDemand Clock move-out after this partition's preparation (§5.2).
+  KvMigrationRuntime::SyncHwCcUsage(*partition);
+  partition->MoveOutClockVictim(config_.node_id);
+  return Status::Ok();
+}
+
 CasResult KVEngine::CompareExchange(std::string_view key,
                                     std::string_view expected,
                                     std::string_view desired) {
