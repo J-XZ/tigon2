@@ -22,6 +22,9 @@ pat_topology = re.compile(
     r'E2E_THREAD_TOPOLOGY node=(\d+) foreground=(\d+) demuxer=(\d+) '
     r'kv_threads=(\d+) affinity=(\S+)'
 )
+pat_scan_rows = re.compile(
+    r'E2E_SCAN_ROWS_RETURNED node=(\d+) scan_ops=(\d+) rows=(\d+)'
+)
 pat_case = re.compile(r'round(\d+)-workload([abcde])-(load|run)$')
 rows = []
 for path in sorted(log_root.rglob('*.log')):
@@ -37,45 +40,60 @@ for path in sorted(log_root.rglob('*.log')):
         'kv_threads': int(topology.group(4)) if topology else 0,
         'cpu_affinity': topology.group(5) if topology else 'unreported',
     }
+    scan_by_node = {
+        int(m.group(1)): {
+            'scan_ops': int(m.group(2)),
+            'scan_rows_returned': int(m.group(3)),
+        }
+        for m in pat_scan_rows.finditer(text)
+    }
     found = False
     for m in pat_new.finditer(text):
         found = True
+        node = int(m.group(2))
+        scan = scan_by_node.get(node, {'scan_ops': 0, 'scan_rows_returned': 0})
         rows.append({
             'file': str(path),
             'case': f'workload{case_match.group(2)}',
             'round': int(case_match.group(1)),
             'stage': case_match.group(3),
             'phase': m.group(1),
-            'node': int(m.group(2)),
+            'node': node,
             'ops': int(m.group(3)),
             'duration_us': int(m.group(4)),
             'trace_first': int(m.group(5) or 0),
             'trace_workers': int(m.group(6) or 1),
             'batch_ops': int(m.group(7) or 0),
+            'scan_ops': scan['scan_ops'],
+            'scan_rows_returned': scan['scan_rows_returned'],
             **topology_fields,
         })
     if found:
         continue
     for phase, node, ops, elapsed in pat_legacy.findall(text):
+        node_i = int(node)
+        scan = scan_by_node.get(node_i, {'scan_ops': 0, 'scan_rows_returned': 0})
         rows.append({
             'file': str(path),
             'case': f'workload{case_match.group(2)}',
             'round': int(case_match.group(1)),
             'stage': case_match.group(3),
             'phase': phase,
-            'node': int(node),
+            'node': node_i,
             'ops': int(ops),
             'duration_us': int(elapsed),
             'trace_first': 0,
             'trace_workers': 1,
             'batch_ops': 0,
+            'scan_ops': scan['scan_ops'],
+            'scan_rows_returned': scan['scan_rows_returned'],
             **topology_fields,
         })
 
 fields = [
     'file', 'case', 'round', 'stage', 'phase', 'node', 'ops', 'duration_us', 'trace_first',
-    'trace_workers', 'batch_ops', 'foreground_threads', 'demuxer_threads',
-    'kv_threads', 'cpu_affinity'
+    'trace_workers', 'batch_ops', 'scan_ops', 'scan_rows_returned',
+    'foreground_threads', 'demuxer_threads', 'kv_threads', 'cpu_affinity'
 ]
 with (out / 'ycsb_rows.csv').open('w', newline='') as f:
     writer = csv.DictWriter(f, fieldnames=fields)
@@ -102,6 +120,9 @@ for (case, round_id, stage), items in sorted(round_groups.items()):
         'duration_us_max': duration_us_max,
         'duration_sec_max': duration_us_max / 1e6,
         'ops_per_sec': ops_sum * 1e6 / duration_us_max if duration_us_max else 0.0,
+        'scan_ops_sum': sum(item.get('scan_ops', 0) for item in items),
+        'scan_rows_returned_sum':
+            sum(item.get('scan_rows_returned', 0) for item in items),
     })
 
 case_groups = {}

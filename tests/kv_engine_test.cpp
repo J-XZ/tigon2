@@ -15,8 +15,10 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
+#include <algorithm>
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -235,6 +237,53 @@ int main() {
     assert(found.status.ok() && found.value == "value");
   }
   unlink(path.c_str());
+
+  // §11.12 / §15.1: single-VM Scan oracle — exact key set vs start/limit.
+  {
+    char oracle_template[] = "/tmp/tigonkv-engine-scan-oracle-XXXXXX";
+    const int oracle_fd = mkstemp(oracle_template);
+    assert(oracle_fd >= 0);
+    close(oracle_fd);
+    const std::string oracle_path(oracle_template);
+    auto oracle_config = ConfigFor(oracle_path);
+    oracle_config.partition_count = 16;
+    auto engine = tigonkv::engine::KVEngine::Open(oracle_config, true);
+    std::vector<std::string> keys;
+    for (int i = 0; i < 64; ++i) {
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "k%02d", i);
+      keys.emplace_back(buf);
+      assert(engine->Put(keys.back(), std::string("v") + buf).ok());
+    }
+    std::sort(keys.begin(), keys.end());
+    const auto expect_scan = [&](std::string_view start, uint64_t limit) {
+      std::vector<std::string> expected;
+      for (const auto &key : keys) {
+        if (key < start) continue;
+        expected.push_back(key);
+        if (limit != 0 && expected.size() >= limit) break;
+      }
+      const auto got = engine->Scan(start, limit);
+      assert(got.status.ok());
+      assert(got.items.size() == expected.size());
+      for (size_t i = 0; i < expected.size(); ++i) {
+        assert(got.items[i].key == expected[i]);
+        assert(got.items[i].value == std::string("v") + expected[i]);
+      }
+    };
+    expect_scan("", 0);
+    expect_scan("", 7);
+    expect_scan("k00", 1);
+    expect_scan("k00", 0);
+    expect_scan("k10", 5);
+    expect_scan("k63", 1);
+    expect_scan("k63", 10);
+    expect_scan("k99", 10);  // past end → empty
+    expect_scan("k05", 0);
+    // Mid-key that is not present still returns the next key onward.
+    expect_scan("k0a", 3);
+    unlink(oracle_path.c_str());
+  }
 
   char routed_template[] = "/tmp/tigonkv-engine-route-XXXXXX";
   const int routed_fd = mkstemp(routed_template);

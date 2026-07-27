@@ -124,10 +124,64 @@ void WaitForHostRelease(const std::string &phase, KVStore &store) {
 
 struct ReplayResult {
   uint64_t ops = 0;
+  uint64_t scan_ops = 0;
+  uint64_t scan_rows_returned = 0;
 };
+
+struct ScanExpectState {
+  bool expect_nonempty = false;
+  bool has_max_key = false;
+  std::string max_key;
+  std::mutex mutex;
+
+  void NotePut(const std::string &key) {
+    if (!expect_nonempty) return;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!has_max_key || key > max_key) {
+      max_key = key;
+      has_max_key = true;
+    }
+  }
+
+  void CheckScan(const std::string &start_key, size_t limit, size_t rows,
+                 uint64_t line_no) {
+    if (!expect_nonempty || limit == 0 || rows != 0) return;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!has_max_key) return;
+    if (start_key < max_key)
+      Fail("SCAN returned 0 rows below known max key at line " +
+           std::to_string(line_no));
+  }
+};
+
+bool ScanExpectNonemptyEnabled(int argc, char **argv) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--scan-expect-nonempty") return true;
+    if (arg == "--no-scan-expect-nonempty") return false;
+  }
+  return Env("TIGONKV_E2E_SCAN_EXPECT_NONEMPTY",
+             "CXLKV_E2E_SCAN_EXPECT_NONEMPTY", "0") == "1";
+}
+
+void SeedScanMaxKey(ScanExpectState *state) {
+  const std::string configured =
+      Env("TIGONKV_E2E_SCAN_MAX_KEY", "CXLKV_E2E_SCAN_MAX_KEY");
+  if (configured.empty() || state == nullptr || !state->expect_nonempty) return;
+  std::lock_guard<std::mutex> lock(state->mutex);
+  state->max_key = configured;
+  state->has_max_key = true;
+}
+
+void PrintScanRows(uint32_t node, uint64_t scan_ops, uint64_t rows) {
+  std::cout << "E2E_SCAN_ROWS_RETURNED node=" << node
+            << " scan_ops=" << scan_ops
+            << " rows=" << rows << "\n";
+}
 
 ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_64 *rng,
                          uint32_t fixed_key_size, uint32_t fixed_value_size,
+                         ScanExpectState *scan_expect = nullptr,
                          std::atomic<uint64_t> *progress_ops = nullptr) {
   constexpr uint64_t kProgressPublishBatch = 256;
   std::ifstream input(trace);
@@ -162,6 +216,7 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_
     if (op == "PUT") {
       status = store.Put(key, FixedTraceValue(rng, fixed_value_size));
       (void)len;  // cxlkv ignores PUT LEN when synthesizing FixedTraceValue
+      if (status.ok() && scan_expect != nullptr) scan_expect->NotePut(key);
     } else if (op == "GET") {
       if (len != 0) Fail("GET LEN must be zero");
       status = store.Get(key).status;
@@ -173,8 +228,20 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_
     } else if (op == "SCAN") {
       ScanResult scan = store.Scan(key, len);
       status = scan.status;
-      if (status.ok() && len != 0 && scan.items.size() > len)
-        Fail("SCAN returned more than requested at line " + std::to_string(line_no));
+      if (status.ok()) {
+        ++result.scan_ops;
+        result.scan_rows_returned += scan.items.size();
+        if (len != 0 && scan.items.size() > len)
+          Fail("SCAN returned more than requested at line " + std::to_string(line_no));
+        for (size_t i = 0; i < scan.items.size(); ++i) {
+          if (scan.items[i].key < key ||
+              (i != 0 && scan.items[i - 1].key >= scan.items[i].key))
+            Fail("SCAN result ordering mismatch at line " +
+                 std::to_string(line_no));
+        }
+        if (scan_expect != nullptr)
+          scan_expect->CheckScan(key, len, scan.items.size(), line_no);
+      }
     } else {
       Fail("unknown operation at line " + std::to_string(line_no));
     }
@@ -212,7 +279,7 @@ void PrintThreadTopology(uint32_t node, uint64_t foreground,
 
 int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
                   const std::string &trace_dir, uint64_t workers, uint32_t batch_ops,
-                  uint64_t value_seed) {
+                  uint64_t value_seed, ScanExpectState *scan_expect) {
   const bool stage_markers =
       Env("TIGONKV_E2E_STAGE_MARKERS", "CXLKV_E2E_STAGE_MARKERS", "0") == "1";
   const bool legacy_progress =
@@ -265,7 +332,7 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
         while (!replay_start.load(std::memory_order_acquire))
           std::this_thread::yield();
         results[worker] = ReplayTrace(*store, traces[worker], &rng, config.fixed_key_size,
-                                      config.fixed_value_size,
+                                      config.fixed_value_size, scan_expect,
                                       heartbeat ? &progress_ops : nullptr);
         worker_end[worker] = std::chrono::steady_clock::now();
         store->ReleaseWorker();
@@ -325,17 +392,34 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
   log_stage("checkpoint_done");
   uint64_t ops = 0;
-  for (const auto &result : results) ops += result.ops;
+  uint64_t scan_ops = 0;
+  uint64_t scan_rows = 0;
+  for (const auto &result : results) {
+    ops += result.ops;
+    scan_ops += result.scan_ops;
+    scan_rows += result.scan_rows_returned;
+  }
+  if (scan_expect != nullptr && scan_expect->expect_nonempty && scan_ops != 0 &&
+      scan_rows == 0)
+    Fail("SCAN expect-nonempty: all " + std::to_string(scan_ops) +
+         " scan ops returned 0 rows");
+  // Prefer engine TLS aggregate when present; runner counter is the contract
+  // line for cross-node summarizers even if DumpStats is truncated.
+  const uint64_t store_scan_rows = store->Runtime().scan_rows_returned;
+  if (store_scan_rows != scan_rows)
+    Fail("scan_rows_returned mismatch runner=" + std::to_string(scan_rows) +
+         " store=" + std::to_string(store_scan_rows));
   PrintThreadTopology(config.node_id, workers, config.cpu_affinity);
   PrintTraceTime(phase, config.node_id, ops, duration_us, trace_first,
                  static_cast<uint32_t>(workers), batch_ops);
+  PrintScanRows(config.node_id, scan_ops, scan_rows);
   std::cout << store->DumpStats();
   std::cout << "e2e_trace_runner[node" << config.node_id << "]: passed.\n";
   return 0;
 }
 }  // namespace
 
-int main() {
+int main(int argc, char **argv) {
   std::unique_ptr<KVStore> store;
   std::string trace;
   std::string phase;
@@ -374,11 +458,15 @@ int main() {
     const uint64_t trace_workers = ParseUnsigned(
         Env("TIGONKV_E2E_TRACE_WORKERS", "CXLKV_E2E_TRACE_WORKERS", "1"), "trace workers");
     const std::string trace_dir = Env("TIGONKV_E2E_TRACE_DIR", "CXLKV_E2E_TRACE_DIR");
+    ScanExpectState scan_expect;
+    scan_expect.expect_nonempty = ScanExpectNonemptyEnabled(argc, argv);
+    SeedScanMaxKey(&scan_expect);
     // Guest YCSB uses TRACE_DIR even for 1 worker/VM; only fall back to a
     // single TRACE_FILE when no directory is provided.
     if (!trace_dir.empty()) {
       if (trace_workers == 0) Fail("TIGONKV_E2E_TRACE_WORKERS must be >= 1");
-      return RunMultiTrace(config, reset, phase, trace_dir, trace_workers, batch_ops, value_seed);
+      return RunMultiTrace(config, reset, phase, trace_dir, trace_workers, batch_ops,
+                           value_seed, &scan_expect);
     }
     if (trace_workers > 1)
       Fail("TIGONKV_E2E_TRACE_DIR is required for multi-worker replay");
@@ -394,6 +482,8 @@ int main() {
     std::mt19937_64 rng(value_seed ^ (static_cast<uint64_t>(trace_first) << 32));
     auto start = std::chrono::steady_clock::now();
     std::string line;
+    uint64_t scan_ops = 0;
+    uint64_t scan_rows = 0;
     while (std::getline(input, line)) {
       ++line_no;
       if (line.empty() || line[0] == '#') continue;
@@ -420,6 +510,7 @@ int main() {
       if (op == "PUT") {
         status = store->Put(key, FixedTraceValue(&rng, config.fixed_value_size));
         (void)len;
+        if (status.ok()) scan_expect.NotePut(key);
       } else if (op == "GET") {
         if (len != 0) Fail("GET LEN must be zero");
         status = store->Get(key).status;
@@ -432,12 +523,15 @@ int main() {
         ScanResult result = store->Scan(key, len);
         status = result.status;
         if (status.ok()) {
+          ++scan_ops;
+          scan_rows += result.items.size();
           if (len != 0 && result.items.size() > len)
             Fail("SCAN returned more than requested at line " + std::to_string(line_no));
           for (size_t i = 0; i < result.items.size(); ++i) {
             if (result.items[i].key < key || (i != 0 && result.items[i - 1].key >= result.items[i].key))
               Fail("SCAN result ordering mismatch at line " + std::to_string(line_no));
           }
+          scan_expect.CheckScan(key, len, result.items.size(), line_no);
         }
       } else {
         Fail("unknown operation at line " + std::to_string(line_no));
@@ -445,6 +539,13 @@ int main() {
       if (!status.ok()) Fail("operation failed at line " + std::to_string(line_no) + ": " + status.message);
       ++ops;
     }
+    if (scan_expect.expect_nonempty && scan_ops != 0 && scan_rows == 0)
+      Fail("SCAN expect-nonempty: all " + std::to_string(scan_ops) +
+           " scan ops returned 0 rows");
+    const uint64_t store_scan_rows = store->Runtime().scan_rows_returned;
+    if (store_scan_rows != scan_rows)
+      Fail("scan_rows_returned mismatch runner=" + std::to_string(scan_rows) +
+           " store=" + std::to_string(store_scan_rows));
     const auto duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start).count());
     WaitForHostRelease(phase, *store);
@@ -453,6 +554,7 @@ int main() {
     if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
     PrintThreadTopology(config.node_id, 1, config.cpu_affinity);
     PrintTraceTime(phase, config.node_id, ops, duration_us, trace_first, 1, batch_ops);
+    PrintScanRows(config.node_id, scan_ops, scan_rows);
     std::cout << store->DumpStats();
     std::cout << "e2e_trace_runner[node" << config.node_id << "]: passed.\n";
     return 0;

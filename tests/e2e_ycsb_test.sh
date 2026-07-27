@@ -33,6 +33,9 @@ if (( need_prepare )); then
 fi
 
 echo "TIGONKV_E2E_YCSB_CTEST log_root=$logs traces=$traces"
+# Functional path enables Scan nonempty checks (§11.12); formal throughput
+# measurements should leave TIGONKV_E2E_SCAN_EXPECT_NONEMPTY unset/0.
+export TIGONKV_E2E_SCAN_EXPECT_NONEMPTY="${TIGONKV_E2E_SCAN_EXPECT_NONEMPTY:-1}"
 "$root/run_e2e_ycsb_rounds.sh" --traces "$traces" --logs "$logs" --rounds 1 --vm-count 4 \
   --config "$TIGONKV_EXPERIMENT_CONFIG_JSONC"
 echo "TIGONKV_E2E_YCSB_CTEST passed"

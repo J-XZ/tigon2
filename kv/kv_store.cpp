@@ -52,6 +52,7 @@ void AddRuntimeStats(RuntimeStats *total, const RuntimeStats &part) {
   total->migration_out += part.migration_out;
   total->network_tx_bytes += part.network_tx_bytes;
   total->network_rx_bytes += part.network_rx_bytes;
+  total->scan_rows_returned += part.scan_rows_returned;
 }
 
 std::string StripComments(std::string text) {
@@ -894,8 +895,12 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
   ScanResult result = impl_->engine->Scan(start_key, limit);
-  if (result.status.ok()) ++runtime.commits;
-  else ++runtime.aborts;
+  if (result.status.ok()) {
+    ++runtime.commits;
+    runtime.scan_rows_returned += result.items.size();
+  } else {
+    ++runtime.aborts;
+  }
   return result;
 }
 
@@ -1027,6 +1032,7 @@ std::string KVStore::DumpStats() const {
   out += "migration_out=" + std::to_string(runtime.migration_out) + "\n";
   out += "network_tx_bytes=" + std::to_string(runtime.network_tx_bytes) + "\n";
   out += "network_rx_bytes=" + std::to_string(runtime.network_rx_bytes) + "\n";
+  out += "scan_rows_returned=" + std::to_string(runtime.scan_rows_returned) + "\n";
   const latency_sim::Stats latency = latency_sim::GlobalLatencySimulator().SnapshotStats();
   const auto ratio = [](uint64_t hits, uint64_t misses) {
     const uint64_t total = hits + misses;

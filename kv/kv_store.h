@@ -73,6 +73,8 @@ struct RuntimeStats {
   uint64_t migration_out = 0;
   uint64_t network_tx_bytes = 0;
   uint64_t network_rx_bytes = 0;
+  // Sum of Scan result rows returned by successful Scan calls (§11.12).
+  uint64_t scan_rows_returned = 0;
 };
 
 struct MemoryStats {

@@ -41,6 +41,9 @@ rg -Fq 'readlink \"\$proc/exe\"' "$guest_workflow"
 # A guest that finishes replay first must keep servicing peer transport until
 # every VM reaches replay_done.
 rg -q 'TIGONKV_E2E_RELEASE_FILE=' "$guest_workflow"
+rg -q 'TIGONKV_E2E_SCAN_EXPECT_NONEMPTY=' "$guest_workflow"
+rg -q 'E2E_SCAN_ROWS_RETURNED' "$root/tools/e2e_trace_runner.cpp"
+rg -q 'scan_rows_returned' "$root/kv/kv_store.h"
 rg -q 'all_replayed' "$guest_workflow"
 rg -q "remote .*touch.*release_file" "$guest_workflow"
 rg -q 'TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5' "$guest_workflow"
