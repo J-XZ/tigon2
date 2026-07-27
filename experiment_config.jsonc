@@ -102,7 +102,7 @@
   "tigon_kv": {
     "partition_count": 16,
     "fixed_key_size": 32,
-    "fixed_value_size": 1000,
+    "fixed_value_size": 32,
     "hw_cc_budget_mb": 1024,
     "owner_private_swcc_fraction": 0.35,
     "migration_policy": "Clock",

@@ -1,62 +1,145 @@
-# TigonKV YCSB 指南
+## 目标参数
 
-`tigonkv_run_ycsb_experiment.sh` 是本仓唯一的 YCSB 编排入口。它使用本仓
-`thirdparty_libs/YCSB-cpp` 生成 trace，并回放本仓 `e2e_trace_runner`；不会读取或
-执行兄弟工程的脚本、构建物或 VM 镜像。
+| 项 | 值 |
+|----|-----|
+| 构建 | RelWithDebInfo |
+| 延迟注入 | 关（`--no-latency`） |
+| 拓扑 | 4 VM × 4 前台线程（脚本硬性要求） |
+| Preload | 1,000,000 KV |
+| 每 workload run | 1,000,000 ops |
+| KV | key 32 B / value 32 B（YCSB 脚本写死） |
+| Workloads | load + a/b/c/d/e |
 
-## 快速准备
+说明：编排上 **每个 workload 都会先 load 再 run**（每轮对 a…e：`pool_reset → load → run`）。trace 只生成一份共享 load；不是「全局只 load 一次再连跑 a–e」。
 
-先在不接触 VM 的模式验证产物合同：
+---
 
-```bash
-./tigonkv_run_ycsb_experiment.sh --prepare-only --skip-trace-gen \
-  --record-count 10000 --operation-count 10000 --workloads a
-```
+## 0. 前置（一次性）
 
-去掉 `--skip-trace-gen` 后会调用本仓 YCSB-cpp 生成 load/run trace。默认
-workload 是 `a,b,c,d`；允许的封闭集合是 `a,b,c,d,e`。旧实现有 E 专项历史
-证据，但当前 range-move-in Scan 与后续修复必须以本轮 fresh validation 为准；
-选择 E 仍需显式传 `--workloads a,b,c,d,e`。
-
-## 实际回放
-
-实际运行前必须已有、且通过只读检查的四 VM 拓扑：
+在仓库根目录：
 
 ```bash
-./tigonkv_check_vms.sh
-./tigonkv_run_ycsb_experiment.sh --rounds 1 --record-count 10000 \
-  --operation-count 10000 --workloads a
+cd /root/code/tigon2
+
+# YCSB-cpp submodule（生成 trace）
+git submodule update --init thirdparty_libs/YCSB-cpp
+
+# RelWithDebInfo 构建
+cmake -S . -B build-relwithdebinfo -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-relwithdebinfo -j$(nproc)
+
+# 若尚无镜像（只需做一次）
+./tigonkv_make_vm_img.sh   # 或按脚本支持加 --force
 ```
 
-脚本默认在 `exp_data/ycsb_tigonkv_<UTC 时间>` 写入生成配置、trace、逐轮日志、
-CSV、JSON 和报告。每个 workload 的 load/run 分开执行；计时只来自 runner 输出的
-`E2E_TRACE_TIME_US`。每个 VM 还必须保留
-`E2E_THREAD_TOPOLOGY foreground=4 demuxer=1 kv_threads=5
-affinity=distinct_allowed_cpus`；demuxer 保留原 Tigon IncomingDispatcher 的
-专用接收入环线程形态，但当前 deferred FIFO 不是逐结构同构。它不执行 KV
-请求，仍计入 CPU 使用，不能只报告 4 个 worker。
-runner 编排主线程可按 `TIGONKV_E2E_TRACE_HEARTBEAT_SEC` 输出心跳；它不服务
-KV 请求，但会在 replay 期间低频读取每 256 ops 批量发布的 progress counter。
-汇总器忽略心跳行；这个并发控制线程及其受测期开销仍须披露。stage marker 由
-独立的 `TIGONKV_E2E_STAGE_MARKERS` 控制，不需要打开 verbose。
+确认 `image/root.img`、SSH 公钥（配置里的 `local_ssh_pub_key` / 本机 `~/.ssh/id_rsa.pub`）就绪。
 
-正式 5M 对比须显式传入 `--record-count 5000000 --operation-count 5000000`
-和 `--shared-size-mb 65536 --no-latency`，并在 topology preflight、当前 HEAD
-完整单测和所需多轮 e2e 验收之后执行。VM 生命周期脚本的实际状态变更必须显式使用
-`--allow-state-change`；默认 dry-run 不修改宿主机。
+---
 
-汇总按 `roundN-workload[a-e]-(load|run)` 分组。每轮先求各 node 的
-`ops_sum` 与 `duration_sec_max`；同一 case 再求 `avg_ops_sum` 和
-`avg_duration_sec`，其比值输出为 `ops_per_sec_from_avg_round_max`。heartbeat
-与 stage 行都不参与解析。
+## 1. 启动 4 VM 拓扑
 
-## 恢复与故障排查
-
-- `--skip-build`、`--skip-vm-init`、`--skip-trace-gen` 可复用已有阶段；每个选项
-  都应仅在对应产物已验证时使用。
-- 失败时先检查 `round_logs/` 中每个 VM 的 runner 输出和 `E2E_TRACE_FAILURE`。
-- 汇总器可独立重跑：
+会改宿主机状态，必须显式授权：
 
 ```bash
-python3 scripts/summarize_ycsb_experiment.py --log-root OUT/round_logs --out-dir OUT
+# 建议先 dry-run 看 QEMU 命令
+./tigonkv_init_vms.sh --config experiment_config.jsonc --dry-run
+
+# 实机拉起（含共享内存 tmpfs、QEMU、guest 驱动等）
+./tigonkv_init_vms.sh --config experiment_config.jsonc --allow-state-change
+# 若要对齐 cxlkv 默认 host tuning，按脚本选项加 --apply-host-tuning
+
+# 只读检查：4 VM、SSH、ivshmem、NUMA
+./tigonkv_check_vms.sh --config experiment_config.jsonc
 ```
+
+---
+
+## 2. 一键跑 YCSB（1M load / 1M ops / a–e / 无延迟）
+
+```bash
+./tigonkv_run_ycsb_experiment.sh \
+  --rounds 1 \
+  --record-count 1000000 \
+  --operation-count 1000000 \
+  --threads-per-node 4 \
+  --workloads a,b,c,d,e \
+  --no-latency \
+  --shared-size-mb 32768 \
+  --out-dir exp_data/ycsb_1m_abcde_$(date -u +%Y%m%dT%H%M%SZ)
+```
+
+脚本内部会：
+
+1. 生成 `configs/experiment_config_ycsb_4vm.jsonc`：HWCC 1024MB、SWCC=rest、`fixed_*=32/32`、关闭 latency  
+2. 用本仓 YCSB-cpp 生成 trace：  
+   - 共享 **load**（via workloadc）  
+   - `workloada`…`workloade` 的 **run**（A 带 UPDATE→GET+PUT；D 用 `latest`；其余 zipfian）  
+3. `cmake --build build-relwithdebinfo --target e2e_trace_runner`  
+4. `tigonkv_check_vms.sh`（可用 `--skip-vm-init` 若刚检查过）  
+5. `run_guest_ycsb_workflows.sh`：对每个 workload 做 **load → run**（4×4 回放）  
+6. `summarize_ycsb_experiment.py` 出汇总  
+
+若 VM 已 OK、二进制已编好，可加：`--skip-build --skip-vm-init`。
+
+---
+
+## 3. 可选：先只准备、不碰 VM
+
+```bash
+./tigonkv_run_ycsb_experiment.sh \
+  --prepare-only \
+  --record-count 1000000 \
+  --operation-count 1000000 \
+  --threads-per-node 4 \
+  --workloads a,b,c,d,e \
+  --no-latency \
+  --shared-size-mb 32768 \
+  --out-dir exp_data/ycsb_1m_prep
+```
+
+确认 `traces/`、`run_meta.json` 后再去掉 `--prepare-only` 正式跑（可加 `--skip-trace-gen` 复用）。
+
+---
+
+## 4. 产物与怎么看结果
+
+输出目录大致包括：
+
+- `run_meta.json` — record/op/threads/workloads、32/32  
+- `configs/experiment_config_ycsb_4vm.jsonc`  
+- `traces/load/`、`traces/workloada/`…  
+- `round_logs/round1-workload{a-e}-{load,run}/vm{0-3}.log`  
+- 汇总 CSV/JSON/报告（`summarize_ycsb_experiment.py`）
+
+每 VM 日志应有：
+
+- `E2E_THREAD_TOPOLOGY foreground=4 demuxer=1 …`  
+- `E2E_TRACE_TIME_US …`（计时只认这个）  
+- `e2e_trace_runner[nodeN]: passed.`
+
+单独重汇总：
+
+```bash
+python3 scripts/summarize_ycsb_experiment.py \
+  --log-root OUT/round_logs --out-dir OUT
+```
+
+---
+
+## 5. 结束后停 VM（可选）
+
+```bash
+./tigonkv_kill_vms.sh --config experiment_config.jsonc --allow-state-change
+```
+
+---
+
+## 注意
+
+1. **1M 不是脚本默认**（默认 10 万）；必须显式传 `1000000`。  
+2. **`--no-latency` 必加**，否则可能仍带默认 latency 配置（脚本只在该开关下关 enabled）。  
+3. **`--shared-size-mb 32768`** 与根配置一致；若 OOM/arena 不够再升到 `65536`（须为 2 的幂）。  
+4. 含 **E** 时 Scan 更重，可把 `--round-timeout` 调大（默认 7200s）。  
+5. 实际 init/kill 必须 `--allow-state-change`；Ask 模式我无法替你执行。
+
+核心就是：**RelWithDebInfo 构建 → init+check 4VM → 一条 `tigonkv_run_ycsb_experiment.sh`（1M/1M、4 线程、`a,b,c,d,e`、`--no-latency`）**。
