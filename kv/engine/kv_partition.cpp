@@ -285,6 +285,13 @@ bool KVPartition::InsertPrivateRow(const FixedKey &key, PrivateRow *row) {
   return true;
 }
 
+void KVPartition::FreeUnpublishedPrivateRow(PrivateRow *row) {
+  if (row == nullptr) return;
+  const uint64_t bytes =
+      sizeof(PrivateRow) + fixed_key_size_ + fixed_value_size_;
+  regions_.FreeOwnerPrivate(row, bytes, partition_id_, owner_shard_);
+}
+
 PrivateRow *KVPartition::AllocateRow(const FixedKey &key, std::string_view value) {
   const uint64_t bytes =
       sizeof(PrivateRow) + fixed_key_size_ + fixed_value_size_;
@@ -365,8 +372,12 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
   SharedMutationGuard mutation(*this);
   auto *row = AllocateRow(fixed_key, value);
   row_offset = regions_.swcc().ToOffset(row);
-  if (!InsertPrivateRow(fixed_key, row))
-    throw std::runtime_error("private tree insert race without owner serialization");
+  if (!InsertPrivateRow(fixed_key, row)) {
+    // Concurrent create race: another owner worker published first. Free the
+    // unpublished loser and retry as an upsert (§10.9).
+    FreeUnpublishedPrivateRow(row);
+    return PutPrivate(key, value);
+  }
   PersistRoots();
   return true;
 }
@@ -583,14 +594,19 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   const FixedKey fixed_key = MakeKey(key);
   if (!private_tree_->lookup(fixed_key, row_offset)) {
     if (!expected.empty()) return false;
-    SharedMutationGuard mutation(*this);
-    auto *row = AllocateRow(fixed_key, desired);
-    if (!InsertPrivateRow(fixed_key, row))
-      throw std::runtime_error("private tree CAS insert race without owner serialization");
-    PersistRoots();
-    *exchanged = true;
-    if (inserted != nullptr) *inserted = true;
-    return true;
+    {
+      SharedMutationGuard mutation(*this);
+      auto *row = AllocateRow(fixed_key, desired);
+      if (InsertPrivateRow(fixed_key, row)) {
+        PersistRoots();
+        *exchanged = true;
+        if (inserted != nullptr) *inserted = true;
+        return true;
+      }
+      FreeUnpublishedPrivateRow(row);
+    }
+    // Loser of create race: re-resolve the winner and compare expected.
+    if (!private_tree_->lookup(fixed_key, row_offset)) return false;
   }
   auto *row = RowFromOffset(row_offset);
   LockRow(row);
@@ -650,14 +666,19 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
   const FixedKey fixed_key = MakeKey(key);
   if (!private_tree_->lookup(fixed_key, row_offset)) {
     const std::string encoded = std::to_string(delta);
-    SharedMutationGuard mutation(*this);
-    auto *row = AllocateRow(fixed_key, encoded);
-    if (!InsertPrivateRow(fixed_key, row))
-      throw std::runtime_error("private tree increment insert race without owner serialization");
-    PersistRoots();
-    *value = delta;
-    if (inserted != nullptr) *inserted = true;
-    return true;
+    {
+      SharedMutationGuard mutation(*this);
+      auto *row = AllocateRow(fixed_key, encoded);
+      if (InsertPrivateRow(fixed_key, row)) {
+        PersistRoots();
+        *value = delta;
+        if (inserted != nullptr) *inserted = true;
+        return true;
+      }
+      FreeUnpublishedPrivateRow(row);
+    }
+    // Loser of create race: apply delta on the published row (§10.9).
+    if (!private_tree_->lookup(fixed_key, row_offset)) return false;
   }
   auto *row = RowFromOffset(row_offset);
   LockRow(row);
@@ -813,6 +834,21 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id,
       }
       UnlockRow(private_row);
     }
+    // Move-in already pinned; if the private locator raced away, recover the
+    // smeta from the shared tree so the caller can unpin (§10.8).
+    if (*pinned_existing == nullptr) {
+      RegionOffset shared_offset = kNullOffset;
+      if (shared_tree_->lookup(fixed_key, shared_offset) &&
+          shared_offset != kNullOffset) {
+        *pinned_existing = static_cast<star::TwoPLPashaMetadataShared *>(
+            regions_.hwcc().FromOffset(shared_offset));
+      }
+    }
+    if (*pinned_existing == nullptr) {
+      // Pin was taken but no resolvable smeta remains — should not happen
+      // while ref_cnt blocks move-out; treat as hard failure rather than leak.
+      throw std::runtime_error("move-in pin without resolvable smeta");
+    }
   }
   return result == star::migration_result::SUCCESS;
 }
@@ -865,6 +901,11 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     smeta_mem = regions_.Allocate(sizeof(star::TwoPLPashaMetadataShared),
         AllocationDomain::kHwccMetadata, owner_shard_);
   } catch (const std::bad_alloc &) {
+    if (payload_mem != nullptr) {
+      regions_.Free(payload_mem, payload_bytes,
+                    AllocationDomain::kSharedPayloadSwcc, owner_shard_,
+                    owner_shard_);
+    }
     UnlockNeighborhood(&neighborhood);
     return star::migration_result::FAIL_OOM;
   }
@@ -889,8 +930,15 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
   if (inc_ref_cnt) {
     if (smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+      smeta->clear_write_locked();
       smeta->unlock();
       UnlockNeighborhood(&neighborhood);
+      regions_.Free(smeta_mem, sizeof(star::TwoPLPashaMetadataShared),
+                    AllocationDomain::kHwccMetadata, owner_shard_,
+                    owner_shard_);
+      regions_.Free(payload_mem, payload_bytes,
+                    AllocationDomain::kSharedPayloadSwcc, owner_shard_,
+                    owner_shard_);
       return star::migration_result::FAIL_OOM;
     }
     smeta->increment_ref_cnt();
@@ -901,6 +949,12 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     smeta->clear_write_locked();
     smeta->unlock();
     UnlockNeighborhood(&neighborhood);
+    regions_.Free(smeta_mem, sizeof(star::TwoPLPashaMetadataShared),
+                  AllocationDomain::kHwccMetadata, owner_shard_,
+                  owner_shard_);
+    regions_.Free(payload_mem, payload_bytes,
+                  AllocationDomain::kSharedPayloadSwcc, owner_shard_,
+                  owner_shard_);
     return star::migration_result::FAIL_OOM;
   }
   RecordPrivateRowStateWrite(row);

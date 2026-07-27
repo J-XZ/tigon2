@@ -160,6 +160,7 @@ class KVPartition {
   void RefreshAdjacencyLocked(const Neighborhood &neighborhood);
   void BreakAdjacencyLocked(const Neighborhood &neighborhood);
   bool InsertPrivateRow(const FixedKey &key, PrivateRow *row);
+  void FreeUnpublishedPrivateRow(PrivateRow *row);
   void BeginSharedMutation();
   void EndSharedMutation();
   class SharedMutationGuard {

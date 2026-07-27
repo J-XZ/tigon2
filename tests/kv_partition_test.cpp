@@ -8,7 +8,9 @@
 #include <cassert>
 #include <cstring>
 #include <cstdio>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <sys/wait.h>
@@ -101,6 +103,50 @@ int main() {
   }
   assert(wrong_owner_rejected);
   assert(partition.PutPrivate("alpha", "one"));
+  // §10.9: concurrent create races must free the unpublished loser and upsert.
+  {
+    std::atomic<uint32_t> ready{0};
+    std::atomic<uint32_t> done{0};
+    std::atomic<bool> start{false};
+    std::thread t0([&] {
+      ebr.thread_init_ebr_meta(0, 0);
+      ready.fetch_add(1, std::memory_order_acq_rel);
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      (void)partition.PutPrivate("race-key", "a");
+      done.fetch_add(1, std::memory_order_acq_rel);
+      ebr.handoff_retired_objects();
+    });
+    std::thread t1([&] {
+      ebr.thread_init_ebr_meta(0, 0);
+      ready.fetch_add(1, std::memory_order_acq_rel);
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      (void)partition.PutPrivate("race-key", "b");
+      done.fetch_add(1, std::memory_order_acq_rel);
+      ebr.handoff_retired_objects();
+    });
+    while (ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    t0.join();
+    t1.join();
+    assert(done.load(std::memory_order_acquire) == 2);
+    std::string raced;
+    assert(partition.GetPrivate("race-key", &raced));
+    assert(raced == "a" || raced == "b");
+    bool cas_exchanged = false;
+    bool cas_inserted = false;
+    assert(partition.CompareExchangePrivate("race-cas", "", "created",
+                                            &cas_exchanged, &cas_inserted));
+    assert(cas_exchanged && cas_inserted);
+    int64_t incr = 0;
+    bool incr_inserted = false;
+    assert(partition.IncrementPrivate("race-incr", 3, &incr, &incr_inserted));
+    assert(incr_inserted && incr == 3);
+    assert(partition.IncrementPrivate("race-incr", 2, &incr, &incr_inserted));
+    assert(!incr_inserted && incr == 5);
+    assert(partition.DeletePrivate("race-key"));
+    assert(partition.DeletePrivate("race-cas"));
+    assert(partition.DeletePrivate("race-incr"));
+  }
   const uint64_t mutation_before_insert = partition.SharedMutationState();
   assert(partition.PutPrivate("beta", "two"));
   assert(partition.SharedMutationState() ==
