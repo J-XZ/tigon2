@@ -13,6 +13,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cerrno>
 #include <fcntl.h>
 #include <string>
 #include <string_view>
@@ -837,5 +838,290 @@ int main() {
     assert(engine_runtime.shared_swcc_flushes >= engine_runtime.migration_in);
   }
   unlink(routed_path.c_str());
+
+  // §14.17 / §11.8: bounded single-key history — private, shared, Forward,
+  // move-in/out. Deterministic barriers + small-state checks (no full
+  // linearizability checker).
+  {
+    char hist_template[] = "/tmp/tigonkv-engine-history-XXXXXX";
+    const int hist_fd = mkstemp(hist_template);
+    assert(hist_fd >= 0);
+    close(hist_fd);
+    const std::string hist_path(hist_template);
+
+    // --- Private-only history on a single owner ---
+    {
+      auto cfg = ConfigFor(hist_path);
+      cfg.foreground_worker_count_per_vm = 4;
+      auto engine = tigonkv::engine::KVEngine::Open(cfg, true);
+      const std::string key = "hist-private";
+      assert(engine->Put(key, "v0").ok());
+
+      // Barriered Put then concurrent Gets: each Get must observe v0 or v1.
+      std::atomic<bool> put_done{false};
+      std::atomic<uint32_t> get_ok{0};
+      std::atomic<bool> get_illegal{false};
+      std::vector<std::thread> readers;
+      for (uint32_t w = 0; w < 4; ++w) {
+        readers.emplace_back([&, w] {
+          engine->BindWorker(w);
+          while (!put_done.load(std::memory_order_acquire)) {
+            const auto g = engine->Get(key);
+            if (!g.status.ok()) {
+              get_illegal.store(true, std::memory_order_relaxed);
+              break;
+            }
+            if (g.value != "v0" && g.value != "v1") {
+              get_illegal.store(true, std::memory_order_relaxed);
+              break;
+            }
+            std::this_thread::yield();
+          }
+          const auto after = engine->Get(key);
+          if (after.status.ok() &&
+              (after.value == "v0" || after.value == "v1"))
+            get_ok.fetch_add(1, std::memory_order_relaxed);
+          else
+            get_illegal.store(true, std::memory_order_relaxed);
+          engine->ReleaseWorker();
+        });
+      }
+      assert(engine->Put(key, "v1").ok());
+      put_done.store(true, std::memory_order_release);
+      for (auto &t : readers) t.join();
+      assert(!get_illegal.load());
+      assert(get_ok.load() == 4);
+      assert(engine->Get(key).value == "v1");
+
+      // CAS: exactly one winner from empty expected on a fresh key.
+      const std::string cas_key = "hist-cas-private";
+      std::atomic<uint32_t> winners{0};
+      std::atomic<bool> cas_bad{false};
+      std::vector<std::thread> casters;
+      for (uint32_t w = 0; w < 4; ++w) {
+        casters.emplace_back([&, w] {
+          engine->BindWorker(w);
+          const auto r = engine->CompareExchange(cas_key, "", "won");
+          if (r.status.ok() && r.exchanged)
+            winners.fetch_add(1, std::memory_order_relaxed);
+          else if (r.status.code != tigonkv::StatusCode::kCompareFailed)
+            cas_bad.store(true, std::memory_order_relaxed);
+          engine->ReleaseWorker();
+        });
+      }
+      for (auto &t : casters) t.join();
+      assert(!cas_bad.load());
+      assert(winners.load() == 1);
+      assert(engine->Get(cas_key).value == "won");
+
+      // Increment: N concurrent +1 from "0" → final == N.
+      const std::string inc_key = "hist-inc-private";
+      assert(engine->Put(inc_key, "0").ok());
+      constexpr uint32_t kIncWorkers = 4;
+      constexpr uint32_t kIncPerWorker = 25;
+      std::atomic<bool> inc_bad{false};
+      std::vector<std::thread> inc_threads;
+      for (uint32_t w = 0; w < kIncWorkers; ++w) {
+        inc_threads.emplace_back([&, w] {
+          engine->BindWorker(w);
+          for (uint32_t i = 0; i < kIncPerWorker; ++i) {
+            for (;;) {
+              const auto r = engine->Increment(inc_key, 1);
+              if (r.status.ok()) break;
+              if (r.status.code != tigonkv::StatusCode::kBusy) {
+                inc_bad.store(true, std::memory_order_relaxed);
+                engine->ReleaseWorker();
+                return;
+              }
+            }
+          }
+          engine->ReleaseWorker();
+        });
+      }
+      for (auto &t : inc_threads) t.join();
+      assert(!inc_bad.load());
+      const auto final_inc = engine->Get(inc_key);
+      assert(final_inc.status.ok());
+      assert(final_inc.value ==
+             std::to_string(kIncWorkers * kIncPerWorker));
+
+      // Delete then Put: Get after delete is NotFound; after put sees new value.
+      assert(engine->Delete(key).ok());
+      assert(engine->Get(key).status.code == tigonkv::StatusCode::kNotFound);
+      assert(engine->Put(key, "v2").ok());
+      assert(engine->Get(key).value == "v2");
+    }
+
+    // --- Cross-node: Forward, move-in, shared read, move-out, remote Increment ---
+    {
+      auto node0_cfg = ConfigFor(hist_path, 2, 0);
+      node0_cfg.foreground_worker_count_per_vm = 2;
+      auto node1_cfg = ConfigFor(hist_path, 2, 1);
+      node1_cfg.foreground_worker_count_per_vm = 2;
+      auto engine0 = tigonkv::engine::KVEngine::Open(node0_cfg, true);
+
+      std::string owned0;
+      std::string owned1;
+      for (uint32_t i = 0; i < 2000 && (owned0.empty() || owned1.empty());
+           ++i) {
+        const std::string k = "hist-x-" + std::to_string(i);
+        if (engine0->OwnerForKey(k) == 0 && owned0.empty()) owned0 = k;
+        if (engine0->OwnerForKey(k) == 1 && owned1.empty()) owned1 = k;
+      }
+      assert(!owned0.empty() && !owned1.empty());
+      assert(engine0->Put(owned0, "owner0-v1").ok());
+
+      // child→parent: phase1 done; parent→child: parent done (EOF on close).
+      int child_to_parent[2];
+      int parent_to_child[2];
+      assert(pipe2(child_to_parent, O_CLOEXEC) == 0);
+      assert(pipe2(parent_to_child, O_CLOEXEC) == 0);
+      const pid_t child = fork();
+      assert(child >= 0);
+      if (child == 0) {
+        close(child_to_parent[0]);
+        close(parent_to_child[1]);
+        auto engine1 = tigonkv::engine::KVEngine::Open(node1_cfg, false);
+        // Remote Get → Forward migrate-in → shared authority.
+        const auto g1 = engine1->Get(owned0);
+        if (!g1.status.ok() || g1.value != "owner0-v1") _exit(41);
+        const auto g2 = engine1->Get(owned0);
+        if (!g2.status.ok() || g2.value != "owner0-v1") _exit(42);
+
+        // Concurrent CAS on the migrated key: at most one exchange succeeds.
+        std::atomic<uint32_t> shared_winners{0};
+        std::atomic<bool> shared_bad{false};
+        std::thread cas_a([&] {
+          engine1->BindWorker(0);
+          for (;;) {
+            const auto r =
+                engine1->CompareExchange(owned0, "owner0-v1", "cas-remote");
+            if (r.status.ok() && r.exchanged) {
+              shared_winners.fetch_add(1, std::memory_order_relaxed);
+              break;
+            }
+            if (r.status.code == tigonkv::StatusCode::kCompareFailed) break;
+            if (r.status.code != tigonkv::StatusCode::kBusy) {
+              shared_bad.store(true, std::memory_order_relaxed);
+              break;
+            }
+          }
+          engine1->ReleaseWorker();
+        });
+        std::thread cas_b([&] {
+          engine1->BindWorker(1);
+          for (;;) {
+            const auto r =
+                engine1->CompareExchange(owned0, "owner0-v1", "cas-remote-b");
+            if (r.status.ok() && r.exchanged) {
+              shared_winners.fetch_add(1, std::memory_order_relaxed);
+              break;
+            }
+            if (r.status.code == tigonkv::StatusCode::kCompareFailed) break;
+            if (r.status.code != tigonkv::StatusCode::kBusy) {
+              shared_bad.store(true, std::memory_order_relaxed);
+              break;
+            }
+          }
+          engine1->ReleaseWorker();
+        });
+        cas_a.join();
+        cas_b.join();
+        if (shared_bad.load() || shared_winners.load() > 1) _exit(43);
+        const auto after_cas = engine1->Get(owned0);
+        if (!after_cas.status.ok()) _exit(44);
+        if (after_cas.value != "cas-remote" &&
+            after_cas.value != "cas-remote-b" &&
+            after_cas.value != "owner0-v1")
+          _exit(45);
+
+        // Seed a key this node owns for parent's Forward Increment history.
+        if (!engine1->Put(owned1, "0").ok()) _exit(46);
+        const char ready = 1;
+        if (write(child_to_parent[1], &ready, 1) != 1) _exit(47);
+        close(child_to_parent[1]);
+
+        // Non-blocking wait for parent EOF while serving Forward requests.
+        {
+          const int flags = fcntl(parent_to_child[0], F_GETFL, 0);
+          if (flags < 0 ||
+              fcntl(parent_to_child[0], F_SETFL, flags | O_NONBLOCK) < 0)
+            _exit(48);
+        }
+        for (;;) {
+          engine1->PollTransport();
+          char sink = 0;
+          const ssize_t n = read(parent_to_child[0], &sink, 1);
+          if (n == 0) break;  // parent closed → done
+          if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+              errno != EINTR)
+            _exit(49);
+          std::this_thread::yield();
+        }
+        close(parent_to_child[0]);
+        _exit(0);
+      }
+
+      close(child_to_parent[1]);
+      close(parent_to_child[0]);
+      // Child's first Get Forwards to us; must PollTransport while waiting.
+      {
+        const int flags = fcntl(child_to_parent[0], F_GETFL, 0);
+        assert(flags >= 0);
+        assert(fcntl(child_to_parent[0], F_SETFL, flags | O_NONBLOCK) == 0);
+      }
+      char marker = 0;
+      for (;;) {
+        engine0->PollTransport();
+        const ssize_t n = read(child_to_parent[0], &marker, 1);
+        if (n == 1) break;
+        if (n == 0) assert(false && "child closed before ready");
+        assert(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                         errno == EINTR));
+        std::this_thread::yield();
+      }
+      close(child_to_parent[0]);
+
+      // After child migrated owned0, MoveOut restores private authority.
+      bool moved = false;
+      for (int i = 0; i < 64 && !moved; ++i) {
+        engine0->PollTransport();
+        moved = engine0->MoveOut(owned0).ok();
+      }
+      assert(moved);
+      const auto after_moveout = engine0->Get(owned0);
+      assert(after_moveout.status.ok());
+      assert(after_moveout.value == "cas-remote" ||
+             after_moveout.value == "cas-remote-b" ||
+             after_moveout.value == "owner0-v1");
+
+      // Forward Increment on node1-owned key: returns form serial 1..10.
+      for (int expected = 1; expected <= 10; ++expected) {
+        for (;;) {
+          engine0->PollTransport();
+          const auto r = engine0->Increment(owned1, 1);
+          if (r.status.ok()) {
+            assert(r.value == expected);
+            break;
+          }
+          assert(r.status.code == tigonkv::StatusCode::kBusy);
+        }
+      }
+      const auto inc_get = engine0->Get(owned1);
+      assert(inc_get.status.ok() && inc_get.value == "10");
+
+      close(parent_to_child[1]);  // wake child EOF
+      int status = 0;
+      for (;;) {
+        engine0->PollTransport();
+        const pid_t done = waitpid(child, &status, WNOHANG);
+        if (done == child) break;
+        assert(done == 0);
+      }
+      assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    unlink(hist_path.c_str());
+  }
+
   return 0;
 }
