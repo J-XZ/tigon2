@@ -26,6 +26,13 @@ constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
 constexpr uint32_t kMaxAllocatorShards = 64;
 
+// Frozen architecture contract (Scan原始Tigon对齐修改方案.md §11.1 / §14.1).
+// Formal KV API and wire protocol accept exactly one logical table; partitions
+// are hash routing shards, not additional tables. Single-key APIs are
+// linearizable; Scan is not a global cross-partition snapshot.
+constexpr uint32_t kSingleTableId = 0;
+static_assert(kSingleTableId == 0, "TigonKV exposes exactly one logical table");
+
 enum class AllocationDomain : uint32_t {
   kHwccIndex = 0,
   kHwccMetadata,

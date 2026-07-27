@@ -3,11 +3,39 @@
 > 当前 `my-work` 的已实现数据路径、线程/CPU 计数和实验声明以
 > [当前对比口径.md](当前对比口径.md) 为准。本文件保留设计依据、施工历史和
 > 验收矩阵；其中以“HEAD/现版”描述的旧问题不表示当前实现仍有该缺陷。
+> Scan / 点操作 / Clock tracker 的**目标合同**以
+> [Scan原始Tigon对齐修改方案.md](Scan原始Tigon对齐修改方案.md) 为准，按该文
+> §14 顺序落地；落地前 `当前对比口径.md` 仍描述现版路径。
 
 本文档（`PLAN.md`）是唯一有效的完整改造计划。核心立场：**不追求与原实现隔离
 的独立 TigonKV 分支，允许直接修改原始 Tigon 源码；最终只要求扩展后的系统
 可以运行，不保证旧 bench 等原有入口仍可运行**。不采用"可选钩子 + 默认旧行为
 兼容"的双路径设计，热路径集成一律为零间接开销的就地替换。
+
+## 架构合同冻结（§14.1；不改数据路径的文档/常量钉死）
+
+以下合同已冻结，后续实现不得另选；测试常量见
+`kv/engine/kv_types_layout.h` 的 `kSingleTableId`：
+
+1. **单逻辑表**：正式 KV API 与 wire 不接受 `table_id`；唯一常量表
+   `kSingleTableId=0`。partition 只是路由/并发分片，不是多张表。
+2. **Hash partition**：`partition = StablePartitionForKey(key) % partition_count`，
+   `owner = partition % vm_count`；禁止改为 range partition 或单共享树。
+3. **单 key 线性一致**：Put/Get/Delete/CAS/Increment 提供可测的单 key
+   线性历史；不把跨 partition 全局 Scan snapshot 写成默认强一致合同。
+4. **Scan 非全局 snapshot（目标路径）**：远端 partition CXL-first +
+   adjacency 完整性；仅不完整时对该 partition 发 range move-in；禁止不完整
+   CXL 与 owner value 混源；正式热路径删除 `ScanCertificate` /
+   owner-grouped dual-source / mutation-generation 全局证书。`exhausted`
+   是 TigonKV 为任意 start_key 新增的必要 EOF 提示，须披露。
+5. **保留的薄适配**：定长 KV 编码、RegionOffset、双区域 allocator、单操作
+   Busy 重试、每 partition 的 Clock `ITable` adapter、payload-retire/upsert
+   等已文档化例外；不得新增第二权威索引/锁/迁移状态/Scan cache。
+6. **进程 DRAM 硬约束（目标）**：除有界在途缓冲、线程栈与 partition handle
+   外，不得有随 KV/迁移行数线性增长的进程堆结构（含 PolicyClock DRAM
+   tracker，须迁入 owner-private SWCC）。
+
+实施顺序与验收见 `Scan原始Tigon对齐修改方案.md` §14–§16。
 
 **本文档同时是施工 agent 的任务书：下文所有"必须/禁止"都是对你（施工
 agent）的直接指令。执行协议如下。**
@@ -1097,35 +1125,22 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
   **禁止**留永久 tombstone 壳驻留私有树/arena）；若未迁移：从私有树摘除并
   arena 回收。非 owner：**始终 `DELETE_FWD`**，即使 shared 命中（§3.3）。
   删除完成后该 key 回到 EMPTY（可被重新 PUT）。
-- **SCAN(start, limit)**（§1.5.3；恢复原 TwoPLPasha range move-in 形态）：
-  1. 本地 owner 扫描 private locator tree。locator 在 move-in 后仍保留；
-     每行持 PrivateRow 锁判 `is_migrated`，未迁移值从 private SWCC 读取，
-     已迁移值跟随 `migrated_smeta_off` 并按 SCC 读取。这样只有一个 owner
-     locator 流，不需要把 private/shared 两棵树作为并列权威源归并。
-  2. 每个远端 owner 收到 `SCAN_MIGRATE(start, page_limit)` 后，从各 owned
-     partition 的 key-only locator 流做 owner 级归并，选出全局请求前缀并以
-     原路径 `move_row_in(..., inc_ref=false)` move-in；owner 不预读/返回 value，
-     并额外 move-in 每 partition 的左邻居与 cutoff 后首行作为边界。响应只回
-     cutoff、边界状态及逻辑 EOF 代际证书；requester 从该 owner 的 shared CXL
-     tree 按 SCC 读取，并用原 `TwoPLPashaMetadataShared` next/prev real bits
-     验证逐 partition 邻接。并发 insert/delete/move-out 会保守清除相邻 bit，
-     令该 owner 页重新执行 range move-in+CXL read；这是正常并发重试，不按
-     固定次数伪报 corruption。证书中的 per-partition selected-count 锚定
-     首尾端点；仅无右边界的真实 EOF 使用 per-partition logical-mutation
-     generation 在读后线性化，二者都不替代内部 next/prev 邻接。禁止按
-     “再次扫描的位置”交接
-     persistent pin，
-     也禁止混合不完整 CXL seed 与 owner RPC 行。
-  3. requester 对本地 owner 流和各远端 CXL 流做分页 k 路堆归并；每页最多
-     64 条，续页从上一 key 重新执行对应的 owner range move-in/CXL read，
-     凑满全局 `limit` 即早停。`limit==0` 与 cxlkv 相同表示不限制，但本仓仍有
-     **1,048,576** 条安全上限（非 cxlkv 合同；正式对比应使用 trace 中显式
-     非零 limit 或声明差异）。
-     KV adapter 直接复用原表 smeta 的 next/prev adjacency bits，并在逻辑
-     insert/delete 及 move-in/out 的局部相邻行锁临界区维护；generation 只
-     补充证明逻辑 EOF 与 CXL 端点稳定。它保留原“owner range move-in 后 CXL-only”
-     数据流，而不是把不完整 CXL 与 owner value 合并。
-  4. 正确性优先；若 Scan 验收未通过，按 §1.5.2 标记 `ycsb_e=unsupported`
+- **SCAN(start, limit)**（目标合同见 `Scan原始Tigon对齐修改方案.md` §4–§6；
+  现版仍可能走 owner-grouped certificate，按该文 §14 替换，禁止长期保留
+  混合双源中间态）：
+  1. **本地 owner source**：扫描 private locator tree；migrated 行跟随
+     `migrated_smeta_off` + SCC；不把 private/shared 两棵树作并列权威归并。
+  2. **远端 partition source（CXL-first）**：先直接扫该 partition 的 shared
+     CXL，按原 next/prev adjacency 判定完整性；仅 CXL 空、邻接不完整或缺
+     结束边界时，才对该 partition 的 owner 发 range move-in（owner 不返回
+     value）；响应后重扫 CXL。禁止不完整 CXL 与 owner value 混源。正式热
+     路径删除 `ScanCertificate` / selected-count / mutation-generation 全局
+     证书；`exhausted` 是任意 start_key 下的必要 EOF 提示（须披露）。
+  3. requester 对 16 个 partition 完整流做有界 k 路归并；每页续扫从上一
+     key 重探针；凑满全局 `limit` 早停。`limit==0` 保留 **1,048,576** 安全
+     上限（正式对比应用显式非零 limit 或声明差异）。
+  4. Scan **不**承诺跨 partition 线性一致全局快照；单 key API 仍线性一致。
+     正确性优先；若 Scan 验收未通过，按 §1.5.2 标记 `ycsb_e=unsupported`
      （脚本对含 `e` 硬失败），**不得假跑**；但 §6.1 Scan∥migration 单测仍
      为强制（与是否宣称 E 支持解耦）。
 - **CAS/INCR**：单行写锁内 read-modify-write；owner 同样先判

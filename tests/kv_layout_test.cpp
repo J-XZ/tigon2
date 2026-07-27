@@ -6,6 +6,10 @@
 
 int main() {
   using namespace tigonkv::engine;
+  // Frozen architecture contract constants (PLAN.md §14.1).
+  assert(kSingleTableId == 0);
+  assert(kMaxFixedKeyBytes == 32);
+  assert(kMaxPartitions >= 16);
   const FixedKey alpha = FixedKey::From("alpha", 8);
   const FixedKey beta = FixedKey::From("beta", 8);
   assert(alpha.Compare(alpha) == 0);
