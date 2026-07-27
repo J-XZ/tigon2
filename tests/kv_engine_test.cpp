@@ -99,7 +99,8 @@ int main() {
         tigonkv::engine::KvMessageType::kPut, 1, 0, 7,
         wrong_owner_key, "value");
     while (!rings[0].enqueue(
-        reinterpret_cast<char *>(&request), sizeof(request)))
+        reinterpret_cast<char *>(&request),
+        tigonkv::engine::WireSize(request)))
       std::this_thread::yield();
     for (;;) engine->PollTransport();
   }
@@ -176,8 +177,9 @@ int main() {
     for (;;) {
       alignas(64) char bytes[sizeof(tigonkv::engine::KvMessage)];
       const uint64_t got = rings[1].recv(bytes, sizeof(bytes));
-      if (got == sizeof(outbound)) {
-        std::memcpy(&outbound, bytes, sizeof(outbound));
+      if (got >= tigonkv::engine::WireHeaderBytes()) {
+        std::memcpy(&outbound, bytes, got);
+        assert(tigonkv::engine::ValidWireFrame(got, outbound));
         break;
       }
       assert(std::chrono::steady_clock::now() < drain_deadline);
@@ -191,7 +193,7 @@ int main() {
     auto response = tigonkv::engine::MakeResponse(
         1, 0, outbound.request_id, tigonkv::StatusCode::kOk);
     while (!rings[0].enqueue(reinterpret_cast<char *>(&response),
-                             sizeof(response)))
+                             tigonkv::engine::WireSize(response)))
       std::this_thread::yield();
     const auto settle = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(200);
@@ -221,7 +223,7 @@ int main() {
       auto response = tigonkv::engine::MakeResponse(
           1, 0, /*request_id=*/0xdeadbeefULL);
       while (!rings[0].enqueue(reinterpret_cast<char *>(&response),
-                               sizeof(response)))
+                               tigonkv::engine::WireSize(response)))
         std::this_thread::yield();
       for (;;) engine->PollTransport();
     }
@@ -229,6 +231,136 @@ int main() {
     assert(waitpid(unknown_child, &unknown_status, 0) == unknown_child);
     assert(WIFSIGNALED(unknown_status) && WTERMSIG(unknown_status) == SIGABRT);
     unlink(unknown_template);
+  }
+
+  // §11.4: forged value_size / trailing bytes abort demux; mixed sizes round-trip.
+  {
+    char wire_bad_template[] = "/tmp/tigonkv-engine-wire-bad-XXXXXX";
+    const int wire_bad_fd = mkstemp(wire_bad_template);
+    assert(wire_bad_fd >= 0);
+    close(wire_bad_fd);
+    const pid_t wire_bad_child = fork();
+    assert(wire_bad_child >= 0);
+    if (wire_bad_child == 0) {
+      const rlimit no_core{0, 0};
+      (void)setrlimit(RLIMIT_CORE, &no_core);
+      auto config = ConfigFor(wire_bad_template, 2, 0);
+      auto engine = tigonkv::engine::KVEngine::Open(config, true);
+      void *root = nullptr;
+      star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+          star::CXLMemory::cxl_transport_root_index, &root);
+      auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+      // Claim value_size=32 but only send the header (truncated value).
+      auto forged = tigonkv::engine::MakeRequest(
+          tigonkv::engine::KvMessageType::kPut, 1, 0, 99, "wire-bad",
+          std::string(32, 'z'));
+      while (!rings[0].enqueue(reinterpret_cast<char *>(&forged),
+                               tigonkv::engine::WireHeaderBytes()))
+        std::this_thread::yield();
+      for (;;) engine->PollTransport();
+    }
+    int wire_bad_status = 0;
+    assert(waitpid(wire_bad_child, &wire_bad_status, 0) == wire_bad_child);
+    assert(WIFSIGNALED(wire_bad_status) &&
+           WTERMSIG(wire_bad_status) == SIGABRT);
+    unlink(wire_bad_template);
+  }
+  {
+    char wire_tail_template[] = "/tmp/tigonkv-engine-wire-tail-XXXXXX";
+    const int wire_tail_fd = mkstemp(wire_tail_template);
+    assert(wire_tail_fd >= 0);
+    close(wire_tail_fd);
+    const pid_t wire_tail_child = fork();
+    assert(wire_tail_child >= 0);
+    if (wire_tail_child == 0) {
+      const rlimit no_core{0, 0};
+      (void)setrlimit(RLIMIT_CORE, &no_core);
+      auto config = ConfigFor(wire_tail_template, 2, 0);
+      auto engine = tigonkv::engine::KVEngine::Open(config, true);
+      void *root = nullptr;
+      star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+          star::CXLMemory::cxl_transport_root_index, &root);
+      auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+      // value_size=0 but enqueue full POD (extra trailing bytes).
+      auto empty = tigonkv::engine::MakeResponse(1, 0, 42);
+      while (!rings[0].enqueue(reinterpret_cast<char *>(&empty),
+                               sizeof(empty)))
+        std::this_thread::yield();
+      for (;;) engine->PollTransport();
+    }
+    int wire_tail_status = 0;
+    assert(waitpid(wire_tail_child, &wire_tail_status, 0) == wire_tail_child);
+    assert(WIFSIGNALED(wire_tail_status) &&
+           WTERMSIG(wire_tail_status) == SIGABRT);
+    unlink(wire_tail_template);
+  }
+  {
+    // Mixed 0/8/32B values: node0 Forward Put tx bytes == WireSize(req)+WireSize(rsp).
+    char wire_ok_template[] = "/tmp/tigonkv-engine-wire-ok-XXXXXX";
+    const int wire_ok_fd = mkstemp(wire_ok_template);
+    assert(wire_ok_fd >= 0);
+    close(wire_ok_fd);
+    auto node0_cfg = ConfigFor(wire_ok_template, 2, 0);
+    auto node1_cfg = ConfigFor(wire_ok_template, 2, 1);
+    std::vector<std::pair<std::string, size_t>> remote_puts;
+    {
+      auto probe = tigonkv::engine::KVEngine::Open(node0_cfg, true);
+      for (size_t n : {size_t{0}, size_t{8}, size_t{32}}) {
+        for (uint32_t i = 0; i < 4000; ++i) {
+          const std::string key =
+              "wire-mix-" + std::to_string(n) + "-" + std::to_string(i);
+          if (probe->OwnerForKey(key) == 1) {
+            remote_puts.emplace_back(key, n);
+            break;
+          }
+        }
+      }
+      assert(remote_puts.size() == 3);
+    }
+    const pid_t peer = fork();
+    assert(peer >= 0);
+    if (peer == 0) {
+      auto node1 = tigonkv::engine::KVEngine::Open(node1_cfg, false);
+      node1->BindWorker(0);
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(15);
+      size_t seen = 0;
+      while (seen < remote_puts.size()) {
+        node1->PollTransport();
+        seen = 0;
+        for (const auto &entry : remote_puts) {
+          if (node1->Get(entry.first).status.ok()) ++seen;
+        }
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::yield();
+      }
+      for (const auto &entry : remote_puts) {
+        const auto got = node1->Get(entry.first);
+        assert(got.status.ok());
+        assert(got.value.size() == entry.second);
+      }
+      node1->ReleaseWorker();
+      _exit(0);
+    }
+    auto node0 = tigonkv::engine::KVEngine::Open(node0_cfg, false);
+    node0->BindWorker(0);
+    const uint64_t tx_before = node0->NetworkTxBytes();
+    uint64_t expected_tx = 0;
+    for (const auto &entry : remote_puts) {
+      const std::string value(entry.second, 'v');
+      assert(node0->Put(entry.first, value).ok());
+      expected_tx += tigonkv::engine::WireSize(tigonkv::engine::MakeRequest(
+          tigonkv::engine::KvMessageType::kPut, 0, 1, 1, entry.first, value));
+    }
+    node0->ReleaseWorker();
+    assert(node0->NetworkTxBytes() - tx_before == expected_tx);
+    // Responses are received on node0; each empty ack is exactly the header.
+    assert(node0->NetworkRxBytes() ==
+           remote_puts.size() * tigonkv::engine::WireHeaderBytes());
+    int peer_status = 0;
+    assert(waitpid(peer, &peer_status, 0) == peer);
+    assert(WIFEXITED(peer_status) && WEXITSTATUS(peer_status) == 0);
+    unlink(wire_ok_template);
   }
 
   char ring_latency_template[] = "/tmp/tigonkv-ring-latency-XXXXXX";
@@ -473,8 +605,11 @@ int main() {
           _exit(16);
       }
       // One range-migrate request plus one cursor range-migrate request. Values
-      // travel through CXL, so the requester sends only range-migration frames.
-      if (authoritative_scan_tx != 2 * sizeof(tigonkv::engine::KvMessage)) _exit(17);
+      // travel through CXL, so the requester sends only range-migration frames
+      // (header + 8-byte limit; §11.4 WireSize).
+      const size_t scan_migrate_wire =
+          tigonkv::engine::WireHeaderBytes() + sizeof(uint64_t);
+      if (authoritative_scan_tx != 2 * scan_migrate_wire) _exit(17);
       const auto boundary_scan = node_one->Scan(promoted_scan_keys[63], 3);
       if (!boundary_scan.status.ok() || boundary_scan.items.size() != 3)
         _exit(29);

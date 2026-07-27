@@ -3,6 +3,7 @@
 #include "kv/kv_store.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -29,7 +30,9 @@ enum class KvMessageType : uint8_t {
 };
 
 struct KvMessage {
-  KvMessageType type = KvMessageType::kGet;
+  // Default type is an illegal wire value so zeroed/uninitialized frames fail
+  // validation instead of looking like a live Get (§12.4).
+  KvMessageType type = static_cast<KvMessageType>(0);
   uint8_t reserved[3]{};
   uint32_t source_node = 0;
   uint32_t destination_node = 0;
@@ -41,13 +44,32 @@ struct KvMessage {
   std::array<char, 1024> value{};
 };
 static_assert(sizeof(KvMessage) < 2039, "KV message must fit one transport entry");
+static_assert(offsetof(KvMessage, value) == 68,
+              "wire header size must stay offsetof(value); key stays fixed 32B");
+
+// Variable-length wire: send header + actual value bytes only (§11.4).
+// Key remains fixed 32B inside the header; value padding is omitted on the wire.
+inline constexpr size_t WireHeaderBytes() { return offsetof(KvMessage, value); }
+
+inline size_t WireSize(const KvMessage &message) {
+  if (message.value_size > message.value.size())
+    throw std::invalid_argument("KV message value_size exceeds capacity");
+  return WireHeaderBytes() + message.value_size;
+}
+
+inline bool ValidWireFrame(size_t received, const KvMessage &message) {
+  if (received < WireHeaderBytes() || received > sizeof(KvMessage)) return false;
+  if (message.key_size > message.key.size()) return false;
+  if (message.value_size > message.value.size()) return false;
+  return received == WireHeaderBytes() + message.value_size;
+}
 
 inline KvMessage MakeRequest(KvMessageType type, uint32_t source, uint32_t destination,
                              uint64_t request_id, std::string_view key,
                              std::string_view value = {}) {
   if (key.size() > KvMessage{}.key.size() || value.size() > KvMessage{}.value.size())
     throw std::invalid_argument("KV message field exceeds fixed transport contract");
-  KvMessage message;
+  KvMessage message{};
   message.type = type;
   message.source_node = source;
   message.destination_node = destination;

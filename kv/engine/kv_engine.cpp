@@ -1134,12 +1134,13 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
   unsigned spins = 0;
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::seconds(config_.sync_timeout_sec);
+  const size_t wire_size = WireSize(message);
   for (;;) {
     bool enqueued = false;
     try {
       enqueued = rings_[message.destination_node].enqueue(
           const_cast<char *>(reinterpret_cast<const char *>(&message)),
-          sizeof(message));
+          wire_size);
     } catch (const std::exception &error) {
       TransportFatal(config_.node_id, "ring_enqueue", error.what(), &message);
     } catch (...) {
@@ -1169,7 +1170,7 @@ void KVEngine::SendTransportMessage(const KvMessage &message) {
     else
       std::this_thread::yield();
   }
-  network_tx_bytes_.fetch_add(sizeof(message), std::memory_order_relaxed);
+  network_tx_bytes_.fetch_add(wire_size, std::memory_order_relaxed);
 }
 
 Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_view value,
@@ -1365,11 +1366,14 @@ void KVEngine::InboundDemuxerLoop() {
           // before publishing a response notification or deferred request.
           mem_access::DelayActiveScopeNow();
           if (received == 0) break;
-          if (received != sizeof(KvMessage))
+          KvMessage message{};
+          if (received < WireHeaderBytes() || received > sizeof(KvMessage))
             TransportFatal(config_.node_id, "ring_recv",
                            "malformed KV transport entry");
-          KvMessage message{};
-          std::memcpy(&message, bytes, sizeof(message));
+          std::memcpy(&message, bytes, received);
+          if (!ValidWireFrame(received, message))
+            TransportFatal(config_.node_id, "ring_recv",
+                           "KV wire length/value_size mismatch");
           network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
           try {
             DemuxTransportMessage(message);

@@ -1,8 +1,10 @@
 #include "kv/engine/kv_types_layout.h"
+#include "kv/engine/kv_messages.h"
 
 #include <cassert>
 #include <cstring>
 #include <new>
+#include <string>
 
 int main() {
   using namespace tigonkv::engine;
@@ -10,6 +12,26 @@ int main() {
   assert(kSingleTableId == 0);
   assert(kMaxFixedKeyBytes == 32);
   assert(kMaxPartitions >= 16);
+  // §11.4 WireSize: header = offsetof(value); value bytes only on the wire.
+  assert(WireHeaderBytes() == offsetof(KvMessage, value));
+  {
+    KvMessage empty = MakeRequest(KvMessageType::kMigrate, 0, 1, 1, "k");
+    assert(empty.value_size == 0);
+    assert(WireSize(empty) == WireHeaderBytes());
+    assert(ValidWireFrame(WireSize(empty), empty));
+    KvMessage small = MakeRequest(KvMessageType::kPut, 0, 1, 2, "k",
+                                  std::string(32, 'v'));
+    assert(WireSize(small) == WireHeaderBytes() + 32);
+    assert(ValidWireFrame(WireSize(small), small));
+    assert(!ValidWireFrame(WireHeaderBytes(), small));  // truncated value
+    KvMessage forged = small;
+    forged.value_size = 0;
+    assert(!ValidWireFrame(WireSize(small), forged));  // trailing / forged size
+    KvMessage maxv = MakeRequest(KvMessageType::kPut, 0, 1, 3, "k",
+                                 std::string(1024, 'x'));
+    assert(WireSize(maxv) == sizeof(KvMessage));
+    assert(ValidWireFrame(WireSize(maxv), maxv));
+  }
   const FixedKey alpha = FixedKey::From("alpha", 8);
   const FixedKey beta = FixedKey::From("beta", 8);
   assert(alpha.Compare(alpha) == 0);
