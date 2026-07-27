@@ -73,11 +73,12 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
         regions_.hwcc().FromOffset(
             directory_.shared_root.load(std::memory_order_acquire)));
     shared_tree_->bind_published_root(&directory_.shared_root);
+    persisted_private_root_offset_ = private_root;
   } else {
     private_tree_ = new PrivateTree(private_binding_);
     shared_tree_ = new SharedTree(shared_binding_);
     shared_tree_->bind_published_root(&directory_.shared_root);
-    PersistRoots();
+    PersistPrivateRootIfChanged();
   }
   // Clock tracker rebuild runs after KvMigrationRuntime::Install so the
   // process-local PolicyClock exists (PLAN §4.5 attach rebuild).
@@ -378,7 +379,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
     FreeUnpublishedPrivateRow(row);
     return PutPrivate(key, value);
   }
-  PersistRoots();
+  PersistPrivateRootIfChanged();
   return true;
 }
 
@@ -598,7 +599,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
       SharedMutationGuard mutation(*this);
       auto *row = AllocateRow(fixed_key, desired);
       if (InsertPrivateRow(fixed_key, row)) {
-        PersistRoots();
+        PersistPrivateRootIfChanged();
         *exchanged = true;
         if (inserted != nullptr) *inserted = true;
         return true;
@@ -670,7 +671,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
       SharedMutationGuard mutation(*this);
       auto *row = AllocateRow(fixed_key, encoded);
       if (InsertPrivateRow(fixed_key, row)) {
-        PersistRoots();
+        PersistPrivateRootIfChanged();
         *value = delta;
         if (inserted != nullptr) *inserted = true;
         return true;
@@ -970,7 +971,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   smeta->lock();
   smeta->clear_write_locked();
   smeta->unlock_for_publication();
-  PersistRoots();
+  PersistPrivateRootIfChanged();
   mem_access::HwccAtomicRmw(&directory_.migration_in_seq);
   directory_.migration_in_seq.fetch_add(1, std::memory_order_relaxed);
   star::num_data_move_in.fetch_add(1, std::memory_order_relaxed);
@@ -1069,7 +1070,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
                           star::CXLMemory::METADATA_FREE, owner_shard_);
   ebr_.add_retired_object(payload, fixed_value_size_,
                           star::CXLMemory::DATA_FREE, owner_shard_);
-  PersistRoots();
+  PersistPrivateRootIfChanged();
   star::num_data_move_out.fetch_add(1, std::memory_order_relaxed);
   KvMigrationRuntime::SyncHwCcUsage(*this);
   return true;
@@ -1491,7 +1492,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
     ebr_.add_retired_object(row, row_bytes, star::CXLMemory::MISC_FREE,
                             owner_shard_, partition_id_);
     UnlockNeighborhood(&neighborhood);
-    PersistRoots();
+    PersistPrivateRootIfChanged();
     if (retired_smeta != nullptr) {
       // The invalid, unindexed smeta remains write-locked as the publication
       // gate while synthetic CXL latency is paid. No private-row latch is held.
@@ -1611,17 +1612,17 @@ uint64_t KVPartition::migrated_key_count() const {
 }
 
 
-void KVPartition::PersistRoots() {
+void KVPartition::PersistPrivateRootIfChanged() {
+  // Shared live root is published only by BPlusTree::store_root through
+  // bind_published_root; do not rewrite directory_.shared_root here (§11.6).
+  const RegionOffset private_root =
+      regions_.swcc().ToOffset(private_tree_->root_for_persistence());
+  if (private_root == persisted_private_root_offset_) return;
   mem_access::HwccWrite(&directory_.private_root,
                         sizeof(directory_.private_root));
-  directory_.private_root = regions_.swcc().ToOffset(
-      private_tree_->root_for_persistence());
-  // Shared live root is published on every store_root via the HWCC atomic slot;
-  // keep the slot coherent after owner-local mirror updates.
-  mem_access::HwccAtomicStore(&directory_.shared_root);
-  directory_.shared_root.store(
-      regions_.hwcc().ToOffset(shared_tree_->root_for_persistence()),
-      std::memory_order_release);
+  directory_.private_root = private_root;
+  persisted_private_root_offset_ = private_root;
+  ++private_root_publishes_;
 }
 
 }  // namespace tigonkv::engine

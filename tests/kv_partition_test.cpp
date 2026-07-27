@@ -103,6 +103,14 @@ int main() {
   }
   assert(wrong_owner_rejected);
   assert(partition.PutPrivate("alpha", "one"));
+  const uint64_t root_pubs_after_create = partition.PrivateRootPublishCount();
+  assert(root_pubs_after_create >= 1);
+  // §11.6: value updates that do not change private root must not republish.
+  assert(!partition.PutPrivate("alpha", "two"));
+  assert(!partition.PutPrivate("alpha", "three"));
+  assert(partition.PrivateRootPublishCount() == root_pubs_after_create);
+  assert(regions.layout().partitions[5].private_root !=
+         tigonkv::engine::kNullOffset);
   // §10.9: concurrent create races must free the unpublished loser and upsert.
   {
     std::atomic<uint32_t> ready{0};

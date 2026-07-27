@@ -110,7 +110,8 @@ class KVPartition {
 
   // Must be called after an operation which might split or collapse a root.
   // It writes only region-relative offsets into the persistent directory.
-  void PersistRoots();
+  void PersistPrivateRootIfChanged();
+  uint64_t PrivateRootPublishCount() const { return private_root_publishes_; }
 
   // KV-adapted Helper move-in/out bodies used as PolicyClock callbacks.
   // Caller (PolicyClock) already holds the per-partition Clock tracker lock.
@@ -187,6 +188,9 @@ class KVPartition {
   btreeolc_cxl::TreeNodeAllocation shared_binding_;
   PrivateTree *private_tree_ = nullptr;
   SharedTree *shared_tree_ = nullptr;
+  // Process-local cache of the last published private root offset (§11.6).
+  RegionOffset persisted_private_root_offset_ = kNullOffset;
+  uint64_t private_root_publishes_ = 0;
 };
 
 }  // namespace tigonkv::engine
