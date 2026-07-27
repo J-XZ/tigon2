@@ -28,6 +28,23 @@ uint64_t ParseUnsigned(const std::string &text, const std::string &label) {
   return value;
 }
 [[noreturn]] void Fail(const std::string &message) { throw std::runtime_error(message); }
+
+// §10.1/§10.2: Busy is contention, not corruption. Retry the full logical op
+// (original transaction abort/retry) with PollTransport so peers make progress.
+constexpr int kBusyRetryBudget = 64;
+
+template <typename Op>
+Status RunWithBusyRetry(KVStore &store, Op &&op) {
+  Status status;
+  for (int attempt = 0; attempt < kBusyRetryBudget; ++attempt) {
+    status = op();
+    if (status.code != StatusCode::kBusy) return status;
+    (void)store.PollTransport();
+    std::this_thread::yield();
+  }
+  return status;
+}
+
 uint64_t ReadDecimal(const std::string &line, size_t *pos, const std::string &label) {
   const size_t begin = *pos;
   while (*pos < line.size() && line[*pos] >= '0' && line[*pos] <= '9') ++*pos;
@@ -214,20 +231,30 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_
     const std::string key = FixedTraceKey(raw_key, fixed_key_size);
     Status status;
     if (op == "PUT") {
-      status = store.Put(key, FixedTraceValue(rng, fixed_value_size));
+      const std::string value = FixedTraceValue(rng, fixed_value_size);
       (void)len;  // cxlkv ignores PUT LEN when synthesizing FixedTraceValue
+      status = RunWithBusyRetry(store, [&] { return store.Put(key, value); });
       if (status.ok() && scan_expect != nullptr) scan_expect->NotePut(key);
     } else if (op == "GET") {
       if (len != 0) Fail("GET LEN must be zero");
-      status = store.Get(key).status;
-      if (status.code == StatusCode::kNotFound) status = Status::Ok();
+      status = RunWithBusyRetry(store, [&] {
+        Status s = store.Get(key).status;
+        if (s.code == StatusCode::kNotFound) s = Status::Ok();
+        return s;
+      });
     } else if (op == "DELETE") {
       if (len != 0) Fail("DELETE LEN must be zero");
-      status = store.Delete(key);
-      if (status.code == StatusCode::kNotFound) status = Status::Ok();
+      status = RunWithBusyRetry(store, [&] {
+        Status s = store.Delete(key);
+        if (s.code == StatusCode::kNotFound) s = Status::Ok();
+        return s;
+      });
     } else if (op == "SCAN") {
-      ScanResult scan = store.Scan(key, len);
-      status = scan.status;
+      ScanResult scan;
+      status = RunWithBusyRetry(store, [&] {
+        scan = store.Scan(key, len);
+        return scan.status;
+      });
       if (status.ok()) {
         ++result.scan_ops;
         result.scan_rows_returned += scan.items.size();
@@ -508,20 +535,30 @@ int main(int argc, char **argv) {
       const std::string key = FixedTraceKey(raw_key, config.fixed_key_size);
       Status status;
       if (op == "PUT") {
-        status = store->Put(key, FixedTraceValue(&rng, config.fixed_value_size));
+        const std::string value = FixedTraceValue(&rng, config.fixed_value_size);
         (void)len;
+        status = RunWithBusyRetry(*store, [&] { return store->Put(key, value); });
         if (status.ok()) scan_expect.NotePut(key);
       } else if (op == "GET") {
         if (len != 0) Fail("GET LEN must be zero");
-        status = store->Get(key).status;
-        if (status.code == StatusCode::kNotFound) status = Status::Ok();
+        status = RunWithBusyRetry(*store, [&] {
+          Status s = store->Get(key).status;
+          if (s.code == StatusCode::kNotFound) s = Status::Ok();
+          return s;
+        });
       } else if (op == "DELETE") {
         if (len != 0) Fail("DELETE LEN must be zero");
-        status = store->Delete(key);
-        if (status.code == StatusCode::kNotFound) status = Status::Ok();
+        status = RunWithBusyRetry(*store, [&] {
+          Status s = store->Delete(key);
+          if (s.code == StatusCode::kNotFound) s = Status::Ok();
+          return s;
+        });
       } else if (op == "SCAN") {
-        ScanResult result = store->Scan(key, len);
-        status = result.status;
+        ScanResult result;
+        status = RunWithBusyRetry(*store, [&] {
+          result = store->Scan(key, len);
+          return result.status;
+        });
         if (status.ok()) {
           ++scan_ops;
           scan_rows += result.items.size();

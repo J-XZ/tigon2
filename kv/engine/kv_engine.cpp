@@ -383,18 +383,26 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
     }
     return Forward(KvMessageType::kPut, key, value, nullptr, route.owner);
   }
-  try {
-    route.partition->PutPrivate(key, value);
-    return Status::Ok();
-  } catch (const std::bad_alloc &) {
-    return Status::Error(StatusCode::kOutOfMemory, "private arena exhausted");
-  } catch (const std::runtime_error &e) {
-    if (std::string_view(e.what()).find("busy") != std::string_view::npos)
-      return Status::Error(StatusCode::kBusy, e.what());
-    return Status::Error(StatusCode::kCorruption, e.what());
-  } catch (const std::exception &e) {
-    return Status::Error(StatusCode::kCorruption, e.what());
+  // Owner migrated write can contend on shared row locks; one helper attempt
+  // returns Busy (§10.2). Retry at the logical Put boundary like shared path.
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    try {
+      route.partition->PutPrivate(key, value);
+      return Status::Ok();
+    } catch (const std::bad_alloc &) {
+      return Status::Error(StatusCode::kOutOfMemory, "private arena exhausted");
+    } catch (const std::runtime_error &e) {
+      if (std::string_view(e.what()).find("busy") != std::string_view::npos) {
+        PollTransport();
+        std::this_thread::yield();
+        continue;
+      }
+      return Status::Error(StatusCode::kCorruption, e.what());
+    } catch (const std::exception &e) {
+      return Status::Error(StatusCode::kCorruption, e.what());
+    }
   }
+  return Status::Error(StatusCode::kBusy, "owner put retry budget exceeded");
 }
 
 GetResult KVEngine::Get(std::string_view key) {
@@ -1365,9 +1373,28 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
   };
   if (message.type == KvMessageType::kPut) {
     try {
-      const bool inserted = partition->PutPrivate(key, value);
-      if (!inserted) promote_updated_row();
-      response.status = static_cast<uint32_t>(StatusCode::kOk);
+      bool inserted = false;
+      bool busy = false;
+      for (int attempt = 0; attempt < 8; ++attempt) {
+        try {
+          inserted = partition->PutPrivate(key, value);
+          busy = false;
+          break;
+        } catch (const std::runtime_error &e) {
+          if (std::string_view(e.what()).find("busy") == std::string_view::npos)
+            throw;
+          busy = true;
+          // Nested Poll only applies responses; still yields so peers progress.
+          PollTransport();
+          std::this_thread::yield();
+        }
+      }
+      if (busy) {
+        response.status = static_cast<uint32_t>(StatusCode::kBusy);
+      } else {
+        if (!inserted) promote_updated_row();
+        response.status = static_cast<uint32_t>(StatusCode::kOk);
+      }
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
     } catch (const std::runtime_error &e) {
