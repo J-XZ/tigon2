@@ -95,7 +95,7 @@ inline KvMessage MakeResponse(uint32_t source, uint32_t destination, uint64_t re
 constexpr uint32_t kScanMigrateFlagCursorDuplicate = 1u;
 constexpr uint32_t kScanMigrateKnownFlags = kScanMigrateFlagCursorDuplicate;
 constexpr size_t kScanMigrateRequestBytes = 16;  // partition_id + flags + limit
-constexpr size_t kScanMigrateResponseBytes = 5;  // partition_id + exhausted
+constexpr size_t kScanMigrateResponseBytes = 6;  // partition_id + exhausted + no_pred
 
 inline void AppendLe32(std::string *out, uint32_t value) {
   const char bytes[4] = {
@@ -151,20 +151,23 @@ inline bool DecodeScanMigrateRequest(std::string_view value, uint32_t *partition
   return true;
 }
 
-inline std::string EncodeScanMigrateResponse(uint32_t partition_id, bool exhausted) {
+inline std::string EncodeScanMigrateResponse(uint32_t partition_id, bool exhausted,
+                                             bool no_predecessor = false) {
   std::string out;
   out.reserve(kScanMigrateResponseBytes);
   AppendLe32(&out, partition_id);
   out.push_back(exhausted ? '\1' : '\0');
+  out.push_back(no_predecessor ? '\1' : '\0');
   return out;
 }
 
 inline bool DecodeScanMigrateResponse(std::string_view value, uint32_t *partition_id,
-                                      bool *exhausted) {
+                                      bool *exhausted, bool *no_predecessor = nullptr) {
   if (partition_id == nullptr || exhausted == nullptr) return false;
   if (value.size() != kScanMigrateResponseBytes) return false;
-  if (!ConsumeLe32(&value, partition_id) || value.size() != 1) return false;
+  if (!ConsumeLe32(&value, partition_id) || value.size() != 2) return false;
   *exhausted = value[0] != 0;
+  if (no_predecessor != nullptr) *no_predecessor = value[1] != 0;
   return true;
 }
 

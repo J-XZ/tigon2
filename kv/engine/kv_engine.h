@@ -68,7 +68,8 @@ class KVEngine {
                                     std::string_view start_key,
                                     bool cursor_is_duplicate,
                                     uint64_t output_limit, uint32_t requester,
-                                    bool *exhausted_out);
+                                    bool *exhausted_out,
+                                    bool *no_predecessor_out = nullptr);
 
  private:
   struct KeyRoute {
@@ -89,9 +90,6 @@ class KVEngine {
                  std::string *response_value, uint32_t owner);
   // TwoPLPasha DATA_MIGRATION: ask owner to move_row_in, then requester CXL-accesses.
   Status RequestMigrate(std::string_view key);
-  Status RequestScanMigrate(uint32_t owner, std::string_view start_key,
-                            uint64_t limit,
-                            std::string *migration_certificate);
   CasResult ForwardCompareExchange(std::string_view key, std::string_view expected,
                                    std::string_view desired);
   struct PendingResponse {
@@ -108,13 +106,6 @@ class KVEngine {
   Status AwaitResponse(uint64_t request_id,
                        const std::shared_ptr<PendingResponse> &pending,
                        std::string *response_value);
-  ScanResult ScanOwnedPartitions(std::string_view start_key, uint64_t limit);
-  ScanResult ScanSharedPartitions(uint32_t owner, std::string_view start_key,
-                                  uint64_t limit,
-                                  std::string_view migration_certificate);
-  Status PrepareSharedScan(std::string_view start_key, uint64_t limit,
-                           uint32_t requester,
-                           std::string *migration_certificate);
   // Demuxer path: apply responses / queue requests. Never sends.
   void DemuxTransportMessage(const KvMessage &message);
   void WakePendingForwarders();

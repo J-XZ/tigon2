@@ -96,6 +96,18 @@ class KVPartition {
       const FixedKey &min_key,
       const std::function<bool(const FixedKey &key, RegionOffset smeta_off,
                                bool is_last_tuple)> &processor) const;
+  // CXL-first page probe (§4.3–§4.5): adjacency under leaf latch; values after.
+  struct SharedScanProbeResult {
+    Status status = Status::Ok();
+    bool scan_success = false;
+    bool migration_required = false;
+    bool more = false;
+    std::vector<std::pair<std::string, std::string>> items;
+  };
+  SharedScanProbeResult ProbeSharedScanPage(
+      std::string_view start_key, uint64_t output_limit,
+      bool owner_exhausted_for_cursor, bool cursor_is_duplicate,
+      bool owner_no_predecessor_for_cursor = false) const;
   // TwoPLPasha range proof: rows through cutoff plus one right boundary must
   // form the logical private-tree adjacency chain.  For an exhausted range,
   // expected_count anchors both endpoints; expected_generation linearizes
@@ -154,6 +166,11 @@ class KVPartition {
                     RegionOffset *smeta_offset) const;
   bool TryPinSharedEntry(
       const FixedKey &key, RegionOffset expected_offset,
+      star::TwoPLPashaMetadataShared **smeta) const;
+  // Pin without shared-tree re-lookup; only safe while scanForUpdate holds the
+  // leaf write lock (lookup would self-deadlock on that leaf).
+  bool TryPinSharedEntryUnderScan(
+      RegionOffset expected_offset,
       star::TwoPLPashaMetadataShared **smeta) const;
   struct RowRef {
     FixedKey key{};

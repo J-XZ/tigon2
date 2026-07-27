@@ -43,14 +43,15 @@ int main() {
     assert(!DecodeScanMigrateRequest(req + "x", &pid, &flags, &limit));
     const auto bad_flags = EncodeScanMigrateRequest(0, 2u, 1);
     assert(!DecodeScanMigrateRequest(bad_flags, &pid, &flags, &limit));
-    const auto resp = EncodeScanMigrateResponse(7, true);
+    const auto resp = EncodeScanMigrateResponse(7, true, true);
     assert(resp.size() == kScanMigrateResponseBytes);
     bool exhausted = false;
-    assert(DecodeScanMigrateResponse(resp, &pid, &exhausted));
-    assert(pid == 7 && exhausted);
-    assert(DecodeScanMigrateResponse(EncodeScanMigrateResponse(3, false), &pid,
-                                     &exhausted));
-    assert(pid == 3 && !exhausted);
+    bool no_pred = false;
+    assert(DecodeScanMigrateResponse(resp, &pid, &exhausted, &no_pred));
+    assert(pid == 7 && exhausted && no_pred);
+    assert(DecodeScanMigrateResponse(EncodeScanMigrateResponse(3, false, false),
+                                     &pid, &exhausted, &no_pred));
+    assert(pid == 3 && !exhausted && !no_pred);
   }
   const FixedKey alpha = FixedKey::From("alpha", 8);
   const FixedKey beta = FixedKey::From("beta", 8);

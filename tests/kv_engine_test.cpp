@@ -652,12 +652,16 @@ int main() {
             item.value != "owner-authority")
           _exit(16);
       }
-      // One range-migrate request plus one cursor range-migrate request. Values
-      // travel through CXL, so the requester sends only range-migration frames
-      // (header + 8-byte limit; §11.4 WireSize).
+      // Values travel through CXL; requester sends only ScanMigrate frames
+      // (§5.1 codec). Per-partition CXL-first may issue one migrate per remote
+      // partition that needs range move-in (no longer a fixed count of 2).
       const size_t scan_migrate_wire =
-          tigonkv::engine::WireHeaderBytes() + sizeof(uint64_t);
-      if (authoritative_scan_tx != 2 * scan_migrate_wire) _exit(17);
+          tigonkv::engine::WireHeaderBytes() +
+          tigonkv::engine::kScanMigrateRequestBytes;
+      if (scan_migrate_wire == 0 ||
+          authoritative_scan_tx % scan_migrate_wire != 0 ||
+          authoritative_scan_tx == 0)
+        _exit(17);
       const auto boundary_scan = node_one->Scan(promoted_scan_keys[63], 3);
       if (!boundary_scan.status.ok() || boundary_scan.items.size() != 3)
         _exit(29);

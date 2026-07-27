@@ -1255,6 +1255,144 @@ void KVPartition::ScanSharedForUpdate(
       });
 }
 
+KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
+    std::string_view start_key, uint64_t output_limit,
+    bool owner_exhausted_for_cursor, bool cursor_is_duplicate,
+    bool owner_no_predecessor_for_cursor) const {
+  EnterEbr();
+  SharedScanProbeResult result;
+  if (output_limit == 0) {
+    result.status =
+        Status::Error(StatusCode::kInvalidArgument, "probe requires non-zero limit");
+    return result;
+  }
+  const FixedKey min_key = MakeKey(start_key);
+  struct Pinned {
+    FixedKey key{};
+    star::TwoPLPashaMetadataShared *smeta = nullptr;
+  };
+  std::vector<Pinned> pinned;
+  auto unpin_all = [&] {
+    for (auto &row : pinned)
+      star::TwoPLPashaHelper::kv_unpin_shared_ref(row.smeta);
+    pinned.clear();
+  };
+  bool busy = false;
+  bool corruption = false;
+  bool stop = false;
+  FixedKey last_emitted{};
+  bool has_last_emitted = false;
+
+  ScanSharedForUpdate(min_key, [&](const FixedKey &key, RegionOffset smeta_off,
+                                   bool is_last_tuple) {
+    if (stop) return true;
+    if (key.Compare(min_key) < 0) return false;
+    if (cursor_is_duplicate && key.Compare(min_key) == 0) return false;
+    if (has_last_emitted && key.Compare(last_emitted) <= 0) return false;
+
+    const bool is_limit_boundary =
+        pinned.size() == output_limit;
+    star::TwoPLPashaMetadataShared *smeta = nullptr;
+    if (!TryPinSharedEntryUnderScan(smeta_off, &smeta)) {
+      busy = true;
+      stop = true;
+      return true;
+    }
+    smeta->lock();
+    const bool key_equals_min = key.Compare(min_key) == 0;
+    bool adj_ok = star::TwoPLPashaHelper::scan_row_adjacency_ok(
+        key_equals_min, is_limit_boundary, smeta->get_prev_key_real_bit(),
+        smeta->get_next_key_real_bit());
+    // Open left edge: first output row with key > min and owner reported no
+    // private predecessor — exempt prev_real (legacy no_predecessor).
+    if (!adj_ok && owner_no_predecessor_for_cursor && !has_last_emitted &&
+        !is_limit_boundary && !key_equals_min) {
+      adj_ok = star::TwoPLPashaHelper::scan_row_adjacency_ok(
+          true, is_limit_boundary, smeta->get_prev_key_real_bit(),
+          smeta->get_next_key_real_bit());
+    }
+    // §4.5: with a one-shot owner EOF hint, exempt next_real on the leaf's
+    // last tuple (still require prev when not key==min / open-left).
+    if (!adj_ok && owner_exhausted_for_cursor && is_last_tuple) {
+      adj_ok = star::TwoPLPashaHelper::scan_row_adjacency_ok(
+          key_equals_min || owner_no_predecessor_for_cursor, is_limit_boundary,
+          smeta->get_prev_key_real_bit(), true);
+    }
+    smeta->unlock();
+    if (!adj_ok) {
+      star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+      result.migration_required = true;
+      stop = true;
+      return true;
+    }
+    if (is_limit_boundary) {
+      // Right boundary row: adjacency only; not part of the result page.
+      star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+      result.more = true;
+      stop = true;
+      return true;
+    }
+    pinned.push_back({key, smeta});
+    last_emitted = key;
+    has_last_emitted = true;
+    if (is_last_tuple && owner_exhausted_for_cursor) {
+      // Reached true EOF inside this page.
+      stop = true;
+      return true;
+    }
+    return false;
+  });
+
+  if (busy) {
+    unpin_all();
+    result.status = Status::Error(StatusCode::kBusy, "shared scan pin contention");
+    return result;
+  }
+  if (corruption) {
+    unpin_all();
+    result.status =
+        Status::Error(StatusCode::kCorruption, "shared scan protocol error");
+    return result;
+  }
+  if (result.migration_required) {
+    unpin_all();
+    return result;
+  }
+  if (pinned.empty()) {
+    if (owner_exhausted_for_cursor) {
+      result.scan_success = true;
+      result.more = false;
+      return result;
+    }
+    result.migration_required = true;
+    return result;
+  }
+
+  for (auto &row : pinned) {
+    std::string value(fixed_value_size_, '\0');
+    uint32_t value_len = 0;
+    bool read = false;
+    for (uint32_t attempt = 0; attempt < 64 && !read; ++attempt) {
+      read = star::TwoPLPashaHelper::kv_shared_read_value(
+          row.smeta, owner_shard_, value.data(), value.size(), &value_len,
+          true);
+      if (!read) std::this_thread::yield();
+    }
+    if (!read) {
+      unpin_all();
+      result.status =
+          Status::Error(StatusCode::kBusy, "shared scan value read contention");
+      return result;
+    }
+    value.resize(value_len);
+    result.items.emplace_back(KeyString(row.key), std::move(value));
+    NoteSharedAccess(row.smeta);
+  }
+  unpin_all();
+  result.scan_success = true;
+  return result;
+}
+
 bool KVPartition::PrivatePredecessorKey(
     std::string_view key, std::string *predecessor) const {
   EnterEbr();
@@ -1577,6 +1715,20 @@ bool KVPartition::TryPinSharedEntry(
     star::TwoPLPashaHelper::kv_unpin_shared_ref(candidate);
     return false;
   }
+  *smeta = candidate;
+  return true;
+}
+
+bool KVPartition::TryPinSharedEntryUnderScan(
+    RegionOffset expected_offset,
+    star::TwoPLPashaMetadataShared **smeta) const {
+  // Under scanForUpdate the leaf is already write-locked; must not re-enter
+  // the shared tree (lookup would deadlock on the same leaf).
+  if (smeta == nullptr || expected_offset == kNullOffset) return false;
+  *smeta = nullptr;
+  auto *candidate = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(expected_offset));
+  if (!star::TwoPLPashaHelper::kv_pin_shared_ref(candidate)) return false;
   *smeta = candidate;
   return true;
 }
