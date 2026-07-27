@@ -54,10 +54,8 @@ if no_latency == 'true': lat['enabled']=lat['foreground_enabled']=lat['merge_ena
 # Formal YCSB / e2e_trace alignment with cxlkv: fixed 32/32.
 d['tigon_kv']['fixed_key_size']=32
 d['tigon_kv']['fixed_value_size']=32
-# §11.10: hw_cc_budget_mb is Clock dynamic budget, not physical HWCC. Leave
-# headroom under hwcc.size_mb=1024 for static layout/transport/EBR (~16MB+).
-budget=int(d['tigon_kv'].get('hw_cc_budget_mb', 1000))
-d['tigon_kv']['hw_cc_budget_mb']=min(budget, 1000)
+# §11.10: hw_cc_budget_mb may equal hwcc.size_mb (full physical). Open clamps
+# Clock dynamic budget after static domains; do not pre-shrink here.
 json.dump(d, open(dst, 'w', encoding='utf-8'), indent=2)
 selected=workloads.split(',')
 meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32}

@@ -120,6 +120,11 @@ class KVEngine {
   void InboundDemuxerLoop();
 
   Config config_;
+  // Per-owner Clock dynamic HWCC limit after Open clamps configured budget to
+  // capacity remaining once static HWCC domains are accounted (§11.10).
+  // Install / Memory / EnforceMigrationBudget all use this value — not the raw
+  // (config.hw_cc_budget_mb − EBR) / vm_count formula alone.
+  uint64_t owner_migration_dynamic_budget_bytes_ = 0;
   std::unique_ptr<DualRegionMappedPool> pool_;
   // CXL-resident shared EBR (HWCC); not owned / not deleted — pool lifetime.
   star::CXL_EBR *ebr_ = nullptr;

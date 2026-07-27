@@ -103,9 +103,9 @@
     "partition_count": 16,
     "fixed_key_size": 32,
     "fixed_value_size": 32,
-    // Clock dynamic budget (not physical HWCC size). Must leave room for
-    // static domains (~layout+transport 16MB+EBR) under hwcc.size_mb=1024.
-    "hw_cc_budget_mb": 1000,
+    // Clock dynamic budget ceiling (operators set full physical HWCC).
+    // Open clamps after static domains (layout+allocator+transport+EBR) (§11.10).
+    "hw_cc_budget_mb": 1024,
     "owner_private_swcc_fraction": 0.35,
     "migration_policy": "Clock",
     "when_to_move_out": "OnDemand",

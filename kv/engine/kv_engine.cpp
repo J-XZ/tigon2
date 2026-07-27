@@ -283,43 +283,46 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   std::vector<KVPartition *> partition_ptrs;
   partition_ptrs.reserve(engine->partitions_.size());
   for (auto &partition : engine->partitions_) partition_ptrs.push_back(partition.get());
+  // §11.10: hw_cc_budget_mb is the full configured Clock allowance (typically
+  // equal to hwcc.size_mb). Open measures static HWCC domains and clamps the
+  // per-owner dynamic pool to what remains; operators do not under-configure
+  // the JSONC for layout/allocator/transport/EBR headroom.
   const uint64_t budget_bytes = config.hw_cc_budget_mb * 1024ULL * 1024ULL;
-  const uint64_t hw_budget =
-      (budget_bytes - star::CXL_EBR::max_ebr_retiring_memory) / config.vm_count;
-  // §11.10: migration dynamic budget must fit in physical HWCC *after* static
-  // domains (layout/allocator/transport/EBR). Formal configs set
-  // hw_cc_budget_mb below hwcc.size_mb so static headroom remains.
-  {
-    const auto &layout = engine->pool_->allocator().layout();
-    uint64_t static_hwcc = 0;
-    for (size_t domain :
-         {static_cast<size_t>(AllocationDomain::kHwccLayout),
-          static_cast<size_t>(AllocationDomain::kHwccAllocatorMetadata),
-          static_cast<size_t>(AllocationDomain::kTransport),
-          static_cast<size_t>(AllocationDomain::kHwccEbr)}) {
-      static_hwcc +=
-          layout.domains[domain].used_bytes.load(std::memory_order_relaxed);
-    }
-    const uint64_t physical_hwcc = config.hwcc_size_mb * 1024ULL * 1024ULL;
-    const uint64_t remaining_after_static =
-        physical_hwcc > static_hwcc ? physical_hwcc - static_hwcc : 0;
-    const uint64_t dynamic_total =
-        static_cast<uint64_t>(config.vm_count) * hw_budget;
-    if (dynamic_total > remaining_after_static) {
-      const uint64_t max_budget_bytes =
-          remaining_after_static + star::CXL_EBR::max_ebr_retiring_memory;
-      const uint64_t suggest_mb = max_budget_bytes / (1024ULL * 1024ULL);
-      std::ostringstream detail;
-      detail << "tigonkv: owner dynamic HWCC budget exceeds capacity remaining "
-                "after static domains (static="
-             << static_hwcc << " dynamic_total=" << dynamic_total
-             << " remaining=" << remaining_after_static
-             << " physical=" << physical_hwcc
-             << "); lower hw_cc_budget_mb to <=" << suggest_mb
-             << " or raise hwcc.size_mb (§11.10)";
-      throw std::runtime_error(detail.str());
-    }
+  const uint64_t ebr_reserve = star::CXL_EBR::max_ebr_retiring_memory;
+  if (budget_bytes <= ebr_reserve)
+    throw std::runtime_error(
+        "tigonkv: hw_cc_budget_mb must exceed CXL_EBR::max_ebr_retiring_memory");
+  const uint64_t configured_clock_total = budget_bytes - ebr_reserve;
+  const auto &layout = engine->pool_->allocator().layout();
+  uint64_t static_hwcc = 0;
+  for (size_t domain :
+       {static_cast<size_t>(AllocationDomain::kHwccLayout),
+        static_cast<size_t>(AllocationDomain::kHwccAllocatorMetadata),
+        static_cast<size_t>(AllocationDomain::kTransport),
+        static_cast<size_t>(AllocationDomain::kHwccEbr)}) {
+    static_hwcc +=
+        layout.domains[domain].used_bytes.load(std::memory_order_relaxed);
   }
+  const uint64_t physical_hwcc = config.hwcc_size_mb * 1024ULL * 1024ULL;
+  const uint64_t remaining_after_static =
+      physical_hwcc > static_hwcc ? physical_hwcc - static_hwcc : 0;
+  if (remaining_after_static < static_cast<uint64_t>(config.vm_count)) {
+    std::ostringstream detail;
+    detail << "tigonkv: no HWCC capacity left for Clock dynamic budget after "
+              "static domains (static="
+           << static_hwcc << " physical=" << physical_hwcc
+           << " remaining=" << remaining_after_static
+           << " vm_count=" << config.vm_count << ") (§11.10)";
+    throw std::runtime_error(detail.str());
+  }
+  const uint64_t effective_clock_total =
+      std::min(configured_clock_total, remaining_after_static);
+  const uint64_t hw_budget = effective_clock_total / config.vm_count;
+  if (hw_budget == 0)
+    throw std::runtime_error(
+        "tigonkv: per-owner Clock dynamic HWCC budget is zero after clamping "
+        "to remaining-after-static (§11.10)");
+  engine->owner_migration_dynamic_budget_bytes_ = hw_budget;
   KvMigrationRuntime::Instance().Install(
       partition_ptrs, config.fixed_key_size, config.fixed_value_size,
       config.node_id, config.partition_count, hw_budget);
@@ -865,10 +868,9 @@ MemoryStats KVEngine::Memory() const {
   // Physical capacity vs Clock dynamic limit (§11.10). Clock links live in
   // SWCC PrivateRow after §11.14, so process-heap tracker DRAM is zero.
   stats.physical_hwcc_capacity_bytes = config_.hwcc_size_mb * 1024ULL * 1024ULL;
+  // Open-time clamp (§11.10); do not recompute from raw config alone.
   stats.owner_migration_dynamic_budget_bytes =
-      (config_.hw_cc_budget_mb * 1024ULL * 1024ULL -
-       star::CXL_EBR::max_ebr_retiring_memory) /
-      config_.vm_count;
+      owner_migration_dynamic_budget_bytes_;
   stats.allocator_local_dram_bytes = 0;
   stats.rss_kb = CurrentRssKb();
   return stats;
@@ -1489,8 +1491,8 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
 }
 
 void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
-  const uint64_t hw_budget = (config_.hw_cc_budget_mb * 1024ULL * 1024ULL -
-      star::CXL_EBR::max_ebr_retiring_memory) / config_.vm_count;
+  // Use the Open-time clamp after static domains (§11.10), not raw config.
+  const uint64_t hw_budget = owner_migration_dynamic_budget_bytes_;
   const bool payload_high = partition.shared_payload_used_bytes() * 10 >=
       partition.shared_payload_capacity_bytes() * 9;
   const uint64_t hw_used = partition.hwcc_used_bytes();

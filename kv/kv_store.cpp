@@ -712,7 +712,9 @@ void Config::Validate() const {
       migration_policy != "Clock" || when_to_move_out != "OnDemand" ||
       scc_mechanism != "WriteThrough")
     throw std::invalid_argument("invalid allocator budget fractions");
-  // §11.10: dynamic budget must leave room for EBR retiring and be > 0 per VM.
+  // §11.10: config may equal hwcc_size_mb (full physical). Validate only that
+  // the configured ceiling exceeds EBR retiring and yields a non-zero per-VM
+  // share; Open clamps further to remaining-after-static.
   {
     const uint64_t budget_bytes = hw_cc_budget_mb * 1024ULL * 1024ULL;
     if (budget_bytes <= star::CXL_EBR::max_ebr_retiring_memory)
@@ -723,9 +725,6 @@ void Config::Validate() const {
     if (owner_dynamic == 0)
       throw std::invalid_argument(
           "owner migration dynamic HWCC budget underflows to zero");
-    // Exact dynamic_total ≤ physical − static is enforced in KVEngine::Open
-    // after layout/transport/EBR domains are allocated (§11.10). Formal configs
-    // set hw_cc_budget_mb below hwcc_size_mb so static headroom remains.
   }
   if (latency_cache_model != "none" && latency_cache_model != "fixed_hit_rate" &&
       latency_cache_model != "per_thread_lru")

@@ -1394,18 +1394,20 @@ owner_dynamic_limit =
 验证：
 
 1. 保留上述 PLAN/原 Tigon 动态 budget 公式和 per-owner counter。
-   校验要写准：`kv_store.cpp:698` 已经拒绝 `hw_cc_budget_mb == 0`，所以
+   校验要写准：`kv_store.cpp` 已经拒绝 `hw_cc_budget_mb == 0`，所以
    减法不会真正下溢；**真实风险是 `hw_cc_budget_mb == 1` 时
    `1MiB - max_ebr_retiring_memory(1MiB) = 0`，per-host budget 变成 0，
    Clock 于是每次调用都判定超预算并无休止 move-out**。因此校验条件应是
-   `hw_cc_budget_mb * 1MiB > max_ebr_retiring_memory` 且
+   `hw_cc_budget_mb * 1MiB > max_ebr_retiring_memory` 且最终
    `owner_dynamic_limit > 0`，两者都 hard-fail；
-2. Open 另外验证
-   `static_hwcc + vm_count * owner_dynamic_limit <= physical_hwcc_capacity`。
-   若不成立必须拒绝配置，不能静默越界；
-3. `static_hwcc` 用现有 domain counter 计算
-   `layout + HWCC allocator metadata + transport + EBR`，只做容量校验与报告，
-   不重复塞进每个 owner 的 Clock counter；
+2. Open **不要求** JSONC 预先把 `hw_cc_budget_mb` 设得小于 `hwcc.size_mb`。
+   正式配置可令二者相等（全物理额度）。Open 用 domain counter 量
+   `static_hwcc = layout + HWCC allocator metadata + transport + EBR`，再
+   `effective_clock_total = min(configured_clock_total, physical − static)`，
+   `owner_dynamic_limit = effective_clock_total / vm_count`。静态 headroom
+   **内部自动预留**；仅当剩余不足以分给各 owner 时拒绝，不能静默越界；
+3. `static_hwcc` 只做容量 clamp 与报告，不重复塞进每个 owner 的 Clock
+   counter；
 4. `EnforceMigrationBudget` 目前在 payload 水位触发时用
    `star::cxl_memory.set_total_hw_cc_usage(hw_budget)`（`kv_engine.cpp:1640`）
    人为把全局计数器抬到预算线，而 `SyncHwCcUsage` 又会把同一个全局变量写成

@@ -382,7 +382,7 @@ experiment_config 段）与根 `experiment_config.jsonc`。
     "scc_mechanism": "WriteThrough",   // 唯一合法值；其它字符串 hard fail
     "migration_policy": "Clock",       // 唯一合法值
     "when_to_move_out": "OnDemand",    // 唯一合法值
-    "hw_cc_budget_mb": 1000,
+    "hw_cc_budget_mb": 1024,  // may equal hwcc.size_mb; Open clamps after static (§11.10)
     "owner_private_swcc_fraction": 0.35,
     "partition_count": 16,
     "transport_ring_total_mb": 16
@@ -527,7 +527,7 @@ experiment_config 段）与根 `experiment_config.jsonc`。
 | `vm.ssh_base_port` / `first_ip` / `bridge_tap_ip` | 10022 / 192.168.100.2 / 192.168.100.1 |
 | `host_cpu` 三组核数 | reserved 1、ivshmem 2、vm_cores 32（与 cxlkv 根配置同构） |
 | `e2e.foreground_worker_count_per_vm` | 4 |
-| `tigon_kv`：`hw_cc_budget_mb` / `owner_private_swcc_fraction` / `partition_count` / `transport_ring_total_mb` | **1000** / 0.35 / 16 / 16（budget 低于 `hwcc.size_mb=1024`，为静态域留 headroom；§11.10） |
+| `tigon_kv`：`hw_cc_budget_mb` / `owner_private_swcc_fraction` / `partition_count` / `transport_ring_total_mb` | **1024** / 0.35 / 16 / 16（可等于 `hwcc.size_mb`；Open 在静态域之后自动 clamp Clock 动态池；§11.10） |
 | `scc_mechanism` / `migration_policy` / `when_to_move_out` | WriteThrough / Clock / OnDemand（均为唯一合法值） |
 | 构建 | 正式验收 = RelWithDebInfo `-O3 -g3 -march=native` + 编译器对应 LTO（GCC `-flto` / Clang `-flto=full`）；Debug/ASAN 用于诊断且不产出性能结论 |
 | HWCC 占用 | 静态核算（layout+分配器头+transport 16MB+EBR）≪1024MB；动态受 `hw_cc_budget_per_host` move-out 限界（≈105B/shared 行）；上限 1024MB，倾向更小 |
@@ -1040,12 +1040,13 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
   5. 失败回滚：insert 失败或 OOM → 释放未发布的 smeta/payload，保持
      `is_migrated=0` 且 shared 无 key；禁止泄漏或双挂。
 - **move-out 触发**（补全 P3 的缺口）：
-  1. `TOTAL_HW_CC_USAGE >= hw_cc_budget_per_host`，其中
-     `hw_cc_budget_per_host = (hw_cc_budget_mb*1MiB −
-     CXL_EBR::max_ebr_retiring_memory) / vm_count`（`hw_cc_budget_mb`
-     缺省 = `hwcc.size_mb`；transport 环计入 `TOTAL_HW_CC_USAGE`，**不再**
-     另减"静态开销"；与原 `TwoPLPashaExecutor` 公式同构）→ OnDemand：每次
-     move-in 后检查并 `move_row_out(partition)`；
+  1. `TOTAL_HW_CC_USAGE >= hw_cc_budget_per_host`，其中配置侧
+     `configured = (hw_cc_budget_mb*1MiB − CXL_EBR::max_ebr_retiring_memory)
+     / vm_count`（`hw_cc_budget_mb` 缺省 = `hwcc.size_mb`），Open 再对
+     `configured_clock_total` 与 `physical − static` 取 min 后按 VM 均分得到
+     实际 `hw_cc_budget_per_host`（§11.10；transport 环计入
+     `TOTAL_HW_CC_USAGE`）→ OnDemand：每次 move-in 后检查并
+     `move_row_out(partition)`；
   2. shared payload 段 used ≥ **90%**（钉死高水位）→ 同样触发（新增，因
      payload 池有限）；
   3. 无 victim（全部无法满足 §3.3 quiescence）→ 重试 **16** 次后 hard fail
