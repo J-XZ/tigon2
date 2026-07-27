@@ -286,6 +286,8 @@ inline int RunE2E08MultiVm() {
       config,
       PositiveEnv("TIGONKV_E2E_THREADS",
                   config.foreground_worker_count_per_vm));
+  std::cout.flush();
+  std::cerr.flush();
   CheckpointOrThrow(*main_store);
   std::cout << main_store->DumpStats();
   std::cout << "e2e_08_vm[node" << config.node_id << "]: passed.\n";
@@ -335,6 +337,8 @@ inline int RunE2E09MultiVm() {
       config,
       PositiveEnv("TIGONKV_E2E_THREADS",
                   config.foreground_worker_count_per_vm));
+  std::cout.flush();
+  std::cerr.flush();
   CheckpointOrThrow(*main_store);
   std::cout << main_store->DumpStats();
   std::cout << "e2e_09_vm[node" << config.node_id << "]: passed.\n";

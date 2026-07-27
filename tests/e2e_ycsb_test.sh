@@ -2,6 +2,9 @@
 # CTest entry for e2e_ycsb (≡ cxlkv e2e_10): 4VM × 4 worker load + workloada (1 round).
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# e2e_ycsb / FixedTrace is 32/32. Do not inherit the e2e_08/09 overlay
+# (fixed_value_size=1000) from TIGONKV_E2E_EXPERIMENT_CONFIG_JSONC leftovers.
+export TIGONKV_E2E_EXPERIMENT_CONFIG_JSONC="${TIGONKV_E2E_YCSB_CONFIG_JSONC:-$root/experiment_config.jsonc}"
 # shellcheck source=tests/e2e_multivm_common.sh
 source "$root/tests/e2e_multivm_common.sh"
 tigonkv_e2e_multivm_preflight

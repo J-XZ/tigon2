@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sstream>
 #include <thread>
 
 namespace tigonkv::engine {
@@ -918,8 +919,19 @@ void DualRegionAllocator::FlushCheckpointRanges(
   mem_access::HwccRead(&header_->layout.vm_count,
                        sizeof(header_->layout.vm_count) +
                            sizeof(header_->layout.partition_count));
-  if (node_id >= header_->layout.vm_count)
-    throw std::invalid_argument("checkpoint node outside layout");
+  if (node_id >= header_->layout.vm_count) {
+    std::ostringstream detail;
+    detail << "checkpoint node outside layout node_id=" << node_id
+           << " layout.vm_count=" << header_->layout.vm_count
+           << " layout.partition_count=" << header_->layout.partition_count
+           << " layout_version=" << header_->layout.layout_version
+           << " magic=" << header_->layout.magic
+           << " state=" << header_->layout.state.load(std::memory_order_relaxed)
+           << " header=" << static_cast<const void *>(header_)
+           << " pool_base=" << static_cast<const void *>(pool_)
+           << " config.vm_count=" << config_.vm_count;
+    throw std::invalid_argument(detail.str());
+  }
   mem_access::HwccAtomicLoad(&header_->layout.clean_epoch);
   const uint64_t target =
       header_->layout.clean_epoch.load(std::memory_order_acquire) + 1;
