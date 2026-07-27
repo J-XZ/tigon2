@@ -1241,6 +1241,20 @@ bool KVPartition::ScanShared(
   return complete;
 }
 
+void KVPartition::ScanSharedForUpdate(
+    const FixedKey &min_key,
+    const std::function<bool(const FixedKey &key, RegionOffset smeta_off,
+                             bool is_last_tuple)> &processor) const {
+  EnterEbr();
+  if (!processor) throw std::invalid_argument("null ScanSharedForUpdate processor");
+  // Passthrough only: no adjacency, pin, or migration decisions (§4.3).
+  shared_tree_->scanForUpdate(
+      min_key, [&](const FixedKey &key, RegionOffset &smeta_off,
+                   bool is_last_tuple) -> bool {
+        return processor(key, smeta_off, is_last_tuple);
+      });
+}
+
 bool KVPartition::PrivatePredecessorKey(
     std::string_view key, std::string *predecessor) const {
   EnterEbr();

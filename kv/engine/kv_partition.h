@@ -89,6 +89,13 @@ class KVPartition {
   bool ScanShared(
       std::string_view start_key, uint64_t limit,
       std::vector<std::pair<std::string, std::string>> *items) const;
+  // Thin CXLTable::scan-style entry: shared_tree_->scanForUpdate only.
+  // Processor returns true to stop (BTreeOLC_CXL end semantics). Adapter does
+  // ValueType→RegionOffset passthrough; no adjacency/migration logic (§4.3).
+  void ScanSharedForUpdate(
+      const FixedKey &min_key,
+      const std::function<bool(const FixedKey &key, RegionOffset smeta_off,
+                               bool is_last_tuple)> &processor) const;
   // TwoPLPasha range proof: rows through cutoff plus one right boundary must
   // form the logical private-tree adjacency chain.  For an exhausted range,
   // expected_count anchors both endpoints; expected_generation linearizes
@@ -102,7 +109,6 @@ class KVPartition {
   uint64_t SharedMutationState() const;
   // Invokes PolicyClock::move_row_out for this partition.
   bool MoveOutClockVictim(uint32_t host_id);
-  // Rebuild DRAM Clock tracker entries from the shared tree after attach.
   void ClockLock();
   void ClockUnlock();
   void ClockTrackMigratedKey(const void *key_bytes);

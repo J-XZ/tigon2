@@ -386,6 +386,38 @@ int main() {
   std::vector<std::pair<std::string, std::string>> shared_scan;
   assert(partition.ScanShared("alpha", 2, &shared_scan));
   assert(shared_scan == scan);
+  // §4.3: ScanSharedForUpdate visits shared keys in order with is_last_tuple.
+  {
+    std::vector<tigonkv::engine::FixedKey> visited;
+    size_t callbacks = 0;
+    const auto start =
+        tigonkv::engine::FixedKey::From("alpha", regions.layout().fixed_key_size);
+    partition.ScanSharedForUpdate(
+        start,
+        [&](const tigonkv::engine::FixedKey &key, tigonkv::engine::RegionOffset off,
+            bool /*is_last*/) {
+          ++callbacks;
+          assert(off != tigonkv::engine::kNullOffset);
+          visited.push_back(key);
+          return visited.size() >= 2;  // stop after two keys
+        });
+    assert(callbacks == 2);
+    assert(visited.size() == 2);
+    assert(visited[0].Compare(start) == 0);
+    size_t full = 0;
+    bool full_last = false;
+    tigonkv::engine::FixedKey zero{};
+    partition.ScanSharedForUpdate(
+        zero,
+        [&](const tigonkv::engine::FixedKey &, tigonkv::engine::RegionOffset,
+            bool is_last) {
+          ++full;
+          if (is_last) full_last = true;
+          return false;
+        });
+    assert(full >= 2);
+    assert(full_last);
+  }
   assert(partition.MoveOutPrivate("alpha", 1));
 
   // A partial CXL row set is not an authoritative range. Original
