@@ -206,33 +206,34 @@ int main() {
     unlink(late_template);
   }
 
-  // Unknown response request_id (not abandoned) remains fatal.
+  // Unknown response after tombstone miss/eviction: demuxer drops and counts,
+  // never aborts the process (§10.11 post-audit).
   {
     char unknown_template[] = "/tmp/tigonkv-engine-unknown-resp-XXXXXX";
     const int unknown_fd = mkstemp(unknown_template);
     assert(unknown_fd >= 0);
     close(unknown_fd);
-    const pid_t unknown_child = fork();
-    assert(unknown_child >= 0);
-    if (unknown_child == 0) {
-      const rlimit no_core{0, 0};
-      (void)setrlimit(RLIMIT_CORE, &no_core);
-      auto config = ConfigFor(unknown_template, 2, 0);
-      auto engine = tigonkv::engine::KVEngine::Open(config, true);
-      void *root = nullptr;
-      star::CXLMemory::wait_and_retrieve_cxl_shared_data(
-          star::CXLMemory::cxl_transport_root_index, &root);
-      auto *rings = static_cast<star::MPSCRingBuffer *>(root);
-      auto response = tigonkv::engine::MakeResponse(
-          1, 0, /*request_id=*/0xdeadbeefULL);
-      while (!rings[0].enqueue(reinterpret_cast<char *>(&response),
-                               tigonkv::engine::WireSize(response)))
-        std::this_thread::yield();
-      for (;;) engine->PollTransport();
+    auto config = ConfigFor(unknown_template, 1, 0);
+    auto engine = tigonkv::engine::KVEngine::Open(config, true);
+    const uint64_t before = engine->EngineRuntime().abandoned_responses;
+    void *root = nullptr;
+    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+        star::CXLMemory::cxl_transport_root_index, &root);
+    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+    auto response = tigonkv::engine::MakeResponse(
+        0, 0, /*request_id=*/0xdeadbeefULL);
+    // Inject via the local inbound path: enqueue to this node's ring and let
+    // the demuxer apply it (same fate as a late peer response).
+    assert(rings[0].enqueue(reinterpret_cast<char *>(&response),
+                            tigonkv::engine::WireSize(response)));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (engine->EngineRuntime().abandoned_responses <= before &&
+           std::chrono::steady_clock::now() < deadline) {
+      engine->PollTransport();
+      std::this_thread::yield();
     }
-    int unknown_status = 0;
-    assert(waitpid(unknown_child, &unknown_status, 0) == unknown_child);
-    assert(WIFSIGNALED(unknown_status) && WTERMSIG(unknown_status) == SIGABRT);
+    assert(engine->EngineRuntime().abandoned_responses > before);
     unlink(unknown_template);
   }
 

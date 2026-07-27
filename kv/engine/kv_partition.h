@@ -94,8 +94,10 @@ class KVPartition {
       std::string_view start_key, uint64_t limit,
       std::vector<std::string> *keys,
       const std::function<void()> *progress = nullptr) const;
+  // Test/legacy helper; formal Scan uses ProbeSharedScanPage. host_id is the
+  // SCC reader identity (requester), not owner_shard_.
   bool ScanShared(
-      std::string_view start_key, uint64_t limit,
+      std::string_view start_key, uint64_t limit, uint32_t host_id,
       std::vector<std::pair<std::string, std::string>> *items) const;
   // Thin CXLTable::scan-style entry: shared_tree_->scanForUpdate only.
   // Processor returns true to stop (BTreeOLC_CXL end semantics). Adapter does
@@ -112,8 +114,10 @@ class KVPartition {
     bool more = false;
     std::vector<std::pair<std::string, std::string>> items;
   };
+  // host_id is the requester (SCC cache bit / clflush identity), not the
+  // partition owner. Matches original TwoPLPasha coordinator_id on remote scan.
   SharedScanProbeResult ProbeSharedScanPage(
-      std::string_view start_key, uint64_t output_limit,
+      uint32_t host_id, std::string_view start_key, uint64_t output_limit,
       bool owner_exhausted_for_cursor, bool cursor_is_duplicate,
       bool owner_no_predecessor_for_cursor = false) const;
   // TwoPLPasha range proof: rows through cutoff plus one right boundary must
@@ -123,7 +127,7 @@ class KVPartition {
   bool ScanSharedComplete(
       std::string_view start_key, const FixedKey &cutoff, bool exhausted,
       bool no_predecessor, uint32_t expected_count,
-      uint32_t expected_generation,
+      uint32_t expected_generation, uint32_t host_id,
       std::vector<std::pair<std::string, std::string>> *items) const;
   bool PrivatePredecessorKey(std::string_view key, std::string *predecessor) const;
   uint64_t SharedMutationState() const;

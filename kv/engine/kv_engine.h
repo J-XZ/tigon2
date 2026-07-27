@@ -147,7 +147,8 @@ class KVEngine {
   std::unordered_map<uint64_t, std::shared_ptr<PendingResponse>>
       pending_responses_;
   // Bounded tombstones for Await timeouts (§10.11). Late responses matching a
-  // tombstone are dropped; unknown ids remain fatal.
+  // tombstone are dropped; responses whose tombstone was FIFO-evicted are also
+  // dropped and counted (never abort demuxer).
   std::unordered_set<uint64_t> abandoned_request_ids_;
   std::deque<uint64_t> abandoned_request_order_;
   // Demuxer enqueues requests here; FG PollTransport / Await drains them.

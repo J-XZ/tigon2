@@ -295,8 +295,8 @@ int main() {
   assert(partition.CompareExchangePrivate("new-cas", "", "created", &exchanged));
   assert(exchanged && partition.GetPrivate("new-cas", &value) && value == "created");
 
-  // PolicyClock init sets second_chance=0, so a never-accessed migrated row is
-  // eligible on the first over-budget move_row_out (original OnDemand gate).
+  // Fresh move-in starts with second_chance=1; ClockAdvanceCursor wraps so the
+  // same eviction pass can clear the chance then move the victim out.
   // Other keys (e.g. gamma) may still be migrated; counter is O(1) track/untrack.
   assert(partition.PutPrivate("clock", "victim"));
   assert(partition.PromotePrivate("clock", 1));
@@ -404,7 +404,7 @@ int main() {
   for (const auto &key : scan_keys)
     assert(partition.EnsureInShared(key, 1) == tigonkv::StatusCode::kOk);
   std::vector<std::pair<std::string, std::string>> shared_scan;
-  assert(partition.ScanShared("alpha", 2, &shared_scan));
+  assert(partition.ScanShared("alpha", 2, /*host_id=*/1, &shared_scan));
   assert(shared_scan == scan);
   // §4.3: ScanSharedForUpdate visits shared keys in order with is_last_tuple.
   {
@@ -456,23 +456,23 @@ int main() {
           "adj-c", regions.layout().fixed_key_size);
   assert(!partition.ScanSharedComplete(
       "adj-a", adj_c, true, false, 3, adjacency_generation(),
-      &complete_shared));
+      /*host_id=*/1, &complete_shared));
   assert(partition.PromotePrivate("adj-b", 1));
   assert(partition.ScanSharedComplete(
       "adj-a", adj_c, true, false, 3, adjacency_generation(),
-      &complete_shared));
+      /*host_id=*/1, &complete_shared));
   assert((complete_shared ==
           std::vector<std::pair<std::string, std::string>>{
               {"adj-a", "a"}, {"adj-b", "b"}, {"adj-c", "c"}}));
   assert(partition.MoveOutPrivate("adj-b", 1));
   assert(!partition.ScanSharedComplete(
       "adj-a", adj_c, true, false, 3, adjacency_generation(),
-      &complete_shared));
+      /*host_id=*/1, &complete_shared));
   assert(partition.PromotePrivate("adj-b", 1));
   assert(partition.DeletePrivate("adj-b"));
   assert(partition.ScanSharedComplete(
       "adj-a", adj_c, true, false, 2, adjacency_generation(),
-      &complete_shared));
+      /*host_id=*/1, &complete_shared));
   assert((complete_shared ==
           std::vector<std::pair<std::string, std::string>>{
               {"adj-a", "a"}, {"adj-c", "c"}}));
@@ -486,11 +486,11 @@ int main() {
   const uint32_t endpoint_mutation = adjacency_generation();
   assert(partition.ScanSharedComplete(
       "zz-endpoint", endpoint_cutoff, true, false, 1, endpoint_mutation,
-      &complete_shared));
+      /*host_id=*/1, &complete_shared));
   assert(partition.MoveOutPrivate("zz-endpoint", 1));
   assert(!partition.ScanSharedComplete(
       "zz-endpoint", endpoint_cutoff, true, false, 1, endpoint_mutation,
-      &complete_shared));
+      /*host_id=*/1, &complete_shared));
 
   // Bounded dual-tree merge: migrated shared authority + later private rows,
   // without collecting the full remaining keyspace before applying limit.

@@ -27,7 +27,10 @@ namespace star
 class PolicyClock : public MigrationManager {
     public:
         struct ClockMeta {
-                std::atomic<uint8_t> second_chance{0};
+                // Fresh move-in starts with a second chance so OnDemand
+                // move-out after ScanMigrate/Prepare cannot immediately
+                // evict the page the requester is about to probe.
+                std::atomic<uint8_t> second_chance{1};
         };
 
         PolicyClock(std::function<migration_result(ITable *, const void *, const std::tuple<std::atomic<uint64_t> *, void *> &, bool, void *&)> move_from_partition_to_shared_region,

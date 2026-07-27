@@ -314,57 +314,62 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
   EnterEbr();
   if (value.size() > fixed_value_size_)
     throw std::invalid_argument("private value exceeds fixed value size");
-  const FixedKey fixed_key = MakeKey(key);
-  RegionOffset row_offset = kNullOffset;
-  if (private_tree_->lookup(fixed_key, row_offset)) {
-    auto *row = RowFromOffset(row_offset);
-    LockRow(row);
-    if (row->is_tombstone) {
+  // Iterative upsert: create-race losers free and retry without recursion.
+  for (int attempt = 0;; ++attempt) {
+    if (attempt > 1024)
+      throw std::runtime_error("private put create-race busy");
+    const FixedKey fixed_key = MakeKey(key);
+    RegionOffset row_offset = kNullOffset;
+    if (private_tree_->lookup(fixed_key, row_offset)) {
+      auto *row = RowFromOffset(row_offset);
+      LockRow(row);
+      if (row->is_tombstone) {
+        UnlockRow(row);
+        // Concurrent delete/EBR: do not report Ok without a published write.
+        throw std::runtime_error("tombstone put busy");
+      }
+      if (row->is_migrated) {
+        const RegionOffset smeta_offset = row->migrated_smeta_off;
+        if (smeta_offset == kNullOffset ||
+            !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
+          UnlockRow(row);
+          throw std::runtime_error("migrated row locator busy");
+        }
+        auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+            regions_.hwcc().FromOffset(smeta_offset));
+        // Follow PrivateRow offset under latch (§10.3); one helper attempt (§10.2).
+        const bool written = star::TwoPLPashaHelper::kv_shared_write(
+            smeta, owner_shard_, value.data(), value.size());
+        if (written) {
+          RecordPrivateRowStateWrite(row);
+          row->value_len = static_cast<uint32_t>(value.size());
+          ++row->version;
+          smeta->set_value_len(row->value_len);
+          NoteSharedAccess(smeta);
+          UnlockRow(row);
+          return false;
+        }
+        UnlockRow(row);
+        throw std::runtime_error("migrated row shared write busy");
+      }
+      RecordPrivateRowStateWrite(row);
+      row->value_len = static_cast<uint32_t>(value.size());
+      std::memcpy(row->kv + row->key_len, value.data(), value.size());
+      mem_access::PrivateWrite(row->kv + row->key_len, value.size());
+      ++row->version;
       UnlockRow(row);
       return false;
     }
-    if (row->is_migrated) {
-      const RegionOffset smeta_offset = row->migrated_smeta_off;
-      if (smeta_offset == kNullOffset ||
-          !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
-        UnlockRow(row);
-        return false;
-      }
-      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-          regions_.hwcc().FromOffset(smeta_offset));
-      // Follow PrivateRow offset under latch (§10.3); one helper attempt (§10.2).
-      const bool written = star::TwoPLPashaHelper::kv_shared_write(
-          smeta, owner_shard_, value.data(), value.size());
-      if (written) {
-        RecordPrivateRowStateWrite(row);
-        row->value_len = static_cast<uint32_t>(value.size());
-        ++row->version;
-        smeta->set_value_len(row->value_len);
-        NoteSharedAccess(smeta);
-        UnlockRow(row);
-        return false;
-      }
-      UnlockRow(row);
-      throw std::runtime_error("migrated row shared write busy");
+    auto *row = AllocateRow(fixed_key, value);
+    if (!InsertPrivateRow(fixed_key, row)) {
+      // Concurrent create race: another owner worker published first. Free the
+      // unpublished loser and retry as an upsert (§10.9).
+      FreeUnpublishedPrivateRow(row);
+      continue;
     }
-    RecordPrivateRowStateWrite(row);
-    row->value_len = static_cast<uint32_t>(value.size());
-    std::memcpy(row->kv + row->key_len, value.data(), value.size());
-    mem_access::PrivateWrite(row->kv + row->key_len, value.size());
-    ++row->version;
-    UnlockRow(row);
-    return false;
+    PersistPrivateRootIfChanged();
+    return true;
   }
-  auto *row = AllocateRow(fixed_key, value);
-  row_offset = regions_.swcc().ToOffset(row);
-  if (!InsertPrivateRow(fixed_key, row)) {
-    // Concurrent create race: another owner worker published first. Free the
-    // unpublished loser and retry as an upsert (§10.9).
-    FreeUnpublishedPrivateRow(row);
-    return PutPrivate(key, value);
-  }
-  PersistPrivateRootIfChanged();
-  return true;
 }
 
 bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
@@ -1156,7 +1161,7 @@ bool KVPartition::ScanOwnedKeys(
 }
 
 bool KVPartition::ScanShared(
-    std::string_view start_key, uint64_t limit,
+    std::string_view start_key, uint64_t limit, uint32_t host_id,
     std::vector<std::pair<std::string, std::string>> *items) const {
   EnterEbr();
   if (items == nullptr) throw std::invalid_argument("null shared scan output");
@@ -1179,7 +1184,7 @@ bool KVPartition::ScanShared(
     bool read = false;
     for (uint32_t attempt = 0; attempt < 64 && !read; ++attempt) {
       read = star::TwoPLPashaHelper::kv_shared_read_value(
-          smeta, owner_shard_, value.data(), value.size(), &value_len);
+          smeta, host_id, value.data(), value.size(), &value_len);
       if (!read) std::this_thread::yield();
     }
     if (!read) {
@@ -1207,7 +1212,7 @@ void KVPartition::ScanSharedForUpdate(
 }
 
 KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
-    std::string_view start_key, uint64_t output_limit,
+    uint32_t host_id, std::string_view start_key, uint64_t output_limit,
     bool owner_exhausted_for_cursor, bool cursor_is_duplicate,
     bool owner_no_predecessor_for_cursor) const {
   EnterEbr();
@@ -1325,7 +1330,7 @@ KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
     bool read = false;
     for (uint32_t attempt = 0; attempt < 64 && !read; ++attempt) {
       read = star::TwoPLPashaHelper::kv_shared_read_value(
-          row.smeta, owner_shard_, value.data(), value.size(), &value_len,
+          row.smeta, host_id, value.data(), value.size(), &value_len,
           true);
       if (!read) std::this_thread::yield();
     }
@@ -1362,7 +1367,7 @@ bool KVPartition::PrivatePredecessorKey(
 bool KVPartition::ScanSharedComplete(
     std::string_view start_key, const FixedKey &cutoff, bool exhausted,
     bool no_predecessor, uint32_t expected_count,
-    uint32_t expected_generation,
+    uint32_t expected_generation, uint32_t host_id,
     std::vector<std::pair<std::string, std::string>> *items) const {
   EnterEbr();
   if (items == nullptr)
@@ -1432,7 +1437,7 @@ bool KVPartition::ScanSharedComplete(
       bool read = false;
       for (uint32_t attempt = 0; attempt < 64 && !read; ++attempt) {
         read = star::TwoPLPashaHelper::kv_shared_read_value(
-            row.smeta, owner_shard_, value.data(), value.size(), &value_len,
+            row.smeta, host_id, value.data(), value.size(), &value_len,
             true);
         if (!read) std::this_thread::yield();
       }
@@ -1667,6 +1672,9 @@ void KVPartition::ClockTrackMigratedKey(const void *key_bytes) {
   if (!private_tree_->lookup(fixed_key, row_off) || row_off == kNullOffset)
     throw std::runtime_error("ClockTrackMigratedKey: private row missing");
   auto *row = RowFromOffset(row_off);
+  // Move-in unlocks the neighborhood before track; a concurrent move-out may
+  // have already cleared is_migrated. Never link a non-migrated row.
+  if (!row->is_migrated || row->migrated_smeta_off == kNullOffset) return;
   // Already linked?
   if (row->clock_prev_off != kNullOffset || row->clock_next_off != kNullOffset ||
       directory_.clock_head == row_off || directory_.clock_tail == row_off) {
@@ -1754,7 +1762,11 @@ RegionOffset KVPartition::ClockAdvanceCursor() {
   } else {
     auto *cur = RowFromOffset(directory_.clock_cursor);
     RecordPrivateRowStateRead(cur);
-    directory_.clock_cursor = cur->clock_next_off;
+    const RegionOffset next = cur->clock_next_off;
+    // Linear intrusive list: wrap to head so a lone node with a fresh
+    // second_chance can be reconsidered in the same eviction pass.
+    directory_.clock_cursor =
+        (next == kNullOffset) ? directory_.clock_head : next;
   }
   return directory_.clock_cursor;
 }
@@ -1782,8 +1794,12 @@ bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget,
     if (victim_off == kNullOffset) break;
     auto *row = RowFromOffset(victim_off);
     if (row == nullptr || !row->is_migrated ||
-        row->migrated_smeta_off == kNullOffset)
+        row->migrated_smeta_off == kNullOffset) {
+      // Stale list node after concurrent move-out raced past track: drop it
+      // so migrated_key_count and the intrusive list stay honest.
+      ClockUntrackRowOffset(victim_off);
       continue;
+    }
     auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
         regions_.hwcc().FromOffset(row->migrated_smeta_off));
     auto *clock_meta =

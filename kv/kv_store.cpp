@@ -32,8 +32,23 @@ namespace {
 
 constexpr size_t kMaxKey = 256;
 constexpr size_t kMaxValue = 4096;
+// Match e2e_trace_runner: Busy is contention, retry at the logical op boundary
+// so YCSB and API callers share one contract with the engine's inner budgets.
+constexpr int kStoreBusyRetryBudget = 64;
 thread_local KVStore *TlsRuntimeOwner = nullptr;
 thread_local RuntimeStats *TlsRuntimeStats = nullptr;
+
+template <typename Op>
+Status RunWithBusyRetry(KVStore *store, Op &&op) {
+  Status status;
+  for (int attempt = 0; attempt < kStoreBusyRetryBudget; ++attempt) {
+    status = op();
+    if (status.code != StatusCode::kBusy) return status;
+    if (store != nullptr) store->PollTransport();
+    std::this_thread::yield();
+  }
+  return status;
+}
 
 void AddRuntimeStats(RuntimeStats *total, const RuntimeStats &part) {
   total->logical_ops += part.logical_ops;
@@ -864,7 +879,9 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
   catch (const std::exception &e) { return Status::Error(StatusCode::kInvalidArgument, e.what()); }
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
-  Status status = impl_->engine->Put(key, value);
+  Status status = RunWithBusyRetry(this, [&] {
+    return impl_->engine->Put(key, value);
+  });
   if (status.ok()) { ++runtime.commits; ++runtime.private_puts; }
   else ++runtime.aborts;
   return status;
@@ -878,7 +895,12 @@ GetResult KVStore::Get(std::string_view key) {
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
-  GetResult result = impl_->engine->Get(key);
+  GetResult result;
+  Status status = RunWithBusyRetry(this, [&] {
+    result = impl_->engine->Get(key);
+    return result.status;
+  });
+  result.status = status;
   if (result.status.ok()) { ++runtime.commits; ++runtime.private_gets; }
   else if (result.status.code != StatusCode::kNotFound) ++runtime.aborts;
   return result;
@@ -892,7 +914,9 @@ Status KVStore::Delete(std::string_view key) {
     return Status::Error(StatusCode::kInvalidArgument, "invalid key");
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
-  Status status = impl_->engine->Delete(key);
+  Status status = RunWithBusyRetry(this, [&] {
+    return impl_->engine->Delete(key);
+  });
   if (status.ok()) { ++runtime.commits; ++runtime.private_deletes; }
   else if (status.code != StatusCode::kNotFound) ++runtime.aborts;
   return status;
@@ -918,7 +942,12 @@ ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
   ++runtime.scan_ops;
-  ScanResult result = impl_->engine->Scan(start_key, limit);
+  ScanResult result;
+  Status status = RunWithBusyRetry(this, [&] {
+    result = impl_->engine->Scan(start_key, limit);
+    return result.status;
+  });
+  result.status = status;
   if (result.status.ok()) {
     ++runtime.commits;
     runtime.scan_rows_returned += result.items.size();
@@ -937,9 +966,15 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
   catch (const std::exception &e) { return {Status::Error(StatusCode::kInvalidArgument, e.what()), false}; }
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
-  CasResult result = impl_->engine->CompareExchange(key, expected, desired);
+  CasResult result;
+  Status status = RunWithBusyRetry(this, [&] {
+    result = impl_->engine->CompareExchange(key, expected, desired);
+    return result.status;
+  });
+  result.status = status;
   if (result.status.ok()) { ++runtime.commits; ++runtime.private_puts; }
   else if (result.status.code == StatusCode::kCompareFailed) ++runtime.aborts;
+  else if (result.status.code != StatusCode::kNotFound) ++runtime.aborts;
   return result;
 }
 
@@ -951,7 +986,12 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), 0};
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
-  IncrementResult result = impl_->engine->Increment(key, delta);
+  IncrementResult result;
+  Status status = RunWithBusyRetry(this, [&] {
+    result = impl_->engine->Increment(key, delta);
+    return result.status;
+  });
+  result.status = status;
   if (result.status.ok()) { ++runtime.commits; ++runtime.private_puts; }
   else ++runtime.aborts;
   return result;
