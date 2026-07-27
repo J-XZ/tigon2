@@ -723,10 +723,9 @@ void Config::Validate() const {
     if (owner_dynamic == 0)
       throw std::invalid_argument(
           "owner migration dynamic HWCC budget underflows to zero");
-    // Exact static_hwcc + vm_count * owner_dynamic ≤ physical is enforced in
-    // KVEngine::Open after layout/transport/EBR domains are allocated (§11.10).
-    // Do not approximate here: formal configs often set hw_cc_budget_mb ==
-    // hwcc_size_mb (policy budget vs physical region are distinct concepts).
+    // Exact dynamic_total ≤ physical − static is enforced in KVEngine::Open
+    // after layout/transport/EBR domains are allocated (§11.10). Formal configs
+    // set hw_cc_budget_mb below hwcc_size_mb so static headroom remains.
   }
   if (latency_cache_model != "none" && latency_cache_model != "fixed_hit_rate" &&
       latency_cache_model != "per_thread_lru")

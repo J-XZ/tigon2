@@ -382,7 +382,7 @@ experiment_config 段）与根 `experiment_config.jsonc`。
     "scc_mechanism": "WriteThrough",   // 唯一合法值；其它字符串 hard fail
     "migration_policy": "Clock",       // 唯一合法值
     "when_to_move_out": "OnDemand",    // 唯一合法值
-    "hw_cc_budget_mb": 1024,
+    "hw_cc_budget_mb": 1000,
     "owner_private_swcc_fraction": 0.35,
     "partition_count": 16,
     "transport_ring_total_mb": 16
@@ -527,7 +527,7 @@ experiment_config 段）与根 `experiment_config.jsonc`。
 | `vm.ssh_base_port` / `first_ip` / `bridge_tap_ip` | 10022 / 192.168.100.2 / 192.168.100.1 |
 | `host_cpu` 三组核数 | reserved 1、ivshmem 2、vm_cores 32（与 cxlkv 根配置同构） |
 | `e2e.foreground_worker_count_per_vm` | 4 |
-| `tigon_kv`：`hw_cc_budget_mb` / `owner_private_swcc_fraction` / `partition_count` / `transport_ring_total_mb` | 1024 / 0.35 / 16 / 16 |
+| `tigon_kv`：`hw_cc_budget_mb` / `owner_private_swcc_fraction` / `partition_count` / `transport_ring_total_mb` | **1000** / 0.35 / 16 / 16（budget 低于 `hwcc.size_mb=1024`，为静态域留 headroom；§11.10） |
 | `scc_mechanism` / `migration_policy` / `when_to_move_out` | WriteThrough / Clock / OnDemand（均为唯一合法值） |
 | 构建 | 正式验收 = RelWithDebInfo `-O3 -g3 -march=native` + 编译器对应 LTO（GCC `-flto` / Clang `-flto=full`）；Debug/ASAN 用于诊断且不产出性能结论 |
 | HWCC 占用 | 静态核算（layout+分配器头+transport 16MB+EBR）≪1024MB；动态受 `hw_cc_budget_per_host` move-out 限界（≈105B/shared 行）；上限 1024MB，倾向更小 |

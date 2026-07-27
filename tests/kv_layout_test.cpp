@@ -32,8 +32,12 @@ int main() {
     assert(!ValidWireFrame(WireSize(small), forged));  // trailing / forged size
     KvMessage maxv = MakeRequest(KvMessageType::kPut, 0, 1, 3, "k",
                                  std::string(1024, 'x'));
-    assert(WireSize(maxv) == sizeof(KvMessage));
+    // Max wire is header+1024 value bytes. sizeof(KvMessage) may include
+    // trailing alignment padding (1092 wire vs 1096 object on this ABI).
+    assert(WireSize(maxv) == WireHeaderBytes() + maxv.value.size());
+    assert(WireSize(maxv) <= sizeof(KvMessage));
     assert(ValidWireFrame(WireSize(maxv), maxv));
+    assert(!ValidWireFrame(sizeof(KvMessage), maxv));  // padded recv != wire
   }
   // §5.1 ScanMigrate codec round-trip and reject unknown flags / wrong size.
   {

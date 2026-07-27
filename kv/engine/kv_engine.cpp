@@ -286,7 +286,9 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   const uint64_t budget_bytes = config.hw_cc_budget_mb * 1024ULL * 1024ULL;
   const uint64_t hw_budget =
       (budget_bytes - star::CXL_EBR::max_ebr_retiring_memory) / config.vm_count;
-  // §11.10: static HWCC + per-owner dynamic budgets must fit physical HWCC.
+  // §11.10: migration dynamic budget must fit in physical HWCC *after* static
+  // domains (layout/allocator/transport/EBR). Formal configs set
+  // hw_cc_budget_mb below hwcc.size_mb so static headroom remains.
   {
     const auto &layout = engine->pool_->allocator().layout();
     uint64_t static_hwcc = 0;
@@ -299,15 +301,22 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
           layout.domains[domain].used_bytes.load(std::memory_order_relaxed);
     }
     const uint64_t physical_hwcc = config.hwcc_size_mb * 1024ULL * 1024ULL;
+    const uint64_t remaining_after_static =
+        physical_hwcc > static_hwcc ? physical_hwcc - static_hwcc : 0;
     const uint64_t dynamic_total =
         static_cast<uint64_t>(config.vm_count) * hw_budget;
-    if (static_hwcc + dynamic_total > physical_hwcc) {
+    if (dynamic_total > remaining_after_static) {
+      const uint64_t max_budget_bytes =
+          remaining_after_static + star::CXL_EBR::max_ebr_retiring_memory;
+      const uint64_t suggest_mb = max_budget_bytes / (1024ULL * 1024ULL);
       std::ostringstream detail;
-      detail << "tigonkv: static HWCC + owner dynamic budgets exceed physical "
-                "HWCC (static="
+      detail << "tigonkv: owner dynamic HWCC budget exceeds capacity remaining "
+                "after static domains (static="
              << static_hwcc << " dynamic_total=" << dynamic_total
+             << " remaining=" << remaining_after_static
              << " physical=" << physical_hwcc
-             << "); raise hwcc.size_mb or lower hw_cc_budget_mb (§11.10)";
+             << "); lower hw_cc_budget_mb to <=" << suggest_mb
+             << " or raise hwcc.size_mb (§11.10)";
       throw std::runtime_error(detail.str());
     }
   }
