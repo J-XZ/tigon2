@@ -1674,14 +1674,18 @@ void KVPartition::ClockTrackMigratedKey(const void *key_bytes) {
         row->clock_prev_off != kNullOffset || row->clock_next_off != kNullOffset)
       return;  // idempotent re-track
   }
+  RecordPrivateRowStateWrite(row);
   row->clock_prev_off = kNullOffset;
   row->clock_next_off = kNullOffset;
+  mem_access::HwccWrite(&directory_.clock_head, sizeof(directory_.clock_head));
+  mem_access::HwccWrite(&directory_.clock_tail, sizeof(directory_.clock_tail));
   if (directory_.clock_head == kNullOffset &&
       directory_.clock_tail == kNullOffset) {
     directory_.clock_head = row_off;
     directory_.clock_tail = row_off;
   } else {
     auto *tail = RowFromOffset(directory_.clock_tail);
+    RecordPrivateRowStateWrite(tail);
     tail->clock_next_off = row_off;
     row->clock_prev_off = directory_.clock_tail;
     directory_.clock_tail = row_off;
@@ -1708,6 +1712,10 @@ void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
       directory_.clock_head == row_off || directory_.clock_tail == row_off ||
       row->clock_prev_off != kNullOffset || row->clock_next_off != kNullOffset;
   if (!was_linked) return;
+  mem_access::HwccWrite(&directory_.clock_head, sizeof(directory_.clock_head));
+  mem_access::HwccWrite(&directory_.clock_tail, sizeof(directory_.clock_tail));
+  mem_access::HwccWrite(&directory_.clock_cursor,
+                        sizeof(directory_.clock_cursor));
   if (directory_.clock_cursor == row_off)
     directory_.clock_cursor = row->clock_prev_off;
   if (directory_.clock_head == directory_.clock_tail) {
@@ -1716,16 +1724,21 @@ void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
     directory_.clock_tail = kNullOffset;
   } else {
     if (row->clock_prev_off != kNullOffset) {
-      RowFromOffset(row->clock_prev_off)->clock_next_off = row->clock_next_off;
+      auto *prev = RowFromOffset(row->clock_prev_off);
+      RecordPrivateRowStateWrite(prev);
+      prev->clock_next_off = row->clock_next_off;
     }
     if (row->clock_next_off != kNullOffset) {
-      RowFromOffset(row->clock_next_off)->clock_prev_off = row->clock_prev_off;
+      auto *next = RowFromOffset(row->clock_next_off);
+      RecordPrivateRowStateWrite(next);
+      next->clock_prev_off = row->clock_prev_off;
     }
     if (directory_.clock_head == row_off)
       directory_.clock_head = row->clock_next_off;
     if (directory_.clock_tail == row_off)
       directory_.clock_tail = row->clock_prev_off;
   }
+  RecordPrivateRowStateWrite(row);
   row->clock_prev_off = kNullOffset;
   row->clock_next_off = kNullOffset;
   mem_access::HwccAtomicRmw(&directory_.migrated_key_count);
@@ -1733,10 +1746,14 @@ void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
 }
 
 RegionOffset KVPartition::ClockAdvanceCursor() {
-  if (directory_.clock_cursor == kNullOffset)
+  mem_access::HwccWrite(&directory_.clock_cursor,
+                        sizeof(directory_.clock_cursor));
+  if (directory_.clock_cursor == kNullOffset) {
+    mem_access::HwccRead(&directory_.clock_head, sizeof(directory_.clock_head));
     directory_.clock_cursor = directory_.clock_head;
-  else {
+  } else {
     auto *cur = RowFromOffset(directory_.clock_cursor);
+    RecordPrivateRowStateRead(cur);
     directory_.clock_cursor = cur->clock_next_off;
   }
   return directory_.clock_cursor;
