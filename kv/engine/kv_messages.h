@@ -59,4 +59,13 @@ inline KvMessage MakeRequest(KvMessageType type, uint32_t source, uint32_t desti
   return message;
 }
 
+inline KvMessage MakeResponse(uint32_t source, uint32_t destination, uint64_t request_id,
+                              StatusCode status = StatusCode::kOk,
+                              std::string_view value = {}) {
+  KvMessage message = MakeRequest(KvMessageType::kResponse, source, destination,
+                                  request_id, {}, value);
+  message.status = static_cast<uint32_t>(status);
+  return message;
+}
+
 }  // namespace tigonkv::engine

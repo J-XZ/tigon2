@@ -75,6 +75,8 @@ struct RuntimeStats {
   uint64_t network_rx_bytes = 0;
   // Sum of Scan result rows returned by successful Scan calls (§11.12).
   uint64_t scan_rows_returned = 0;
+  // Late responses dropped after Await timeout tombstones (§10.11).
+  uint64_t abandoned_responses = 0;
 };
 
 struct MemoryStats {

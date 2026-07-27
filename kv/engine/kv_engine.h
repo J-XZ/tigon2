@@ -11,6 +11,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <string_view>
 #include <vector>
 
@@ -86,6 +87,9 @@ class KVEngine {
   };
   std::shared_ptr<PendingResponse> RegisterPendingResponse(uint64_t request_id);
   void RemovePendingResponse(uint64_t request_id);
+  void AbandonPendingResponse(uint64_t request_id);
+  // Caller must hold pending_response_mutex_.
+  bool ConsumeAbandonedRequestLocked(uint64_t request_id);
   Status AwaitResponse(uint64_t request_id,
                        const std::shared_ptr<PendingResponse> &pending,
                        std::string *response_value);
@@ -131,6 +135,10 @@ class KVEngine {
   std::mutex pending_response_mutex_;
   std::unordered_map<uint64_t, std::shared_ptr<PendingResponse>>
       pending_responses_;
+  // Bounded tombstones for Await timeouts (§10.11). Late responses matching a
+  // tombstone are dropped; unknown ids remain fatal.
+  std::unordered_set<uint64_t> abandoned_request_ids_;
+  std::deque<uint64_t> abandoned_request_order_;
   // Demuxer enqueues requests here; FG PollTransport / Await drains them.
   // Nested serve (TlsRequestServeDepth != 0) must not pop/serve — OLC safety.
   // Single shared unbounded queue: demuxer never blocks on enqueue, and any
@@ -154,6 +162,7 @@ class KVEngine {
   std::atomic<uint64_t> shared_swcc_flushes_{0};
   std::atomic<uint64_t> migration_in_{0};
   std::atomic<uint64_t> migration_out_{0};
+  std::atomic<uint64_t> abandoned_responses_{0};
 };
 
 }  // namespace tigonkv::engine

@@ -53,6 +53,7 @@ void AddRuntimeStats(RuntimeStats *total, const RuntimeStats &part) {
   total->network_tx_bytes += part.network_tx_bytes;
   total->network_rx_bytes += part.network_rx_bytes;
   total->scan_rows_returned += part.scan_rows_returned;
+  total->abandoned_responses += part.abandoned_responses;
 }
 
 std::string StripComments(std::string text) {
@@ -985,6 +986,7 @@ RuntimeStats KVStore::Runtime() const {
     stats.shared_swcc_flushes += engine.shared_swcc_flushes;
     stats.migration_in += engine.migration_in;
     stats.migration_out += engine.migration_out;
+    stats.abandoned_responses += engine.abandoned_responses;
     stats.network_tx_bytes = engine.network_tx_bytes;
     stats.network_rx_bytes = engine.network_rx_bytes;
   }
@@ -1033,6 +1035,7 @@ std::string KVStore::DumpStats() const {
   out += "network_tx_bytes=" + std::to_string(runtime.network_tx_bytes) + "\n";
   out += "network_rx_bytes=" + std::to_string(runtime.network_rx_bytes) + "\n";
   out += "scan_rows_returned=" + std::to_string(runtime.scan_rows_returned) + "\n";
+  out += "abandoned_responses=" + std::to_string(runtime.abandoned_responses) + "\n";
   const latency_sim::Stats latency = latency_sim::GlobalLatencySimulator().SnapshotStats();
   const auto ratio = [](uint64_t hits, uint64_t misses) {
     const uint64_t total = hits + misses;

@@ -1067,6 +1067,8 @@ RuntimeStats KVEngine::EngineRuntime() const {
   stats.shared_swcc_flushes = shared_swcc_flushes_.load(std::memory_order_relaxed);
   stats.migration_in = migration_in_.load(std::memory_order_relaxed);
   stats.migration_out = migration_out_.load(std::memory_order_relaxed);
+  stats.abandoned_responses =
+      abandoned_responses_.load(std::memory_order_relaxed);
   stats.network_tx_bytes = NetworkTxBytes();
   stats.network_rx_bytes = NetworkRxBytes();
   return stats;
@@ -1196,6 +1198,36 @@ void KVEngine::RemovePendingResponse(uint64_t request_id) {
   pending_responses_.erase(request_id);
 }
 
+void KVEngine::AbandonPendingResponse(uint64_t request_id) {
+  // Capacity tracks in-flight workers: each may abandon a small burst of RPCs
+  // without unbounded growth (§10.11 / §11.13).
+  const size_t max_abandoned = std::max<size_t>(
+      256, static_cast<size_t>(config_.foreground_worker_count_per_vm) * 128);
+  std::lock_guard<std::mutex> lock(pending_response_mutex_);
+  pending_responses_.erase(request_id);
+  if (abandoned_request_ids_.insert(request_id).second)
+    abandoned_request_order_.push_back(request_id);
+  while (abandoned_request_order_.size() > max_abandoned) {
+    const uint64_t oldest = abandoned_request_order_.front();
+    abandoned_request_order_.pop_front();
+    abandoned_request_ids_.erase(oldest);
+  }
+}
+
+bool KVEngine::ConsumeAbandonedRequestLocked(uint64_t request_id) {
+  auto it = abandoned_request_ids_.find(request_id);
+  if (it == abandoned_request_ids_.end()) return false;
+  abandoned_request_ids_.erase(it);
+  for (auto order = abandoned_request_order_.begin();
+       order != abandoned_request_order_.end(); ++order) {
+    if (*order == request_id) {
+      abandoned_request_order_.erase(order);
+      break;
+    }
+  }
+  return true;
+}
+
 Status KVEngine::AwaitResponse(
     uint64_t request_id, const std::shared_ptr<PendingResponse> &pending,
     std::string *response_value) {
@@ -1212,8 +1244,9 @@ Status KVEngine::AwaitResponse(
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline) {
         lock.unlock();
-        RemovePendingResponse(request_id);
-        return Status::Error(StatusCode::kCorruption, "forwarded owner response timed out");
+        AbandonPendingResponse(request_id);
+        return Status::Error(StatusCode::kBusy,
+                             "forwarded owner response timed out");
       }
       // Demux notifies this CV both for the matching response and when an
       // inbound request needs cooperative service. Holding pending->mutex
@@ -1337,8 +1370,13 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
     {
       std::lock_guard<std::mutex> lock(pending_response_mutex_);
       auto it = pending_responses_.find(message.request_id);
-      if (it == pending_responses_.end())
+      if (it == pending_responses_.end()) {
+        if (ConsumeAbandonedRequestLocked(message.request_id)) {
+          abandoned_responses_.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
         throw std::runtime_error("response has no pending request");
+      }
       pending = it->second;
     }
     {

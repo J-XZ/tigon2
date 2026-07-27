@@ -143,6 +143,94 @@ int main() {
   assert(WIFSIGNALED(full_status) && WTERMSIG(full_status) == SIGABRT);
   unlink(full_template);
 
+  // §10.11: Await timeout abandons request_id; late response must not abort.
+  {
+    char late_template[] = "/tmp/tigonkv-engine-late-resp-XXXXXX";
+    const int late_fd = mkstemp(late_template);
+    assert(late_fd >= 0);
+    close(late_fd);
+    auto late_config = ConfigFor(late_template, 2, 0);
+    late_config.sync_timeout_sec = 1;
+    auto engine = tigonkv::engine::KVEngine::Open(late_config, true);
+    std::string remote_key;
+    for (uint32_t i = 0; i < 1000; ++i) {
+      remote_key = "late-resp-" + std::to_string(i);
+      if (engine->OwnerForKey(remote_key) == 1) break;
+    }
+    assert(!remote_key.empty() && engine->OwnerForKey(remote_key) == 1);
+    void *root = nullptr;
+    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+        star::CXLMemory::cxl_transport_root_index, &root);
+    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+    std::atomic<bool> get_done{false};
+    tigonkv::StatusCode get_code = tigonkv::StatusCode::kOk;
+    std::thread getter([&] {
+      engine->BindWorker(0);
+      get_code = engine->Get(remote_key).status.code;
+      engine->ReleaseWorker();
+      get_done.store(true, std::memory_order_release);
+    });
+    tigonkv::engine::KvMessage outbound{};
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+      alignas(64) char bytes[sizeof(tigonkv::engine::KvMessage)];
+      const uint64_t got = rings[1].recv(bytes, sizeof(bytes));
+      if (got == sizeof(outbound)) {
+        std::memcpy(&outbound, bytes, sizeof(outbound));
+        break;
+      }
+      assert(std::chrono::steady_clock::now() < drain_deadline);
+      std::this_thread::yield();
+    }
+    assert(outbound.request_id != 0);
+    while (!get_done.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    getter.join();
+    assert(get_code == tigonkv::StatusCode::kBusy);
+    auto response = tigonkv::engine::MakeResponse(
+        1, 0, outbound.request_id, tigonkv::StatusCode::kOk);
+    while (!rings[0].enqueue(reinterpret_cast<char *>(&response),
+                             sizeof(response)))
+      std::this_thread::yield();
+    const auto settle = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(200);
+    while (std::chrono::steady_clock::now() < settle)
+      std::this_thread::yield();
+    assert(engine->EngineRuntime().abandoned_responses >= 1);
+    unlink(late_template);
+  }
+
+  // Unknown response request_id (not abandoned) remains fatal.
+  {
+    char unknown_template[] = "/tmp/tigonkv-engine-unknown-resp-XXXXXX";
+    const int unknown_fd = mkstemp(unknown_template);
+    assert(unknown_fd >= 0);
+    close(unknown_fd);
+    const pid_t unknown_child = fork();
+    assert(unknown_child >= 0);
+    if (unknown_child == 0) {
+      const rlimit no_core{0, 0};
+      (void)setrlimit(RLIMIT_CORE, &no_core);
+      auto config = ConfigFor(unknown_template, 2, 0);
+      auto engine = tigonkv::engine::KVEngine::Open(config, true);
+      void *root = nullptr;
+      star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+          star::CXLMemory::cxl_transport_root_index, &root);
+      auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+      auto response = tigonkv::engine::MakeResponse(
+          1, 0, /*request_id=*/0xdeadbeefULL);
+      while (!rings[0].enqueue(reinterpret_cast<char *>(&response),
+                               sizeof(response)))
+        std::this_thread::yield();
+      for (;;) engine->PollTransport();
+    }
+    int unknown_status = 0;
+    assert(waitpid(unknown_child, &unknown_status, 0) == unknown_child);
+    assert(WIFSIGNALED(unknown_status) && WTERMSIG(unknown_status) == SIGABRT);
+    unlink(unknown_template);
+  }
+
   char ring_latency_template[] = "/tmp/tigonkv-ring-latency-XXXXXX";
   const int ring_latency_fd = mkstemp(ring_latency_template);
   assert(ring_latency_fd >= 0);
