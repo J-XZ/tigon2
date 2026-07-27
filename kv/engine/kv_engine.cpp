@@ -64,6 +64,23 @@ uint64_t CurrentRssKb() {
 // nested FG polls only need to skip ServeDeferred.
 thread_local uint32_t TlsRequestServeDepth = 0;
 
+// §13: Scan hot path only bumps TLS; flushed once at Scan return.
+struct ScanTlsDiag {
+  uint64_t partition_probes = 0;
+  uint64_t migrate_rpcs = 0;
+};
+thread_local ScanTlsDiag TlsScanDiag{};
+
+struct ScanTlsFlushGuard {
+  std::atomic<uint64_t> *probes;
+  std::atomic<uint64_t> *migrates;
+  ~ScanTlsFlushGuard() {
+    probes->fetch_add(TlsScanDiag.partition_probes, std::memory_order_relaxed);
+    migrates->fetch_add(TlsScanDiag.migrate_rpcs, std::memory_order_relaxed);
+    TlsScanDiag = {};
+  }
+};
+
 struct RequestServeDepthGuard {
   RequestServeDepthGuard() { ++TlsRequestServeDepth; }
   ~RequestServeDepthGuard() { --TlsRequestServeDepth; }
@@ -435,6 +452,8 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
   constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
   if (limit > kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
+  TlsScanDiag = {};
+  ScanTlsFlushGuard flush_guard{&scan_partition_probes_, &scan_migrate_rpcs_};
   constexpr uint64_t kPageSize = 64;
   const uint64_t target = limit == 0 ? kScanSafetyLimit : limit;
   const auto scan_deadline =
@@ -487,6 +506,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
             cursor, page_cap, source->owner_exhausted_for_cursor,
             source->has_cursor, source->owner_no_predecessor_for_cursor);
       }
+      ++TlsScanDiag.partition_probes;
       PollTransport();
       source->owner_exhausted_for_cursor = false;
       source->owner_no_predecessor_for_cursor = false;
@@ -514,6 +534,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
           SendTransportMessage(MakeRequest(
               KvMessageType::kScanMigrate, config_.node_id, source->owner,
               request_id, cursor, payload));
+          ++TlsScanDiag.migrate_rpcs;
         } catch (...) {
           RemovePendingResponse(request_id);
           throw;
@@ -562,6 +583,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       RequestServeDepthGuard depth_guard;
       ok = partition->ScanOwned(cursor, fetch, &items, &progress);
     }
+    ++TlsScanDiag.partition_probes;
     PollTransport();
     if (!ok)
       return Status::Error(StatusCode::kBusy,
@@ -670,19 +692,27 @@ Status KVEngine::PreparePartitionSharedScan(
   } else if (keys.empty() && no_predecessor_out != nullptr) {
     *no_predecessor_out = true;
   }
+  uint64_t movein_attempted = 0;
   for (const auto &key : keys) {
     bool moved_in = false;
+    ++movein_attempted;
     const StatusCode code =
         partition->EnsureInShared(key, requester, &moved_in);
     // Original TwoPLPashaMessage.h:353-361: NotFound is a race, skip the key.
     if (code == StatusCode::kNotFound) continue;
-    if (code != StatusCode::kOk)
+    if (code != StatusCode::kOk) {
+      scan_owner_rows_movein_attempted_.fetch_add(
+          movein_attempted, std::memory_order_relaxed);
       return Status::Error(code, "partition scan range move-in failed");
+    }
     if (moved_in) {
       migration_in_.fetch_add(1, std::memory_order_relaxed);
       shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
     }
   }
+  // One atomic add for the whole preparation RPC (§13 — not per Scan result row).
+  scan_owner_rows_movein_attempted_.fetch_add(movein_attempted,
+                                              std::memory_order_relaxed);
   // One OnDemand Clock move-out after this partition's preparation (§5.2).
   KvMigrationRuntime::SyncHwCcUsage(*partition);
   partition->MoveOutClockVictim(config_.node_id);
@@ -837,6 +867,14 @@ RuntimeStats KVEngine::EngineRuntime() const {
   stats.migration_out = migration_out_.load(std::memory_order_relaxed);
   stats.abandoned_responses =
       abandoned_responses_.load(std::memory_order_relaxed);
+  stats.scan_partition_probes =
+      scan_partition_probes_.load(std::memory_order_relaxed);
+  stats.scan_migrate_rpcs =
+      scan_migrate_rpcs_.load(std::memory_order_relaxed);
+  stats.scan_owner_rows_movein_attempted =
+      scan_owner_rows_movein_attempted_.load(std::memory_order_relaxed);
+  stats.deferred_queue_peak =
+      deferred_queue_peak_.load(std::memory_order_relaxed);
   stats.network_tx_bytes = NetworkTxBytes();
   stats.network_rx_bytes = NetworkRxBytes();
   return stats;
@@ -1150,6 +1188,13 @@ void KVEngine::DemuxTransportMessage(const KvMessage &message) {
   {
     std::lock_guard<std::mutex> lock(deferred_request_mutex_);
     deferred_transport_requests_.push_back(message);
+    const uint64_t depth =
+        static_cast<uint64_t>(deferred_transport_requests_.size());
+    uint64_t peak = deferred_queue_peak_.load(std::memory_order_relaxed);
+    while (depth > peak &&
+           !deferred_queue_peak_.compare_exchange_weak(
+               peak, depth, std::memory_order_relaxed)) {
+    }
   }
   WakePendingForwarders();
 }

@@ -445,6 +445,11 @@ int main() {
     assert(scan.status.ok() && scan.items.size() == 2);
     assert(scan.items[0].key == "alpha" && scan.items[0].value == "cas-value");
     assert(scan.items[1].key == "counter" && scan.items[1].value == "3");
+    {
+      const auto rt = engine->EngineRuntime();
+      assert(rt.scan_partition_probes >= single_owner.partition_count);
+      assert(rt.scan_migrate_rpcs == 0);
+    }
     assert(engine->Delete("alpha").ok());
     assert(engine->Get("alpha").status.code == tigonkv::StatusCode::kNotFound);
     std::atomic<bool> worker_bound{false};

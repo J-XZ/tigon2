@@ -136,10 +136,14 @@ python3 scripts/summarize_ycsb_experiment.py \
 
 ## 注意
 
-1. **1M 不是脚本默认**（默认 10 万）；必须显式传 `1000000`。  
-2. **`--no-latency` 必加**，否则可能仍带默认 latency 配置（脚本只在该开关下关 enabled）。  
-3. **`--shared-size-mb 32768`** 与根配置一致；若 OOM/arena 不够再升到 `65536`（须为 2 的幂）。  
-4. 含 **E** 时 Scan 更重，可把 `--round-timeout` 调大（默认 7200s）。  
+1. **1M 不是脚本默认**（默认 10 万）；必须显式传 `1000000`。
+2. **`--no-latency` 必加**，否则可能仍带默认 latency 配置（脚本只在该开关下关 enabled）。
+3. **`--shared-size-mb 32768`** 与根配置一致；若 OOM/arena 不够再升到 `65536`（须为 2 的幂）。
+4. 含 **E** 时 Scan 更重，可把 `--round-timeout` 调大（默认 7200s）。E 是全局
+   兼容 Scan（hash partition k 路归并），**不等价**于原始 TwoPLPasha 单
+   partition native Scan；正式报告须分开表述。DumpStats 的
+   `scan_migrate_rpcs` / `scan_partition_probes` / `scan_rows_returned` 用于
+   判断 warm CXL 后是否仍大量 RPC、以及 Scan 是否真返回了行。
 5. 实际 init/kill 必须 `--allow-state-change`；Ask 模式我无法替你执行。
 
 核心就是：**RelWithDebInfo 构建 → init+check 4VM → 一条 `tigonkv_run_ycsb_experiment.sh`（1M/1M、4 线程、`a,b,c,d,e`、`--no-latency`）**。
