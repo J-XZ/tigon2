@@ -1,6 +1,7 @@
 #include "kv/engine/kv_partition.h"
 #include "kv/engine/kv_migration.h"
 #include "kv/engine/mem_access.h"
+#include "protocol/Pasha/PolicyClock.h"
 
 #include <algorithm>
 #include <charconv>
@@ -80,6 +81,8 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
     shared_tree_->bind_published_root(&directory_.shared_root);
     PersistPrivateRootIfChanged();
   }
+  pthread_spin_init(&clock_lock_, PTHREAD_PROCESS_PRIVATE);
+  clock_lock_inited_ = true;
   // Clock tracker rebuild runs after KvMigrationRuntime::Install so the
   // process-local PolicyClock exists (PLAN §4.5 attach rebuild).
 }
@@ -1060,8 +1063,12 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
     UnlockNeighborhood(&neighborhood);
     return false;
   }
+  const RegionOffset clock_row_off = neighborhood.current.offset;
   RefreshAdjacencyLocked(neighborhood);
   UnlockNeighborhood(&neighborhood);
+  ClockLock();
+  ClockUntrackRowOffset(clock_row_off);
+  ClockUnlock();
   mem_access::DelayActiveScopeNow();
   smeta->lock();
   smeta->clear_write_locked();
@@ -1474,7 +1481,11 @@ bool KVPartition::DeletePrivateForMigrationManager(
       RecordPrivateRowStateWrite(row);
       row->is_migrated = 0;
       row->migrated_smeta_off = kNullOffset;
-      *need_untrack = true;
+      // Unlink before the PrivateRow is EBR-retired (§11.14).
+      ClockLock();
+      ClockUntrackRowOffset(neighborhood.current.offset);
+      ClockUnlock();
+      *need_untrack = false;  // already untracked by offset
       *migration_policy_meta = &smeta->migration_policy_meta;
       retired_smeta = smeta;
       retired_payload = payload;
@@ -1556,23 +1567,138 @@ bool KVPartition::TryPinSharedEntry(
   return true;
 }
 
-void KVPartition::RebuildClockTracker() {
-  EnterEbr();
-  auto *clock = KvMigrationRuntime::Instance().clock();
-  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
-  if (clock == nullptr || table == nullptr) return;
-  FixedKey low{};
-  FixedKey high{};
-  std::memset(high.bytes, 0xff, sizeof(high.bytes));
-  std::vector<SharedTree::KeyValuePair> entries;
-  shared_tree_->scan(low, high, true, true, 0, entries);
-  for (const auto &entry : entries) {
-    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-        regions_.hwcc().FromOffset(entry.second));
-    std::tuple<std::atomic<uint64_t> *, void *> row{nullptr, nullptr};
-    clock->track_already_migrated(table, entry.first.bytes, row,
-                                  &smeta->migration_policy_meta);
+void KVPartition::ClockLock() {
+  pthread_spin_lock(&clock_lock_);
+}
+
+void KVPartition::ClockUnlock() {
+  pthread_spin_unlock(&clock_lock_);
+}
+
+void KVPartition::ClockTrackMigratedKey(const void *key_bytes) {
+  const FixedKey fixed_key =
+      FixedKey::From(std::string_view(static_cast<const char *>(key_bytes),
+                                      fixed_key_size_),
+                     fixed_key_size_);
+  RegionOffset row_off = kNullOffset;
+  if (!private_tree_->lookup(fixed_key, row_off) || row_off == kNullOffset)
+    throw std::runtime_error("ClockTrackMigratedKey: private row missing");
+  auto *row = RowFromOffset(row_off);
+  // Already linked?
+  if (row->clock_prev_off != kNullOffset || row->clock_next_off != kNullOffset ||
+      directory_.clock_head == row_off || directory_.clock_tail == row_off) {
+    if (directory_.clock_head == row_off || directory_.clock_tail == row_off ||
+        row->clock_prev_off != kNullOffset || row->clock_next_off != kNullOffset)
+      return;  // idempotent re-track
   }
+  row->clock_prev_off = kNullOffset;
+  row->clock_next_off = kNullOffset;
+  if (directory_.clock_head == kNullOffset &&
+      directory_.clock_tail == kNullOffset) {
+    directory_.clock_head = row_off;
+    directory_.clock_tail = row_off;
+  } else {
+    auto *tail = RowFromOffset(directory_.clock_tail);
+    tail->clock_next_off = row_off;
+    row->clock_prev_off = directory_.clock_tail;
+    directory_.clock_tail = row_off;
+  }
+}
+
+void KVPartition::ClockUntrackMigratedKey(const void *key_bytes) {
+  const FixedKey fixed_key =
+      FixedKey::From(std::string_view(static_cast<const char *>(key_bytes),
+                                      fixed_key_size_),
+                     fixed_key_size_);
+  RegionOffset row_off = kNullOffset;
+  if (!private_tree_->lookup(fixed_key, row_off) || row_off == kNullOffset)
+    return;
+  ClockUntrackRowOffset(row_off);
+}
+
+void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
+  if (row_off == kNullOffset) return;
+  auto *row = RowFromOffset(row_off);
+  if (directory_.clock_cursor == row_off)
+    directory_.clock_cursor = row->clock_prev_off;
+  if (directory_.clock_head == kNullOffset &&
+      directory_.clock_tail == kNullOffset)
+    return;
+  if (directory_.clock_head == directory_.clock_tail) {
+    if (directory_.clock_head != row_off) return;
+    directory_.clock_head = kNullOffset;
+    directory_.clock_tail = kNullOffset;
+  } else {
+    if (row->clock_prev_off != kNullOffset) {
+      RowFromOffset(row->clock_prev_off)->clock_next_off = row->clock_next_off;
+    }
+    if (row->clock_next_off != kNullOffset) {
+      RowFromOffset(row->clock_next_off)->clock_prev_off = row->clock_prev_off;
+    }
+    if (directory_.clock_head == row_off)
+      directory_.clock_head = row->clock_next_off;
+    if (directory_.clock_tail == row_off)
+      directory_.clock_tail = row->clock_prev_off;
+  }
+  row->clock_prev_off = kNullOffset;
+  row->clock_next_off = kNullOffset;
+}
+
+RegionOffset KVPartition::ClockAdvanceCursor() {
+  if (directory_.clock_cursor == kNullOffset)
+    directory_.clock_cursor = directory_.clock_head;
+  else {
+    auto *cur = RowFromOffset(directory_.clock_cursor);
+    directory_.clock_cursor = cur->clock_next_off;
+  }
+  return directory_.clock_cursor;
+}
+
+bool KVPartition::ClockMoveOutRow(RegionOffset row_off) {
+  if (row_off == kNullOffset) return false;
+  auto *row = RowFromOffset(row_off);
+  return MoveOutForMigrationManager(row->kv);
+}
+
+bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget) {
+  bool ret = false;
+  ClockLock();
+  if (star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
+      hw_cc_budget) {
+    ClockUnlock();
+    return false;
+  }
+  // Bound the scan so an empty/corrupt list cannot spin forever.
+  for (uint32_t steps = 0; steps < 1024; ++steps) {
+    const RegionOffset victim_off = ClockAdvanceCursor();
+    if (victim_off == kNullOffset) break;
+    auto *row = RowFromOffset(victim_off);
+    if (row == nullptr || !row->is_migrated ||
+        row->migrated_smeta_off == kNullOffset)
+      continue;
+    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+        regions_.hwcc().FromOffset(row->migrated_smeta_off));
+    auto *clock_meta =
+        reinterpret_cast<star::PolicyClock::ClockMeta *>(&smeta->migration_policy_meta);
+    mem_access::HwccAtomicRmw(&clock_meta->second_chance);
+    if (clock_meta->second_chance.exchange(0, std::memory_order_relaxed) == 1)
+      continue;
+    FixedKey victim_key{};
+    std::memcpy(victim_key.bytes, row->kv, fixed_key_size_);
+    // Do not hold the Clock spinlock across move-out (§11.15).
+    ClockUnlock();
+    // MoveOutForMigrationManager untracks under its own brief ClockLock.
+    const bool moved = MoveOutForMigrationManager(victim_key.bytes);
+    ClockLock();
+    if (moved &&
+        star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
+            hw_cc_budget) {
+      ret = true;
+      break;
+    }
+  }
+  ClockUnlock();
+  return ret;
 }
 
 bool KVPartition::MoveOutClockVictim(uint32_t host_id) {

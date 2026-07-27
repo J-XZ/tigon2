@@ -403,10 +403,8 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   KvMigrationRuntime::Instance().Install(
       partition_ptrs, config.fixed_key_size, config.fixed_value_size,
       config.node_id, config.partition_count, hw_budget);
-  for (auto &partition : engine->partitions_) {
-    if (engine->OwnerForPartition(partition->partition_id()) == config.node_id)
-      partition->RebuildClockTracker();
-  }
+  // Clock list head/tail/cursor and PrivateRow links persist in SWCC; attach
+  // does not rebuild a process-heap tracker (§11.14).
   engine->StartInboundDemuxer();
   if (reset) engine->pool_->allocator().PublishReady();
   return engine;

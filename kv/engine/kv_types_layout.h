@@ -20,7 +20,9 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // v11: the Scan generation also covers logical-key insertion/deletion.
 // v12: original TwoPLPasha next/prev adjacency bits make shared visibility
 // changes self-validating; the generation now certifies logical EOF only.
-constexpr uint32_t kSharedLayoutVersion = 12;
+// v13: PolicyClock tracker links live in PrivateRow / PartitionDirectoryEntry
+// (owner-private SWCC), not process-heap ClockTrackerNode (§11.14).
+constexpr uint32_t kSharedLayoutVersion = 13;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -95,8 +97,13 @@ struct alignas(64) PrivateRow {
   uint32_t value_len = 0;
   uint64_t version = 0;
   RegionOffset migrated_smeta_off = kNullOffset;
+  // Intrusive PolicyClock list links in owner-private SWCC (§11.14).
+  RegionOffset clock_prev_off = kNullOffset;
+  RegionOffset clock_next_off = kNullOffset;
   char kv[];
 };
+static_assert(sizeof(PrivateRow) == 64,
+              "PrivateRow clock links must stay inside the existing 64B header");
 
 struct alignas(64) PartitionDirectoryEntry {
   RegionOffset private_root = kNullOffset;
@@ -109,7 +116,13 @@ struct alignas(64) PartitionDirectoryEntry {
   // mutations in flight. Remote CXL range readers use this only to certify an
   // exhausted private-tree tail; shared move-in/out uses next/prev bits.
   std::atomic<uint64_t> shared_mutation_state{0};
+  // Owner-local Clock list head/tail/cursor over PrivateRow offsets (§11.14).
+  RegionOffset clock_head = kNullOffset;
+  RegionOffset clock_tail = kNullOffset;
+  RegionOffset clock_cursor = kNullOffset;
 };
+static_assert(sizeof(PartitionDirectoryEntry) == 64,
+              "Clock directory fields must stay inside the existing 64B entry");
 
 // The first object in the HWCC region. Fields are fixed-width so an attach in a
 // separately mapped process can validate the complete layout before dereference.

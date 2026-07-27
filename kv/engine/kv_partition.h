@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <pthread.h>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -102,7 +103,16 @@ class KVPartition {
   // Invokes PolicyClock::move_row_out for this partition.
   bool MoveOutClockVictim(uint32_t host_id);
   // Rebuild DRAM Clock tracker entries from the shared tree after attach.
-  void RebuildClockTracker();
+  void ClockLock();
+  void ClockUnlock();
+  void ClockTrackMigratedKey(const void *key_bytes);
+  void ClockUntrackMigratedKey(const void *key_bytes);
+  void ClockUntrackRowOffset(RegionOffset row_off);
+  // Returns the PrivateRow offset under the Clock cursor (or kNullOffset).
+  RegionOffset ClockAdvanceCursor();
+  bool ClockMoveOutRow(RegionOffset row_off);
+  // Second-chance eviction loop used by PolicyClock::move_row_out (§11.14).
+  bool ClockEvictUntilUnderBudget(uint64_t hw_cc_budget);
   uint64_t shared_payload_used_bytes() const;
   uint64_t shared_payload_capacity_bytes() const;
   uint64_t hwcc_used_bytes() const;
@@ -191,6 +201,9 @@ class KVPartition {
   // Process-local cache of the last published private root offset (§11.6).
   RegionOffset persisted_private_root_offset_ = kNullOffset;
   uint64_t private_root_publishes_ = 0;
+  // Process-local Clock list lock; list nodes live in SWCC PrivateRow (§11.14).
+  pthread_spinlock_t clock_lock_{};
+  bool clock_lock_inited_ = false;
 };
 
 }  // namespace tigonkv::engine
