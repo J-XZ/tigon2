@@ -598,11 +598,15 @@ class TwoPLPashaHelper {
                                     const void *src, std::size_t size)
         {
                 if (smeta == nullptr || scc_manager == nullptr) return false;
-                for (;;) {
+                // One logical write attempt: bounded reader-drain yields, never
+                // leave writer_waiting=1 on a false return (§10.2c).
+                constexpr int kMaxReaderDrainAttempts = 256;
+                for (int attempt = 0; attempt < kMaxReaderDrainAttempts; ++attempt) {
                         smeta->lock();
                         auto *scc_data = smeta->get_scc_data();
                         if (smeta->is_write_locked() ||
                             smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+                                smeta->set_writer_waiting(0);
                                 smeta->unlock();
                                 return false;
                         }
@@ -649,6 +653,10 @@ class TwoPLPashaHelper {
                         smeta->unlock();
                         return true;
                 }
+                smeta->lock();
+                smeta->set_writer_waiting(0);
+                smeta->unlock();
+                return false;
         }
 
         template <typename Mutator>
@@ -658,17 +666,20 @@ class TwoPLPashaHelper {
         {
                 if (smeta == nullptr || scc_manager == nullptr || changed == nullptr)
                         return false;
-                for (;;) {
+                constexpr int kMaxContentionAttempts = 256;
+                for (int attempt = 0; attempt < kMaxContentionAttempts; ++attempt) {
                         smeta->lock();
                         auto *scc_data = smeta->get_scc_data();
                         const uint32_t size = smeta->get_value_len();
                         if (size > capacity ||
                             !smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) ||
                             smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+                                smeta->set_writer_waiting(0);
                                 smeta->unlock();
                                 return false;
                         }
                         if (smeta->is_write_locked()) {
+                                smeta->set_writer_waiting(0);
                                 smeta->unlock();
                                 std::this_thread::yield();
                                 continue;
@@ -712,6 +723,7 @@ class TwoPLPashaHelper {
                                 DCHECK(smeta->get_ref_cnt() > 0);
                                 smeta->decrement_ref_cnt();
                                 smeta->clear_write_locked();
+                                smeta->set_writer_waiting(0);
                                 smeta->unlock();
                                 throw;
                         }
@@ -736,10 +748,15 @@ class TwoPLPashaHelper {
                         DCHECK(smeta->get_ref_cnt() > 0);
                         smeta->decrement_ref_cnt();
                         smeta->clear_write_locked();
+                        smeta->set_writer_waiting(0);
                         smeta->unlock();
                         *changed = write;
                         return true;
                 }
+                smeta->lock();
+                smeta->set_writer_waiting(0);
+                smeta->unlock();
+                return false;
         }
 
         // Explicit migration-style pin used when a requester observes an

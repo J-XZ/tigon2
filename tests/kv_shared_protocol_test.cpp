@@ -7,6 +7,7 @@
 #include <cassert>
 #include <charconv>
 #include <cstring>
+#include <atomic>
 #include <thread>
 #include <vector>
 #include <sys/mman.h>
@@ -101,18 +102,21 @@ int main() {
       simulator.BeginScope(latency_sim::ScopeKind::kForeground);
       for (int iteration = 0; iteration < 250; ++iteration) {
         bool changed = false;
-        assert(star::TwoPLPashaHelper::kv_shared_update(
-            meta, host % 2, 16,
-            [](const std::string &current, std::string *replacement) {
-              int value = 0;
-              const auto parsed =
-                  std::from_chars(current.data(), current.data() + current.size(), value);
-              assert(parsed.ec == std::errc{} &&
-                     parsed.ptr == current.data() + current.size());
-              *replacement = std::to_string(value + 1);
-              return true;
-            },
-            &changed));
+        for (;;) {
+          if (star::TwoPLPashaHelper::kv_shared_update(
+                  meta, host % 2, 16,
+                  [](const std::string &current, std::string *replacement) {
+                    int value = 0;
+                    const auto parsed = std::from_chars(
+                        current.data(), current.data() + current.size(), value);
+                    assert(parsed.ec == std::errc{} &&
+                           parsed.ptr == current.data() + current.size());
+                    *replacement = std::to_string(value + 1);
+                    return true;
+                  },
+                  &changed))
+            break;
+        }
         assert(changed);
       }
       simulator.EndScopeAndDelay();
@@ -126,6 +130,58 @@ int main() {
   assert(std::string(incremented, incremented_size) == "1000");
   assert(meta->ref_cnt == 0 && meta->get_reader_count() == 0 &&
          !meta->is_write_locked());
+
+  // §10.2c: every false return path clears writer_waiting so readers recover.
+  {
+    meta->lock();
+    meta->set_writer_waiting(1);
+    meta->set_write_locked();
+    meta->unlock();
+    assert(!star::TwoPLPashaHelper::kv_shared_write(meta, 0, "x", 1));
+    assert(meta->get_writer_waiting() == 0);
+    meta->lock();
+    meta->clear_write_locked();
+    meta->unlock();
+
+    meta->lock();
+    meta->increase_reader_count();
+    meta->unlock();
+    std::atomic<bool> writer_started{false};
+    std::thread stalled_writer([&] {
+      simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+      writer_started.store(true, std::memory_order_release);
+      assert(!star::TwoPLPashaHelper::kv_shared_write(meta, 0, "y", 1));
+      assert(meta->get_writer_waiting() == 0);
+      simulator.EndScopeAndDelay();
+    });
+    while (!writer_started.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    stalled_writer.join();
+    meta->lock();
+    meta->decrease_reader_count();
+    meta->unlock();
+    assert(meta->get_writer_waiting() == 0);
+    char readable[16] = {};
+    uint32_t readable_size = 0;
+    assert(star::TwoPLPashaHelper::kv_shared_read_value(
+        meta, 0, readable, sizeof(readable), &readable_size));
+    assert(readable_size > 0);
+
+    meta->lock();
+    meta->set_writer_waiting(1);
+    meta->set_write_locked();
+    meta->unlock();
+    bool changed = false;
+    assert(!star::TwoPLPashaHelper::kv_shared_update(
+        meta, 0, 16,
+        [](const std::string &, std::string *) { return false; }, &changed));
+    // write_locked path yields then may still fail; waiting must be clear.
+    assert(meta->get_writer_waiting() == 0);
+    meta->lock();
+    meta->clear_write_locked();
+    meta->set_writer_waiting(0);
+    meta->unlock();
+  }
 
   simulator.EndScopeAndDelay();
   const auto latency_stats = simulator.TakeStatsAndReset();
