@@ -1,10 +1,10 @@
 {
   "shared_memory": {
-    "size_mb": 16,
+    "size_mb": 32,
     "path": "/tmp/tigonkv-multivm-trace-backing",
     "device_path": "/dev/ivpci0",
-    "hwcc": { "offset_mb": 0, "size_mb": 4 },
-    "swcc": { "offset_mb": 4, "size_mb": 12 }
+    "hwcc": { "offset_mb": 0, "size_mb": 16 },
+    "swcc": { "offset_mb": 16, "size_mb": 16 }
   },
   "vm": { "count": 2 },
   "tigon_kv": {

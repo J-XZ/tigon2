@@ -12,6 +12,9 @@ int main() {
   assert(kSingleTableId == 0);
   assert(kMaxFixedKeyBytes == 32);
   assert(kMaxPartitions >= 16);
+  assert(kSharedLayoutVersion == 14);
+  assert(sizeof(PartitionDirectoryEntry) == 128);
+  assert(sizeof(PrivateRow) == 64);
   // §11.4 WireSize: header = offsetof(value); value bytes only on the wire.
   assert(WireHeaderBytes() == offsetof(KvMessage, value));
   {

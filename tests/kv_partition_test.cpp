@@ -297,11 +297,15 @@ int main() {
 
   // PolicyClock init sets second_chance=0, so a never-accessed migrated row is
   // eligible on the first over-budget move_row_out (original OnDemand gate).
+  // Other keys (e.g. gamma) may still be migrated; counter is O(1) track/untrack.
   assert(partition.PutPrivate("clock", "victim"));
   assert(partition.PromotePrivate("clock", 1));
+  const uint64_t migrated_before_clock = partition.migrated_key_count();
+  assert(migrated_before_clock >= 1);
   star::cxl_memory.set_total_hw_cc_usage(
       (1024ULL * 1024ULL * 1024ULL - star::CXL_EBR::max_ebr_retiring_memory) / 2);
   assert(partition.MoveOutClockVictim(1));
+  assert(partition.migrated_key_count() == migrated_before_clock - 1);
   assert(partition.GetPrivate("clock", &value) && value == "victim");
   latency_sim::Config budget_counter_latency;
   budget_counter_latency.enabled = true;

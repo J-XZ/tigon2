@@ -29,11 +29,13 @@ tigonkv::Config ConfigFor(const std::string &path, uint32_t vm_count = 1,
                            uint32_t node_id = 0) {
   tigonkv::Config config;
   config.shared_memory_path = path;
-  config.size_mb = 16;
+  // §11.10: physical HWCC must hold static (layout/transport/EBR/allocator)
+  // plus vm_count * owner dynamic budget; keep budget below hwcc.size_mb.
+  config.size_mb = 32;
   config.hwcc_offset_mb = 0;
-  config.hwcc_size_mb = 4;
-  config.swcc_offset_mb = 4;
-  config.swcc_size_mb = 12;
+  config.hwcc_size_mb = 16;
+  config.swcc_offset_mb = 16;
+  config.swcc_size_mb = 16;
   config.hw_cc_budget_mb = 4;
   config.vm_count = vm_count;
   config.node_id = node_id;
@@ -412,6 +414,13 @@ int main() {
   {
     auto engine = tigonkv::engine::KVEngine::Open(single_owner, true);
     assert(star::CXLMemory::bound_owner_shard() == single_owner.node_id);
+    {
+      const auto mem = engine->Memory();
+      assert(mem.physical_hwcc_capacity_bytes ==
+             single_owner.hwcc_size_mb * 1024ULL * 1024ULL);
+      assert(mem.owner_migration_dynamic_budget_bytes > 0);
+      assert(mem.allocator_local_dram_bytes == 0);
+    }
     // §14.7 / §11.5: hash partition routing is stable and index-aligned.
     for (uint32_t i = 0; i < 4096; ++i) {
       const std::string key = "route-oracle-" + std::to_string(i);

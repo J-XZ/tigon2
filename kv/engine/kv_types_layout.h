@@ -22,7 +22,8 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // changes self-validating; the generation now certifies logical EOF only.
 // v13: PolicyClock tracker links live in PrivateRow / PartitionDirectoryEntry
 // (owner-private SWCC), not process-heap ClockTrackerNode (§11.14).
-constexpr uint32_t kSharedLayoutVersion = 13;
+// v14: PartitionDirectoryEntry carries O(1) migrated_key_count (§11.16).
+constexpr uint32_t kSharedLayoutVersion = 14;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -120,9 +121,11 @@ struct alignas(64) PartitionDirectoryEntry {
   RegionOffset clock_head = kNullOffset;
   RegionOffset clock_tail = kNullOffset;
   RegionOffset clock_cursor = kNullOffset;
+  // Maintained under ClockLock on track/untrack; DumpStats reads O(1) (§11.16).
+  std::atomic<uint64_t> migrated_key_count{0};
 };
-static_assert(sizeof(PartitionDirectoryEntry) == 64,
-              "Clock directory fields must stay inside the existing 64B entry");
+static_assert(sizeof(PartitionDirectoryEntry) == 128,
+              "v14 directory entry includes migrated_key_count (2 cache lines)");
 
 // The first object in the HWCC region. Fields are fixed-width so an attach in a
 // separately mapped process can validate the complete layout before dereference.

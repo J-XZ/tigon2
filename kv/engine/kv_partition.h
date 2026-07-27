@@ -127,8 +127,6 @@ class KVPartition {
       std::vector<std::pair<std::string, std::string>> *items) const;
   bool PrivatePredecessorKey(std::string_view key, std::string *predecessor) const;
   uint64_t SharedMutationState() const;
-  // Invokes PolicyClock::move_row_out for this partition.
-  bool MoveOutClockVictim(uint32_t host_id);
   void ClockLock();
   void ClockUnlock();
   void ClockTrackMigratedKey(const void *key_bytes);
@@ -138,7 +136,12 @@ class KVPartition {
   RegionOffset ClockAdvanceCursor();
   bool ClockMoveOutRow(RegionOffset row_off);
   // Second-chance eviction loop used by PolicyClock::move_row_out (§11.14).
-  bool ClockEvictUntilUnderBudget(uint64_t hw_cc_budget);
+  // force_at_least_one: payload watermark eviction without rewriting the
+  // global CXLMemory HWCC counter (§11.10).
+  bool ClockEvictUntilUnderBudget(uint64_t hw_cc_budget,
+                                  bool force_at_least_one = false);
+  // When force_at_least_one, bypass PolicyClock's TOTAL_HW_CC_USAGE gate.
+  bool MoveOutClockVictim(uint32_t host_id, bool force_at_least_one = false);
   uint64_t shared_payload_used_bytes() const;
   uint64_t shared_payload_capacity_bytes() const;
   uint64_t hwcc_used_bytes() const;

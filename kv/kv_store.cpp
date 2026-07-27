@@ -1,5 +1,6 @@
 #include "kv/kv_store.h"
 
+#include "common/CXL_EBR.h"
 #include "kv/engine/kv_engine.h"
 #include "kv/engine/latency_inject.h"
 #include "kv/engine/mem_access.h"
@@ -704,6 +705,22 @@ void Config::Validate() const {
       migration_policy != "Clock" || when_to_move_out != "OnDemand" ||
       scc_mechanism != "WriteThrough")
     throw std::invalid_argument("invalid allocator budget fractions");
+  // §11.10: dynamic budget must leave room for EBR retiring and be > 0 per VM.
+  {
+    const uint64_t budget_bytes = hw_cc_budget_mb * 1024ULL * 1024ULL;
+    if (budget_bytes <= star::CXL_EBR::max_ebr_retiring_memory)
+      throw std::invalid_argument(
+          "hw_cc_budget_mb must exceed CXL_EBR::max_ebr_retiring_memory");
+    const uint64_t owner_dynamic =
+        (budget_bytes - star::CXL_EBR::max_ebr_retiring_memory) / vm_count;
+    if (owner_dynamic == 0)
+      throw std::invalid_argument(
+          "owner migration dynamic HWCC budget underflows to zero");
+    // Exact static_hwcc + vm_count * owner_dynamic ≤ physical is enforced in
+    // KVEngine::Open after layout/transport/EBR domains are allocated (§11.10).
+    // Do not approximate here: formal configs often set hw_cc_budget_mb ==
+    // hwcc_size_mb (policy budget vs physical region are distinct concepts).
+  }
   if (latency_cache_model != "none" && latency_cache_model != "fixed_hit_rate" &&
       latency_cache_model != "per_thread_lru")
     throw std::invalid_argument("unknown latency cache model");
@@ -1015,7 +1032,17 @@ std::string KVStore::DumpStats() const {
   out += "retired_pending_bytes=" + std::to_string(memory.retired_pending_bytes) + "\n";
   out += "reclaimed_total_bytes=" + std::to_string(memory.reclaimed_total_bytes) + "\n";
   out += "active_shared_rows=" + std::to_string(memory.active_shared_rows) + "\n";
+  out += "physical_hwcc_capacity_bytes=" +
+         std::to_string(memory.physical_hwcc_capacity_bytes) + "\n";
+  out += "owner_migration_dynamic_budget_bytes=" +
+         std::to_string(memory.owner_migration_dynamic_budget_bytes) + "\n";
   out += "rss_kb=" + std::to_string(memory.rss_kb) + "\n";
+  // §11.11: disclose foreground vs service threads; do not hide the demuxer.
+  out += "foreground_worker_count_per_vm=" +
+         std::to_string(config_.foreground_worker_count_per_vm) + "\n";
+  out += "inbound_demuxer_threads=1\n";
+  out += "kv_threads_per_vm=" +
+         std::to_string(config_.foreground_worker_count_per_vm + 1) + "\n";
   out += "TIGONKV_RUNTIME_STATS\nnode=" + std::to_string(config_.node_id) + "\n";
   out += "logical_ops=" + std::to_string(runtime.logical_ops) + "\n";
   out += "commits=" + std::to_string(runtime.commits) + "\n";

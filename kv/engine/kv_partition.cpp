@@ -1686,6 +1686,8 @@ void KVPartition::ClockTrackMigratedKey(const void *key_bytes) {
     row->clock_prev_off = directory_.clock_tail;
     directory_.clock_tail = row_off;
   }
+  mem_access::HwccAtomicRmw(&directory_.migrated_key_count);
+  directory_.migrated_key_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void KVPartition::ClockUntrackMigratedKey(const void *key_bytes) {
@@ -1702,11 +1704,12 @@ void KVPartition::ClockUntrackMigratedKey(const void *key_bytes) {
 void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
   if (row_off == kNullOffset) return;
   auto *row = RowFromOffset(row_off);
+  const bool was_linked =
+      directory_.clock_head == row_off || directory_.clock_tail == row_off ||
+      row->clock_prev_off != kNullOffset || row->clock_next_off != kNullOffset;
+  if (!was_linked) return;
   if (directory_.clock_cursor == row_off)
     directory_.clock_cursor = row->clock_prev_off;
-  if (directory_.clock_head == kNullOffset &&
-      directory_.clock_tail == kNullOffset)
-    return;
   if (directory_.clock_head == directory_.clock_tail) {
     if (directory_.clock_head != row_off) return;
     directory_.clock_head = kNullOffset;
@@ -1725,6 +1728,8 @@ void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
   }
   row->clock_prev_off = kNullOffset;
   row->clock_next_off = kNullOffset;
+  mem_access::HwccAtomicRmw(&directory_.migrated_key_count);
+  directory_.migrated_key_count.fetch_sub(1, std::memory_order_relaxed);
 }
 
 RegionOffset KVPartition::ClockAdvanceCursor() {
@@ -1743,11 +1748,14 @@ bool KVPartition::ClockMoveOutRow(RegionOffset row_off) {
   return MoveOutForMigrationManager(row->kv);
 }
 
-bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget) {
+bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget,
+                                             bool force_at_least_one) {
   bool ret = false;
+  bool moved_once = false;
   ClockLock();
-  if (star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
-      hw_cc_budget) {
+  if (!force_at_least_one &&
+      star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
+          hw_cc_budget) {
     ClockUnlock();
     return false;
   }
@@ -1773,24 +1781,29 @@ bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget) {
     // MoveOutForMigrationManager untracks under its own brief ClockLock.
     const bool moved = MoveOutForMigrationManager(victim_key.bytes);
     ClockLock();
-    if (moved &&
-        star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
-            hw_cc_budget) {
-      ret = true;
-      break;
+    if (moved) {
+      moved_once = true;
+      if (force_at_least_one ||
+          star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
+              hw_cc_budget) {
+        ret = true;
+        break;
+      }
     }
   }
   ClockUnlock();
-  return ret;
+  return force_at_least_one ? moved_once : ret;
 }
 
-bool KVPartition::MoveOutClockVictim(uint32_t host_id) {
+bool KVPartition::MoveOutClockVictim(uint32_t host_id, bool force_at_least_one) {
   (void)host_id;
   EnterEbr();
+  if (force_at_least_one) {
+    // Payload watermark: do not rewrite CXLMemory::TOTAL_HW_CC_USAGE (§11.10).
+    return ClockEvictUntilUnderBudget(/*hw_cc_budget=*/0, true);
+  }
   if (star::migration_manager == nullptr) return false;
-  // Caller (EnforceMigrationBudget / tests) syncs CXLMemory::TOTAL_HW_CC_USAGE
-  // before invoking so PolicyClock's original budget gate sees the intended
-  // over-budget condition.
+  // Caller syncs CXLMemory::TOTAL_HW_CC_USAGE for the HWCC over-budget path.
   return star::migration_manager->move_row_out(partition_id_);
 }
 
@@ -1812,12 +1825,8 @@ uint64_t KVPartition::hwcc_used_bytes() const {
 }
 
 uint64_t KVPartition::migrated_key_count() const {
-  FixedKey low{};
-  FixedKey high{};
-  std::memset(high.bytes, 0xff, sizeof(high.bytes));
-  std::vector<SharedTree::KeyValuePair> entries;
-  shared_tree_->scan(low, high, true, true, 0, entries);
-  return entries.size();
+  mem_access::HwccAtomicLoad(&directory_.migrated_key_count);
+  return directory_.migrated_key_count.load(std::memory_order_relaxed);
 }
 
 

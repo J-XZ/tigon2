@@ -214,10 +214,10 @@ int main() {
   std::remove(latency_config_path.c_str());
 
   Config uneven;
-  uneven.size_mb = 16;
-  uneven.hwcc_size_mb = 4;
-  uneven.swcc_offset_mb = 4;
-  uneven.swcc_size_mb = 12;
+  uneven.size_mb = 32;
+  uneven.hwcc_size_mb = 16;
+  uneven.swcc_offset_mb = 16;
+  uneven.swcc_size_mb = 16;
   uneven.hw_cc_budget_mb = 4;
   uneven.vm_count = 2;
   uneven.node_id = 1;
@@ -228,10 +228,10 @@ int main() {
   std::remove(path.c_str());
   Config config;
   config.shared_memory_path = path;
-  config.size_mb = 16;
-  config.hwcc_size_mb = 4;
-  config.swcc_offset_mb = 4;
-  config.swcc_size_mb = 12;
+  config.size_mb = 32;
+  config.hwcc_size_mb = 16;
+  config.swcc_offset_mb = 16;
+  config.swcc_size_mb = 16;
   config.hw_cc_budget_mb = 4;
   config.vm_count = 1;
   config.partition_count = 8;

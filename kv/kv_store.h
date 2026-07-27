@@ -98,6 +98,9 @@ struct MemoryStats {
   uint64_t retired_pending_bytes = 0;
   uint64_t reclaimed_total_bytes = 0;
   uint64_t active_shared_rows = 0;
+  // Physical HWCC region size vs per-owner Clock dynamic limit (§11.10).
+  uint64_t physical_hwcc_capacity_bytes = 0;
+  uint64_t owner_migration_dynamic_budget_bytes = 0;
   uint64_t rss_kb = 0;
 };
 

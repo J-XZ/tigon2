@@ -266,8 +266,34 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   std::vector<KVPartition *> partition_ptrs;
   partition_ptrs.reserve(engine->partitions_.size());
   for (auto &partition : engine->partitions_) partition_ptrs.push_back(partition.get());
-  const uint64_t hw_budget = (config.hw_cc_budget_mb * 1024ULL * 1024ULL -
-      star::CXL_EBR::max_ebr_retiring_memory) / config.vm_count;
+  const uint64_t budget_bytes = config.hw_cc_budget_mb * 1024ULL * 1024ULL;
+  const uint64_t hw_budget =
+      (budget_bytes - star::CXL_EBR::max_ebr_retiring_memory) / config.vm_count;
+  // §11.10: static HWCC + per-owner dynamic budgets must fit physical HWCC.
+  {
+    const auto &layout = engine->pool_->allocator().layout();
+    uint64_t static_hwcc = 0;
+    for (size_t domain :
+         {static_cast<size_t>(AllocationDomain::kHwccLayout),
+          static_cast<size_t>(AllocationDomain::kHwccAllocatorMetadata),
+          static_cast<size_t>(AllocationDomain::kTransport),
+          static_cast<size_t>(AllocationDomain::kHwccEbr)}) {
+      static_hwcc +=
+          layout.domains[domain].used_bytes.load(std::memory_order_relaxed);
+    }
+    const uint64_t physical_hwcc = config.hwcc_size_mb * 1024ULL * 1024ULL;
+    const uint64_t dynamic_total =
+        static_cast<uint64_t>(config.vm_count) * hw_budget;
+    if (static_hwcc + dynamic_total > physical_hwcc) {
+      std::ostringstream detail;
+      detail << "tigonkv: static HWCC + owner dynamic budgets exceed physical "
+                "HWCC (static="
+             << static_hwcc << " dynamic_total=" << dynamic_total
+             << " physical=" << physical_hwcc
+             << "); raise hwcc.size_mb or lower hw_cc_budget_mb (§11.10)";
+      throw std::runtime_error(detail.str());
+    }
+  }
   KvMigrationRuntime::Instance().Install(
       partition_ptrs, config.fixed_key_size, config.fixed_value_size,
       config.node_id, config.partition_count, hw_budget);
@@ -789,6 +815,14 @@ MemoryStats KVEngine::Memory() const {
       stats.allocator_swcc_metadata_bytes;
   for (const auto &partition : partitions_)
     stats.active_shared_rows += partition->migrated_key_count();
+  // Physical capacity vs Clock dynamic limit (§11.10). Clock links live in
+  // SWCC PrivateRow after §11.14, so process-heap tracker DRAM is zero.
+  stats.physical_hwcc_capacity_bytes = config_.hwcc_size_mb * 1024ULL * 1024ULL;
+  stats.owner_migration_dynamic_budget_bytes =
+      (config_.hw_cc_budget_mb * 1024ULL * 1024ULL -
+       star::CXL_EBR::max_ebr_retiring_memory) /
+      config_.vm_count;
+  stats.allocator_local_dram_bytes = 0;
   stats.rss_kb = CurrentRssKb();
   return stats;
 }
@@ -1380,18 +1414,16 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
       partition.shared_payload_capacity_bytes() * 9;
   const uint64_t hw_used = partition.hwcc_used_bytes();
   if (hw_used < hw_budget && !payload_high) return;
-  // PolicyClock budgets against CXLMemory::TOTAL_HW_CC_USAGE.  When only the
-  // shared-payload watermark trips, force the counter to the budget so the
-  // original move_row_out scan still runs.
-  if (payload_high && hw_used < hw_budget)
-    star::cxl_memory.set_total_hw_cc_usage(hw_budget);
-  else
-    KvMigrationRuntime::SyncHwCcUsage(partition);
+  // HWCC over-budget: sync the real counter for PolicyClock's gate.
+  // Payload watermark: force one eviction without rewriting TOTAL_HW_CC_USAGE
+  // (§11.10) — that shared counter must not be used as a signaling channel.
+  const bool force_at_least_one = payload_high && hw_used < hw_budget;
+  if (!force_at_least_one) KvMigrationRuntime::SyncHwCcUsage(partition);
   for (uint32_t pass = 0; pass < 2; ++pass) {
     for (auto &candidate : partitions_) {
       if (OwnerForPartition(candidate->partition_id()) != config_.node_id)
         continue;
-      if (candidate->MoveOutClockVictim(config_.node_id)) {
+      if (candidate->MoveOutClockVictim(config_.node_id, force_at_least_one)) {
         migration_out_.fetch_add(1, std::memory_order_relaxed);
         return;
       }
