@@ -52,7 +52,8 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
       private_binding_{&regions, AllocationDomain::kOwnerPrivateSwcc, owner_shard, &ebr,
                        partition_id},
       shared_binding_{&regions, AllocationDomain::kHwccIndex, owner_shard, &ebr} {
-  star::CXLMemory::bind_dual_region_allocator(&regions, owner_shard);
+  // Process-level CXLMemory owner binding is set once in KVEngine::Open to
+  // config.node_id. Do not rebind per partition (§11.3).
   if (partition_id >=
       ReadHwccConfigField(&regions.layout().partition_count))
     throw std::invalid_argument("partition id outside persistent layout");

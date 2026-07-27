@@ -58,6 +58,8 @@ int main() {
   auto &regions = pool.allocator();
   star::CXLMemory memory;
   star::CXLMemory::bind_dual_region_allocator(&regions, 1);
+  // Fixture binds the process owner once for this VM before any partition
+  // construct; KVPartition must not rebind (§11.3).
   void *index_object = memory.cxlalloc_malloc_wrapper(
       128, star::CXLMemory::INDEX_ALLOCATION);
   void *payload_object = memory.cxlalloc_malloc_wrapper(
@@ -80,6 +82,7 @@ int main() {
   regions.FreeOwnerPrivate(private_reuse, 128, 5, 1);
   assert(regions.AllocateOwnerPrivate(128, 5, 1) == private_reuse);
   tigonkv::engine::KVPartition partition(regions, ebr, 5, 1, false);
+  assert(star::CXLMemory::bound_owner_shard() == 1);
   assert(regions.OwnerPrivateArenaOffset(5) ==
          regions.layout().partitions[5].private_arena);
   {

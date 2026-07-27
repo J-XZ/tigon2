@@ -385,6 +385,9 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
         engine->pool_->allocator(), *engine->ebr_, partition,
         engine->OwnerForPartition(partition), attach));
   }
+  if (star::CXLMemory::bound_owner_shard() != config.node_id)
+    throw std::runtime_error(
+        "tigonkv: process allocator owner rebound after partition construct");
   std::vector<KVPartition *> partition_ptrs;
   partition_ptrs.reserve(engine->partitions_.size());
   for (auto &partition : engine->partitions_) partition_ptrs.push_back(partition.get());

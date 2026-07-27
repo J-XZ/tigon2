@@ -191,6 +191,7 @@ int main() {
   const auto single_owner = ConfigFor(path);
   {
     auto engine = tigonkv::engine::KVEngine::Open(single_owner, true);
+    assert(star::CXLMemory::bound_owner_shard() == single_owner.node_id);
     assert(engine->Put("alpha", "one").ok());
     assert(engine->Put("alpha", "updated").ok());
     const auto found = engine->Get("alpha");
@@ -296,12 +297,16 @@ int main() {
   node_one_config.foreground_worker_count_per_vm = 4;
   {
     auto engine = tigonkv::engine::KVEngine::Open(node_zero, true);
+    assert(star::CXLMemory::bound_owner_shard() == 0);
     for (uint32_t i = 0; i < 100; ++i) {
       const std::string key = "route-" + std::to_string(i);
       const uint32_t partition = engine->PartitionForKey(key);
       assert(engine->OwnerForKey(key) == partition % node_zero.vm_count);
       if (engine->OwnerForKey(key) == 1) break;
     }
+    // Constructing every partition (owners 0 and 1) must not rebind the
+    // process-level allocator owner away from this VM (§11.3).
+    assert(star::CXLMemory::bound_owner_shard() == 0);
 
     std::string owner_zero_key;
     for (uint32_t i = 0; i < 100; ++i) {
@@ -353,6 +358,7 @@ int main() {
     if (child == 0) {
       close(scan_ready[0]);
       auto node_one = tigonkv::engine::KVEngine::Open(node_one_config, false);
+      if (star::CXLMemory::bound_owner_shard() != 1) _exit(30);
       if (!node_one->Put(owner_one_key, "owner-one").ok()) _exit(1);
       for (const auto &key : promoted_scan_keys) {
         const auto promoted = node_one->Get(key);

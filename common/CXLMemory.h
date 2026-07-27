@@ -63,6 +63,10 @@ class CXLMemory {
                 owner_shard_ = owner_shard;
         }
 
+        // Read-only process binding used by tests / Open invariants (§11.3).
+        static uint32_t bound_owner_shard() { return owner_shard_; }
+        static bool dual_region_allocator_bound() { return dual_regions_ != nullptr; }
+
         static uint64_t pointer_to_pool_offset(const void *pointer)
         {
                 if (dual_regions_ == nullptr)
@@ -79,6 +83,9 @@ class CXLMemory {
 
         void init_cxlalloc_for_given_thread(uint64_t threads_num_per_host, uint64_t thread_id, uint64_t hosts_num, uint64_t host_id)
         {
+                // Legacy Tigon thread init. TigonKV workers must not call this: the
+                // process owner shard is bound once to node_id in KVEngine::Open
+                // (§11.3). Host_id may still be used by source-only benchmarks.
                 (void)threads_num_per_host; (void)thread_id; (void)hosts_num;
                 if (dual_regions_ == nullptr)
                         throw std::runtime_error("tigonkv: dual-region allocator is not bound");
