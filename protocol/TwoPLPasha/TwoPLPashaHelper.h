@@ -493,6 +493,22 @@ class TwoPLPashaHelper {
         {
         }
 
+        // Pure per-row adjacency predicate from TwoPLPashaExecutor.h:294-310.
+        // Caller holds smeta latch. Returns true when bits satisfy the scan rule
+        // (so migration is NOT required). Branch order is intentional:
+        //   key == min  → need next_real only
+        //   size==limit → need prev_real only (KV always uses non-zero limit)
+        //   otherwise   → need prev_real && next_real
+        // Does not lock, touch transport, B+Tree, or KV strings (§4.6.2).
+        static bool scan_row_adjacency_ok(bool key_equals_min,
+                                          bool is_limit_boundary,
+                                          bool prev_real, bool next_real)
+        {
+                if (key_equals_min) return next_real;
+                if (is_limit_boundary) return prev_real;
+                return prev_real && next_real;
+        }
+
         // tigonkv: KV path uses the original shared metadata word and SCC
         // sequence without transaction Context/Table objects.  reader_count
         // covers the SCC critical section; payload ref_cnt is pinned for the

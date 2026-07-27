@@ -76,6 +76,35 @@ int main() {
   RecordingScc fake;
   star::scc_manager = &fake;
   fake.init_scc_metadata(meta, 0);
+  // §4.6.2 / §4.4: scan_row_adjacency_ok matches TwoPLPashaExecutor:294-310.
+  {
+    using H = star::TwoPLPashaHelper;
+    // key == min: only next_real matters
+    assert(H::scan_row_adjacency_ok(true, false, false, true));
+    assert(!H::scan_row_adjacency_ok(true, false, true, false));
+    assert(H::scan_row_adjacency_ok(true, true, false, true));  // min wins over limit
+    // limit boundary: only prev_real
+    assert(H::scan_row_adjacency_ok(false, true, true, false));
+    assert(!H::scan_row_adjacency_ok(false, true, false, true));
+    // intermediate: both
+    assert(H::scan_row_adjacency_ok(false, false, true, true));
+    assert(!H::scan_row_adjacency_ok(false, false, true, false));
+    assert(!H::scan_row_adjacency_ok(false, false, false, true));
+    assert(!H::scan_row_adjacency_ok(false, false, false, false));
+    // Exhaustive oracle vs inlined original branches.
+    for (int bits = 0; bits < 16; ++bits) {
+      const bool key_eq = (bits & 1) != 0;
+      const bool limit_b = (bits & 2) != 0;
+      const bool prev = (bits & 4) != 0;
+      const bool next = (bits & 8) != 0;
+      bool expected = true;
+      if (key_eq) expected = next;
+      else if (limit_b) expected = prev;
+      else expected = prev && next;
+      assert(H::scan_row_adjacency_ok(key_eq, limit_b, prev, next) == expected);
+    }
+  }
+
   assert(star::TwoPLPashaHelper::kv_shared_write(meta, 0, "shared-value", 12));
   assert(meta->ref_cnt == 0);
   assert(meta->value_len == 12);

@@ -291,22 +291,12 @@ class TwoPLPashaExecutor : public Executor<Workload, TwoPLPasha<typename Workloa
                                                 TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
 
                                                 smeta->lock();
-                                                if (table->compare_key(key, min_key) == 0) {
-                                                        // if the first key matches the min_key, then we do not care about the previous key
-                                                        DCHECK(scan_results.size() == 0);
-                                                        if (smeta->get_next_key_real_bit() == false) {
-                                                                migration_required = true;
-                                                        }
-                                                } else if (scan_results.size() == limit) {
-                                                        // we do not care about the next key of the next key
-                                                        if (smeta->get_prev_key_real_bit() == false) {
-                                                                migration_required = true;
-                                                        }
-                                                } else {
-                                                        // for intermediate keys, we care about both the next and previous keys
-                                                        if (smeta->get_next_key_real_bit() == false || smeta->get_prev_key_real_bit() == false) {
-                                                                migration_required = true;
-                                                        }
+                                                if (!TwoPLPashaHelper::scan_row_adjacency_ok(
+                                                        table->compare_key(key, min_key) == 0,
+                                                        scan_results.size() == limit,
+                                                        smeta->get_prev_key_real_bit(),
+                                                        smeta->get_next_key_real_bit())) {
+                                                        migration_required = true;
                                                 }
                                                 smeta->unlock();
 
