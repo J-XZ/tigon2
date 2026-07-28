@@ -186,7 +186,10 @@ class KVPartition {
     PrivateValueStruct *value = nullptr;
     PrivateMetadataLocal *metadata = nullptr;
   };
-  struct Neighborhood {
+  // Ephemeral arguments supplied by one B+Tree leaf callback.  This is not a
+  // second lookup/retry state machine; all three entries are valid only while
+  // that callback retains the original leaf latches.
+  struct AdjacentRows {
     bool has_prev = false;
     bool has_current = false;
     bool has_next = false;
@@ -194,11 +197,11 @@ class KVPartition {
     RowRef current;
     RowRef next;
   };
-  static void UnlockNeighborhood(Neighborhood *neighborhood);
+  static void UnlockAdjacentRows(AdjacentRows *rows);
   void SetNextReal(const RowRef &row, bool real);
   void SetPrevReal(const RowRef &row, bool real);
-  void RefreshAdjacencyLocked(const Neighborhood &neighborhood);
-  void BreakAdjacencyLocked(const Neighborhood &neighborhood);
+  void ApplySharedAdjacency(const AdjacentRows &rows);
+  void ClearSharedAdjacency(const AdjacentRows &rows);
   bool InsertPrivateValue(const FixedKey &key, PrivateValueStruct *value);
   void FreeUnpublishedPrivateValue(PrivateValueStruct *value);
   DualRegionAllocator &regions_;

@@ -164,12 +164,12 @@ void KVPartition::UnlockRow(PrivateMetadataLocal *metadata) {
   metadata->unlock();
 }
 
-void KVPartition::UnlockNeighborhood(Neighborhood *neighborhood) {
-  if (neighborhood == nullptr) return;
-  if (neighborhood->has_next) UnlockRow(neighborhood->next.metadata);
-  if (neighborhood->has_current) UnlockRow(neighborhood->current.metadata);
-  if (neighborhood->has_prev) UnlockRow(neighborhood->prev.metadata);
-  *neighborhood = {};
+void KVPartition::UnlockAdjacentRows(AdjacentRows *rows) {
+  if (rows == nullptr) return;
+  if (rows->has_next) UnlockRow(rows->next.metadata);
+  if (rows->has_current) UnlockRow(rows->current.metadata);
+  if (rows->has_prev) UnlockRow(rows->prev.metadata);
+  *rows = {};
 }
 
 void KVPartition::SetNextReal(const RowRef &row, bool real) {
@@ -202,8 +202,7 @@ void KVPartition::SetPrevReal(const RowRef &row, bool real) {
   smeta->unlock();
 }
 
-void KVPartition::RefreshAdjacencyLocked(
-    const Neighborhood &neighborhood) {
+void KVPartition::ApplySharedAdjacency(const AdjacentRows &neighborhood) {
   const bool prev_migrated =
       neighborhood.has_prev && neighborhood.prev.metadata->is_valid &&
       neighborhood.prev.metadata->is_migrated;
@@ -228,8 +227,7 @@ void KVPartition::RefreshAdjacencyLocked(
   }
 }
 
-void KVPartition::BreakAdjacencyLocked(
-    const Neighborhood &neighborhood) {
+void KVPartition::ClearSharedAdjacency(const AdjacentRows &neighborhood) {
   if (neighborhood.has_prev) SetNextReal(neighborhood.prev, false);
   if (neighborhood.has_current) {
     SetPrevReal(neighborhood.current, false);
@@ -862,7 +860,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
       [&](const void *prev_key, void *prev_meta, void *prev_data,
           const void *cur_key, void *cur_meta, void *cur_data,
           const void *next_key, void *next_meta, void *next_data) {
-        Neighborhood neighborhood;
+        AdjacentRows neighborhood;
         const auto fill = [&](const void *row_key, void *row_meta,
                               void *row_data, bool *present, RowRef *row) {
           if (row_key == nullptr || row_meta == nullptr || row_data == nullptr)
@@ -888,29 +886,29 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   auto *private_value = neighborhood.current.value;
   auto *metadata = neighborhood.current.metadata;
   if (!metadata->is_valid) {
-    UnlockNeighborhood(&neighborhood);
+    UnlockAdjacentRows(&neighborhood);
     return star::migration_result::FAIL_OOM;
   }
   if (metadata->is_migrated) {
-    RefreshAdjacencyLocked(neighborhood);
+    ApplySharedAdjacency(neighborhood);
     if (inc_ref_cnt) {
       // Caller (PromotePrivate with pinned_existing) will unpin exactly once.
       // Only report FAIL_ALREADY_IN_CXL when the pin is actually held; a failed
       // pin must not hand back smeta or RelWithDebInfo uint8_t ref_cnt wraps
       // 0→255 and saturates every later shared read/write (YCSB Forward stall).
       if (metadata->migrated_smeta_off == kNullOffset) {
-        UnlockNeighborhood(&neighborhood);
+        UnlockAdjacentRows(&neighborhood);
         return star::migration_result::FAIL_OOM;
       }
       auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
           regions_.hwcc().FromOffset(metadata->migrated_smeta_off));
       if (!star::TwoPLPashaHelper::kv_pin_shared_ref(smeta)) {
-        UnlockNeighborhood(&neighborhood);
+        UnlockAdjacentRows(&neighborhood);
         return star::migration_result::FAIL_OOM;
       }
       migration_policy_meta = &smeta->migration_policy_meta;
     }
-    UnlockNeighborhood(&neighborhood);
+    UnlockAdjacentRows(&neighborhood);
     return star::migration_result::FAIL_ALREADY_IN_CXL;
   }
   const uint64_t payload_bytes = fixed_value_size_;
@@ -938,7 +936,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
                     AllocationDomain::kSharedPayloadSwcc, owner_shard_,
                     owner_shard_);
     }
-    UnlockNeighborhood(&neighborhood);
+    UnlockAdjacentRows(&neighborhood);
     return star::migration_result::FAIL_OOM;
   }
   auto *payload = new (payload_mem) star::TwoPLPashaSharedDataSCC;
@@ -967,7 +965,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     if (smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
       smeta->clear_write_locked();
       smeta->unlock();
-      UnlockNeighborhood(&neighborhood);
+      UnlockAdjacentRows(&neighborhood);
       regions_.Free(smeta_mem, sizeof(star::TwoPLPashaMetadataShared),
                     AllocationDomain::kHwccMetadata, owner_shard_,
                     owner_shard_);
@@ -984,7 +982,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     if (inc_ref_cnt) smeta->decrement_ref_cnt();
     smeta->clear_write_locked();
     smeta->unlock();
-    UnlockNeighborhood(&neighborhood);
+    UnlockAdjacentRows(&neighborhood);
     regions_.Free(smeta_mem, sizeof(star::TwoPLPashaMetadataShared),
                   AllocationDomain::kHwccMetadata, owner_shard_,
                   owner_shard_);
@@ -1004,8 +1002,8 @@ star::migration_result KVPartition::MoveInForMigrationManager(
                                   fixed_value_size_);
   migration_policy_meta = &smeta->migration_policy_meta;
   smeta->unlock();
-  RefreshAdjacencyLocked(neighborhood);
-  UnlockNeighborhood(&neighborhood);
+  ApplySharedAdjacency(neighborhood);
+  UnlockAdjacentRows(&neighborhood);
   mem_access::DelayActiveScopeNow();
   smeta->lock();
   smeta->clear_write_locked();
@@ -1039,7 +1037,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
       [&](const void *prev_key, void *prev_meta, void *prev_data,
           const void *cur_key, void *cur_meta, void *cur_data,
           const void *next_key, void *next_meta, void *next_data) {
-        Neighborhood neighborhood;
+        AdjacentRows neighborhood;
         const auto fill = [&](const void *row_key, void *row_meta,
                               void *row_data, bool *present, RowRef *row) {
           if (row_key == nullptr || row_meta == nullptr || row_data == nullptr)
@@ -1065,16 +1063,16 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   auto *private_value = neighborhood.current.value;
   auto *metadata = neighborhood.current.metadata;
   if (!metadata->is_migrated || metadata->migrated_smeta_off == kNullOffset) {
-    UnlockNeighborhood(&neighborhood);
+    UnlockAdjacentRows(&neighborhood);
     return false;
   }
   const RegionOffset smeta_offset = metadata->migrated_smeta_off;
   RegionOffset indexed = kNullOffset;
   if (!shared_tree_->lookup(fixed_key, indexed) || indexed != smeta_offset) {
-    UnlockNeighborhood(&neighborhood);
+    UnlockAdjacentRows(&neighborhood);
     return false;
   }
-  BreakAdjacencyLocked(neighborhood);
+  ClearSharedAdjacency(neighborhood);
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(smeta_offset));
   smeta->lock();
@@ -1082,8 +1080,8 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
       smeta->is_write_locked()) {
     smeta->unlock();
-    RefreshAdjacencyLocked(neighborhood);
-    UnlockNeighborhood(&neighborhood);
+    ApplySharedAdjacency(neighborhood);
+    UnlockAdjacentRows(&neighborhood);
     return false;
   }
   smeta->set_write_locked();
@@ -1091,8 +1089,8 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index)) {
     smeta->clear_write_locked();
     smeta->unlock();
-    RefreshAdjacencyLocked(neighborhood);
-    UnlockNeighborhood(&neighborhood);
+    ApplySharedAdjacency(neighborhood);
+    UnlockAdjacentRows(&neighborhood);
     return false;
   }
   if (smeta->is_data_modified_since_moved_in()) {
@@ -1122,13 +1120,13 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
     RecordPrivateMetadataWrite(metadata);
     smeta->clear_write_locked();
     smeta->unlock();
-    RefreshAdjacencyLocked(neighborhood);
-    UnlockNeighborhood(&neighborhood);
+    ApplySharedAdjacency(neighborhood);
+    UnlockAdjacentRows(&neighborhood);
     return false;
   }
   const RegionOffset clock_row_off = neighborhood.current.offset;
-  RefreshAdjacencyLocked(neighborhood);
-  UnlockNeighborhood(&neighborhood);
+  ApplySharedAdjacency(neighborhood);
+  UnlockAdjacentRows(&neighborhood);
   ClockLock();
   ClockUntrackRowOffset(clock_row_off);
   ClockUnlock();
@@ -1493,7 +1491,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
           const FixedKey *cur_key, RegionOffset *cur_off,
           const FixedKey *next_key, RegionOffset *next_off) {
         if (cur_key == nullptr || cur_off == nullptr) return false;
-        Neighborhood neighborhood;
+        AdjacentRows neighborhood;
         const auto fill = [&](const FixedKey *row_key, RegionOffset *row_off,
                               bool *present, RowRef *row) {
           if (row_key == nullptr || row_off == nullptr) return;
@@ -1511,14 +1509,14 @@ bool KVPartition::DeletePrivateForMigrationManager(
         if (neighborhood.has_prev) LockRow(neighborhood.prev.metadata);
         if (neighborhood.has_current) LockRow(neighborhood.current.metadata);
         if (neighborhood.has_next) LockRow(neighborhood.next.metadata);
-        const auto unlock = [&] { UnlockNeighborhood(&neighborhood); };
+        const auto unlock = [&] { UnlockAdjacentRows(&neighborhood); };
         auto *private_value = neighborhood.current.value;
         auto *metadata = neighborhood.current.metadata;
         if (!metadata->is_valid) {
           unlock();
           return false;
         }
-        BreakAdjacencyLocked(neighborhood);
+        ClearSharedAdjacency(neighborhood);
         metadata->is_valid = false;
         RecordPrivateMetadataWrite(metadata);
         if (metadata->scc_data_off != kNullOffset) {
@@ -1527,7 +1525,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
           if (!regions_.IsSwccAddress(retired_payload)) {
             metadata->is_valid = true;
             RecordPrivateMetadataWrite(metadata);
-            RefreshAdjacencyLocked(neighborhood);
+            ApplySharedAdjacency(neighborhood);
             failure = DeleteFailure::kCorruption;
             failure_detail = "delete has cached SCC payload outside SWCC";
             unlock();
@@ -1540,7 +1538,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
               !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
             metadata->is_valid = true;
             RecordPrivateMetadataWrite(metadata);
-            RefreshAdjacencyLocked(neighborhood);
+            ApplySharedAdjacency(neighborhood);
             failure = DeleteFailure::kCorruption;
             failure_detail = "migrated delete has inconsistent shared offset";
             unlock();
@@ -1554,7 +1552,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
             smeta->unlock();
             metadata->is_valid = true;
             RecordPrivateMetadataWrite(metadata);
-            RefreshAdjacencyLocked(neighborhood);
+            ApplySharedAdjacency(neighborhood);
             failure = DeleteFailure::kCorruption;
             failure_detail = "migrated row payload disagrees with local cache";
             unlock();
@@ -1565,7 +1563,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
             smeta->unlock();
             metadata->is_valid = true;
             RecordPrivateMetadataWrite(metadata);
-            RefreshAdjacencyLocked(neighborhood);
+            ApplySharedAdjacency(neighborhood);
             failure = DeleteFailure::kBusy;
             failure_detail = "delete shared-row busy";
             unlock();
@@ -1579,7 +1577,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
             smeta->unlock();
             metadata->is_valid = true;
             RecordPrivateMetadataWrite(metadata);
-            RefreshAdjacencyLocked(neighborhood);
+            ApplySharedAdjacency(neighborhood);
             failure = DeleteFailure::kCorruption;
             failure_detail = "shared tree remove failed during delete";
             unlock();
@@ -1597,9 +1595,9 @@ bool KVPartition::DeletePrivateForMigrationManager(
         }
         metadata->scc_data_off = kNullOffset;
         RecordPrivateMetadataWrite(metadata);
-        Neighborhood remaining = neighborhood;
+        AdjacentRows remaining = neighborhood;
         remaining.has_current = false;
-        RefreshAdjacencyLocked(remaining);
+        ApplySharedAdjacency(remaining);
         retired_value = private_value;
         retired_metadata = metadata;
         unlock();
