@@ -1645,14 +1645,43 @@ bool KVPartition::ScanLocalPartition(
         } else if (migrated) {
           LockRow(metadata);
           const RegionOffset smeta_offset = metadata->migrated_smeta_off;
-          const bool valid = metadata->is_valid && smeta_offset != kNullOffset &&
+          const bool has_locator = smeta_offset != kNullOffset &&
               regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset));
-          auto *smeta = valid
+          auto *smeta = has_locator
               ? static_cast<star::TwoPLPashaMetadataShared *>(
                     regions_.hwcc().FromOffset(smeta_offset))
               : nullptr;
+          bool valid = false;
+          if (smeta != nullptr) {
+            auto *scc_data = smeta->get_scc_data();
+            smeta->lock();
+            // Keep the original migrated read-lock refresh before judging the
+            // owner-local valid mirror.  A remote insert publishes validity
+            // in smeta; its first owner scan must consume that existing dirty
+            // notification just as the original read_lock path does.
+            star::scc_manager->prepare_read(smeta, owner_shard_, scc_data,
+                                            fixed_value_size_);
+            if (smeta->is_data_modified_since_moved_in()) {
+              valid = smeta->get_flag(
+                  star::TwoPLPashaMetadataShared::valid_flag_index);
+              if (valid) {
+                metadata->is_valid = true;
+                metadata->tid = smeta->tid;
+                star::scc_manager->do_read(nullptr, owner_shard_,
+                                           private_value->data, scc_data->data,
+                                           fixed_value_size_);
+                mem_access::PrivateWrite(private_value->data,
+                                         fixed_value_size_);
+                RecordPrivateMetadataWrite(metadata);
+                smeta->clear_is_data_modified_since_moved_in();
+              }
+            } else {
+              valid = metadata->is_valid;
+            }
+            smeta->unlock();
+          }
           UnlockRow(metadata);
-          if (smeta == nullptr || !star::TwoPLPashaHelper::kv_shared_scan_read_lock(
+          if (!valid || !star::TwoPLPashaHelper::kv_shared_scan_read_lock(
                   smeta, owner_shard_, fixed_value_size_, &row.shared_data)) {
             scan_success = false;
             stop = true;
