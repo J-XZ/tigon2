@@ -377,6 +377,11 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
     // Reattach after Ready observes the immutable layout only.  Re-running
     // owner initialization here would publish a second root.
     engine->pool_->allocator().WaitUntilReady();
+    // The dynamic arena controls persist in this owner's private SWCC, but
+    // their RegionAllocator handles are process-local.  Reconstruct only the
+    // attaching owner's handles; never initialize or bind another owner's
+    // private allocator from this VM.
+    engine->pool_->allocator().BindOwnerPrivateAllocators(config.node_id);
   }
 
   // Regular non-owning handles are reconstructed only after Ready made every

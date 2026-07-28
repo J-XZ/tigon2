@@ -242,8 +242,13 @@ int main() {
     close(late_fd);
     auto late_config = ConfigFor(late_template, 2, 0);
     late_config.sync_timeout_sec = 1;
-    auto peer = JoiningPeer(ConfigFor(late_template, 2, 1));
-    auto engine = tigonkv::engine::KVEngine::Open(late_config, true);
+    std::unique_ptr<tigonkv::engine::KVEngine> engine;
+    {
+      // This case injects the response itself.  Join owner startup first, then
+      // stop the peer so no real response races the synthetic late response.
+      auto peer = JoiningPeer(ConfigFor(late_template, 2, 1));
+      engine = tigonkv::engine::KVEngine::Open(late_config, true);
+    }
     std::string remote_key;
     for (uint32_t i = 0; i < 1000; ++i) {
       remote_key = "late-resp-" + std::to_string(i);
