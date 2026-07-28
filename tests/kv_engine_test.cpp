@@ -474,9 +474,14 @@ int main() {
   assert(ring_latency_fd >= 0);
   close(ring_latency_fd);
   {
-    auto engine =
-        tigonkv::engine::KVEngine::Open(
-            ConfigFor(ring_latency_template, 2, 0), true);
+    std::unique_ptr<tigonkv::engine::KVEngine> engine;
+    {
+      // This direct ring test needs both owner-private arenas initialized,
+      // but no live peer is allowed to consume ring 1.
+      auto peer = JoiningPeer(ConfigFor(ring_latency_template, 2, 1));
+      engine = tigonkv::engine::KVEngine::Open(
+          ConfigFor(ring_latency_template, 2, 0), true);
+    }
     void *root = nullptr;
     star::CXLMemory::wait_and_retrieve_cxl_shared_data(
         star::CXLMemory::cxl_transport_root_index, &root);
@@ -709,7 +714,14 @@ int main() {
   auto node_one_config = ConfigFor(routed_path, 2, 1);
   node_one_config.foreground_worker_count_per_vm = 4;
   {
-    auto engine = tigonkv::engine::KVEngine::Open(node_zero, true);
+    std::unique_ptr<tigonkv::engine::KVEngine> engine;
+    {
+      // The later child is the real peer for this test.  It cannot join until
+      // after the parent has seeded the owner-0 state, so use a short-lived
+      // owner only to satisfy first-layout initialization.
+      auto bootstrap = JoiningPeer(node_one_config);
+      engine = tigonkv::engine::KVEngine::Open(node_zero, true);
+    }
     assert(star::CXLMemory::bound_owner_shard() == 0);
     for (const std::string_view key : {"H-route", "a-route"}) {
       const uint32_t partition = engine->PartitionForKey(key);
@@ -1066,7 +1078,11 @@ int main() {
       node0_cfg.foreground_worker_count_per_vm = 2;
       auto node1_cfg = ConfigFor(hist_path, 2, 1);
       node1_cfg.foreground_worker_count_per_vm = 2;
-      auto engine0 = tigonkv::engine::KVEngine::Open(node0_cfg, true);
+      std::unique_ptr<tigonkv::engine::KVEngine> engine0;
+      {
+        auto bootstrap = JoiningPeer(node1_cfg);
+        engine0 = tigonkv::engine::KVEngine::Open(node0_cfg, true);
+      }
 
       const std::string owned0 = "H-hist-owner0";
       const std::string owned1 = "a-hist-owner1";
