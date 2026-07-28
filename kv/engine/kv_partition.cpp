@@ -1596,75 +1596,116 @@ std::string KVPartition::KeyString(const FixedKey &key) const {
 bool KVPartition::ScanOwned(
     std::string_view start_key, uint64_t limit,
     std::vector<std::pair<std::string, std::string>> *items,
-    const std::function<void()> *progress, std::string_view inclusive_max) const {
+    std::string_view inclusive_max) const {
   EnterEbr();
   if (items == nullptr) throw std::invalid_argument("null partition scan output");
-  // Original local TwoPLPasha scan walks the owner table, not the CXL index.
-  // Our private tree retains one locator for every migrated row, so following
-  // is_migrated under that row's lock gives one authority without a dual-tree
-  // merge or migration-sequence retry.
-  FixedKey high{};
-  if (inclusive_max.empty())
-    std::memset(high.bytes, 0xff, sizeof(high.bytes));
-  else
-    high = MakeKey(inclusive_max);
-  items->clear();
-  FixedKey low = MakeKey(start_key);
-  bool left_inclusive = true;
-  for (;;) {
-    if (limit != 0 && items->size() >= limit) break;
-    const uint64_t remaining =
-        limit == 0 ? 0 : static_cast<uint64_t>(limit - items->size());
-    const uint32_t fetch =
-        remaining > std::numeric_limits<uint32_t>::max()
-            ? 0
-            : static_cast<uint32_t>(remaining);
-    std::vector<PrivateTree::KeyValuePair> rows;
-    private_tree_->scan(low, high, left_inclusive, true, fetch, rows);
-    if (rows.empty()) break;
-    for (const auto &entry : rows) {
-      if (IsInternalMaxSentinel(entry.first)) break;
-      auto *private_value = ValueFromOffset(entry.second.row);
-      auto *metadata = MetadataFromValue(private_value);
-      {
-        LockRow(metadata);
-        if (!metadata->is_valid) {
-          UnlockRow(metadata);
-          continue;
-        }
-        std::string value;
-        bool read = true;
-        if (!metadata->is_migrated) {
-          value.assign(private_value->data, fixed_value_size_);
-          mem_access::PrivateRead(
-              private_value->data, fixed_value_size_);
-        } else {
-          auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-              regions_.hwcc().FromOffset(metadata->migrated_smeta_off));
-          value.resize(fixed_value_size_);
-          read = star::TwoPLPashaHelper::kv_shared_read_value(
-              smeta, owner_shard_, value.data(), value.size(),
-              star::TwoPLPashaHelper::KvSharedRefMode::kOwnerLocalLatch);
-        }
-        UnlockRow(metadata);
-        if (read) {
-          items->emplace_back(KeyString(entry.first), std::move(value));
-        } else {
-          // A shared-row lock conflict is ordinary operation contention.  Do
-          // not add a Scan-local deadline/retry policy; the facade retries the
-          // logical Scan as a whole.
-          return false;
-        }
-      }
-      if (limit != 0 && items->size() >= limit) break;
+  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
+  if (table == nullptr)
+    throw std::runtime_error("owner scan table is unavailable");
+  const FixedKey min_key = MakeKey(start_key);
+  FixedKey max_key{};
+  if (inclusive_max.empty()) std::memset(max_key.bytes, 0xff, sizeof(max_key.bytes));
+  else max_key = MakeKey(inclusive_max);
+
+  // One scan fragment retains each original read lock through the right
+  // boundary, then copies values and releases together.  The only adaptation
+  // is resolving owner-private offsets back into transient row views.
+  struct HeldRow {
+    FixedKey key{};
+    PrivateMetadataLocal *private_metadata = nullptr;
+    star::TwoPLPashaMetadataShared *shared_metadata = nullptr;
+    star::TwoPLPashaSharedDataSCC *shared_data = nullptr;
+    std::string private_value;
+    bool output = false;
+  };
+  std::vector<HeldRow> held;
+  const auto release_all = [&] {
+    for (auto it = held.rbegin(); it != held.rend(); ++it) {
+      if (it->private_metadata != nullptr)
+        star::TwoPLPashaHelper::read_lock_release(*it->private_metadata);
+      if (it->shared_metadata != nullptr)
+        star::TwoPLPashaHelper::kv_shared_scan_read_unlock(it->shared_metadata);
     }
-    if (progress != nullptr) (*progress)();
-    if (limit == 0 || (limit != 0 && items->size() >= limit) ||
-        rows.size() < fetch)
-      break;
-    low = rows.back().first;
-    left_inclusive = false;
+    held.clear();
+  };
+
+  items->clear();
+  bool scan_success = true;
+  bool stop = false;
+  uint64_t output_count = 0;
+  table->scan(&min_key,
+      [&](const void *raw_key, std::atomic<uint64_t> * /*meta_slot*/,
+          void *data, bool is_last_tuple) -> bool {
+        if (stop) return true;
+        const auto &key = *static_cast<const FixedKey *>(raw_key);
+        if (key.Compare(min_key) < 0) return false;
+        const bool boundary = is_last_tuple ||
+            (limit != 0 && output_count == limit) || key.Compare(max_key) > 0;
+        auto *private_value = reinterpret_cast<PrivateValueStruct *>(
+            static_cast<char *>(data) - sizeof(PrivateValueStruct));
+        auto *metadata = MetadataFromValue(private_value);
+        HeldRow row;
+        row.key = key;
+        row.output = !boundary && !IsInternalMaxSentinel(key);
+        bool local_read = false;
+        bool migrated = false;
+        row.private_value.resize(fixed_value_size_);
+        star::TwoPLPashaHelper::take_read_lock_and_read(
+            *metadata, private_value->data, row.private_value.data(),
+            row.private_value.size(), local_read, &migrated);
+        if (local_read) {
+          mem_access::PrivateRead(private_value->data, fixed_value_size_);
+          row.private_metadata = metadata;
+        } else if (migrated) {
+          LockRow(metadata);
+          const RegionOffset smeta_offset = metadata->migrated_smeta_off;
+          const bool valid = metadata->is_valid && smeta_offset != kNullOffset &&
+              regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset));
+          auto *smeta = valid
+              ? static_cast<star::TwoPLPashaMetadataShared *>(
+                    regions_.hwcc().FromOffset(smeta_offset))
+              : nullptr;
+          UnlockRow(metadata);
+          if (smeta == nullptr || !star::TwoPLPashaHelper::kv_shared_scan_read_lock(
+                  smeta, owner_shard_, fixed_value_size_, &row.shared_data)) {
+            scan_success = false;
+            stop = true;
+            return true;
+          }
+          row.shared_metadata = smeta;
+        } else {
+          // A deleted row or lock conflict is a failed original scan
+          // primitive.  The single facade Busy retry decides whether to retry.
+          scan_success = false;
+          stop = true;
+          return true;
+        }
+        held.push_back(std::move(row));
+        if (boundary) {
+          stop = true;
+          return true;
+        }
+        if (row.output) ++output_count;
+        return false;
+      });
+  if (!scan_success) {
+    release_all();
+    return false;
   }
+  for (auto &row : held) {
+    if (!row.output) continue;
+    std::string value;
+    if (row.shared_metadata != nullptr) {
+      value.resize(fixed_value_size_);
+      mem_access::SharedPayloadRead(row.shared_data->data, value.size());
+      star::scc_manager->do_read(row.shared_metadata, owner_shard_, value.data(),
+                                 row.shared_data->data, value.size());
+    } else {
+      value = std::move(row.private_value);
+    }
+    items->emplace_back(KeyString(row.key), std::move(value));
+  }
+  release_all();
   return true;
 }
 

@@ -141,7 +141,6 @@ class KVPartition {
   // for non-owned partitions.
   bool ScanOwned(std::string_view start_key, uint64_t limit,
                  std::vector<std::pair<std::string, std::string>> *items,
-                 const std::function<void()> *progress = nullptr,
                  std::string_view inclusive_max = {}) const;
   // Thin CXLTable::scan-style entry: shared_tree_->scanForUpdate only.
   // Processor returns true to stop (BTreeOLC_CXL end semantics). Adapter does

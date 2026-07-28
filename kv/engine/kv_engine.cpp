@@ -764,9 +764,8 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
     Status status;
     if (OwnerForPartition(partition_id) == config_.node_id) {
       std::vector<std::pair<std::string, std::string>> items;
-      const std::function<void()> progress = [this] { PollTransport(); };
       const bool ok = partitions_[partition_id]->ScanOwned(
-          min_key, remaining, &items, &progress, inclusive_max);
+          min_key, remaining, &items, inclusive_max);
       ++TlsScanDiag.partition_probes;
       PollTransport();
       status = ok ? Status::Ok()
