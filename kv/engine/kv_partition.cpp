@@ -1804,18 +1804,40 @@ bool KVPartition::PrivatePredecessorKey(
 
 bool KVPartition::DeletePrivate(std::string_view key) {
   EnterEbr();
-  // Call the partition delete path directly so Busy throws propagate to the
-  // engine. PolicyClock::delete_specific_row_and_move_out is only a thin
-  // trampoline that would otherwise mask failures as false (§10.2b).
+  const FixedKey fixed_key = MakeKey(key);
+  RegionOffset row_offset = kNullOffset;
+  if (!LookupPrivateOffset(fixed_key, &row_offset)) return false;
+  auto *value = ValueFromOffset(row_offset);
+  OwnerNextRowLock row_lock;
+  if (!AcquireOwnerNextRowWriteLock(value, &row_lock)) {
+    auto *metadata = MetadataFromValue(value);
+    LockRow(metadata);
+    const bool valid = metadata->is_valid;
+    UnlockRow(metadata);
+    if (!valid) return false;
+    throw std::runtime_error("private delete busy");
+  }
+
+  // Match the original read-and-delete order: take the write lock first,
+  // then let the PolicyClock callback consume it with the deleted row.  The
+  // successful callback retires the row, so it must not be released again.
   bool need_untrack = false;
   void *migration_policy_meta = nullptr;
-  return DeletePrivateForMigrationManager(
-      key, &need_untrack, &migration_policy_meta);
+  try {
+    const bool deleted = DeletePrivateForMigrationManager(
+        key, &need_untrack, &migration_policy_meta, true);
+    if (!deleted)
+      ReleaseOwnerNextRowWriteLock(row_lock, 0, false);
+    return deleted;
+  } catch (...) {
+    ReleaseOwnerNextRowWriteLock(row_lock, 0, false);
+    throw;
+  }
 }
 
 bool KVPartition::DeletePrivateForMigrationManager(
     std::string_view key, bool *need_untrack,
-    void **migration_policy_meta) {
+    void **migration_policy_meta, bool writer_prelocked) {
   EnterEbr();
   if (need_untrack == nullptr || migration_policy_meta == nullptr)
     throw std::invalid_argument("null Clock delete output");
@@ -1907,7 +1929,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
             return false;
           }
           if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
-              smeta->is_write_locked()) {
+              (!writer_prelocked && smeta->is_write_locked())) {
             smeta->unlock();
             metadata->is_valid = true;
             RecordPrivateMetadataWrite(metadata);
@@ -1917,7 +1939,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
             unlock();
             return false;
           }
-          smeta->set_write_locked();
+          if (!writer_prelocked) smeta->set_write_locked();
           smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
           if (!shared_tree_->remove(fixed_key)) {
             smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);

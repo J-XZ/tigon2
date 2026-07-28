@@ -94,7 +94,7 @@ class KVPartition {
   // PolicyClock callback. The caller holds this partition's Clock tracker.
   bool DeletePrivateForMigrationManager(
       std::string_view key, bool *need_untrack,
-      void **migration_policy_meta);
+      void **migration_policy_meta, bool writer_prelocked = false);
   bool CompareExchangePrivate(std::string_view key, std::string_view expected,
                               std::string_view desired, bool *exchanged,
                               bool *inserted = nullptr);
