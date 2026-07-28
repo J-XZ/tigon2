@@ -87,6 +87,22 @@ struct TreeNodeAllocation {
 
 inline thread_local bool TreeAccessIsHwcc = true;
 
+// A tree's allocation binding, not the last node visited by this thread,
+// determines the memory domain. Nested private/shared operations restore the
+// outer domain on return so an outer leaf unlock cannot be charged as HWCC.
+class TreeAccessScope {
+ public:
+  explicit TreeAccessScope(const TreeNodeAllocation &allocation)
+      : previous_(TreeAccessIsHwcc) {
+    TreeAccessIsHwcc =
+        allocation.domain != tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc;
+  }
+  ~TreeAccessScope() { TreeAccessIsHwcc = previous_; }
+
+ private:
+  bool previous_;
+};
+
 inline void RecordTreeDataRead(const void *address, uint64_t bytes) {
 	if (TreeAccessIsHwcc)
 		tigonkv::engine::mem_access::HwccRead(address, bytes);
@@ -128,8 +144,6 @@ inline void RecordTreeAtomicRmw(const void *address) {
 inline void RecordTreeAccess(const TreeNodeAllocation &allocation, const void *page,
                              bool write) {
 	if (page == nullptr) return;
-	TreeAccessIsHwcc =
-	    allocation.domain != tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc;
 	constexpr uint64_t kNodeMetadataBytes = 64;
 	if (allocation.domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc) {
 		if (write) tigonkv::engine::mem_access::PrivateWrite(page, kNodeMetadataBytes);
@@ -1569,6 +1583,7 @@ class BPlusTree {
 		, keyUnique_(isUnique)
 		, allocation_(allocation)
 	{
+		TreeAccessScope access_scope(allocation_);
 		char *base = reinterpret_cast<char *>(allocation_.Allocate(LeafPageSize));
 		store_root(new (base) BTreeLeaf()); // Placement new
 		stats_.leaf_nodes++;
@@ -1584,6 +1599,7 @@ class BPlusTree {
 		, keyUnique_(isUnique)
 		, allocation_(allocation)
 	{
+		TreeAccessScope access_scope(allocation_);
 		if (persisted_root == nullptr) {
 			throw std::invalid_argument("BPlusTree attach requires a persisted root");
 		}
@@ -1595,6 +1611,7 @@ class BPlusTree {
 	// visible-root semantics). Private trees leave published_root_ null.
 	void bind_published_root(std::atomic<tigonkv::engine::RegionOffset> *slot)
 	{
+		TreeAccessScope access_scope(allocation_);
 		if (slot == nullptr)
 			throw std::invalid_argument("BPlusTree published root slot is null");
 		tigonkv::engine::mem_access::HwccAtomicLoad(slot);
@@ -1618,6 +1635,7 @@ class BPlusTree {
 
 	void makeRoot(const KeyType &k, NodeBase *leftChild, NodeBase *rightChild)
 	{
+		TreeAccessScope access_scope(allocation_);
 		char *base = reinterpret_cast<char *>(allocation_.Allocate(InnerPageSize));
 		auto inner = new (base) BTreeInner(); // Placement new
 		RecordTreeAccess(allocation_, inner, true);
@@ -1853,6 +1871,7 @@ class BPlusTree {
 	 */
 	bool insert(const KeyType &k, const ValueType &v)
 	{
+		TreeAccessScope access_scope(allocation_);
 		int restartCount = 0;
 restart:
 		// need yield CPU when come here at second time
@@ -2017,6 +2036,7 @@ restart:
 	 */
 	ValueType insert(const KeyType &k, const ValueType &v, bool *result)
 	{
+		TreeAccessScope access_scope(allocation_);
 		int restartCount = 0;
 restart:
 		// need yield CPU when come here at second time
@@ -2355,6 +2375,7 @@ restart:
 	 */
 	btreeolc_cxl::RemoveResult remove(const KeyType &key, std::function<btreeolc_cxl::RemovePredicateResult(const ValueType &)> value_predicate)
 	{
+		TreeAccessScope access_scope(allocation_);
 		ValueType v;
 		return _remove_with_value_predicate(std::make_pair(key, v), value_predicate);
 	}
@@ -2365,6 +2386,7 @@ restart:
 	 */
 	bool remove(const KeyType &key)
 	{
+		TreeAccessScope access_scope(allocation_);
 		return _remove(key);
 	}
 
@@ -2374,6 +2396,7 @@ restart:
 	 */
 	bool remove(const KeyType &key, ValueType value)
 	{
+		TreeAccessScope access_scope(allocation_);
 		return _remove(key);
 	}
 
@@ -2391,6 +2414,7 @@ restart:
 	 */
 	void scan(const KeyType &lowKey, const KeyType &highKey, bool leftExist, bool rightExist, uint32_t limit, std::vector<KeyValuePair> &res)
 	{
+		TreeAccessScope access_scope(allocation_);
 		int restartCount = 0;
 restart:
 		res.clear();
@@ -2488,6 +2512,7 @@ restart:
 	 */
 	void scanForUpdate(const KeyType &startKey, std::function<bool(const KeyType &, ValueType &, bool)> processor)
 	{
+		TreeAccessScope access_scope(allocation_);
 		bool leftExist = true;
 		int restartCount = 0;
 		int leavesTraversed = 0;
@@ -2840,6 +2865,7 @@ restart:
 	 */
 	bool lookup(const KeyType &key, ValueType &result)
 	{
+		TreeAccessScope access_scope(allocation_);
 		return _lookup(key, result);
 	}
 
@@ -2854,6 +2880,7 @@ restart:
 	 */
 	bool lookupAdjacent(const KeyType &key, AdjacentResult &result)
 	{
+		TreeAccessScope access_scope(allocation_);
 		int restartCount = 0;
 		for (;;) {
 			if (restartCount++)
@@ -3013,6 +3040,7 @@ restart:
 	 */
 	bool lookupForUpdate(const KeyType &key, std::function<void(const KeyType &key, ValueType &value)> update_processor)
 	{
+		TreeAccessScope access_scope(allocation_);
 		return _lookupForUpdate(key, update_processor);
 	}
 
@@ -3023,6 +3051,7 @@ restart:
 	 */
 	bool lookup(const KeyType &key, const ValueType &value, ValueType &result)
 	{
+		TreeAccessScope access_scope(allocation_);
 		return _lookup({ key, value }, result, false);
 	}
 
