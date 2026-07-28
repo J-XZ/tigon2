@@ -259,6 +259,8 @@ class KVPartition {
                                           std::string_view value,
                                           OwnerNextRowLock *locked_row);
   bool PublishOwnerPlaceholder(const FixedKey &key, uint64_t commit_tid);
+  bool CreatePrivateWithOwnerInsert(const FixedKey &key,
+                                    std::string_view value);
   void FreeUnpublishedPrivateValue(PrivateValueStruct *value);
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;

@@ -470,6 +470,21 @@ bool KVPartition::PublishOwnerPlaceholder(const FixedKey &key,
   return true;
 }
 
+bool KVPartition::CreatePrivateWithOwnerInsert(const FixedKey &key,
+                                               std::string_view value) {
+  OwnerNextRowLock next_row;
+  if (!InsertOwnerPlaceholderWithNextLock(key, value, &next_row)) return false;
+  const uint64_t commit_tid = star::TwoPLPashaHelper::kv_next_commit_tid(
+      next_row.observed_tid);
+  if (!PublishOwnerPlaceholder(key, commit_tid)) {
+    ReleaseOwnerNextRowWriteLock(next_row, 0, false);
+    throw std::runtime_error("owner insert placeholder publication failed");
+  }
+  ReleaseOwnerNextRowWriteLock(next_row, commit_tid, true);
+  PersistPrivateRootIfChanged();
+  return true;
+}
+
 void KVPartition::FreeUnpublishedPrivateValue(PrivateValueStruct *value) {
   if (value == nullptr) return;
   auto *metadata = MetadataFromValue(value);
@@ -576,22 +591,13 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       RecordPrivateMetadataWrite(metadata);
       return false;
     }
-    OwnerNextRowLock next_row;
-    if (!InsertOwnerPlaceholderWithNextLock(fixed_key, value, &next_row)) {
+    if (!CreatePrivateWithOwnerInsert(fixed_key, value)) {
       // The original insert helper leaves no placeholder when it cannot lock
       // the successor or loses the tree create race.  The KV facade owns the
       // bounded Busy retry, so re-resolve the key here without a second
       // create protocol.
       continue;
     }
-    const uint64_t commit_tid = star::TwoPLPashaHelper::kv_next_commit_tid(
-        next_row.observed_tid);
-    if (!PublishOwnerPlaceholder(fixed_key, commit_tid)) {
-      ReleaseOwnerNextRowWriteLock(next_row, 0, false);
-      throw std::runtime_error("owner insert placeholder publication failed");
-    }
-    ReleaseOwnerNextRowWriteLock(next_row, commit_tid, true);
-    PersistPrivateRootIfChanged();
     return true;
   }
 }
@@ -918,18 +924,14 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   const FixedKey fixed_key = MakeKey(key);
   if (!LookupPrivateOffset(fixed_key, &row_offset)) {
     if (!expected.empty()) return false;
-    {
-      auto *private_value = AllocateValue(desired);
-      if (InsertPrivateValue(fixed_key, private_value)) {
-        PersistPrivateRootIfChanged();
-        *exchanged = true;
-        if (inserted != nullptr) *inserted = true;
-        return true;
-      }
-      FreeUnpublishedPrivateValue(private_value);
+    if (CreatePrivateWithOwnerInsert(fixed_key, desired)) {
+      *exchanged = true;
+      if (inserted != nullptr) *inserted = true;
+      return true;
     }
     // Loser of create race: re-resolve the winner and compare expected.
-    if (!LookupPrivateOffset(fixed_key, &row_offset)) return false;
+    if (!LookupPrivateOffset(fixed_key, &row_offset))
+      throw std::runtime_error("private CAS create busy");
   }
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
@@ -994,18 +996,14 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
     std::string encoded;
     if (!EncodeCanonicalFixedDecimal(delta, fixed_value_size_, &encoded))
       throw std::invalid_argument("increment value exceeds fixed value size");
-    {
-      auto *private_value = AllocateValue(encoded);
-      if (InsertPrivateValue(fixed_key, private_value)) {
-        PersistPrivateRootIfChanged();
-        *value = delta;
-        if (inserted != nullptr) *inserted = true;
-        return true;
-      }
-      FreeUnpublishedPrivateValue(private_value);
+    if (CreatePrivateWithOwnerInsert(fixed_key, encoded)) {
+      *value = delta;
+      if (inserted != nullptr) *inserted = true;
+      return true;
     }
     // Loser of create race: apply delta on the published row (§10.9).
-    if (!LookupPrivateOffset(fixed_key, &row_offset)) return false;
+    if (!LookupPrivateOffset(fixed_key, &row_offset))
+      throw std::runtime_error("private increment create busy");
   }
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
