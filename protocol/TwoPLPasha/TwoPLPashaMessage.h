@@ -373,6 +373,7 @@ class TwoPLPashaMessageHandler {
 		DCHECK(dec.size() == 0);
 
                 move_in_scan_range(table, min_key, max_key, limit);
+                success = true;
 
 		// prepare response message header
 		auto message_size = MessagePiece::get_header_size() + sizeof(success) + sizeof(key_offset);
