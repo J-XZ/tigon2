@@ -47,10 +47,13 @@ SCC、Clock/MigrationManager 和 EBR；不要把它重写成另一套 KV。
 
 ## 不可违反的正确性边界
 
-- HWCC 承担跨 VM 同步；所有跨 VM latch/ref/state/root 必须使用正确的原子、
-  锁和 `mem_access` wrapper。
-- shared SWCC 不具备跨 VM CPU cache coherence或原子性；跨节点同步字段不得
-  放在其中，shared payload只能经SCC状态、flush/invalidate和HWCC元数据保护。
+- HWCC承担未由SCC保护的跨VM同步；latch/ref/root、Clock second chance和
+  adjacency必须使用正确的原子、锁和`mem_access` wrapper。原
+  TwoPLPasha的tid/valid可继续留在shared SWCC，但只能和payload一起严格走
+  SCC prepare/finish/flush，不能裸读写。
+- shared SWCC 不具备跨 VM CPU cache coherence或原子性；除原SCC保护的
+  tid/valid/row image外，不得放跨节点同步字段。该row image只能经SCC状态、
+  flush/invalidate和HWCC smeta保护。
 - owner-private SWCC只由所属VM访问，同VM多CPU核心具备正常硬件cache coherence
   和CPU原子性；原本地OLC/atomic/spinlock应保留，仅把持久指针改为RegionOffset。
   非owner不得读取该区域，也不得给它额外套SCC或跨节点锁。
@@ -69,6 +72,8 @@ SCC、Clock/MigrationManager 和 EBR；不要把它重写成另一套 KV。
   双区域 allocator、定长 KV、单操作 Busy retry 和 wire framing 使用薄适配。
 - 不关闭 SCC、Clock、migration 或 EBR，不把范围分区改回 hash 只为提高 E，
   也不单方面修改原 Clock policy 让结果更好看。
+- 正式路径固定`model_cxl_search_overhead=false`，与master主实验一致；不能启用
+  原“without the optimization”消融来人为增加一次shared-index查询。
 - 正式 YCSB 默认：RelWithDebInfo、4VM × 4 foreground、key/value 32B、相同
   trace 和计时窗口。每 VM 还固定有 1 个 inbound demuxer；报告必须写
   `foreground=4 + demuxer=1` 并披露双方所有 service/background CPU。
