@@ -60,7 +60,7 @@ std::tuple<star::ITable::MetaDataType *, void *> KvPartitionTable::search(
     const void *key) {
   partition_->EnterEbr();
   RegionOffset offset = kNullOffset;
-  if (!partition_->private_tree_->lookup(TableKey(key), offset))
+  if (!partition_->LookupPrivateOffset(TableKey(key), &offset))
     return std::make_tuple(nullptr, nullptr);
   return Row(offset);
 }
@@ -80,8 +80,9 @@ void KvPartitionTable::scan(
   partition_->EnterEbr();
   const FixedKey &start = TableKey(min_key);
   partition_->private_tree_->scanForUpdate(
-      start, [&](const FixedKey &key, RegionOffset &offset, bool is_last) {
-        auto [meta, data] = Row(offset);
+      start, [&](const FixedKey &key, KVPartition::PrivateTreeValue &offset,
+                 bool is_last) {
+        auto [meta, data] = Row(offset.row);
         return processor(&key, meta, data, is_last);
       });
 }
@@ -93,7 +94,8 @@ bool KvPartitionTable::insert(const void *key, const void *value,
   auto *metadata = partition_->MetadataFromValue(row);
   metadata->is_valid = !is_placeholder;
   const bool inserted = partition_->private_tree_->insert(
-      TableKey(key), partition_->regions_.swcc().ToOffset(row));
+      TableKey(key), KVPartition::PrivateTreeValue{
+                         partition_->regions_.swcc().ToOffset(row)});
   if (!inserted) {
     partition_->FreeUnpublishedPrivateValue(row);
     return false;
@@ -110,12 +112,13 @@ bool KvPartitionTable::insert_lock_next_key(
   partition_->EnterEbr();
   auto *row = partition_->AllocateValue(TableValue(value, value_size_));
   partition_->MetadataFromValue(row)->is_valid = !is_placeholder;
-  const RegionOffset row_offset = partition_->regions_.swcc().ToOffset(row);
+  const KVPartition::PrivateTreeValue row_offset{
+      partition_->regions_.swcc().ToOffset(row)};
   const bool inserted = partition_->private_tree_->insert_lock_next_key(
       TableKey(key), row_offset,
-      [&](const FixedKey *next_key, RegionOffset *next_offset) {
+      [&](const FixedKey *next_key, KVPartition::PrivateTreeValue *next_offset) {
         auto [meta, data] = next_offset == nullptr ? std::make_tuple(nullptr, nullptr)
-                                                    : Row(*next_offset);
+                                                    : Row(next_offset->row);
         return processor(next_key, meta, data);
       });
   if (!inserted) {
@@ -135,17 +138,18 @@ bool KvPartitionTable::insert_and_process_adjacent_tuples(
   partition_->EnterEbr();
   auto *row = partition_->AllocateValue(TableValue(value, value_size_));
   partition_->MetadataFromValue(row)->is_valid = !is_placeholder;
-  const RegionOffset row_offset = partition_->regions_.swcc().ToOffset(row);
+  const KVPartition::PrivateTreeValue row_offset{
+      partition_->regions_.swcc().ToOffset(row)};
   const bool inserted = partition_->private_tree_->insert_and_process_adjacent_tuples(
       TableKey(key), row_offset,
-      [&](const FixedKey *prev_key, RegionOffset *prev_offset,
-          const FixedKey *next_key, RegionOffset *next_offset) {
+      [&](const FixedKey *prev_key, KVPartition::PrivateTreeValue *prev_offset,
+          const FixedKey *next_key, KVPartition::PrivateTreeValue *next_offset) {
         auto [prev_meta, prev_data] = prev_offset == nullptr
                                           ? std::make_tuple(nullptr, nullptr)
-                                          : Row(*prev_offset);
+                                          : Row(prev_offset->row);
         auto [next_meta, next_data] = next_offset == nullptr
                                           ? std::make_tuple(nullptr, nullptr)
-                                          : Row(*next_offset);
+                                          : Row(next_offset->row);
         return processor(prev_key, prev_meta, prev_data, next_key, next_meta,
                          next_data);
       });
@@ -172,18 +176,21 @@ bool KvPartitionTable::remove_and_process_adjacent_tuples(
   partition_->EnterEbr();
   const bool removed = partition_->private_tree_->remove_and_process_adjacent_keys(
       TableKey(key),
-      [&](const FixedKey *prev_key, RegionOffset *prev_offset,
-          const FixedKey *cur_key, RegionOffset *cur_offset,
-          const FixedKey *next_key, RegionOffset *next_offset) {
+      [&](const FixedKey *prev_key, KVPartition::PrivateTreeValue *prev_offset,
+          const FixedKey *cur_key, KVPartition::PrivateTreeValue *cur_offset,
+          const FixedKey *next_key, KVPartition::PrivateTreeValue *next_offset) {
         void *prev_meta = nullptr;
         void *prev_data = nullptr;
         void *cur_meta = nullptr;
         void *cur_data = nullptr;
         void *next_meta = nullptr;
         void *next_data = nullptr;
-        FillAdjacent(prev_offset, &prev_meta, &prev_data);
-        FillAdjacent(cur_offset, &cur_meta, &cur_data);
-        FillAdjacent(next_offset, &next_meta, &next_data);
+        FillAdjacent(prev_offset == nullptr ? nullptr : &prev_offset->row,
+                     &prev_meta, &prev_data);
+        FillAdjacent(cur_offset == nullptr ? nullptr : &cur_offset->row,
+                     &cur_meta, &cur_data);
+        FillAdjacent(next_offset == nullptr ? nullptr : &next_offset->row,
+                     &next_meta, &next_data);
         return processor(prev_key, prev_meta, prev_data, cur_key, cur_meta,
                          cur_data, next_key, next_meta, next_data);
       });
@@ -196,7 +203,7 @@ void KvPartitionTable::update(
     std::function<void(const void *, const void *)> on_update) {
   partition_->EnterEbr();
   RegionOffset offset = kNullOffset;
-  if (!partition_->private_tree_->lookup(TableKey(key), offset))
+  if (!partition_->LookupPrivateOffset(TableKey(key), &offset))
     throw std::runtime_error("table update missing key");
   auto *row = partition_->ValueFromOffset(offset);
   if (on_update) on_update(key, row->data);
@@ -212,18 +219,21 @@ bool KvPartitionTable::search_and_update_next_key_info(
   partition_->EnterEbr();
   return partition_->private_tree_->lookupForNextKeyUpdate(
       TableKey(key),
-      [&](const FixedKey *prev_key, RegionOffset *prev_offset,
-          const FixedKey *cur_key, RegionOffset *cur_offset,
-          const FixedKey *next_key, RegionOffset *next_offset) {
+      [&](const FixedKey *prev_key, KVPartition::PrivateTreeValue *prev_offset,
+          const FixedKey *cur_key, KVPartition::PrivateTreeValue *cur_offset,
+          const FixedKey *next_key, KVPartition::PrivateTreeValue *next_offset) {
         void *prev_meta = nullptr;
         void *prev_data = nullptr;
         void *cur_meta = nullptr;
         void *cur_data = nullptr;
         void *next_meta = nullptr;
         void *next_data = nullptr;
-        FillAdjacent(prev_offset, &prev_meta, &prev_data);
-        FillAdjacent(cur_offset, &cur_meta, &cur_data);
-        FillAdjacent(next_offset, &next_meta, &next_data);
+        FillAdjacent(prev_offset == nullptr ? nullptr : &prev_offset->row,
+                     &prev_meta, &prev_data);
+        FillAdjacent(cur_offset == nullptr ? nullptr : &cur_offset->row,
+                     &cur_meta, &cur_data);
+        FillAdjacent(next_offset == nullptr ? nullptr : &next_offset->row,
+                     &next_meta, &next_data);
         processor(prev_key, prev_meta, prev_data, cur_key, cur_meta, cur_data,
                   next_key, next_meta, next_data);
       });

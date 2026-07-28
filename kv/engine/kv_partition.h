@@ -35,13 +35,43 @@ enum class SharedAccessState : uint8_t {
 // (star::migration_manager); this class supplies the KV move-in/out callbacks.
 class KVPartition {
  public:
-  using PrivateTree = btreeolc_cxl::BPlusTree<FixedKey, RegionOffset,
-                                              FixedKeyComparator,
-                                              std::equal_to<RegionOffset>>;
-  // Shared leaf = smeta RegionOffset only (PLAN / TwoPLPasha CXL table). Length
-  // Shared leaf stores RegionOffset to HWCC smeta. Payload width is the
-  // partition's fixed_value_size_, so no logical value length is persisted.
-  using SharedTree = PrivateTree;
+  struct PrivateTreeValue {
+    RegionOffset row{kNullOffset};
+  };
+  struct PrivateTreeValueComparator {
+    int operator()(const PrivateTreeValue &left,
+                   const PrivateTreeValue &right) const {
+      return left.row == right.row ? 0 : 1;
+    }
+  };
+  // Mechanical CXLTableBTreeOLC leaf form: row offset plus the original
+  // leaf-local validity flag.  Global row validity remains authoritative in
+  // HWCC smeta/SCC; this flag is maintained with the leaf itself.
+  struct SharedTreeValue {
+    SharedTreeValue() = default;
+    SharedTreeValue(const SharedTreeValue &other) : row(other.row) {
+      is_valid.store(other.is_valid.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+    }
+    SharedTreeValue &operator=(const SharedTreeValue &other) {
+      row = other.row;
+      is_valid.store(other.is_valid.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+      return *this;
+    }
+    RegionOffset row{kNullOffset};
+    std::atomic<bool> is_valid{false};
+  };
+  struct SharedTreeValueComparator {
+    int operator()(const SharedTreeValue &left,
+                   const SharedTreeValue &right) const {
+      return left.row == right.row ? 0 : 1;
+    }
+  };
+  using PrivateTree = btreeolc_cxl::BPlusTree<
+      FixedKey, PrivateTreeValue, FixedKeyComparator, PrivateTreeValueComparator>;
+  using SharedTree = btreeolc_cxl::BPlusTree<
+      FixedKey, SharedTreeValue, FixedKeyComparator, SharedTreeValueComparator>;
 
   KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
               uint32_t partition_id, uint32_t owner_shard, bool attach,
@@ -158,6 +188,8 @@ class KVPartition {
   // Matches core/Executor: enter before observing shared tree/row/move paths.
   void EnterEbr() const { ebr_.enter_critical_section(); }
   FixedKey MakeKey(std::string_view key) const;
+  bool LookupPrivateOffset(const FixedKey &key, RegionOffset *offset) const;
+  bool LookupSharedOffset(const FixedKey &key, RegionOffset *offset) const;
   PrivateValueStruct *ValueFromOffset(RegionOffset offset) const;
   PrivateMetadataLocal *MetadataFromValue(PrivateValueStruct *value) const;
   PrivateClockTrackerNode *ClockNodeFromOffset(RegionOffset offset) const;

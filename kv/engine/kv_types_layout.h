@@ -31,7 +31,7 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // v18: drops the unused Scan-certificate mutation generation from HWCC.
 // v19: startup has a single Initializing→Ready publication; clean-exit and
 //      checkpoint coordination are process-local, never shared layout state.
-constexpr uint32_t kSharedLayoutVersion = 19;
+constexpr uint32_t kSharedLayoutVersion = 20;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;

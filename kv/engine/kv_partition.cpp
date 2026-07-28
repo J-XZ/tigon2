@@ -109,7 +109,8 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
     // This is the one bootstrap insertion before a right neighbour exists.
     // Every later logical insert uses the original adjacent callback and sees
     // this tuple as its mandatory next key.
-    if (!private_tree_->insert(sentinel, regions_.swcc().ToOffset(sentinel_value))) {
+    if (!private_tree_->insert(
+            sentinel, PrivateTreeValue{regions_.swcc().ToOffset(sentinel_value)})) {
       FreeUnpublishedPrivateValue(sentinel_value);
       throw std::runtime_error("private tree internal max sentinel duplicate");
     }
@@ -131,6 +132,25 @@ KVPartition::~KVPartition() {
 
 FixedKey KVPartition::MakeKey(std::string_view key) const {
   return FixedKey::From(key, fixed_key_size_);
+}
+
+bool KVPartition::LookupPrivateOffset(const FixedKey &key,
+                                      RegionOffset *offset) const {
+  if (offset == nullptr) throw std::invalid_argument("null private offset");
+  PrivateTreeValue value;
+  if (!private_tree_->lookup(key, value)) return false;
+  *offset = value.row;
+  return value.row != kNullOffset;
+}
+
+bool KVPartition::LookupSharedOffset(const FixedKey &key,
+                                     RegionOffset *offset) const {
+  if (offset == nullptr) throw std::invalid_argument("null shared offset");
+  SharedTreeValue value;
+  if (!shared_tree_->lookup(key, value)) return false;
+  if (!value.is_valid.load(std::memory_order_acquire)) return false;
+  *offset = value.row;
+  return value.row != kNullOffset;
 }
 
 PrivateValueStruct *KVPartition::ValueFromOffset(RegionOffset offset) const {
@@ -238,22 +258,22 @@ void KVPartition::ClearSharedAdjacency(const AdjacentRows &neighborhood) {
 
 bool KVPartition::InsertPrivateValue(const FixedKey &key, PrivateValueStruct *value) {
   auto *metadata = MetadataFromValue(value);
-  const RegionOffset offset = regions_.swcc().ToOffset(value);
+  const PrivateTreeValue offset{regions_.swcc().ToOffset(value)};
   // Direct mechanical use of the original B+Tree adjacent-insert callback.
   // The permanent maximum-key tuple supplies a right neighbour at tree EOF.
   return private_tree_->insert_and_process_adjacent_tuples(
       key, offset,
-      [&](const FixedKey *prev_key, RegionOffset *prev_off,
-          const FixedKey *next_key, RegionOffset *next_off) {
+      [&](const FixedKey *prev_key, PrivateTreeValue *prev_off,
+          const FixedKey *next_key, PrivateTreeValue *next_off) {
         (void)metadata;  // fully initialized before publication in the leaf.
         RowRef prev;
         RowRef next;
         if (prev_key != nullptr && prev_off != nullptr) {
-          prev = {*prev_key, *prev_off, ValueFromOffset(*prev_off), nullptr};
+          prev = {*prev_key, prev_off->row, ValueFromOffset(prev_off->row), nullptr};
           prev.metadata = MetadataFromValue(prev.value);
         }
         if (next_key != nullptr && next_off != nullptr) {
-          next = {*next_key, *next_off, ValueFromOffset(*next_off), nullptr};
+          next = {*next_key, next_off->row, ValueFromOffset(next_off->row), nullptr};
           next.metadata = MetadataFromValue(next.value);
         }
         if (prev.metadata != nullptr) LockRow(prev.metadata);
@@ -314,7 +334,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       throw std::runtime_error("private put create-race busy");
     const FixedKey fixed_key = MakeKey(key);
     RegionOffset row_offset = kNullOffset;
-    if (private_tree_->lookup(fixed_key, row_offset)) {
+    if (LookupPrivateOffset(fixed_key, &row_offset)) {
       auto *private_value = ValueFromOffset(row_offset);
       auto *metadata = MetadataFromValue(private_value);
       LockRow(metadata);
@@ -370,7 +390,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
 bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   EnterEbr();
   RegionOffset row_offset = kNullOffset;
-  if (!private_tree_->lookup(MakeKey(key), row_offset)) return false;
+  if (!LookupPrivateOffset(MakeKey(key), &row_offset)) return false;
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
   // The non-migrated branch is the original take_read_lock_and_read / release
@@ -578,7 +598,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   if (inserted != nullptr) *inserted = false;
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
-  if (!private_tree_->lookup(fixed_key, row_offset)) {
+  if (!LookupPrivateOffset(fixed_key, &row_offset)) {
     if (!expected.empty()) return false;
     {
       auto *private_value = AllocateValue(desired);
@@ -591,7 +611,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
       FreeUnpublishedPrivateValue(private_value);
     }
     // Loser of create race: re-resolve the winner and compare expected.
-    if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+    if (!LookupPrivateOffset(fixed_key, &row_offset)) return false;
   }
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
@@ -652,7 +672,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
   if (inserted != nullptr) *inserted = false;
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
-  if (!private_tree_->lookup(fixed_key, row_offset)) {
+  if (!LookupPrivateOffset(fixed_key, &row_offset)) {
     std::string encoded;
     if (!EncodeCanonicalFixedDecimal(delta, fixed_value_size_, &encoded))
       throw std::invalid_argument("increment value exceeds fixed value size");
@@ -667,7 +687,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
       FreeUnpublishedPrivateValue(private_value);
     }
     // Loser of create race: apply delta on the published row (§10.9).
-    if (!private_tree_->lookup(fixed_key, row_offset)) return false;
+    if (!LookupPrivateOffset(fixed_key, &row_offset)) return false;
   }
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
@@ -779,7 +799,7 @@ StatusCode KVPartition::EnsureInShared(std::string_view key, uint32_t host_id,
   if (result == star::migration_result::FAIL_ALREADY_IN_CXL)
     return StatusCode::kOk;
   RegionOffset row_offset = kNullOffset;
-  if (!private_tree_->lookup(fixed_key, row_offset)) return StatusCode::kNotFound;
+  if (!LookupPrivateOffset(fixed_key, &row_offset)) return StatusCode::kNotFound;
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
   LockRow(metadata);
@@ -817,7 +837,7 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id,
   if (inc_ref && (result == star::migration_result::SUCCESS ||
                   result == star::migration_result::FAIL_ALREADY_IN_CXL)) {
     RegionOffset row_offset = kNullOffset;
-    if (private_tree_->lookup(fixed_key, row_offset)) {
+    if (LookupPrivateOffset(fixed_key, &row_offset)) {
       auto *private_value = ValueFromOffset(row_offset);
       auto *metadata = MetadataFromValue(private_value);
       LockRow(metadata);
@@ -831,7 +851,7 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id,
     // smeta from the shared tree so the caller can unpin (§10.8).
     if (*pinned_existing == nullptr) {
       RegionOffset shared_offset = kNullOffset;
-      if (shared_tree_->lookup(fixed_key, shared_offset) &&
+      if (LookupSharedOffset(fixed_key, &shared_offset) &&
           shared_offset != kNullOffset) {
         *pinned_existing = static_cast<star::TwoPLPashaMetadataShared *>(
             regions_.hwcc().FromOffset(shared_offset));
@@ -978,7 +998,10 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     smeta->increment_ref_cnt();
   }
   const RegionOffset smeta_offset = regions_.hwcc().ToOffset(smeta);
-  if (!shared_tree_->insert(fixed_key, smeta_offset)) {
+  SharedTreeValue shared_value;
+  shared_value.row = smeta_offset;
+  shared_value.is_valid.store(true, std::memory_order_relaxed);
+  if (!shared_tree_->insert(fixed_key, shared_value)) {
     if (inc_ref_cnt) smeta->decrement_ref_cnt();
     smeta->clear_write_locked();
     smeta->unlock();
@@ -1068,7 +1091,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   }
   const RegionOffset smeta_offset = metadata->migrated_smeta_off;
   RegionOffset indexed = kNullOffset;
-  if (!shared_tree_->lookup(fixed_key, indexed) || indexed != smeta_offset) {
+  if (!LookupSharedOffset(fixed_key, &indexed) || indexed != smeta_offset) {
     UnlockAdjacentRows(&neighborhood);
     return false;
   }
@@ -1181,7 +1204,7 @@ bool KVPartition::ScanOwned(
     if (rows.empty()) break;
     for (const auto &entry : rows) {
       if (IsInternalMaxSentinel(entry.first)) break;
-      auto *private_value = ValueFromOffset(entry.second);
+      auto *private_value = ValueFromOffset(entry.second.row);
       auto *metadata = MetadataFromValue(private_value);
       {
         LockRow(metadata);
@@ -1248,7 +1271,7 @@ bool KVPartition::ScanOwnedKeys(
     if (rows.empty()) break;
     for (const auto &entry : rows) {
       if (IsInternalMaxSentinel(entry.first)) break;
-      auto *private_value = ValueFromOffset(entry.second);
+      auto *private_value = ValueFromOffset(entry.second.row);
       auto *metadata = MetadataFromValue(private_value);
       LockRow(metadata);
       if (metadata->is_valid) keys->push_back(KeyString(entry.first));
@@ -1281,7 +1304,7 @@ bool KVPartition::ScanShared(
   bool complete = true;
   for (const auto &entry : rows) {
     auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-        regions_.hwcc().FromOffset(entry.second));
+        regions_.hwcc().FromOffset(entry.second.row));
     std::string value(fixed_value_size_, '\0');
     const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
         smeta, host_id, value.data(), value.size());
@@ -1302,9 +1325,9 @@ void KVPartition::ScanSharedForUpdate(
   if (!processor) throw std::invalid_argument("null ScanSharedForUpdate processor");
   // Passthrough only: no adjacency, pin, or migration decisions (§4.3).
   shared_tree_->scanForUpdate(
-      min_key, [&](const FixedKey &key, RegionOffset &smeta_off,
+      min_key, [&](const FixedKey &key, SharedTreeValue &smeta,
                    bool is_last_tuple) -> bool {
-        return processor(key, smeta_off, is_last_tuple);
+        return processor(key, smeta.row, is_last_tuple);
       });
 }
 
@@ -1487,18 +1510,18 @@ bool KVPartition::DeletePrivateForMigrationManager(
   const uint64_t metadata_bytes = sizeof(PrivateMetadataLocal);
   const bool removed = private_tree_->remove_and_process_adjacent_keys(
       fixed_key,
-      [&](const FixedKey *prev_key, RegionOffset *prev_off,
-          const FixedKey *cur_key, RegionOffset *cur_off,
-          const FixedKey *next_key, RegionOffset *next_off) {
+      [&](const FixedKey *prev_key, PrivateTreeValue *prev_off,
+          const FixedKey *cur_key, PrivateTreeValue *cur_off,
+          const FixedKey *next_key, PrivateTreeValue *next_off) {
         if (cur_key == nullptr || cur_off == nullptr) return false;
         AdjacentRows neighborhood;
-        const auto fill = [&](const FixedKey *row_key, RegionOffset *row_off,
+        const auto fill = [&](const FixedKey *row_key, PrivateTreeValue *row_off,
                               bool *present, RowRef *row) {
           if (row_key == nullptr || row_off == nullptr) return;
           *present = true;
           row->key = *row_key;
-          row->offset = *row_off;
-          row->value = ValueFromOffset(*row_off);
+          row->offset = row_off->row;
+          row->value = ValueFromOffset(row_off->row);
           row->metadata = MetadataFromValue(row->value);
         };
         fill(prev_key, prev_off, &neighborhood.has_prev, &neighborhood.prev);
@@ -1646,7 +1669,7 @@ SharedAccessState KVPartition::TryPinShared(
   *smeta = nullptr;
   *smeta_offset = kNullOffset;
   RegionOffset offset = kNullOffset;
-  if (!shared_tree_->lookup(key, offset) || offset == kNullOffset)
+  if (!LookupSharedOffset(key, &offset) || offset == kNullOffset)
     return SharedAccessState::kMissing;
   auto *candidate = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(offset));
@@ -1654,7 +1677,7 @@ SharedAccessState KVPartition::TryPinShared(
   if (!star::TwoPLPashaHelper::kv_pin_shared_ref(candidate))
     return SharedAccessState::kRetry;
   RegionOffset again = kNullOffset;
-  if (!shared_tree_->lookup(key, again) || again != offset) {
+  if (!LookupSharedOffset(key, &again) || again != offset) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(candidate);
     return SharedAccessState::kRetry;
   }
@@ -1672,7 +1695,7 @@ bool KVPartition::TryPinSharedEntry(
       regions_.hwcc().FromOffset(expected_offset));
   if (!star::TwoPLPashaHelper::kv_pin_shared_ref(candidate)) return false;
   RegionOffset current = kNullOffset;
-  if (!shared_tree_->lookup(key, current) || current != expected_offset) {
+  if (!LookupSharedOffset(key, &current) || current != expected_offset) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(candidate);
     return false;
   }
@@ -1708,7 +1731,7 @@ void KVPartition::ClockTrackMigratedKey(const void *key_bytes) {
                                       fixed_key_size_),
                      fixed_key_size_);
   RegionOffset row_off = kNullOffset;
-  if (!private_tree_->lookup(fixed_key, row_off) || row_off == kNullOffset)
+  if (!LookupPrivateOffset(fixed_key, &row_off) || row_off == kNullOffset)
     throw std::runtime_error("ClockTrackMigratedKey: private row missing");
   auto *private_value = ValueFromOffset(row_off);
   auto *metadata = MetadataFromValue(private_value);
@@ -1748,7 +1771,7 @@ void KVPartition::ClockUntrackMigratedKey(const void *key_bytes) {
                                       fixed_key_size_),
                      fixed_key_size_);
   RegionOffset row_off = kNullOffset;
-  if (!private_tree_->lookup(fixed_key, row_off) || row_off == kNullOffset)
+  if (!LookupPrivateOffset(fixed_key, &row_off) || row_off == kNullOffset)
     return;
   ClockUntrackRowOffset(row_off);
 }
