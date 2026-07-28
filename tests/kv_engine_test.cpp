@@ -583,7 +583,6 @@ int main() {
     release_worker.store(true, std::memory_order_release);
     worker_owner.join();
     assert(engine->Put("persist", "value").ok());
-    assert(engine->Checkpoint().ok());
   }
   {
     auto attached = tigonkv::engine::KVEngine::Open(single_owner, false);

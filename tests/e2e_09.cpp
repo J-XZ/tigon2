@@ -99,7 +99,6 @@ int main() {
       for (;;) {
         const ssize_t read_bytes = read(stop_pipe[0], &stop, 1);
         if (read_bytes == 1 && stop == 'd') {
-          if (!remote_owner->Checkpoint().ok()) _exit(24);
           const char ack = 'd';
           if (write(ack_pipe[1], &ack, 1) != 1) _exit(25);
         }
@@ -128,7 +127,6 @@ int main() {
   auto shared = owner->Memory();
   assert(shared.active_shared_rows > 0 && shared.shared_payload_swcc_used_bytes > 0);
   for (uint32_t i = 0; i < kKeys; ++i) assert(owner->Delete(Key(i)).ok());
-  assert(owner->Checkpoint().ok());
   const char drain = 'd';
   assert(write(stop_pipe[1], &drain, 1) == 1);
   char drain_ack = 0;

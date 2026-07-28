@@ -47,7 +47,6 @@ class KVEngine {
                             std::string_view desired);
   IncrementResult Increment(std::string_view key, int64_t delta);
   MemoryStats Memory() const;
-  Status Checkpoint();
   // Foreground cooperative path (Tigon Worker::process_request analogue):
   // batch-pop deferred inbound requests from the shared Dispatcher FIFO.
   // The dedicated inbound demuxer is the sole MPSC consumer — FG never
@@ -116,7 +115,6 @@ class KVEngine {
   void ServeDeferredRequests();
   void SendTransportMessage(const KvMessage &message);
   void EnforceMigrationBudget(KVPartition &partition);
-  void MarkLayoutDirty();
   void StartInboundDemuxer();
   void StopInboundDemuxer();
   void InboundDemuxerLoop();
@@ -162,7 +160,6 @@ class KVEngine {
   std::deque<KvMessage> deferred_transport_requests_;
   std::atomic<uint64_t> network_tx_bytes_{0};
   std::atomic<uint64_t> network_rx_bytes_{0};
-  std::atomic<bool> layout_dirty_{true};
   std::atomic<uint64_t> shared_gets_{0};
   std::atomic<uint64_t> shared_puts_{0};
   std::atomic<uint64_t> shared_deletes_{0};

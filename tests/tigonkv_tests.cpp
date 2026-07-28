@@ -348,7 +348,6 @@ int main() {
   assert(runtime.aborts == 0);
   assert(runtime.private_puts == 204);
   assert(runtime.private_gets == 201);
-  assert(store->Checkpoint().ok());
   const MemoryStats memory = store->Memory();
   assert(memory.physical_region_split);
   assert(memory.physical_hwcc_used_bytes == memory.logical_hwcc_used_bytes);

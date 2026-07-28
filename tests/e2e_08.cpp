@@ -93,7 +93,6 @@ int main() {
       for (;;) {
         const ssize_t read_bytes = read(stop_pipe[0], &stop, 1);
         if (read_bytes == 1 && stop == 'd') {
-          if (!remote_owner->Checkpoint().ok()) _exit(24);
           const char ack = 'd';
           if (write(ack_pipe[1], &ack, 1) != 1) _exit(25);
         }
@@ -137,7 +136,6 @@ int main() {
     auto status = owner->Delete(Key8(i));
     assert(status.ok());
   }
-  assert(owner->Checkpoint().ok());
   const char drain = 'd';
   assert(write(stop_pipe[1], &drain, 1) == 1);
   char drain_ack = 0;

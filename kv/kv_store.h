@@ -63,7 +63,6 @@ struct RuntimeStats {
   uint64_t private_gets = 0;
   uint64_t private_puts = 0;
   uint64_t private_deletes = 0;
-  uint64_t checkpoint_swcc_flushes = 0;
   uint64_t private_swcc_flushes = 0;
   uint64_t shared_gets = 0;
   uint64_t shared_puts = 0;
@@ -151,7 +150,6 @@ struct Config {
   std::string scc_mechanism = "WriteThrough";
   uint64_t transport_ring_total_mb = 16;
   bool strict_swcc_access = false;
-  bool checkpoint_on_clean_exit = true;
   bool verbose = false;
   bool extra_check = false;
   // Pin foreground workers and the inbound demuxer to distinct CPUs from the
@@ -214,7 +212,6 @@ class KVStore {
   void BindWorker(uint32_t worker_id);
   void ReleaseWorker();
 
-  Status Checkpoint();
   MemoryStats Memory() const;
   RuntimeStats Runtime() const;
   uint32_t StablePartitionForKey(std::string_view key) const;

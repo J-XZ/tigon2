@@ -216,11 +216,6 @@ inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
   return {NowUs() - begin, operations.load(std::memory_order_relaxed)};
 }
 
-inline void CheckpointOrThrow(KVStore &store) {
-  const Status status = store.Checkpoint();
-  if (!status.ok()) throw std::runtime_error("phase checkpoint failed: " + status.message);
-}
-
 inline void PrintThreadTopology(const Config &config, uint64_t foreground) {
   std::cout << "E2E_THREAD_TOPOLOGY node=" << config.node_id
             << " foreground=" << foreground
@@ -243,12 +238,10 @@ inline void DrainTransport(KVStore &store) {
 
 inline int RunE2E08MultiVm() {
   Config config = LoadConfig();
-  config.checkpoint_on_clean_exit = false;
   const bool init_only = Env("TIGONKV_E2E_MULTI_VM_INIT_ONLY") == "1";
   const bool reset = Env("TIGONKV_E2E_RESET") == "1";
   auto main_store = KVStore::Create(config, reset);
   if (init_only) {
-    CheckpointOrThrow(*main_store);
     std::cout << "TIGONKV_E2E_MULTI_VM_INIT node=" << config.node_id << " passed.\n";
     return 0;
   }
@@ -288,7 +281,6 @@ inline int RunE2E08MultiVm() {
                   config.foreground_worker_count_per_vm));
   std::cout.flush();
   std::cerr.flush();
-  CheckpointOrThrow(*main_store);
   std::cout << main_store->DumpStats();
   std::cout << "e2e_08_vm[node" << config.node_id << "]: passed.\n";
   return 0;
@@ -296,12 +288,10 @@ inline int RunE2E08MultiVm() {
 
 inline int RunE2E09MultiVm() {
   Config config = LoadConfig();
-  config.checkpoint_on_clean_exit = false;
   const bool init_only = Env("TIGONKV_E2E_MULTI_VM_INIT_ONLY") == "1";
   const bool reset = Env("TIGONKV_E2E_RESET") == "1";
   auto main_store = KVStore::Create(config, reset);
   if (init_only) {
-    CheckpointOrThrow(*main_store);
     std::cout << "TIGONKV_E2E_MULTI_VM_INIT node=" << config.node_id << " passed.\n";
     return 0;
   }
@@ -339,7 +329,6 @@ inline int RunE2E09MultiVm() {
                   config.foreground_worker_count_per_vm));
   std::cout.flush();
   std::cerr.flush();
-  CheckpointOrThrow(*main_store);
   std::cout << main_store->DumpStats();
   std::cout << "e2e_09_vm[node" << config.node_id << "]: passed.\n";
   return 0;

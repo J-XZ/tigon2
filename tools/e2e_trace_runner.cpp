@@ -386,8 +386,6 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   log_stage("drain_done");
   Barrier(phase, config.node_id, true, store.get());
   log_stage("barrier_done");
-  if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
-  log_stage("checkpoint_done");
   uint64_t ops = 0;
   uint64_t scan_ops = 0;
   uint64_t scan_rows = 0;
@@ -428,8 +426,6 @@ int main(int argc, char **argv) {
   try {
     const std::string experiment = Env("TIGONKV_EXPERIMENT_CONFIG_JSONC", "CXLKV_EXPERIMENT_CONFIG_JSONC", "experiment_config.jsonc");
     Config config = Config::FromJsonc(experiment);
-    // Both runner paths perform an explicit, host-coordinated checkpoint.
-    config.checkpoint_on_clean_exit = false;
     config.node_id = static_cast<uint32_t>(ParseUnsigned(Env("TIGONKV_NODE_ID", "CXLKV_NODE_ID", "0"), "node id"));
     node = config.node_id;
     if (config.latency_enabled &&
@@ -547,7 +543,6 @@ int main(int argc, char **argv) {
     WaitForHostRelease(phase, *store);
     DrainTransport(*store);
     Barrier(phase, config.node_id, true, store.get());
-    if (!store->Checkpoint().ok()) Fail("checkpoint failed after final barrier");
     PrintThreadTopology(config.node_id, 1, config.cpu_affinity);
     PrintTraceTime(phase, config.node_id, ops, duration_us, trace_first, 1, batch_ops);
     PrintScanRows(config.node_id, scan_ops, scan_rows);

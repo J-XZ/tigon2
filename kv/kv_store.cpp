@@ -68,7 +68,6 @@ void AddRuntimeStats(RuntimeStats *total, const RuntimeStats &part) {
   total->private_gets += part.private_gets;
   total->private_puts += part.private_puts;
   total->private_deletes += part.private_deletes;
-  total->checkpoint_swcc_flushes += part.checkpoint_swcc_flushes;
   total->private_swcc_flushes += part.private_swcc_flushes;
   total->shared_gets += part.shared_gets;
   total->shared_puts += part.shared_puts;
@@ -987,7 +986,6 @@ void KVStore::Open(bool reset) {
 
 void KVStore::Close() {
   if (impl_ == nullptr || impl_->engine == nullptr) return;
-  if (config_.checkpoint_on_clean_exit) (void)impl_->engine->Checkpoint();
   impl_->engine.reset();
 }
 
@@ -1164,14 +1162,6 @@ void KVStore::ReleaseWorker() {
   }
 }
 
-Status KVStore::Checkpoint() {
-  engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kForeground);
-  Status status = impl_->engine->Checkpoint();
-  if (status.ok()) ++ThreadRuntime().checkpoint_swcc_flushes;
-  return status;
-}
-
 MemoryStats KVStore::Memory() const { return impl_->engine->Memory(); }
 
 RuntimeStats KVStore::Runtime() const {
@@ -1241,7 +1231,6 @@ std::string KVStore::DumpStats() const {
   out += "private_gets=" + std::to_string(runtime.private_gets) + "\n";
   out += "private_puts=" + std::to_string(runtime.private_puts) + "\n";
   out += "private_deletes=" + std::to_string(runtime.private_deletes) + "\n";
-  out += "checkpoint_swcc_flushes=" + std::to_string(runtime.checkpoint_swcc_flushes) + "\n";
   out += "private_swcc_flushes=" + std::to_string(runtime.private_swcc_flushes) + "\n";
   out += "shared_gets=" + std::to_string(runtime.shared_gets) + "\n";
   out += "shared_puts=" + std::to_string(runtime.shared_puts) + "\n";

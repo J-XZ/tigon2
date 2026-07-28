@@ -517,7 +517,6 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
   if (IsInternalMaxSentinel(key))
     return Status::Error(StatusCode::kInvalidArgument,
                          "internal max sentinel is reserved");
-  MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     if (route.partition == nullptr)
@@ -622,7 +621,6 @@ Status KVEngine::Delete(std::string_view key) {
   if (IsInternalMaxSentinel(key))
     return Status::Error(StatusCode::kInvalidArgument,
                          "internal max sentinel is reserved");
-  MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     const Status migrated =
@@ -883,7 +881,6 @@ CasResult KVEngine::CompareExchange(std::string_view key,
   if (IsInternalMaxSentinel(key))
     return {Status::Error(StatusCode::kInvalidArgument,
                           "internal max sentinel is reserved"), false};
-  MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     auto *visible = route.partition;
@@ -965,7 +962,6 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   if (IsInternalMaxSentinel(key))
     return {Status::Error(StatusCode::kInvalidArgument,
                           "internal max sentinel is reserved"), 0};
-  MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     auto *visible = route.partition;
@@ -1118,23 +1114,6 @@ RuntimeStats KVEngine::EngineRuntime() const {
   stats.network_tx_bytes = NetworkTxBytes();
   stats.network_rx_bytes = NetworkRxBytes();
   return stats;
-}
-
-Status KVEngine::Checkpoint() {
-  try {
-    // Poll a bounded batch before reclamation. Synchronous forwarders also
-    // poll, so this only drains requests already visible to this VM.
-    for (uint32_t i = 0; i < 1024; ++i) PollTransport();
-    pool_->allocator().FlushOwnedRanges(config_.node_id);
-    layout_dirty_.store(false, std::memory_order_release);
-    return Status::Ok();
-  } catch (const std::exception &e) {
-    return Status::Error(StatusCode::kCorruption, e.what());
-  }
-}
-
-void KVEngine::MarkLayoutDirty() {
-  layout_dirty_.store(true, std::memory_order_release);
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {
@@ -1514,7 +1493,6 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
   KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
                                    message.source_node, message.request_id, key);
   if (message.type == KvMessageType::kScanMigrate) {
-    MarkLayoutDirty();
     uint32_t partition_id = 0;
     uint32_t flags = 0;
     uint64_t output_limit = 0;
@@ -1558,11 +1536,6 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     return;
   }
   auto *partition = OwnedPartition(key);
-  if (message.type == KvMessageType::kPut ||
-      message.type == KvMessageType::kDelete ||
-      message.type == KvMessageType::kMigrate ||
-      message.type == KvMessageType::kScanMigrate)
-    MarkLayoutDirty();
   if (partition == nullptr) {
     throw std::runtime_error("request routed to a non-owner node");
   }
@@ -1641,7 +1614,6 @@ Status KVEngine::MoveOut(std::string_view key) {
   if (IsInternalMaxSentinel(key))
     return Status::Error(StatusCode::kInvalidArgument,
                          "internal max sentinel is reserved");
-  MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node)
     return Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding");
