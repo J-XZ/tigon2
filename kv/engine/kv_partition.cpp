@@ -97,6 +97,7 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
         regions_.hwcc().FromOffset(
             directory_.shared_root.load(std::memory_order_acquire)));
     shared_tree_->bind_published_root(&directory_.shared_root);
+    shared_table_ = new SharedTable(shared_tree_, kSingleTableId, partition_id_);
   } else {
     if (!materialize_private)
       throw std::logic_error("reset must materialize every private partition root");
@@ -118,6 +119,7 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
     }
     shared_tree_ = new SharedTree(shared_binding_);
     shared_tree_->bind_published_root(&directory_.shared_root);
+    shared_table_ = new SharedTable(shared_tree_, kSingleTableId, partition_id_);
     PersistPrivateRootIfChanged();
   }
   pthread_spin_init(&clock_lock_, PTHREAD_PROCESS_PRIVATE);
@@ -127,6 +129,7 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
 }
 
 KVPartition::~KVPartition() {
+  delete shared_table_;
   delete private_tree_;
   delete shared_tree_;
   if (clock_lock_inited_) pthread_spin_destroy(&clock_lock_);
@@ -148,11 +151,11 @@ bool KVPartition::LookupPrivateOffset(const FixedKey &key,
 bool KVPartition::LookupSharedOffset(const FixedKey &key,
                                      RegionOffset *offset) const {
   if (offset == nullptr) throw std::invalid_argument("null shared offset");
-  SharedTreeValue value;
-  if (!shared_tree_->lookup(key, value)) return false;
-  if (!value.is_valid.load(std::memory_order_acquire)) return false;
-  *offset = value.row;
-  return value.row != kNullOffset;
+  auto *row = static_cast<star::TwoPLPashaMetadataShared *>(
+      shared_table_->search(&key));
+  if (row == nullptr) return false;
+  *offset = regions_.hwcc().ToOffset(row);
+  return *offset != kNullOffset;
 }
 
 PrivateValueStruct *KVPartition::ValueFromOffset(RegionOffset offset) const {
@@ -677,10 +680,10 @@ StatusCode KVPartition::InsertRemotePlaceholder(std::string_view key,
 
 bool KVPartition::PublishRemotePlaceholder(std::string_view key,
                                            uint32_t requester_id) {
-  RegionOffset smeta_offset = kNullOffset;
-  if (!LookupSharedOffset(MakeKey(key), &smeta_offset) ||
-      smeta_offset == kNullOffset)
-    return false;
+  // The original CXLTable leaf remains valid while the SCC valid bit is
+  // pending remote-insert publication, so its normal CXLTable search is the
+  // correct lookup here as well.
+  const FixedKey fixed_key = MakeKey(key);
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
       regions_.hwcc().FromOffset(smeta_offset));
   return star::TwoPLPashaHelper::kv_remote_publish_insert(smeta, requester_id);
@@ -736,7 +739,8 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
     return false;
   }
   auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-      regions_.hwcc().FromOffset(smeta_offset));
+      shared_table_->search(&fixed_key));
+  if (smeta == nullptr) return false;
   std::string shared(fixed_value_size_, '\0');
   const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
       smeta, owner_shard_, shared.data(), shared.size(),
@@ -1392,10 +1396,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     smeta->increment_ref_cnt();
   }
   const RegionOffset smeta_offset = regions_.hwcc().ToOffset(smeta);
-  SharedTreeValue shared_value;
-  shared_value.row = smeta_offset;
-  shared_value.is_valid.store(true, std::memory_order_relaxed);
-  if (!shared_tree_->insert(fixed_key, shared_value)) {
+  if (!shared_table_->insert(&fixed_key, smeta)) {
     if (inc_ref_cnt) smeta->decrement_ref_cnt();
     smeta->clear_write_locked();
     smeta->unlock();
@@ -1542,7 +1543,7 @@ bool KVPartition::MoveOutPrivateRaw(std::string_view key, uint32_t host_id) {
   metadata->is_migrated = false;
   metadata->migrated_smeta_off = kNullOffset;
   smeta->unlock();
-  if (!shared_tree_->remove(fixed_key)) {
+  if (!shared_table_->remove(&fixed_key, smeta)) {
     smeta->lock();
     smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
     metadata->is_migrated = true;
@@ -1700,10 +1701,10 @@ void KVPartition::ScanSharedForUpdate(
                              bool is_last_tuple)> &processor) const {
   if (!processor) throw std::invalid_argument("null ScanSharedForUpdate processor");
   // Passthrough only: no adjacency, pin, or migration decisions (§4.3).
-  shared_tree_->scanForUpdate(
-      min_key, [&](const FixedKey &key, SharedTreeValue &smeta,
-                   bool is_last_tuple) -> bool {
-        return processor(key, smeta.row, is_last_tuple);
+  shared_table_->scan(
+      &min_key, [&](const void *key, void *row, bool is_last_tuple) -> bool {
+        return processor(*static_cast<const FixedKey *>(key),
+                         regions_.hwcc().ToOffset(row), is_last_tuple);
       });
 }
 
@@ -1966,7 +1967,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
           }
           if (!writer_prelocked) smeta->set_write_locked();
           smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
-          if (!shared_tree_->remove(fixed_key)) {
+          if (!shared_table_->remove(&fixed_key, smeta)) {
             smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
             smeta->clear_write_locked();
             smeta->unlock();

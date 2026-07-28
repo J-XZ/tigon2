@@ -2,6 +2,7 @@
 
 #include "common/CXL_EBR.h"
 #include "common/btree_olc_cxl/BTreeOLC_CXL.h"
+#include "core/CXLTable.h"
 #include "protocol/TwoPLPasha/TwoPLPashaHelper.h"
 #include "protocol/Pasha/MigrationManager.h"
 #include "kv/engine/kv_types_layout.h"
@@ -44,34 +45,15 @@ class KVPartition {
       return left.row == right.row ? 0 : 1;
     }
   };
-  // Mechanical CXLTableBTreeOLC leaf form: row offset plus the original
-  // leaf-local validity flag.  Global row validity remains authoritative in
-  // HWCC smeta/SCC; this flag is maintained with the leaf itself.
-  struct SharedTreeValue {
-    SharedTreeValue() = default;
-    SharedTreeValue(const SharedTreeValue &other) : row(other.row) {
-      is_valid.store(other.is_valid.load(std::memory_order_relaxed),
-                     std::memory_order_relaxed);
-    }
-    SharedTreeValue &operator=(const SharedTreeValue &other) {
-      row = other.row;
-      is_valid.store(other.is_valid.load(std::memory_order_relaxed),
-                     std::memory_order_relaxed);
-      return *this;
-    }
-    RegionOffset row{kNullOffset};
-    std::atomic<bool> is_valid{false};
-  };
-  struct SharedTreeValueComparator {
-    int operator()(const SharedTreeValue &left,
-                   const SharedTreeValue &right) const {
-      return left.row == right.row ? 0 : 1;
-    }
-  };
+  // Reuse the original CXLTableBTreeOLC leaf wrapper.  Its offset_ptr is
+  // position independent because it is stored with the HWCC leaf; it never
+  // persists a process VA.  The C++ table object below remains a non-owning
+  // process-local handle.
+  using SharedTable = star::CXLTableBTreeOLC<FixedKey, FixedKeyComparator>;
+  using SharedTreeValue = SharedTable::BTreeOLCValue;
   using PrivateTree = btreeolc_cxl::BPlusTree<
       FixedKey, PrivateTreeValue, FixedKeyComparator, PrivateTreeValueComparator>;
-  using SharedTree = btreeolc_cxl::BPlusTree<
-      FixedKey, SharedTreeValue, FixedKeyComparator, SharedTreeValueComparator>;
+  using SharedTree = SharedTable::CXLBTree;
 
   KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
               uint32_t partition_id, uint32_t owner_shard, bool attach,
@@ -264,6 +246,7 @@ class KVPartition {
   btreeolc_cxl::TreeNodeAllocation shared_binding_;
   PrivateTree *private_tree_ = nullptr;
   SharedTree *shared_tree_ = nullptr;
+  SharedTable *shared_table_ = nullptr;
   // Process-local cache of the last published private root offset (§11.6).
   RegionOffset persisted_private_root_offset_ = kNullOffset;
   uint64_t private_root_publishes_ = 0;
