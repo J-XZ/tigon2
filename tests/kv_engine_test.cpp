@@ -1002,12 +1002,21 @@ int main() {
       std::atomic<bool> put_done{false};
       std::atomic<uint32_t> get_ok{0};
       std::atomic<bool> get_illegal{false};
+      auto get_after_busy = [&](std::string_view read_key) {
+        tigonkv::GetResult result;
+        for (uint32_t attempt = 0; attempt != 64; ++attempt) {
+          result = engine->Get(read_key);
+          if (result.status.code != tigonkv::StatusCode::kBusy) return result;
+          std::this_thread::yield();
+        }
+        return result;
+      };
       std::vector<std::thread> readers;
       for (uint32_t w = 0; w < 4; ++w) {
         readers.emplace_back([&, w] {
           engine->BindWorker(w);
           while (!put_done.load(std::memory_order_acquire)) {
-            const auto g = engine->Get(key);
+            const auto g = get_after_busy(key);
             if (!g.status.ok()) {
               get_illegal.store(true, std::memory_order_relaxed);
               break;
@@ -1018,7 +1027,7 @@ int main() {
             }
             std::this_thread::yield();
           }
-          const auto after = engine->Get(key);
+          const auto after = get_after_busy(key);
           if (after.status.ok() &&
               (after.value == FixedValue("v0") ||
                after.value == FixedValue("v1")))
