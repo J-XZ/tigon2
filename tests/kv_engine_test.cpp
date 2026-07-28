@@ -502,6 +502,22 @@ int main() {
     const auto found = attached->Get("persist");
     assert(found.status.ok() && found.value == "value");
   }
+  {
+    auto changed_contract = single_owner;
+    changed_contract.transport_ring_total_mb = 2;
+    bool rejected = false;
+    try {
+      (void)tigonkv::engine::KVEngine::Open(changed_contract, false);
+    } catch (const std::runtime_error &) {
+      rejected = true;
+    }
+    assert(rejected);
+    auto local_wiring_only = single_owner;
+    local_wiring_only.device_path = "/dev/not-used-for-file-backed-test";
+    local_wiring_only.network_base_ssh_port += 1;
+    auto attached = tigonkv::engine::KVEngine::Open(local_wiring_only, false);
+    assert(attached->Get("persist").status.ok());
+  }
   unlink(path.c_str());
 
   // §5.2 PreparePartitionSharedScan: cold / already-shared / EOF / bad args.

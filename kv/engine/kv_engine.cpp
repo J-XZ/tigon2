@@ -27,31 +27,95 @@
 namespace tigonkv::engine {
 namespace {
 
-// Layout identity only.  RangePartitionDigest is the routing identity; this
-// digest covers the backing-file name without reintroducing hash routing.
-uint64_t LayoutTextDigest(std::string_view key) {
-  uint64_t h = 1469598103934665603ULL;
-  for (unsigned char c : key) { h ^= c; h *= 1099511628211ULL; }
-  return h;
-}
-
-uint64_t RangePartitionDigest(const Config &config) {
-  uint64_t hash = 1469598103934665603ULL;
-  auto mix = [&](std::string_view text) {
-    for (unsigned char c : text) {
-      hash ^= c;
-      hash *= 1099511628211ULL;
+// Shared layout identity.  This deliberately hashes parsed canonical fields,
+// not JSON spelling or node-local wiring: every attaching VM must agree on
+// routing, persistent layout and latency contract before it dereferences an
+// offset in the shared pool.
+class LayoutDigest {
+ public:
+  void Bytes(const void *data, size_t bytes) {
+    const auto *input = static_cast<const unsigned char *>(data);
+    for (size_t i = 0; i < bytes; ++i) {
+      value_ ^= input[i];
+      value_ *= 1099511628211ULL;
     }
-    // An explicit separator prevents {"ab", "c"} from aliasing
-    // {"a", "bc"}.  This is layout identity, never key routing.
-    hash ^= 0xff;
-    hash *= 1099511628211ULL;
-  };
-  for (const auto &range : config.partition_ranges) {
-    mix(range.lower_key);
-    mix(range.upper_key);
   }
-  return hash;
+  void U64(uint64_t value) {
+    for (size_t byte = 0; byte < sizeof(value); ++byte) {
+      const unsigned char part = static_cast<unsigned char>(value >> (byte * 8));
+      Bytes(&part, sizeof(part));
+    }
+  }
+  void Bool(bool value) { U64(value ? 1 : 0); }
+  void Double(double value) { Bytes(&value, sizeof(value)); }
+  void String(std::string_view value) {
+    U64(value.size());
+    Bytes(value.data(), value.size());
+  }
+  void Field(std::string_view name) { String(name); }
+  uint64_t value() const { return value_; }
+
+ private:
+  uint64_t value_ = 1469598103934665603ULL;
+};
+
+uint64_t SharedLayoutConfigDigest(const Config &config) {
+  LayoutDigest digest;
+  const auto u64 = [&](std::string_view name, uint64_t value) {
+    digest.Field(name); digest.U64(value);
+  };
+  const auto boolean = [&](std::string_view name, bool value) {
+    digest.Field(name); digest.Bool(value);
+  };
+  const auto decimal = [&](std::string_view name, double value) {
+    digest.Field(name); digest.Double(value);
+  };
+  const auto text = [&](std::string_view name, std::string_view value) {
+    digest.Field(name); digest.String(value);
+  };
+  u64("layout_version", kSharedLayoutVersion);
+  u64("partition_count", config.partition_count);
+  u64("vm_count", config.vm_count);
+  u64("foreground_worker_count", config.foreground_worker_count_per_vm);
+  u64("fixed_key_size", config.fixed_key_size);
+  u64("fixed_value_size", config.fixed_value_size);
+  u64("total_pool_bytes", config.size_mb * 1024ULL * 1024ULL);
+  u64("hwcc_offset_bytes", config.hwcc_offset_mb * 1024ULL * 1024ULL);
+  u64("hwcc_size_bytes", config.hwcc_size_mb * 1024ULL * 1024ULL);
+  u64("swcc_offset_bytes", config.swcc_offset_mb * 1024ULL * 1024ULL);
+  u64("swcc_size_bytes", config.swcc_size_mb * 1024ULL * 1024ULL);
+  decimal("owner_private_swcc_fraction", config.owner_private_swcc_fraction);
+  u64("transport_ring_bytes", config.transport_ring_total_mb * 1024ULL * 1024ULL);
+  u64("hwcc_budget_bytes", config.hw_cc_budget_mb * 1024ULL * 1024ULL);
+  text("migration_policy", config.migration_policy);
+  text("when_to_move_out", config.when_to_move_out);
+  text("scc_mechanism", config.scc_mechanism);
+  boolean("model_cxl_search_overhead", false);
+  boolean("internal_max_sentinel", true);
+  for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
+    text("range_lower", config.partition_ranges[partition].lower_key);
+    text("range_upper", config.partition_ranges[partition].upper_key);
+  }
+  boolean("latency_enabled", config.latency_enabled);
+  boolean("latency_foreground_enabled", config.latency_foreground_enabled);
+  boolean("latency_merge_enabled", config.latency_merge_enabled);
+  boolean("latency_stats_enabled", config.latency_stats_enabled);
+  u64("latency_cache_line_bytes", config.latency_cache_line_bytes);
+  decimal("swcc_read_ns", config.swcc_read_ns);
+  decimal("swcc_write_ns", config.swcc_write_ns);
+  decimal("swcc_flush_ns", config.swcc_flush_ns);
+  decimal("hwcc_read_ns", config.hwcc_read_ns);
+  decimal("hwcc_write_ns", config.hwcc_write_ns);
+  decimal("hwcc_atomic_load_ns", config.hwcc_atomic_load_ns);
+  decimal("hwcc_atomic_store_ns", config.hwcc_atomic_store_ns);
+  decimal("hwcc_atomic_rmw_ns", config.hwcc_atomic_rmw_ns);
+  text("latency_cache_model", config.latency_cache_model);
+  boolean("latency_cache_hits_enabled", config.latency_cache_hits_enabled);
+  decimal("latency_cache_fixed_hit_rate", config.latency_cache_fixed_hit_rate);
+  u64("latency_cache_capacity_lines", config.latency_cache_capacity_lines);
+  u64("latency_cache_associativity", config.latency_cache_associativity);
+  decimal("latency_cache_hit_extra_ns", config.latency_cache_hit_extra_ns);
+  return digest.value();
 }
 
 // Multiple foreground KVEngine instances can coexist in one VM. Transport
@@ -192,10 +256,7 @@ DualRegionConfig RegionConfig(const Config &config) {
   region.hwcc_size_bytes = config.hwcc_size_mb * 1024ULL * 1024ULL;
   region.swcc_offset_bytes = config.swcc_offset_mb * 1024ULL * 1024ULL;
   region.swcc_size_bytes = config.swcc_size_mb * 1024ULL * 1024ULL;
-  region.config_hash = LayoutTextDigest(config.shared_memory_path) ^
-                       (static_cast<uint64_t>(config.partition_count) << 32) ^
-                       config.vm_count ^ config.fixed_value_size ^
-                       RangePartitionDigest(config);
+  region.config_hash = SharedLayoutConfigDigest(config);
   region.vm_count = config.vm_count;
   region.partition_count = config.partition_count;
   region.fixed_key_size = config.fixed_key_size;

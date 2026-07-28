@@ -843,6 +843,8 @@ void Config::Validate() {
     auto &range = partition_ranges[partition];
     normalize_boundary(&range.lower_key);
     normalize_boundary(&range.upper_key);
+    if (IsInternalMaxKey(range.lower_key) || IsInternalMaxKey(range.upper_key))
+      throw std::invalid_argument("partition range boundary reserves internal max sentinel");
     if (partition + 1 != partition_count && range.upper_key.empty())
       throw std::invalid_argument("only final partition may have empty upper_key");
     if (!range.lower_key.empty() && !range.upper_key.empty()) {

@@ -249,6 +249,23 @@ int main() {
   uneven.transport_ring_total_mb = 1;
   SetTestRangePartitioning(&uneven);
   uneven.Validate();
+  Config one_sided_boundary = uneven;
+  one_sided_boundary.partition_count = 2;
+  one_sided_boundary.partition_ranges = {{"", "m"}, {"", ""}};
+  one_sided_boundary.Validate();
+  assert(one_sided_boundary.partition_ranges[0].upper_key ==
+         one_sided_boundary.partition_ranges[1].lower_key);
+  assert(one_sided_boundary.PartitionForKey("m") == 1);
+  Config missing_boundary = one_sided_boundary;
+  missing_boundary.partition_ranges = {{"", ""}, {"", ""}};
+  assert(ValidateThrows(missing_boundary));
+  Config reserved_boundary = one_sided_boundary;
+  reserved_boundary.partition_ranges[0].upper_key = MaxKey(32);
+  reserved_boundary.partition_ranges[1].lower_key = MaxKey(32);
+  assert(ValidateThrows(reserved_boundary));
+  Config too_many_partitions = uneven;
+  too_many_partitions.partition_count = 257;
+  assert(ValidateThrows(too_many_partitions));
   const std::string path = "/tmp/tigonkv-facade-" + std::to_string(getpid());
   std::remove(path.c_str());
   Config config;
