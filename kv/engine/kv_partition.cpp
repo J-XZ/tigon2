@@ -521,7 +521,6 @@ PrivateValueStruct *KVPartition::AllocateValue(std::string_view value) {
 }
 
 bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
-  EnterEbr();
   if (value.size() > fixed_value_size_)
     throw std::invalid_argument("private value exceeds fixed value size");
   std::string padded_value;
@@ -603,7 +602,6 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
 StatusCode KVPartition::InsertRemotePlaceholder(std::string_view key,
                                                 std::string_view value,
                                                 uint32_t requester_id) {
-  EnterEbr();
   if (value.size() > fixed_value_size_)
     throw std::invalid_argument("remote insert value exceeds fixed value size");
   std::string padded_value;
@@ -679,7 +677,6 @@ StatusCode KVPartition::InsertRemotePlaceholder(std::string_view key,
 
 bool KVPartition::PublishRemotePlaceholder(std::string_view key,
                                            uint32_t requester_id) {
-  EnterEbr();
   RegionOffset smeta_offset = kNullOffset;
   if (!LookupSharedOffset(MakeKey(key), &smeta_offset) ||
       smeta_offset == kNullOffset)
@@ -690,7 +687,6 @@ bool KVPartition::PublishRemotePlaceholder(std::string_view key,
 }
 
 bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
-  EnterEbr();
   RegionOffset row_offset = kNullOffset;
   if (!LookupPrivateOffset(MakeKey(key), &row_offset)) return false;
   auto *private_value = ValueFromOffset(row_offset);
@@ -763,7 +759,6 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
 SharedAccessState KVPartition::GetShared(std::string_view key, uint32_t host_id,
                                            std::string *value,
                                            bool record_clock_access) const {
-  EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared GET output");
   const FixedKey fixed_key = MakeKey(key);
   star::TwoPLPashaMetadataShared *smeta = nullptr;
@@ -794,7 +789,6 @@ SharedAccessState KVPartition::GetShared(std::string_view key, uint32_t host_id,
 SharedAccessState KVPartition::PutShared(std::string_view key, uint32_t host_id,
                                          std::string_view value,
                                          bool record_clock_access) {
-  EnterEbr();
   if (value.size() > fixed_value_size_)
     throw std::invalid_argument("shared value exceeds fixed value size");
   std::string padded_value;
@@ -819,7 +813,6 @@ SharedAccessState KVPartition::PrepareRemoteDelete(
     std::string_view key, uint32_t host_id,
     star::TwoPLPashaMetadataShared **locked_row,
     bool record_clock_access) {
-  EnterEbr();
   if (locked_row == nullptr)
     throw std::invalid_argument("null remote delete lock output");
   *locked_row = nullptr;
@@ -862,7 +855,6 @@ void KVPartition::AbortRemoteDelete(
 SharedAccessState KVPartition::CompareExchangeShared(
     std::string_view key, uint32_t host_id, std::string_view expected,
     std::string_view desired, bool *exchanged, bool record_clock_access) {
-  EnterEbr();
   if (exchanged == nullptr) throw std::invalid_argument("null shared CAS result");
   if (desired.size() > fixed_value_size_)
     throw std::invalid_argument("shared CAS desired value exceeds fixed value size");
@@ -905,7 +897,6 @@ SharedAccessState KVPartition::IncrementShared(std::string_view key,
                                                uint32_t host_id, int64_t delta,
                                                int64_t *value,
                                                bool record_clock_access) {
-  EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared increment output");
   const FixedKey fixed_key = MakeKey(key);
   star::TwoPLPashaMetadataShared *smeta = nullptr;
@@ -954,7 +945,6 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
                                          std::string_view desired,
                                          bool *exchanged,
                                          bool *inserted) {
-  EnterEbr();
   if (exchanged == nullptr) throw std::invalid_argument("null CAS result");
   if (desired.size() > fixed_value_size_)
     throw std::invalid_argument("CAS desired value exceeds fixed value size");
@@ -1054,7 +1044,6 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
 
 bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
                                    int64_t *value, bool *inserted) {
-  EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null increment result");
   if (inserted != nullptr) *inserted = false;
   RegionOffset row_offset = kNullOffset;
@@ -1174,7 +1163,6 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
 
 StatusCode KVPartition::EnsureInShared(std::string_view key, uint32_t host_id,
                                        bool *moved_in) {
-  EnterEbr();
   (void)host_id;
   if (moved_in != nullptr) *moved_in = false;
   if (star::scc_manager == nullptr) return StatusCode::kOutOfMemory;
@@ -1212,7 +1200,6 @@ bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id) {
 
 bool KVPartition::PromotePrivate(std::string_view key, uint32_t host_id,
                                  star::TwoPLPashaMetadataShared **pinned_existing) {
-  EnterEbr();
   (void)host_id;
   if (pinned_existing != nullptr) *pinned_existing = nullptr;
   if (star::scc_manager == nullptr) return false;
@@ -1470,7 +1457,6 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
 }
 
 bool KVPartition::MoveOutPrivateRaw(std::string_view key, uint32_t host_id) {
-  EnterEbr();
   if (star::scc_manager == nullptr) return false;
   const FixedKey fixed_key = MakeKey(key);
   auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
@@ -1597,7 +1583,6 @@ bool KVPartition::ScanLocalPartition(
     std::string_view start_key, uint64_t limit,
     std::vector<std::pair<std::string, std::string>> *items,
     std::string_view inclusive_max) const {
-  EnterEbr();
   if (items == nullptr) throw std::invalid_argument("null partition scan output");
   auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
   if (table == nullptr)
@@ -1713,7 +1698,6 @@ void KVPartition::ScanSharedForUpdate(
     const FixedKey &min_key,
     const std::function<bool(const FixedKey &key, RegionOffset smeta_off,
                              bool is_last_tuple)> &processor) const {
-  EnterEbr();
   if (!processor) throw std::invalid_argument("null ScanSharedForUpdate processor");
   // Passthrough only: no adjacency, pin, or migration decisions (§4.3).
   shared_tree_->scanForUpdate(
@@ -1726,7 +1710,6 @@ void KVPartition::ScanSharedForUpdate(
 KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
     uint32_t host_id, std::string_view start_key, uint64_t output_limit,
     std::string_view inclusive_max) const {
-  EnterEbr();
   SharedScanResult result;
   const FixedKey min_key = MakeKey(start_key);
   FixedKey max_key{};
@@ -1842,7 +1825,6 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
 }
 
 bool KVPartition::DeletePrivate(std::string_view key) {
-  EnterEbr();
   const FixedKey fixed_key = MakeKey(key);
   RegionOffset row_offset = kNullOffset;
   if (!LookupPrivateOffset(fixed_key, &row_offset)) return false;
@@ -1879,7 +1861,6 @@ bool KVPartition::DeletePrivateForMigrationManager(
     std::string_view key, bool *need_untrack,
     void **migration_policy_meta, bool writer_prelocked,
     bool requester_prelocked) {
-  EnterEbr();
   if (need_untrack == nullptr || migration_policy_meta == nullptr)
     throw std::invalid_argument("null Clock delete output");
   *need_untrack = false;

@@ -188,7 +188,6 @@ class KVPartition {
  private:
   friend class KvPartitionTable;
   // Matches core/Executor: enter before observing shared tree/row/move paths.
-  void EnterEbr() const { ebr_.enter_critical_section(); }
   FixedKey MakeKey(std::string_view key) const;
   bool MoveOutPrivateRaw(std::string_view key, uint32_t host_id);
   bool LookupPrivateOffset(const FixedKey &key, RegionOffset *offset) const;
