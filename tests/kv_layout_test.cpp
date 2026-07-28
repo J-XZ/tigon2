@@ -1,6 +1,8 @@
 #include "kv/engine/kv_types_layout.h"
 #include "kv/engine/region_allocator.h"
-#include "kv/engine/kv_messages.h"
+#include "common/Encoder.h"
+#include "common/Message.h"
+#include "common/MessagePiece.h"
 
 #include <cassert>
 #include <cstring>
@@ -9,7 +11,7 @@
 
 int main() {
   using namespace tigonkv::engine;
-  // Frozen architecture contract constants (PLAN.md §14.1).
+  // Frozen architecture contract constants.
   assert(kSingleTableId == 0);
   assert(kMaxFixedKeyBytes == 32);
   assert(kMaxPartitions >= 16);
@@ -17,56 +19,28 @@ int main() {
   assert(sizeof(PartitionDirectoryEntry) == 64);
   assert(sizeof(PrivateValueStruct) == sizeof(RegionOffset));
   assert(alignof(PrivateMetadataLocal) == 64);
-  // §11.4 WireSize: header = offsetof(value); value bytes only on the wire.
-  assert(WireHeaderBytes() == offsetof(KvMessage, value));
+  // Transport uses the original Message/MessagePiece framing. The largest KV
+  // request is a 32B key + 1024B fixed value + original transaction/key slot.
   {
-    KvMessage empty = MakeRequest(KvMessageType::kMigrate, 0, 1, 1, "k");
-    assert(empty.value_size == 0);
-    assert(WireSize(empty) == WireHeaderBytes());
-    assert(ValidWireFrame(WireSize(empty), empty));
-    KvMessage small = MakeRequest(KvMessageType::kPut, 0, 1, 2, "k",
-                                  std::string(32, 'v'));
-    assert(WireSize(small) == WireHeaderBytes() + 32);
-    assert(ValidWireFrame(WireSize(small), small));
-    assert(!ValidWireFrame(WireHeaderBytes(), small));  // truncated value
-    KvMessage forged = small;
-    forged.value_size = 0;
-    assert(!ValidWireFrame(WireSize(small), forged));  // trailing / forged size
-    KvMessage maxv = MakeRequest(KvMessageType::kPut, 0, 1, 3, "k",
-                                 std::string(1024, 'x'));
-    // Max wire is header+1024 value bytes. sizeof(KvMessage) may include
-    // trailing alignment padding (1092 wire vs 1096 object on this ABI).
-    assert(WireSize(maxv) == WireHeaderBytes() + maxv.value.size());
-    assert(WireSize(maxv) <= sizeof(KvMessage));
-    assert(ValidWireFrame(WireSize(maxv), maxv));
-    assert(!ValidWireFrame(sizeof(KvMessage), maxv));  // padded recv != wire
-  }
-  // §5.1 ScanMigrate codec round-trip and reject unknown flags / wrong size.
-  {
-    const std::string max_key(32, static_cast<char>(0xff));
-    const auto req = EncodeScanMigrateRequest(
-        7, kScanMigrateFlagCursorDuplicate, 17, max_key);
-    assert(req.size() == kScanMigrateRequestBytes);
-    uint32_t pid = 0, flags = 0;
-    uint64_t limit = 0;
-    std::string decoded_max;
-    assert(DecodeScanMigrateRequest(req, &pid, &flags, &limit, &decoded_max));
-    assert(pid == 7 && flags == kScanMigrateFlagCursorDuplicate && limit == 17);
-    assert(decoded_max == max_key);
-    assert(!DecodeScanMigrateRequest(req + "x", &pid, &flags, &limit,
-                                     &decoded_max));
-    const auto bad_flags = EncodeScanMigrateRequest(0, 2u, 1, max_key);
-    assert(!DecodeScanMigrateRequest(bad_flags, &pid, &flags, &limit,
-                                     &decoded_max));
-    const auto resp = EncodeScanMigrateResponse(7, true, true);
-    assert(resp.size() == kScanMigrateResponseBytes);
-    bool exhausted = false;
-    bool no_pred = false;
-    assert(DecodeScanMigrateResponse(resp, &pid, &exhausted, &no_pred));
-    assert(pid == 7 && exhausted && no_pred);
-    assert(DecodeScanMigrateResponse(EncodeScanMigrateResponse(3, false, false),
-                                     &pid, &exhausted, &no_pred));
-    assert(pid == 3 && !exhausted && !no_pred);
+    star::Message message;
+    message.set_source_node_id(0);
+    message.set_dest_node_id(1);
+    message.set_worker_id(3);
+    const uint32_t piece_bytes = star::MessagePiece::get_header_size() + 32 + 1024 +
+        sizeof(uint64_t) + sizeof(uint32_t);
+    const std::string key(32, 'k');
+    const std::string value(1024, 'v');
+    star::Encoder encoder(message.data);
+    encoder << star::MessagePiece::construct_message_piece_header(
+        1, piece_bytes, kSingleTableId, 0);
+    encoder.write_n_bytes(key.data(), key.size());
+    encoder.write_n_bytes(value.data(), value.size());
+    encoder << uint64_t{1} << uint32_t{0};
+    message.flush();
+    assert(message.check_size() && message.check_deadbeef());
+    assert(message.get_message_count() == 1);
+    assert(message.get_message_length() == star::Message::get_prefix_size() + piece_bytes);
+    assert(message.get_message_length() <= 2048 - 9);
   }
   const FixedKey alpha = FixedKey::From("alpha", 8);
   const FixedKey beta = FixedKey::From("beta", 8);

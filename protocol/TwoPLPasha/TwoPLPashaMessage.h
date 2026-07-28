@@ -26,6 +26,10 @@ enum class TwoPLPashaMessage {
         REMOTE_INSERT_REQUEST,
         REMOTE_INSERT_RESPONSE,
         REMOTE_DELETE_REQUEST,
+        // The original remote delete is one-way because transaction cleanup
+        // owns completion.  The synchronous KV facade needs only this empty
+        // completion marker; it carries no new status framing.
+        REMOTE_DELETE_RESPONSE,
         REPLICATION_REQUEST,
 	REPLICATION_RESPONSE,
 	NFIELDS

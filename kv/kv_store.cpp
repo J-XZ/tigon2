@@ -808,6 +808,7 @@ void Config::Validate() {
       fixed_value_size > kMaxValue || shared_memory_numa_node < -1 || vm_numa_node < -1 ||
       network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0 ||
       foreground_worker_count_per_vm > star::CXL_EBR::max_thread_num ||
+      foreground_worker_count_per_vm > 255 ||
       vm_count > star::CXL_EBR::max_coordinator_num)
     throw std::invalid_argument("invalid KV configuration");
   if (partition_ranges.size() != partition_count)

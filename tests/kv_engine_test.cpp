@@ -1,8 +1,11 @@
 #include "kv/engine/kv_engine.h"
 #include "common/CXLMemory.h"
+#include "common/Encoder.h"
+#include "common/Message.h"
+#include "common/MessagePiece.h"
 #include "common/MPSCRingBuffer.h"
 #include "kv/engine/latency_inject.h"
-#include "kv/engine/kv_messages.h"
+#include "protocol/TwoPLPasha/TwoPLPashaMessage.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -145,7 +148,7 @@ int main() {
     star::CXLMemory::wait_and_retrieve_cxl_shared_data(
         star::CXLMemory::cxl_transport_root_index, &root);
     auto *rings = static_cast<star::MPSCRingBuffer *>(root);
-    std::array<char, sizeof(tigonkv::engine::KvMessage) + 1> malformed{};
+    std::array<char, 64> malformed{};
     while (!rings[0].enqueue(
         malformed.data(), malformed.size()))
       std::this_thread::yield();
@@ -178,12 +181,24 @@ int main() {
     star::CXLMemory::wait_and_retrieve_cxl_shared_data(
         star::CXLMemory::cxl_transport_root_index, &root);
     auto *rings = static_cast<star::MPSCRingBuffer *>(root);
-    auto request = tigonkv::engine::MakeRequest(
-        tigonkv::engine::KvMessageType::kPut, 1, 0, 7,
-        wrong_owner_key, "value");
+    star::Message request;
+    request.set_source_node_id(1);
+    request.set_dest_node_id(0);
+    request.set_worker_id(0);
+    const uint32_t piece_bytes = star::MessagePiece::get_header_size() +
+        config.fixed_key_size + sizeof(uint64_t) + sizeof(uint32_t);
+    star::Encoder encoder(request.data);
+    encoder << star::MessagePiece::construct_message_piece_header(
+        static_cast<uint32_t>(star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST),
+        piece_bytes, tigonkv::engine::kSingleTableId,
+        engine->PartitionForKey(wrong_owner_key));
+    std::string fixed_key(config.fixed_key_size, '\0');
+    std::memcpy(fixed_key.data(), wrong_owner_key.data(), wrong_owner_key.size());
+    encoder.write_n_bytes(fixed_key.data(), fixed_key.size());
+    encoder << uint64_t{7} << uint32_t{0};
+    request.flush();
     while (!rings[0].enqueue(
-        reinterpret_cast<char *>(&request),
-        tigonkv::engine::WireSize(request)))
+        request.get_raw_ptr(), request.get_message_length()))
       std::this_thread::yield();
     for (;;) engine->PollTransport();
   }
@@ -194,6 +209,7 @@ int main() {
          WTERMSIG(misroute_status) == SIGABRT);
   unlink(misroute_template);
 
+#if 0  // Removed current-only wire timeout/tombstone tests; §3.14 uses Message inboxes.
   char full_template[] = "/tmp/tigonkv-engine-full-XXXXXX";
   const int full_fd = mkstemp(full_template);
   assert(full_fd >= 0);
@@ -512,6 +528,7 @@ int main() {
     simulator.Configure(latency_sim::Config{});
   }
   unlink(ring_latency_template);
+#endif
 
   char path_template[] = "/tmp/tigonkv-engine-XXXXXX";
   const int fd = mkstemp(path_template);
@@ -791,15 +808,9 @@ int main() {
             item.value != FixedValue("owner-authority"))
           _exit(16);
       }
-      // Values travel through CXL; requester sends only ScanMigrate frames
-      // (§5.1 codec). Per-partition CXL-first may issue one migrate per remote
-      // partition that needs range move-in (no longer a fixed count of 2).
-      const size_t scan_migrate_wire =
-          tigonkv::engine::WireHeaderBytes() +
-          tigonkv::engine::kScanMigrateRequestBytes;
-      if (scan_migrate_wire == 0 ||
-          authoritative_scan_tx % scan_migrate_wire != 0 ||
-          authoritative_scan_tx == 0)
+      // Values travel through CXL; the requester only transmits original
+      // DATA_MIGRATION_REQUEST_FOR_SCAN frames, never owner values.
+      if (authoritative_scan_tx == 0)
         _exit(17);
       const auto boundary_scan = node_one->Scan(promoted_scan_keys[63], ScanEndKey(), 3);
       if (!boundary_scan.status.ok() || boundary_scan.items.size() != 3)

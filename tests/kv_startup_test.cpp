@@ -39,6 +39,15 @@ tigonkv::Config ConfigFor(const std::string &path, uint32_t node_id) {
   return config;
 }
 
+tigonkv::Config OneVmConfigFor(const std::string &path, uint32_t value_size) {
+  tigonkv::Config config = ConfigFor(path, 0);
+  config.vm_count = 1;
+  config.partition_count = 1;
+  config.fixed_value_size = value_size;
+  config.partition_ranges = {{"", ""}};
+  return config;
+}
+
 void WaitForStaticLayout(const char *path) {
   const int fd = open(path, O_RDONLY);
   assert(fd >= 0);
@@ -86,5 +95,34 @@ int main() {
   assert(waitpid(vm0, &status, 0) == vm0);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   unlink(path);
+
+  // Original Message/MessagePiece framing must fit one MPSC record. The
+  // largest remote-insert request is 108 bytes plus the fixed value: 1931
+  // bytes fits the 2039-byte data region exactly, and one byte more is an
+  // Open-time configuration error rather than a dequeue-time corruption.
+  char exact_path[] = "/tmp/tigonkv-startup-exact-XXXXXX";
+  const int exact_seed = mkstemp(exact_path);
+  assert(exact_seed >= 0);
+  close(exact_seed);
+  {
+    auto exact = tigonkv::engine::KVEngine::Open(
+        OneVmConfigFor(exact_path, 1931), true);
+    (void)exact;
+  }
+  unlink(exact_path);
+
+  char oversized_path[] = "/tmp/tigonkv-startup-oversized-XXXXXX";
+  const int oversized_seed = mkstemp(oversized_path);
+  assert(oversized_seed >= 0);
+  close(oversized_seed);
+  bool oversized_rejected = false;
+  try {
+    (void)tigonkv::engine::KVEngine::Open(
+        OneVmConfigFor(oversized_path, 1932), true);
+  } catch (const std::runtime_error &) {
+    oversized_rejected = true;
+  }
+  assert(oversized_rejected);
+  unlink(oversized_path);
   return 0;
 }

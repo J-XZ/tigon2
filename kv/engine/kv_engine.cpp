@@ -3,11 +3,12 @@
 #include "kv/engine/fixed_value.h"
 
 #include "common/CXL_EBR.h"
+#include "common/BufferedReader.h"
 #include "common/MPSCRingBuffer.h"
 #include "kv/engine/kv_partition.h"
 #include "kv/engine/kv_migration.h"
 #include "kv/engine/mem_access.h"
-#include "kv/engine/kv_messages.h"
+#include "protocol/TwoPLPasha/TwoPLPashaMessage.h"
 #include "protocol/TwoPLPasha/TwoPLPashaSCCWriteThrough.h"
 
 #include <stdexcept>
@@ -149,17 +150,6 @@ uint64_t SharedLayoutConfigDigest(const Config &config) {
   return digest.value();
 }
 
-// Multiple foreground KVEngine instances can coexist in one VM. Transport
-// responses are delivered through a node-wide ring, so their request IDs must
-// be unique across the process rather than merely per engine instance.
-std::atomic<uint64_t> ProcessRequestSequence{1};
-
-uint64_t NextRequestId(uint32_t node_id) {
-  constexpr uint64_t kSequenceMask = (1ULL << 56) - 1;
-  const uint64_t sequence = ProcessRequestSequence.fetch_add(1, std::memory_order_relaxed);
-  return (static_cast<uint64_t>(node_id) << 56) | (sequence & kSequenceMask);
-}
-
 uint64_t CurrentRssKb() {
   std::ifstream statm("/proc/self/statm");
   uint64_t pages = 0;
@@ -169,13 +159,10 @@ uint64_t CurrentRssKb() {
   return page_size > 0 ? resident * static_cast<uint64_t>(page_size) / 1024 : 0;
 }
 
-// While serving a request (or walking owned trees for a local Scan), nested
-// PollTransport must not pop/serve deferred requests. Handling another
-// Put/Get request here mutates the same B+trees under OLC and livelocks
-// scan() restart loops (GDB: yield counts > 10M on YCSB-E 4x4).
-// Response/item/done traffic is applied by the inbound demuxer thread, so
-// nested FG polls only need to skip ServeDeferred.
-thread_local uint32_t TlsRequestServeDepth = 0;
+// The original Message header carries the foreground worker identity.  The
+// TLS is only a process-local handle to that worker's SPSC inbox; it is never
+// serialized or published in shared memory.
+thread_local int32_t TlsForegroundWorkerId = -1;
 
 // §13: Scan hot path only bumps TLS; flushed once at Scan return.
 struct ScanTlsDiag {
@@ -194,50 +181,65 @@ struct ScanTlsFlushGuard {
   }
 };
 
-struct RequestServeDepthGuard {
-  RequestServeDepthGuard() { ++TlsRequestServeDepth; }
-  ~RequestServeDepthGuard() { --TlsRequestServeDepth; }
-  RequestServeDepthGuard(const RequestServeDepthGuard &) = delete;
-  RequestServeDepthGuard &operator=(const RequestServeDepthGuard &) = delete;
-};
-
 [[noreturn]] void TransportFatal(uint32_t node_id, const char *stage,
                                  const char *detail,
-                                 const KvMessage *message = nullptr) {
+                                 star::Message *message = nullptr) {
   std::fprintf(stderr,
       "TIGONKV_TRANSPORT_FATAL node=%u stage=%s detail=%s",
       node_id, stage, detail);
   if (message != nullptr) {
     std::fprintf(stderr,
-        " type=%u source=%u destination=%u request_id=%llu key_size=%u value_size=%u",
-        static_cast<unsigned>(message->type), message->source_node,
-        message->destination_node,
-        static_cast<unsigned long long>(message->request_id),
-        message->key_size, message->value_size);
+        " source=%llu destination=%llu worker=%llu count=%llu bytes=%llu",
+        static_cast<unsigned long long>(message->get_source_node_id()),
+        static_cast<unsigned long long>(message->get_dest_node_id()),
+        static_cast<unsigned long long>(message->get_worker_id()),
+        static_cast<unsigned long long>(message->get_message_count()),
+        static_cast<unsigned long long>(message->get_message_length()));
   }
   std::fputc('\n', stderr);
   std::fflush(stderr);
   std::abort();
 }
 
-bool ValidMessageType(KvMessageType type) {
-  switch (type) {
-    case KvMessageType::kPut:
-    case KvMessageType::kDelete:
-    case KvMessageType::kResponse:
-    case KvMessageType::kMigrate:
-    case KvMessageType::kScanMigrate:
-      return true;
-    case KvMessageType::kGet:  // reserved; owner-value GET deleted (§10.4)
-    case KvMessageType::kCasCommitReserved:
-      return false;
-    default:
-      return false;
+enum class RpcResult : uint8_t { kOk = 0, kMissing = 1, kBusy = 2, kNoMemory = 3 };
+
+Status ResultStatus(RpcResult result, const char *operation) {
+  switch (result) {
+    case RpcResult::kOk: return Status::Ok();
+    case RpcResult::kMissing:
+      return Status::Error(StatusCode::kNotFound, std::string(operation) + " missing");
+    case RpcResult::kBusy:
+      return Status::Error(StatusCode::kBusy, std::string(operation) + " busy");
+    case RpcResult::kNoMemory:
+      return Status::Error(StatusCode::kOutOfMemory, std::string(operation) + " out of memory");
+  }
+  TransportFatal(0, "result_decode", "unknown RPC result");
+}
+
+RpcResult EncodeResult(StatusCode code) {
+  switch (code) {
+    case StatusCode::kOk: return RpcResult::kOk;
+    case StatusCode::kNotFound: return RpcResult::kMissing;
+    case StatusCode::kBusy: return RpcResult::kBusy;
+    case StatusCode::kOutOfMemory: return RpcResult::kNoMemory;
+    default: return RpcResult::kBusy;
   }
 }
 
-bool ValidStatusCode(uint32_t status) {
-  return status <= static_cast<uint32_t>(StatusCode::kBusy);
+void InitializeMessage(star::Message *message, uint32_t source, uint32_t destination,
+                       uint32_t worker_id, uint64_t operation_sequence) {
+  message->set_source_node_id(source);
+  message->set_dest_node_id(destination);
+  message->set_worker_id(worker_id);
+  message->set_transaction_id(operation_sequence);
+}
+
+bool IsResponseType(uint32_t type) {
+  using MessageType = star::TwoPLPashaMessage;
+  return type == static_cast<uint32_t>(MessageType::DATA_MIGRATION_RESPONSE) ||
+      type == static_cast<uint32_t>(MessageType::DATA_MIGRATION_RESPONSE_FOR_SCAN) ||
+      type == static_cast<uint32_t>(MessageType::REMOTE_INSERT_RESPONSE) ||
+      type == static_cast<uint32_t>(MessageType::REMOTE_DELETE_RESPONSE);
 }
 
 std::vector<int> AllowedCpus() {
@@ -302,7 +304,17 @@ KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> p
       pool_(std::move(pool)),
       ebr_(ebr),
       scc_(std::move(scc)),
-      worker_owners_(config.foreground_worker_count_per_vm) {}
+      worker_owners_(config.foreground_worker_count_per_vm) {
+  worker_mailboxes_.reserve(config.foreground_worker_count_per_vm);
+  for (uint32_t worker = 0; worker < config.foreground_worker_count_per_vm;
+       ++worker) {
+    auto mailbox = std::make_unique<WorkerMailbox>();
+    mailbox->outbound.reserve(config.vm_count);
+    for (uint32_t destination = 0; destination < config.vm_count; ++destination)
+      mailbox->outbound.push_back(std::make_unique<star::Message>());
+    worker_mailboxes_.push_back(std::move(mailbox));
+  }
+}
 
 KVEngine::~KVEngine() {
   StopInboundDemuxer();
@@ -363,6 +375,26 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
                                                         std::move(scc)));
   engine->affinity_cpus_ = std::move(affinity_cpus);
   engine->rings_ = rings;
+  const uint64_t maximum_piece_bytes = star::MessagePiece::get_header_size() +
+      std::max({static_cast<uint64_t>(config.fixed_key_size) + config.fixed_value_size +
+                    sizeof(uint64_t) + sizeof(uint32_t),
+                static_cast<uint64_t>(config.fixed_key_size) * 2 +
+                    sizeof(uint64_t) * 2 + sizeof(uint32_t),
+                static_cast<uint64_t>(config.fixed_key_size) + sizeof(uint64_t) +
+                    sizeof(uint32_t)});
+  const uint64_t maximum_message_bytes =
+      star::Message::get_prefix_size() + maximum_piece_bytes;
+  if (maximum_message_bytes > star::BufferedReader::BUFFER_SIZE)
+    throw std::runtime_error("tigonkv: maximum Message exceeds BufferedReader buffer");
+  for (uint32_t node = 0; node < config.vm_count; ++node) {
+    if (rings[node].get_entry_size() < maximum_message_bytes) {
+      std::ostringstream detail;
+      detail << "tigonkv: transport ring entry is smaller than maximum Message"
+             << " (node=" << node << " entry=" << rings[node].get_entry_size()
+             << " required=" << maximum_message_bytes << ")";
+      throw std::runtime_error(detail.str());
+    }
+  }
 
   // A joining VM attaches the static HWCC layout with reset=false, but still
   // has to materialize its own SWCC arena/root while the first startup is
@@ -539,7 +571,7 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
     // Existing remote rows follow the original TwoPLPasha path: owner moves
     // the row in, then the requester performs the shared write itself.
     const Status migrated =
-        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+        Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
     if (migrated.ok()) return write_shared();
     if (migrated.code != StatusCode::kNotFound) return migrated;
     // A true create uses the original REMOTE_INSERT ownership split: the owner
@@ -547,7 +579,7 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
     // ref; after the ack the requester publishes only valid (no second data
     // write through the shared payload).
     const Status inserted =
-        Forward(KvMessageType::kPut, key, value, nullptr, route.owner);
+        Forward(RpcKind::kInsert, key, value, route.partition_id, route.owner);
     if (!inserted.ok()) return inserted;
     if (!route.partition->PublishRemotePlaceholder(key, config_.node_id))
       return Status::Error(StatusCode::kBusy,
@@ -589,7 +621,7 @@ GetResult KVEngine::Get(std::string_view key) {
     if (first == SharedAccessState::kRetry)
       return {Status::Error(StatusCode::kBusy, "shared get contention"), {}};
     const Status migrated =
-        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+        Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
     if (!migrated.ok()) return {migrated, {}};
     const SharedAccessState second =
         visible->GetShared(key, config_.node_id, &shared);
@@ -624,7 +656,7 @@ Status KVEngine::Delete(std::string_view key) {
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     const Status migrated =
-        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+        Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
     if (!migrated.ok()) return migrated;
     star::TwoPLPashaMetadataShared *locked_row = nullptr;
     const SharedAccessState prepared = route.partition->PrepareRemoteDelete(
@@ -633,20 +665,12 @@ Status KVEngine::Delete(std::string_view key) {
       return Status::Error(StatusCode::kNotFound, "key not found");
     if (prepared != SharedAccessState::kDone)
       return Status::Error(StatusCode::kBusy, "remote delete shared row busy");
-    bool owner_responded = false;
-    const Status deleted = Forward(KvMessageType::kDelete, key, {}, nullptr,
-                                   route.owner, &owner_responded);
+    const Status deleted = Forward(RpcKind::kDelete, key, {}, route.partition_id,
+                                   route.owner);
     // A successful owner callback consumes the requester write/ref pin with
     // the retired row.  On an unsuccessful ack it is still live and must be
     // restored before the facade retries.
     if (!deleted.ok()) {
-      if (!owner_responded) {
-        // The owner may still consume the row after this requester times out.
-        // Restoring the valid bit or unpinning here would race EBR retirement;
-        // this is an unrecoverable transport failure, not a retryable Busy.
-        LOG(FATAL) << "remote delete completion is unknown after requester "
-                   << "published invalid";
-      }
       route.partition->AbortRemoteDelete(locked_row);
     }
     return deleted;
@@ -682,15 +706,9 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
     bool owner_exhausted = false;
     bool owner_no_predecessor = false;
     for (;;) {
-      KVPartition::SharedScanProbeResult probe;
-      {
-        RequestServeDepthGuard depth_guard;
-        probe = partition->ProbeSharedScanPage(
-            config_.node_id, min_key, scan_limit,
-            owner_exhausted,
-            /*cursor_is_duplicate=*/false,
-            owner_no_predecessor, inclusive_max);
-      }
+      KVPartition::SharedScanProbeResult probe = partition->ProbeSharedScanPage(
+          config_.node_id, min_key, scan_limit, owner_exhausted,
+          /*cursor_is_duplicate=*/false, owner_no_predecessor, inclusive_max);
       ++TlsScanDiag.partition_probes;
       PollTransport();
       if (!probe.status.ok()) return probe.status;
@@ -699,34 +717,13 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
           return Status::Error(StatusCode::kBusy,
                                "CXL scan remains incomplete after move-in");
         migrated_once = true;
-        bool unused_exhausted = false;
-        bool unused_no_predecessor = false;
-        const auto payload =
-            EncodeScanMigrateRequest(partition_id, 0, scan_limit, inclusive_max);
-        const uint64_t request_id = NextRequestId(config_.node_id);
-        auto pending = RegisterPendingResponse(request_id);
-        try {
-          SendTransportMessage(MakeRequest(
-              KvMessageType::kScanMigrate, config_.node_id,
-              OwnerForPartition(partition_id), request_id, min_key, payload));
-          ++TlsScanDiag.migrate_rpcs;
-        } catch (...) {
-          RemovePendingResponse(request_id);
-          throw;
-        }
-        std::string response_value;
-        const Status migrated =
-            AwaitResponse(request_id, pending, &response_value);
+        const Status migrated = Forward(
+            RpcKind::kScanMigrate, min_key, {}, partition_id,
+            OwnerForPartition(partition_id), inclusive_max, scan_limit);
+        ++TlsScanDiag.migrate_rpcs;
         if (!migrated.ok()) return migrated;
-        uint32_t resp_part = 0;
-        if (!DecodeScanMigrateResponse(response_value, &resp_part,
-                                       &unused_exhausted,
-                                       &unused_no_predecessor) ||
-            resp_part != partition_id)
-          return Status::Error(StatusCode::kCorruption,
-                               "malformed scan migrate response");
-        owner_exhausted = unused_exhausted;
-        owner_no_predecessor = unused_no_predecessor;
+        owner_exhausted = false;
+        owner_no_predecessor = false;
         continue;
       }
       if (!probe.scan_success)
@@ -765,12 +762,8 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
     if (OwnerForPartition(partition_id) == config_.node_id) {
       std::vector<std::pair<std::string, std::string>> items;
       const std::function<void()> progress = [this] { PollTransport(); };
-      bool ok = false;
-      {
-        RequestServeDepthGuard depth_guard;
-        ok = partitions_[partition_id]->ScanOwned(min_key, remaining, &items,
-                                                  &progress, inclusive_max);
-      }
+      const bool ok = partitions_[partition_id]->ScanOwned(
+          min_key, remaining, &items, &progress, inclusive_max);
       ++TlsScanDiag.partition_probes;
       PollTransport();
       status = ok ? Status::Ok()
@@ -906,7 +899,7 @@ CasResult KVEngine::CompareExchange(std::string_view key,
     // Match original remote write acquisition: owner only moves an existing
     // row in; requester then takes the shared write/ref path itself.
     const Status migrated =
-        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+        Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
     if (migrated.ok()) {
       state = compare_shared();
       if (state == SharedAccessState::kDone) {
@@ -930,7 +923,7 @@ CasResult KVEngine::CompareExchange(std::string_view key,
     // The established empty-expected create sentinel shares REMOTE_INSERT;
     // it does not revive a separate owner-side CAS protocol.
     const Status inserted =
-        Forward(KvMessageType::kPut, key, desired, nullptr, route.owner);
+        Forward(RpcKind::kInsert, key, desired, route.partition_id, route.owner);
     if (!inserted.ok()) return {inserted, false};
     if (!visible->PublishRemotePlaceholder(key, config_.node_id))
       return {Status::Error(StatusCode::kBusy,
@@ -980,7 +973,7 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
     if (state == SharedAccessState::kRetry)
       return {Status::Error(StatusCode::kBusy, "shared increment contention"), 0};
     const Status migrated =
-        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+        Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
     if (migrated.ok()) {
       state = increment_shared();
       if (state == SharedAccessState::kDone) {
@@ -1001,7 +994,7 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
                             "increment value exceeds fixed value size"),
               0};
     const Status inserted =
-        Forward(KvMessageType::kPut, key, initial, nullptr, route.owner);
+        Forward(RpcKind::kInsert, key, initial, route.partition_id, route.owner);
     if (!inserted.ok()) return {inserted, 0};
     if (!visible->PublishRemotePlaceholder(key, config_.node_id))
       return {Status::Error(StatusCode::kBusy,
@@ -1101,187 +1094,129 @@ RuntimeStats KVEngine::EngineRuntime() const {
   stats.shared_swcc_flushes = shared_swcc_flushes_.load(std::memory_order_relaxed);
   stats.migration_in = migration_in_.load(std::memory_order_relaxed);
   stats.migration_out = migration_out_.load(std::memory_order_relaxed);
-  stats.abandoned_responses =
-      abandoned_responses_.load(std::memory_order_relaxed);
+  stats.abandoned_responses = 0;
   stats.scan_partition_probes =
       scan_partition_probes_.load(std::memory_order_relaxed);
   stats.scan_migrate_rpcs =
       scan_migrate_rpcs_.load(std::memory_order_relaxed);
   stats.scan_owner_rows_movein_attempted =
       scan_owner_rows_movein_attempted_.load(std::memory_order_relaxed);
-  stats.deferred_queue_peak =
-      deferred_queue_peak_.load(std::memory_order_relaxed);
+  stats.deferred_queue_peak = 0;
   stats.network_tx_bytes = NetworkTxBytes();
   stats.network_rx_bytes = NetworkRxBytes();
   return stats;
 }
 
-void KVEngine::SendTransportMessage(const KvMessage &message) {
-  if (rings_ == nullptr || !ValidMessageType(message.type) ||
-      message.source_node >= config_.vm_count ||
-      message.destination_node >= config_.vm_count ||
-      message.key_size > message.key.size() ||
-      message.value_size > message.value.size() ||
-      !ValidStatusCode(message.status))
-    TransportFatal(config_.node_id, "send_validate",
-                   "invalid outgoing KV transport message", &message);
-  // A deferred owner request has an isolated latency scope. Pay all database
-  // access delay after its locks/EBR guards have been released but before the
-  // response becomes visible in the peer's ring.
-  mem_access::DelayIsolatedScopeNow();
-  unsigned spins = 0;
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(config_.sync_timeout_sec);
-  const size_t wire_size = WireSize(message);
-  for (;;) {
-    bool enqueued = false;
-    try {
-      enqueued = rings_[message.destination_node].enqueue(
-          const_cast<char *>(reinterpret_cast<const char *>(&message)),
-          wire_size);
-    } catch (const std::exception &error) {
-      TransportFatal(config_.node_id, "ring_enqueue", error.what(), &message);
-    } catch (...) {
-      TransportFatal(config_.node_id, "ring_enqueue", "non-std exception",
-                     &message);
-    }
-    if (enqueued) break;
-    // A failed full-ring reservation/rollback is itself an HWCC access.
-    // Settle it before host-speed retries can amplify probe traffic.
-    mem_access::DelayActiveScopeNow();
-    if (std::chrono::steady_clock::now() >= deadline) {
-      const auto snapshot = rings_[message.destination_node].snapshot();
-      std::ostringstream detail;
-      detail << "transport enqueue timeout destination="
-             << message.destination_node << " request_id=" << message.request_id
-             << " head=" << snapshot.head << " tail=" << snapshot.tail
-             << " count=" << snapshot.count
-             << " entries=" << snapshot.entries;
-      TransportFatal(config_.node_id, "ring_enqueue_timeout",
-                     detail.str().c_str(), &message);
-    }
-    // Peer demuxers free ring slots. When called from nested Serve (depth>0)
-    // we must not ServeDeferred, but top-level Send during Await may briefly
-    // help demux by yielding; sleeping avoids tight livelock on full rings.
-    if ((++spins & 63u) == 0)
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
-    else
-      std::this_thread::yield();
-  }
-  network_tx_bytes_.fetch_add(wire_size, std::memory_order_relaxed);
+KVEngine::WorkerMailbox &KVEngine::CurrentMailbox() {
+  const uint32_t worker = TlsForegroundWorkerId < 0
+      ? 0 : static_cast<uint32_t>(TlsForegroundWorkerId);
+  if (worker >= worker_mailboxes_.size())
+    TransportFatal(config_.node_id, "worker_mailbox", "foreground worker is not bound");
+  return *worker_mailboxes_[worker];
 }
 
-Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_view value,
-                         std::string *response_value) {
-  return Forward(type, key, value, response_value, OwnerForKey(key));
+star::Message &KVEngine::OutboundMessage(WorkerMailbox &mailbox,
+                                         uint32_t destination,
+                                         uint64_t operation_sequence) {
+  if (destination >= mailbox.outbound.size())
+    TransportFatal(config_.node_id, "outbound", "destination exceeds original Message buffers");
+  auto &message = *mailbox.outbound[destination];
+  message.clear_message_pieces();
+  const uint32_t worker = TlsForegroundWorkerId < 0 ? 0 :
+      static_cast<uint32_t>(TlsForegroundWorkerId);
+  InitializeMessage(&message, config_.node_id, destination, worker,
+                    operation_sequence);
+  return message;
 }
 
-Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_view value,
-                         std::string *response_value, uint32_t owner,
-                         bool *response_received) {
-  const uint64_t request_id = NextRequestId(config_.node_id);
-  auto pending = RegisterPendingResponse(request_id);
+void KVEngine::SendTransportMessage(star::Message &message) {
+  if (rings_ == nullptr || !message.check_size() || !message.check_deadbeef() ||
+      message.get_source_node_id() != config_.node_id ||
+      message.get_dest_node_id() >= config_.vm_count ||
+      message.get_worker_id() >= config_.foreground_worker_count_per_vm ||
+      message.get_message_count() != 1 ||
+      message.get_message_length() > rings_[message.get_dest_node_id()].get_entry_size())
+    TransportFatal(config_.node_id, "send_validate", "invalid original Message frame", &message);
   try {
-    SendTransportMessage(
-        MakeRequest(type, config_.node_id, owner, request_id, key, value));
-  } catch (...) {
-    RemovePendingResponse(request_id);
-    throw;
+    while (!rings_[message.get_dest_node_id()].enqueue(
+        message.get_raw_ptr(), message.get_message_length()))
+      std::this_thread::yield();
+  } catch (const std::exception &error) {
+    TransportFatal(config_.node_id, "send_ring", error.what(), &message);
   }
-  return AwaitResponse(request_id, pending, response_value, response_received);
+  network_tx_bytes_.fetch_add(message.get_message_length(), std::memory_order_relaxed);
+}
+
+Status KVEngine::Forward(RpcKind type, std::string_view key,
+                         std::string_view value, uint32_t partition_id,
+                         uint32_t owner, std::string_view scan_max,
+                         uint64_t scan_limit) {
+  if (owner >= config_.vm_count || partition_id >= config_.partition_count)
+    return Status::Error(StatusCode::kInvalidArgument, "invalid RPC route");
+  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id);
+  if (table == nullptr)
+    return Status::Error(StatusCode::kCorruption, "missing RPC table adapter");
+  if (table->partitionID() != partition_id ||
+      OwnerForPartition(partition_id) != owner)
+    TransportFatal(config_.node_id, "forward", "inconsistent RPC partition route");
+  WorkerMailbox &mailbox = CurrentMailbox();
+  if (mailbox.operation.expected_response_type != 0)
+    TransportFatal(config_.node_id, "forward", "reentrant foreground RPC");
+  const uint64_t sequence = mailbox.next_operation_sequence++;
+  const FixedKey fixed_key = FixedKey::From(key, config_.fixed_key_size);
+  FixedKey fixed_scan_max{};
+  if (type == RpcKind::kScanMigrate)
+    fixed_scan_max = FixedKey::From(scan_max, config_.fixed_key_size);
+  std::string fixed_value;
+  if (type == RpcKind::kInsert) {
+    fixed_value.assign(config_.fixed_value_size, '\0');
+    std::memcpy(fixed_value.data(), value.data(),
+                std::min(value.size(), fixed_value.size()));
+  }
+  star::Message &message = OutboundMessage(mailbox, owner, sequence);
+  uint32_t expected_response = 0;
+  switch (type) {
+    case RpcKind::kMigrate:
+      star::TwoPLPashaMessageFactory::new_data_migration_message(
+          message, *table, fixed_key.bytes, sequence, 0);
+      expected_response = static_cast<uint32_t>(star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE);
+      break;
+    case RpcKind::kInsert:
+      star::TwoPLPashaMessageFactory::new_remote_insert_message(
+          message, *table, fixed_key.bytes, fixed_value.data(), sequence, 0);
+      expected_response = static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_INSERT_RESPONSE);
+      break;
+    case RpcKind::kDelete:
+      star::TwoPLPashaMessageFactory::new_remote_delete_message(message, *table, fixed_key.bytes);
+      expected_response = static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE);
+      break;
+    case RpcKind::kScanMigrate:
+      star::TwoPLPashaMessageFactory::new_data_migration_message_for_scan(
+          message, *table, fixed_key.bytes, fixed_scan_max.bytes, scan_limit, sequence, 0);
+      expected_response = static_cast<uint32_t>(
+          star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN);
+      break;
+  }
+  mailbox.operation = {expected_response, partition_id, sequence, false,
+                       Status::Error(StatusCode::kCorruption, "missing RPC response")};
+  SendTransportMessage(message);
+  message.clear_message_pieces();
+  return AwaitResponse(mailbox);
 }
 
 Status KVEngine::RequestMigrate(std::string_view key) {
   const KeyRoute route = RouteForKey(key);
-  return Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+  return Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
 }
 
-std::shared_ptr<KVEngine::PendingResponse>
-KVEngine::RegisterPendingResponse(uint64_t request_id) {
-  auto pending = std::make_shared<PendingResponse>();
-  std::lock_guard<std::mutex> lock(pending_response_mutex_);
-  if (!pending_responses_.emplace(request_id, pending).second)
-    throw std::runtime_error("duplicate pending response request id");
-  return pending;
-}
-
-void KVEngine::RemovePendingResponse(uint64_t request_id) {
-  std::lock_guard<std::mutex> lock(pending_response_mutex_);
-  pending_responses_.erase(request_id);
-}
-
-void KVEngine::AbandonPendingResponse(uint64_t request_id) {
-  // Capacity tracks in-flight workers: each may abandon a small burst of RPCs
-  // without unbounded growth (§10.11 / §11.13).
-  const size_t max_abandoned = std::max<size_t>(
-      256, static_cast<size_t>(config_.foreground_worker_count_per_vm) * 128);
-  std::lock_guard<std::mutex> lock(pending_response_mutex_);
-  pending_responses_.erase(request_id);
-  if (abandoned_request_ids_.insert(request_id).second)
-    abandoned_request_order_.push_back(request_id);
-  while (abandoned_request_order_.size() > max_abandoned) {
-    const uint64_t oldest = abandoned_request_order_.front();
-    abandoned_request_order_.pop_front();
-    abandoned_request_ids_.erase(oldest);
-  }
-}
-
-bool KVEngine::ConsumeAbandonedRequestLocked(uint64_t request_id) {
-  auto it = abandoned_request_ids_.find(request_id);
-  if (it == abandoned_request_ids_.end()) return false;
-  abandoned_request_ids_.erase(it);
-  for (auto order = abandoned_request_order_.begin();
-       order != abandoned_request_order_.end(); ++order) {
-    if (*order == request_id) {
-      abandoned_request_order_.erase(order);
-      break;
-    }
-  }
-  return true;
-}
-
-Status KVEngine::AwaitResponse(
-    uint64_t request_id, const std::shared_ptr<PendingResponse> &pending,
-    std::string *response_value, bool *response_received) {
-  if (response_received != nullptr) *response_received = false;
-  const auto deadline = std::chrono::steady_clock::now() +
-      std::chrono::seconds(config_.sync_timeout_sec);
-  for (;;) {
-    // Help serve deferred requests so peers waiting on us make progress, while
-    // the demuxer wakes exactly this request when its response arrives. A
-    // bounded timed wait preserves cooperative service liveness without a
-    // busy-yield loop when the peer has no request for us.
+Status KVEngine::AwaitResponse(WorkerMailbox &mailbox) {
+  while (!mailbox.operation.done) {
     PollTransport();
-    std::unique_lock<std::mutex> lock(pending->mutex);
-    if (!pending->done) {
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) {
-        lock.unlock();
-        AbandonPendingResponse(request_id);
-        return Status::Error(StatusCode::kBusy,
-                             "forwarded owner response timed out");
-      }
-      // Demux notifies this CV both for the matching response and when an
-      // inbound request needs cooperative service. Holding pending->mutex
-      // across the check and wait prevents a lost wakeup.
-      pending->cv.wait_until(lock, deadline);
-      continue;
-    }
-    KvMessage response = pending->message;
-    lock.unlock();
-    RemovePendingResponse(request_id);
-    if (response_received != nullptr) *response_received = true;
-    if (response_value != nullptr)
-      response_value->assign(response.value.data(), response.value_size);
-    const StatusCode code = static_cast<StatusCode>(response.status);
-    std::string message;
-    if (code != StatusCode::kOk) {
-      message = "forwarded owner operation failed";
-      if (response.value_size != 0)
-        message += ": " + std::string(response.value.data(), response.value_size);
-    }
-    return {code, std::move(message)};
+    if (!mailbox.operation.done) std::this_thread::yield();
   }
+  const Status result = mailbox.operation.result;
+  mailbox.operation = {};
+  return result;
 }
 
 void KVEngine::StartInboundDemuxer() {
@@ -1301,6 +1236,9 @@ void KVEngine::InboundDemuxerLoop() {
   } catch (const std::exception &error) {
     TransportFatal(config_.node_id, "demux_affinity", error.what());
   }
+  if (rings_ == nullptr)
+    TransportFatal(config_.node_id, "demux", "missing inbound ring");
+  star::BufferedReader reader(rings_[config_.node_id]);
   while (!inbound_demuxer_stop_.load(std::memory_order_acquire)) {
     bool progressed = false;
     {
@@ -1308,145 +1246,37 @@ void KVEngine::InboundDemuxerLoop() {
       // needs its own foreground scope; scopes do not propagate across threads.
       mem_access::LatencyScope latency_scope(
           latency_sim::ScopeKind::kForeground);
-      if (rings_ != nullptr) {
-        for (int drained = 0; drained < 64; ++drained) {
-          alignas(64) char bytes[sizeof(KvMessage)];
-          uint64_t received = 0;
-          try {
-            received = rings_[config_.node_id].recv(bytes, sizeof(bytes));
-          } catch (const std::exception &error) {
-            TransportFatal(config_.node_id, "ring_recv", error.what());
-          } catch (...) {
-            TransportFatal(config_.node_id, "ring_recv", "non-std exception");
-          }
-          // recv has already recorded all inbound HWCC accesses. Pay them
-          // before publishing a response notification or deferred request.
-          mem_access::DelayActiveScopeNow();
-          if (received == 0) break;
-          KvMessage message{};
-          if (received < WireHeaderBytes() || received > sizeof(KvMessage))
-            TransportFatal(config_.node_id, "ring_recv",
-                           "malformed KV transport entry");
-          std::memcpy(&message, bytes, received);
-          if (!ValidWireFrame(received, message))
-            TransportFatal(config_.node_id, "ring_recv",
-                           "KV wire length/value_size mismatch");
-          network_rx_bytes_.fetch_add(received, std::memory_order_relaxed);
-          try {
-            DemuxTransportMessage(message);
-          } catch (const std::exception &error) {
-            TransportFatal(config_.node_id, "demux", error.what(), &message);
-          } catch (...) {
-            TransportFatal(config_.node_id, "demux", "non-std exception", &message);
-          }
-          progressed = true;
+      for (int drained = 0; drained < 64; ++drained) {
+        std::unique_ptr<star::Message> message;
+        try {
+          message = reader.next_message();
+        } catch (const std::exception &error) {
+          TransportFatal(config_.node_id, "ring_recv", error.what());
+        } catch (...) {
+          TransportFatal(config_.node_id, "ring_recv", "non-std exception");
         }
+        mem_access::DelayActiveScopeNow();
+        if (message == nullptr) break;
+        if (!message->check_size() || !message->check_deadbeef() ||
+            message->get_dest_node_id() != config_.node_id ||
+            message->get_source_node_id() >= config_.vm_count ||
+            message->get_worker_id() >= worker_mailboxes_.size() ||
+            message->get_message_count() != 1 ||
+            message->get_message_length() < star::Message::get_prefix_size() +
+                star::MessagePiece::get_header_size())
+          TransportFatal(config_.node_id, "demux", "malformed original Message", message.get());
+        const auto piece = *message->begin();
+        if (piece.get_message_length() < star::MessagePiece::get_header_size() ||
+            piece.get_message_length() !=
+                message->get_message_length() - star::Message::get_prefix_size())
+          TransportFatal(config_.node_id, "demux", "malformed MessagePiece framing", message.get());
+        network_rx_bytes_.fetch_add(message->get_message_length(), std::memory_order_relaxed);
+        worker_mailboxes_[message->get_worker_id()]->inbox.push(message.release());
+        progressed = true;
       }
     }
-    if (!progressed) std::this_thread::sleep_for(std::chrono::microseconds(20));
+    if (!progressed) std::this_thread::yield();
   }
-}
-
-void KVEngine::DemuxTransportMessage(const KvMessage &message) {
-  if (!ValidMessageType(message.type) ||
-      message.destination_node != config_.node_id ||
-      message.source_node >= config_.vm_count ||
-      message.key_size > message.key.size() ||
-      message.value_size > message.value.size() ||
-      !ValidStatusCode(message.status))
-    throw std::runtime_error("invalid KV transport message");
-  if (message.type == KvMessageType::kResponse) {
-    std::shared_ptr<PendingResponse> pending;
-    {
-      std::lock_guard<std::mutex> lock(pending_response_mutex_);
-      auto it = pending_responses_.find(message.request_id);
-      if (it == pending_responses_.end()) {
-        if (ConsumeAbandonedRequestLocked(message.request_id)) {
-          abandoned_responses_.fetch_add(1, std::memory_order_relaxed);
-          return;
-        }
-        // Tombstone may have been FIFO-evicted under timeout storms. Drop
-        // rather than abort the demuxer process (§10.11).
-        abandoned_responses_.fetch_add(1, std::memory_order_relaxed);
-        return;
-      }
-      pending = it->second;
-    }
-    {
-      std::lock_guard<std::mutex> lock(pending->mutex);
-      if (pending->done)
-        throw std::runtime_error("duplicate response for request");
-      pending->message = message;
-      pending->done = true;
-    }
-    pending->cv.notify_one();
-    return;
-  }
-  // Request path: demuxer → shared deferred FIFO (IncomingDispatcher style).
-  // Any FG PollTransport may serve — required so Forward/Await cannot pin
-  // requests on a non-progressing worker shard.
-  {
-    std::lock_guard<std::mutex> lock(deferred_request_mutex_);
-    deferred_transport_requests_.push_back(message);
-    const uint64_t depth =
-        static_cast<uint64_t>(deferred_transport_requests_.size());
-    uint64_t peak = deferred_queue_peak_.load(std::memory_order_relaxed);
-    while (depth > peak &&
-           !deferred_queue_peak_.compare_exchange_weak(
-               peak, depth, std::memory_order_relaxed)) {
-    }
-  }
-  WakePendingForwarders();
-}
-
-void KVEngine::WakePendingForwarders() {
-  std::vector<std::shared_ptr<PendingResponse>> pending;
-  {
-    std::lock_guard<std::mutex> lock(pending_response_mutex_);
-    pending.reserve(pending_responses_.size());
-    for (const auto &entry : pending_responses_)
-      pending.push_back(entry.second);
-  }
-  for (const auto &entry : pending) {
-    // Synchronize with AwaitResponse's check-then-wait interval. notify_one
-    // alone is not sufficient if it races just before wait releases the lock.
-    std::lock_guard<std::mutex> lock(entry->mutex);
-    entry->cv.notify_one();
-  }
-}
-
-void KVEngine::ServeDeferredRequests() {
-  if (TlsRequestServeDepth != 0) return;
-  constexpr size_t kMaxBatch = 64;
-  // Reuse one per-worker batch buffer: no heap allocation on PollTransport's
-  // hot path and only one shared-FIFO lock acquisition per batch.
-  thread_local std::array<KvMessage, kMaxBatch> batch;
-  size_t batch_count = 0;
-  {
-    std::lock_guard<std::mutex> lock(deferred_request_mutex_);
-    batch_count = std::min(kMaxBatch, deferred_transport_requests_.size());
-    for (size_t i = 0; i < batch_count; ++i) {
-      batch[i] = std::move(deferred_transport_requests_.front());
-      deferred_transport_requests_.pop_front();
-    }
-  }
-  for (size_t i = 0; i < batch_count; ++i) {
-    const KvMessage &deferred = batch[i];
-    mem_access::IsolatedLatencyScope request_scope(
-        latency_sim::ScopeKind::kForeground);
-    try {
-      ServeTransportRequest(deferred);
-    } catch (const std::exception &error) {
-      TransportFatal(config_.node_id, "serve", error.what(), &deferred);
-    } catch (...) {
-      TransportFatal(config_.node_id, "serve", "non-std exception", &deferred);
-    }
-  }
-}
-
-void KVEngine::PollTransport() {
-  // FG cooperative serve only — no MPSC recv (demuxer owns that).
-  ServeDeferredRequests();
 }
 
 void KVEngine::BindWorker(uint32_t worker_id) {
@@ -1465,6 +1295,7 @@ void KVEngine::BindWorker(uint32_t worker_id) {
   ebr_->thread_init_ebr_meta(config_.node_id, worker_id);
   star::global_ebr_meta = ebr_;
   worker_owners_[worker_id] = current;
+  TlsForegroundWorkerId = static_cast<int32_t>(worker_id);
 }
 
 void KVEngine::ReleaseWorker() {
@@ -1477,121 +1308,215 @@ void KVEngine::ReleaseWorker() {
   if (owner == worker_owners_.end())
     throw std::runtime_error("ReleaseWorker called by an unbound thread");
   *owner = std::thread::id{};
+  TlsForegroundWorkerId = -1;
 }
 
-void KVEngine::ServeTransportRequest(const KvMessage &message) {
-  if (message.destination_node != config_.node_id ||
-      message.key_size > message.key.size() || message.value_size > message.value.size())
-    throw std::runtime_error("invalid KV transport message");
-  // Responses must never reach the serve path (demuxer applies them).
-  if (message.type == KvMessageType::kResponse)
-    throw std::runtime_error("response traffic must not enter ServeTransportRequest");
+void KVEngine::PollTransport() {
+  WorkerMailbox &mailbox = CurrentMailbox();
+  while (!mailbox.inbox.empty()) {
+    std::unique_ptr<star::Message> message(mailbox.inbox.front());
+    if (!mailbox.inbox.pop())
+      TransportFatal(config_.node_id, "worker_inbox", "SPSC pop failed");
+    mem_access::IsolatedLatencyScope request_scope(latency_sim::ScopeKind::kForeground);
+    DispatchMessage(*message, mailbox);
+  }
+}
 
-  RequestServeDepthGuard depth_guard;
-  const std::string_view key(message.key.data(), message.key_size);
-  const std::string_view value(message.value.data(), message.value_size);
-  KvMessage response = MakeRequest(KvMessageType::kResponse, config_.node_id,
-                                   message.source_node, message.request_id, key);
-  if (message.type == KvMessageType::kScanMigrate) {
-    uint32_t partition_id = 0;
-    uint32_t flags = 0;
-    uint64_t output_limit = 0;
-    std::string inclusive_max;
-    KVPartition *prepared_partition = nullptr;
-    if (!DecodeScanMigrateRequest(value, &partition_id, &flags, &output_limit,
-                                  &inclusive_max)) {
-      response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
-    } else {
-      try {
-        bool exhausted = false;
-        bool no_predecessor = false;
-        const Status status = PreparePartitionSharedScan(
-            partition_id, key, inclusive_max,
-            (flags & kScanMigrateFlagCursorDuplicate) != 0, output_limit,
-            message.source_node, &exhausted, &no_predecessor);
-        response.status = static_cast<uint32_t>(status.code);
-        if (status.ok()) {
-          prepared_partition = partitions_[partition_id].get();
-          const auto encoded =
-              EncodeScanMigrateResponse(partition_id, exhausted, no_predecessor);
-          response.value_size = static_cast<uint32_t>(encoded.size());
-          std::memcpy(response.value.data(), encoded.data(), encoded.size());
-        } else {
-          response.value_size = static_cast<uint32_t>(
-              std::min(status.message.size(), response.value.size()));
-          std::memcpy(response.value.data(), status.message.data(),
-                      response.value_size);
-        }
-      } catch (const std::bad_alloc &) {
-        response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
-      }
+void KVEngine::DispatchMessage(star::Message &message, WorkerMailbox &mailbox) {
+  const auto piece = *message.begin();
+  if (piece.get_table_id() != kSingleTableId ||
+      piece.get_partition_id() >= config_.partition_count)
+    TransportFatal(config_.node_id, "dispatch", "invalid table or partition", &message);
+  if (IsResponseType(piece.get_message_type()))
+    ConsumeTransportResponse(piece, mailbox);
+  else
+    ServeTransportRequest(message, piece, mailbox);
+}
+
+void KVEngine::ConsumeTransportResponse(star::MessagePiece piece,
+                                        WorkerMailbox &mailbox) {
+  auto &operation = mailbox.operation;
+  if (operation.expected_response_type == 0 || operation.done ||
+      piece.get_message_type() != operation.expected_response_type ||
+      piece.get_partition_id() != operation.partition_id)
+    TransportFatal(config_.node_id, "response", "unexpected response for worker operation");
+  auto input = piece.toStringPiece();
+  uint32_t key_offset = 0;
+  if (piece.get_message_type() == static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE)) {
+    if (input.size() != 0)
+      TransportFatal(config_.node_id, "response", "remote delete completion has payload");
+    operation.result = Status::Ok();
+  } else if (piece.get_message_type() == static_cast<uint32_t>(
+                 star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN)) {
+    bool success = false;
+    star::Decoder decoder(input);
+    decoder >> success >> key_offset;
+    if (decoder.size() != 0 || key_offset != 0)
+      TransportFatal(config_.node_id, "response", "malformed scan migration response");
+    operation.result = success ? Status::Ok()
+                               : Status::Error(StatusCode::kBusy, "scan migration failed");
+  } else {
+    uint8_t raw_result = 0;
+    star::Decoder decoder(input);
+    decoder >> raw_result >> key_offset;
+    if (decoder.size() != 0 || key_offset != 0 || raw_result > static_cast<uint8_t>(RpcResult::kNoMemory))
+      TransportFatal(config_.node_id, "response", "malformed RPC result response");
+    operation.result = ResultStatus(static_cast<RpcResult>(raw_result), "owner RPC");
+  }
+  operation.done = true;
+}
+
+void KVEngine::ServeTransportRequest(star::Message &message,
+                                     star::MessagePiece piece,
+                                     WorkerMailbox &mailbox) {
+  if (piece.get_table_id() != kSingleTableId ||
+      piece.get_partition_id() >= config_.partition_count)
+    TransportFatal(config_.node_id, "request", "invalid table or partition", &message);
+  auto *table = KvMigrationRuntime::Instance().TableFor(piece.get_partition_id());
+  if (table == nullptr || table->tableID() != kSingleTableId ||
+      table->partitionID() != piece.get_partition_id())
+    TransportFatal(config_.node_id, "request", "missing table adapter", &message);
+  const uint32_t type = piece.get_message_type();
+  star::Message &response = OutboundMessage(
+      mailbox, message.get_source_node_id(), message.get_transaction_id());
+  const auto make_result_response = [&](uint32_t response_type, RpcResult result,
+                                        uint32_t key_offset) {
+    const auto size = star::MessagePiece::get_header_size() + sizeof(uint8_t) + sizeof(key_offset);
+    star::Encoder encoder(response.data);
+    encoder << star::MessagePiece::construct_message_piece_header(
+        response_type, size, kSingleTableId, piece.get_partition_id());
+    encoder << static_cast<uint8_t>(result) << key_offset;
+    response.flush();
+  };
+  const auto request_bytes = piece.toStringPiece();
+  if (type == static_cast<uint32_t>(star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST)) {
+    if (piece.get_message_length() != star::MessagePiece::get_header_size() +
+            config_.fixed_key_size + sizeof(uint64_t) + sizeof(uint32_t))
+      TransportFatal(config_.node_id, "request", "bad migration request length", &message);
+    const std::string_view key(request_bytes.data(), config_.fixed_key_size);
+    auto trailing = request_bytes;
+    trailing.remove_prefix(config_.fixed_key_size);
+    uint64_t transaction_id = 0;
+    uint32_t key_offset = 0;
+    star::Decoder decoder(trailing);
+    decoder >> transaction_id >> key_offset;
+    if (decoder.size() != 0 || key_offset != 0)
+      TransportFatal(config_.node_id, "request", "bad migration request fields", &message);
+    auto *partition = OwnedPartition(key);
+    if (partition == nullptr || partition->partition_id() != piece.get_partition_id()) {
+      std::ostringstream detail;
+      detail << "migration delivered to non-owner wire_partition="
+             << piece.get_partition_id() << " computed_partition="
+             << RouteForKey(key).partition_id << " computed_owner="
+             << RouteForKey(key).owner;
+      TransportFatal(config_.node_id, "request", detail.str().c_str(), &message);
     }
-    // Ack before OnDemand Clock eviction so the requester can CXL-probe the
-    // page just moved in (same liveness rule as kMigrate).
+    bool moved_in = false;
+    StatusCode status = StatusCode::kCorruption;
+    try {
+      status = partition->EnsureInShared(key, message.get_source_node_id(), &moved_in);
+    } catch (const std::bad_alloc &) {
+      status = StatusCode::kOutOfMemory;
+    }
+    if (status == StatusCode::kOk && moved_in) {
+      migration_in_.fetch_add(1, std::memory_order_relaxed);
+      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+    }
+    make_result_response(static_cast<uint32_t>(star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE),
+                         EncodeResult(status), key_offset);
     SendTransportMessage(response);
-    if (prepared_partition != nullptr) {
-      KvMigrationRuntime::SyncHwCcUsage(*prepared_partition);
-      prepared_partition->MoveOutClockVictim(config_.node_id);
-    }
+    response.clear_message_pieces();
+    if (status == StatusCode::kOk) EnforceMigrationBudget(*partition);
     return;
   }
-  auto *partition = OwnedPartition(key);
-  if (partition == nullptr) {
-    throw std::runtime_error("request routed to a non-owner node");
-  }
-  if (message.type == KvMessageType::kPut) {
+  if (type == static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_INSERT_REQUEST)) {
+    if (piece.get_message_length() != star::MessagePiece::get_header_size() +
+            config_.fixed_key_size + config_.fixed_value_size + sizeof(uint64_t) + sizeof(uint32_t))
+      TransportFatal(config_.node_id, "request", "bad remote insert request length", &message);
+    const std::string_view key(request_bytes.data(), config_.fixed_key_size);
+    const std::string_view value(request_bytes.data() + config_.fixed_key_size,
+                                 config_.fixed_value_size);
+    auto trailing = request_bytes;
+    trailing.remove_prefix(config_.fixed_key_size + config_.fixed_value_size);
+    uint64_t transaction_id = 0;
+    uint32_t key_offset = 0;
+    star::Decoder decoder(trailing);
+    decoder >> transaction_id >> key_offset;
+    if (decoder.size() != 0 || key_offset != 0)
+      TransportFatal(config_.node_id, "request", "bad remote insert request fields", &message);
+    auto *partition = OwnedPartition(key);
+    if (partition == nullptr || partition->partition_id() != piece.get_partition_id())
+      TransportFatal(config_.node_id, "request", "insert delivered to non-owner", &message);
+    StatusCode status = StatusCode::kCorruption;
     try {
-      response.status = static_cast<uint32_t>(
-          partition->InsertRemotePlaceholder(key, value, message.source_node));
+      status = partition->InsertRemotePlaceholder(key, value, message.get_source_node_id());
     } catch (const std::bad_alloc &) {
-      response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
-    } catch (const std::runtime_error &e) {
-      response.status = static_cast<uint32_t>(
-          std::string_view(e.what()).find("busy") != std::string_view::npos
-              ? StatusCode::kBusy
-              : StatusCode::kCorruption);
+      status = StatusCode::kOutOfMemory;
+    } catch (const std::runtime_error &error) {
+      status = std::string_view(error.what()).find("busy") != std::string_view::npos
+          ? StatusCode::kBusy : StatusCode::kCorruption;
     }
-  } else if (message.type == KvMessageType::kDelete) {
-    try {
-      auto *table = KvMigrationRuntime::Instance().TableFor(
-          partition->partition_id());
-      if (table == nullptr || star::migration_manager == nullptr)
-        throw std::runtime_error("remote delete has no installed migration callback");
-      const FixedKey fixed_key = FixedKey::From(key, config_.fixed_key_size);
-      response.status = static_cast<uint32_t>(
-          star::migration_manager->delete_specific_row_and_move_out(
-              table, &fixed_key, /*is_delete_local=*/false)
-              ? StatusCode::kOk : StatusCode::kNotFound);
-    } catch (const std::runtime_error &e) {
-      response.status = static_cast<uint32_t>(
-          std::string_view(e.what()).find("busy") != std::string_view::npos
-              ? StatusCode::kBusy
-              : StatusCode::kCorruption);
-    }
-  } else if (message.type == KvMessageType::kMigrate) {
-    try {
-      bool moved_in = false;
-      const StatusCode migrated =
-          partition->EnsureInShared(key, config_.node_id, &moved_in);
-      response.status = static_cast<uint32_t>(migrated);
-      if (migrated == StatusCode::kOk && moved_in) {
-        migration_in_.fetch_add(1, std::memory_order_relaxed);
-        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-      }
-      // Ack move_in before OnDemand move_out so the requester can TryPin /
-      // CXL-access without racing the same-handler eviction (liveness under
-      // YCSB-A). move_in cost remains on the Migrate critical path.
-      SendTransportMessage(response);
-      if (migrated == StatusCode::kOk)
-        EnforceMigrationBudget(*partition);
-      return;
-    } catch (const std::bad_alloc &) {
-      response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
-    }
-  } else {
-    throw std::runtime_error("unsupported request message type");
+    make_result_response(static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_INSERT_RESPONSE),
+                         EncodeResult(status), key_offset);
+    SendTransportMessage(response);
+    response.clear_message_pieces();
+    return;
   }
-  SendTransportMessage(response);
+  if (type == static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST)) {
+    if (piece.get_message_length() != star::MessagePiece::get_header_size() + config_.fixed_key_size)
+      TransportFatal(config_.node_id, "request", "bad remote delete request length", &message);
+    const std::string_view key(request_bytes.data(), config_.fixed_key_size);
+    auto *partition = OwnedPartition(key);
+    if (partition == nullptr || star::migration_manager == nullptr)
+      TransportFatal(config_.node_id, "request", "delete delivered to non-owner", &message);
+    const FixedKey fixed_key = FixedKey::From(key, config_.fixed_key_size);
+    if (!star::migration_manager->delete_specific_row_and_move_out(
+            table, &fixed_key, /*is_delete_local=*/false))
+      TransportFatal(config_.node_id, "request", "owner delete lost prepared row", &message);
+    const auto size = star::MessagePiece::get_header_size();
+    star::Encoder encoder(response.data);
+    encoder << star::MessagePiece::construct_message_piece_header(
+        static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE),
+        size, kSingleTableId, piece.get_partition_id());
+    response.flush();
+    SendTransportMessage(response);
+    response.clear_message_pieces();
+    return;
+  }
+  if (type == static_cast<uint32_t>(star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN)) {
+    if (piece.get_message_length() != star::MessagePiece::get_header_size() +
+            config_.fixed_key_size * 2 + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t))
+      TransportFatal(config_.node_id, "request", "bad scan migration request length", &message);
+    const std::string_view min_key(request_bytes.data(), config_.fixed_key_size);
+    const std::string_view max_key(request_bytes.data() + config_.fixed_key_size,
+                                   config_.fixed_key_size);
+    auto trailing = request_bytes;
+    trailing.remove_prefix(config_.fixed_key_size * 2);
+    uint64_t limit = 0, transaction_id = 0;
+    uint32_t key_offset = 0;
+    star::Decoder decoder(trailing);
+    decoder >> limit >> transaction_id >> key_offset;
+    if (decoder.size() != 0 || key_offset != 0)
+      TransportFatal(config_.node_id, "request", "bad scan migration request fields", &message);
+    bool exhausted = false;
+    bool no_predecessor = false;
+    const Status status = PreparePartitionSharedScan(
+        piece.get_partition_id(), min_key, max_key, false, limit,
+        message.get_source_node_id(), &exhausted, &no_predecessor);
+    const bool success = status.ok();
+    const auto size = star::MessagePiece::get_header_size() + sizeof(success) + sizeof(key_offset);
+    star::Encoder encoder(response.data);
+    encoder << star::MessagePiece::construct_message_piece_header(
+        static_cast<uint32_t>(star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN),
+        size, kSingleTableId, piece.get_partition_id());
+    encoder << success << key_offset;
+    response.flush();
+    SendTransportMessage(response);
+    response.clear_message_pieces();
+    if (success) EnforceMigrationBudget(*partitions_[piece.get_partition_id()]);
+    return;
+  }
+  TransportFatal(config_.node_id, "request", "unsupported original MessagePiece", &message);
 }
 
 void KVEngine::EnforceMigrationBudget(KVPartition &partition) {

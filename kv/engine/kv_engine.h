@@ -1,17 +1,15 @@
 #pragma once
 
 #include "kv/engine/region_allocator.h"
-#include "kv/engine/kv_messages.h"
 #include "kv/kv_store.h"
+
+#include "common/LockfreeQueue.h"
+#include "common/Message.h"
 
 #include <memory>
 #include <atomic>
-#include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <string_view>
 #include <vector>
 
@@ -22,6 +20,8 @@ class SCCManager;
 
 namespace tigonkv::engine {
 
+enum class RpcKind : uint8_t { kMigrate, kInsert, kDelete, kScanMigrate };
+
 class KVPartition;
 }
 
@@ -29,9 +29,9 @@ namespace star { class MPSCRingBuffer; }
 
 namespace tigonkv::engine {
 
-// Process-local assembly over persistent dual-region state.  Only partitions
-// owned by config.node_id are materialized locally; remote transport is added
-// by kv_messages in M5 without changing this ownership boundary.
+// Process-local assembly over persistent dual-region state. Only partitions
+// owned by config.node_id are materialized locally; remote traffic reuses the
+// original TwoPLPasha Message/MessagePiece framing.
 class KVEngine {
  public:
   static std::unique_ptr<KVEngine> Open(Config config, bool reset);
@@ -48,9 +48,8 @@ class KVEngine {
   IncrementResult Increment(std::string_view key, int64_t delta);
   MemoryStats Memory() const;
   // Foreground cooperative path (Tigon Worker::process_request analogue):
-  // batch-pop deferred inbound requests from the shared Dispatcher FIFO.
-  // The dedicated inbound demuxer is the sole MPSC consumer — FG never
-  // contends for the recv lock.
+  // drain only this worker's original SPSC Message queue. The dedicated
+  // inbound demuxer is the sole MPSC consumer.
   void PollTransport();
   // Bind the calling thread as foreground worker `worker_id` for CXL_EBR TLS
   // and, when configured, its distinct guest CPU.
@@ -85,35 +84,38 @@ class KVEngine {
   KVPartition *OwnedPartition(std::string_view key) const;
   KVPartition *VisiblePartition(std::string_view key) const;
   uint32_t OwnerForPartition(uint32_t partition) const;
-  Status Forward(KvMessageType type, std::string_view key, std::string_view value,
-                 std::string *response_value);
-  Status Forward(KvMessageType type, std::string_view key, std::string_view value,
-                 std::string *response_value, uint32_t owner,
-                 bool *response_received = nullptr);
+  Status Forward(RpcKind type, std::string_view key, std::string_view value,
+                 uint32_t partition_id, uint32_t owner,
+                 std::string_view scan_max = {}, uint64_t scan_limit = 0);
   // TwoPLPasha DATA_MIGRATION: ask owner to move_row_in, then requester CXL-accesses.
   Status RequestMigrate(std::string_view key);
-  struct PendingResponse {
-    std::mutex mutex;
-    std::condition_variable cv;
+  struct OperationContext {
+    uint32_t expected_response_type = 0;
+    uint32_t partition_id = 0;
+    uint64_t operation_sequence = 0;
     bool done = false;
-    KvMessage message{};
+    Status result = Status::Error(StatusCode::kCorruption, "unset RPC result");
   };
-  std::shared_ptr<PendingResponse> RegisterPendingResponse(uint64_t request_id);
-  void RemovePendingResponse(uint64_t request_id);
-  void AbandonPendingResponse(uint64_t request_id);
-  // Caller must hold pending_response_mutex_.
-  bool ConsumeAbandonedRequestLocked(uint64_t request_id);
-  Status AwaitResponse(uint64_t request_id,
-                       const std::shared_ptr<PendingResponse> &pending,
-                       std::string *response_value,
-                       bool *response_received = nullptr);
-  // Demuxer path: apply responses / queue requests. Never sends.
-  void DemuxTransportMessage(const KvMessage &message);
-  void WakePendingForwarders();
-  // Foreground path: serve a queued request (may Send).
-  void ServeTransportRequest(const KvMessage &message);
-  void ServeDeferredRequests();
-  void SendTransportMessage(const KvMessage &message);
+  struct WorkerMailbox {
+    star::LockfreeQueue<star::Message *> inbox;
+    // Original Executor-shaped per-destination buffers. A foreground worker
+    // owns its buffers; SendTransportMessage copies the one-piece frame before
+    // it is cleared for reuse.
+    std::vector<std::unique_ptr<star::Message>> outbound;
+    OperationContext operation;
+    uint64_t next_operation_sequence = 1;
+  };
+  WorkerMailbox &CurrentMailbox();
+  Status AwaitResponse(WorkerMailbox &mailbox);
+  void DispatchMessage(star::Message &message, WorkerMailbox &mailbox);
+  void ServeTransportRequest(star::Message &message,
+                             star::MessagePiece piece,
+                             WorkerMailbox &mailbox);
+  void ConsumeTransportResponse(star::MessagePiece piece,
+                                WorkerMailbox &mailbox);
+  star::Message &OutboundMessage(WorkerMailbox &mailbox, uint32_t destination,
+                                 uint64_t operation_sequence);
+  void SendTransportMessage(star::Message &message);
   void EnforceMigrationBudget(KVPartition &partition);
   void StartInboundDemuxer();
   void StopInboundDemuxer();
@@ -137,27 +139,13 @@ class KVEngine {
   // hot path. Distinct OS threads must not share one EBR/statistics worker id.
   std::mutex worker_owner_mutex_;
   std::vector<std::thread::id> worker_owners_;
+  std::vector<std::unique_ptr<WorkerMailbox>> worker_mailboxes_;
   star::MPSCRingBuffer *rings_ = nullptr;
   // Sole MPSC consumer — mirrors Tigon IncomingDispatcher.  Never serves
   // Put/Get/Scan and never SendTransportMessage (avoids full-ring circular wait).
   std::thread inbound_demuxer_;
   std::atomic<bool> inbound_demuxer_stop_{false};
   uint32_t inbound_demuxer_worker_id_ = 0;
-  std::mutex pending_response_mutex_;
-  std::unordered_map<uint64_t, std::shared_ptr<PendingResponse>>
-      pending_responses_;
-  // Bounded tombstones for Await timeouts (§10.11). Late responses matching a
-  // tombstone are dropped; responses whose tombstone was FIFO-evicted are also
-  // dropped and counted (never abort demuxer).
-  std::unordered_set<uint64_t> abandoned_request_ids_;
-  std::deque<uint64_t> abandoned_request_order_;
-  // Demuxer enqueues requests here; FG PollTransport / Await drains them.
-  // Nested serve (TlsRequestServeDepth != 0) must not pop/serve — OLC safety.
-  // Single shared unbounded queue: demuxer never blocks on enqueue, and any
-  // polling FG worker can serve any request (required for Forward liveness
-  // under YCSB). Affinity is by cooperative steal-from-front FIFO.
-  std::mutex deferred_request_mutex_;
-  std::deque<KvMessage> deferred_transport_requests_;
   std::atomic<uint64_t> network_tx_bytes_{0};
   std::atomic<uint64_t> network_rx_bytes_{0};
   std::atomic<uint64_t> shared_gets_{0};
@@ -166,12 +154,10 @@ class KVEngine {
   std::atomic<uint64_t> shared_swcc_flushes_{0};
   std::atomic<uint64_t> migration_in_{0};
   std::atomic<uint64_t> migration_out_{0};
-  std::atomic<uint64_t> abandoned_responses_{0};
   // §13 Scan diagnostics: flushed from TLS at Scan boundaries / once per RPC.
   std::atomic<uint64_t> scan_partition_probes_{0};
   std::atomic<uint64_t> scan_migrate_rpcs_{0};
   std::atomic<uint64_t> scan_owner_rows_movein_attempted_{0};
-  std::atomic<uint64_t> deferred_queue_peak_{0};
 };
 
 }  // namespace tigonkv::engine
