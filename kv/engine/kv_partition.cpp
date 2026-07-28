@@ -337,13 +337,30 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
     if (LookupPrivateOffset(fixed_key, &row_offset)) {
       auto *private_value = ValueFromOffset(row_offset);
       auto *metadata = MetadataFromValue(private_value);
-      LockRow(metadata);
-      if (!metadata->is_valid) {
-        UnlockRow(metadata);
-        // Concurrent delete/EBR: do not report Ok without a published write.
-        throw std::runtime_error("tombstone put busy");
+      // Keep the original owner write acquisition/release sequence for a
+      // private row.  The offset-backed helper only replaces the persisted
+      // local pointer with PrivateValueStruct::meta; it preserves the tid
+      // lock bits and does not introduce a second row-lock protocol.
+      bool write_locked = false;
+      bool migrated = false;
+      const uint64_t previous_tid =
+          star::TwoPLPashaHelper::kv_take_private_write_lock(
+              *metadata, write_locked, &migrated);
+      if (!write_locked && !migrated) {
+        // Concurrent delete/reader/writer: do not report Ok without a
+        // published write.  The facade owns the bounded Busy retry.
+        throw std::runtime_error("private put busy");
       }
-      if (metadata->is_migrated) {
+      if (migrated) {
+        // The original local helper deliberately redirects migrated rows to
+        // the shared-row write path.  Reacquire only the owner-private
+        // locator latch needed to resolve the offset; the SCC helper owns the
+        // shared write lock and final tid publication.
+        LockRow(metadata);
+        if (!metadata->is_valid || !metadata->is_migrated) {
+          UnlockRow(metadata);
+          throw std::runtime_error("migrated row locator busy");
+        }
         const RegionOffset smeta_offset = metadata->migrated_smeta_off;
         if (smeta_offset == kNullOffset ||
             !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
@@ -370,9 +387,9 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       std::memcpy(private_value->data, value.data(), value.size());
       mem_access::PrivateWrite(private_value->data, fixed_value_size_);
       metadata->is_data_modified_since_moved_out = true;
-      metadata->tid = star::TwoPLPashaHelper::kv_next_commit_tid(metadata->tid);
+      star::TwoPLPashaHelper::kv_private_write_lock_release(
+          *metadata, star::TwoPLPashaHelper::kv_next_commit_tid(previous_tid));
       RecordPrivateMetadataWrite(metadata);
-      UnlockRow(metadata);
       return false;
     }
     auto *private_value = AllocateValue(value);
