@@ -58,7 +58,6 @@ int KvPartitionTable::compare_key(const void *a, const void *b) {
 
 std::tuple<star::ITable::MetaDataType *, void *> KvPartitionTable::search(
     const void *key) {
-  partition_->EnterEbr();
   RegionOffset offset = kNullOffset;
   if (!partition_->LookupPrivateOffset(TableKey(key), &offset))
     return std::make_tuple(nullptr, nullptr);
@@ -77,7 +76,6 @@ void KvPartitionTable::scan(
     const void *min_key,
     std::function<bool(const void *, MetaDataType *, void *, bool)> processor) {
   if (!processor) throw std::invalid_argument("empty table scan processor");
-  partition_->EnterEbr();
   const FixedKey &start = TableKey(min_key);
   partition_->private_tree_->scanForUpdate(
       start, [&](const FixedKey &key, KVPartition::PrivateTreeValue &offset,
@@ -89,7 +87,6 @@ void KvPartitionTable::scan(
 
 bool KvPartitionTable::insert(const void *key, const void *value,
                               bool is_placeholder) {
-  partition_->EnterEbr();
   auto *row = partition_->AllocateValue(TableValue(value, value_size_));
   auto *metadata = partition_->MetadataFromValue(row);
   metadata->is_valid = !is_placeholder;
@@ -109,7 +106,6 @@ bool KvPartitionTable::insert_lock_next_key(
     std::function<bool(const void *, MetaDataType *, void *)> processor,
     bool is_placeholder) {
   if (!processor) throw std::invalid_argument("empty next-key processor");
-  partition_->EnterEbr();
   auto *row = partition_->AllocateValue(TableValue(value, value_size_));
   partition_->MetadataFromValue(row)->is_valid = !is_placeholder;
   const KVPartition::PrivateTreeValue row_offset{
@@ -135,7 +131,6 @@ bool KvPartitionTable::insert_and_process_adjacent_tuples(
                        MetaDataType *, void *)> processor,
     bool is_placeholder) {
   if (!processor) throw std::invalid_argument("empty adjacent-insert processor");
-  partition_->EnterEbr();
   auto *row = partition_->AllocateValue(TableValue(value, value_size_));
   partition_->MetadataFromValue(row)->is_valid = !is_placeholder;
   const KVPartition::PrivateTreeValue row_offset{
@@ -162,7 +157,6 @@ bool KvPartitionTable::insert_and_process_adjacent_tuples(
 }
 
 bool KvPartitionTable::remove(const void *key) {
-  partition_->EnterEbr();
   const bool removed = partition_->private_tree_->remove(TableKey(key));
   if (removed) partition_->PersistPrivateRootIfChanged();
   return removed;
@@ -173,7 +167,6 @@ bool KvPartitionTable::remove_and_process_adjacent_tuples(
     std::function<bool(const void *, void *, void *, const void *, void *,
                        void *, const void *, void *, void *)> processor) {
   if (!processor) throw std::invalid_argument("empty adjacent-delete processor");
-  partition_->EnterEbr();
   const bool removed = partition_->private_tree_->remove_and_process_adjacent_keys(
       TableKey(key),
       [&](const FixedKey *prev_key, KVPartition::PrivateTreeValue *prev_offset,
@@ -201,7 +194,6 @@ bool KvPartitionTable::remove_and_process_adjacent_tuples(
 void KvPartitionTable::update(
     const void *key, const void *value,
     std::function<void(const void *, const void *)> on_update) {
-  partition_->EnterEbr();
   RegionOffset offset = kNullOffset;
   if (!partition_->LookupPrivateOffset(TableKey(key), &offset))
     throw std::runtime_error("table update missing key");
@@ -216,7 +208,6 @@ bool KvPartitionTable::search_and_update_next_key_info(
     std::function<void(const void *, void *, void *, const void *, void *,
                        void *, const void *, void *, void *)> processor) {
   if (!processor) throw std::invalid_argument("empty next-key update processor");
-  partition_->EnterEbr();
   return partition_->private_tree_->lookupForNextKeyUpdate(
       TableKey(key),
       [&](const FixedKey *prev_key, KVPartition::PrivateTreeValue *prev_offset,

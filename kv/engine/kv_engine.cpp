@@ -164,6 +164,25 @@ uint64_t CurrentRssKb() {
 // serialized or published in shared memory.
 thread_local int32_t TlsForegroundWorkerId = -1;
 
+// Original CXL_EBR has no leave state: one foreground operation enters the
+// current epoch before touching tree/row state and keeps that epoch while it
+// waits for RPC.  Nested facade helpers (notably PollTransport while awaiting
+// a response) must therefore reuse the outer entry rather than manufacture a
+// second operation boundary.
+thread_local uint32_t TlsEbrOperationDepth = 0;
+
+class EbrOperationScope {
+ public:
+  explicit EbrOperationScope(star::CXL_EBR *ebr) : ebr_(ebr) {
+    if (ebr_ == nullptr) throw std::runtime_error("null CXL_EBR");
+    if (TlsEbrOperationDepth++ == 0) ebr_->enter_critical_section();
+  }
+  ~EbrOperationScope() { --TlsEbrOperationDepth; }
+
+ private:
+  star::CXL_EBR *ebr_;
+};
+
 // §13: Scan hot path only bumps TLS; flushed once at Scan return.
 struct ScanTlsDiag {
   uint64_t partition_probes = 0;
@@ -546,6 +565,7 @@ KVPartition *KVEngine::VisiblePartition(std::string_view key) const {
 }
 
 Status KVEngine::Put(std::string_view key, std::string_view value) {
+  EbrOperationScope ebr_scope(ebr_);
   if (IsInternalMaxSentinel(key))
     return Status::Error(StatusCode::kInvalidArgument,
                          "internal max sentinel is reserved");
@@ -604,6 +624,7 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
 }
 
 GetResult KVEngine::Get(std::string_view key) {
+  EbrOperationScope ebr_scope(ebr_);
   if (IsInternalMaxSentinel(key))
     return {Status::Error(StatusCode::kInvalidArgument,
                           "internal max sentinel is reserved"), {}};
@@ -651,6 +672,7 @@ GetResult KVEngine::Get(std::string_view key) {
 }
 
 Status KVEngine::Delete(std::string_view key) {
+  EbrOperationScope ebr_scope(ebr_);
   if (IsInternalMaxSentinel(key))
     return Status::Error(StatusCode::kInvalidArgument,
                          "internal max sentinel is reserved");
@@ -698,6 +720,7 @@ Status KVEngine::Delete(std::string_view key) {
 
 ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
                           uint64_t limit) {
+  EbrOperationScope ebr_scope(ebr_);
   if (IsInternalMaxSentinel(start_key))
     return {Status::Error(StatusCode::kInvalidArgument,
                           "internal max sentinel is reserved"), {}};
@@ -783,6 +806,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
 Status KVEngine::PreparePartitionSharedScan(
     uint32_t partition_id, std::string_view start_key,
     std::string_view inclusive_max, uint64_t output_limit) {
+  EbrOperationScope ebr_scope(ebr_);
   if (partition_id >= partitions_.size() ||
       partition_id >= config_.partition_count)
     return Status::Error(StatusCode::kInvalidArgument,
@@ -813,6 +837,7 @@ Status KVEngine::PreparePartitionSharedScan(
 CasResult KVEngine::CompareExchange(std::string_view key,
                                     std::string_view expected,
                                     std::string_view desired) {
+  EbrOperationScope ebr_scope(ebr_);
   if (IsInternalMaxSentinel(key))
     return {Status::Error(StatusCode::kInvalidArgument,
                           "internal max sentinel is reserved"), false};
@@ -895,6 +920,7 @@ CasResult KVEngine::CompareExchange(std::string_view key,
 }
 
 IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
+  EbrOperationScope ebr_scope(ebr_);
   if (IsInternalMaxSentinel(key))
     return {Status::Error(StatusCode::kInvalidArgument,
                           "internal max sentinel is reserved"), 0};
@@ -1248,6 +1274,7 @@ void KVEngine::ReleaseWorker() {
 }
 
 void KVEngine::PollTransport() {
+  EbrOperationScope ebr_scope(ebr_);
   WorkerMailbox &mailbox = CurrentMailbox();
   while (!mailbox.inbox.empty()) {
     std::unique_ptr<star::Message> message(mailbox.inbox.front());
@@ -1470,6 +1497,7 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
 }
 
 Status KVEngine::MoveOut(std::string_view key) {
+  EbrOperationScope ebr_scope(ebr_);
   if (IsInternalMaxSentinel(key))
     return Status::Error(StatusCode::kInvalidArgument,
                          "internal max sentinel is reserved");
