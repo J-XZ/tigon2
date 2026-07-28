@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <charconv>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -44,12 +43,14 @@ uint32_t ReadHwccConfigField(const uint32_t *field) {
 
 KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
                          uint32_t partition_id, uint32_t owner_shard,
-                         bool attach)
+                         bool attach, bool materialize_private)
     : regions_(regions), ebr_(ebr), partition_id_(partition_id),
       owner_shard_(owner_shard),
       fixed_key_size_(ReadHwccConfigField(&regions.layout().fixed_key_size)),
       fixed_value_size_(ReadHwccConfigField(&regions.layout().fixed_value_size)),
       directory_(regions.layout().partitions.at(partition_id)),
+      private_arena_(*static_cast<OwnerPrivateArenaHeader *>(
+          regions.swcc().FromOffset(regions.OwnerPrivateArenaOffset(partition_id)))),
       private_binding_{&regions, AllocationDomain::kOwnerPrivateSwcc, owner_shard, &ebr,
                        partition_id},
       shared_binding_{&regions, AllocationDomain::kHwccIndex, owner_shard, &ebr} {
@@ -59,23 +60,30 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
       ReadHwccConfigField(&regions.layout().partition_count))
     throw std::invalid_argument("partition id outside persistent layout");
   if (attach) {
-    mem_access::HwccRead(&directory_.private_root,
-                         sizeof(directory_.private_root));
-    const RegionOffset private_root = directory_.private_root;
+    RegionOffset private_root = kNullOffset;
+    if (materialize_private) {
+      mem_access::PrivateRead(&private_arena_.private_root,
+                              sizeof(private_arena_.private_root));
+      private_root = private_arena_.private_root;
+    }
     mem_access::HwccAtomicLoad(&directory_.shared_root);
-    if (private_root == kNullOffset ||
+    if ((materialize_private && private_root == kNullOffset) ||
         directory_.shared_root.load(std::memory_order_acquire) == kNullOffset)
       throw std::runtime_error("partition attach missing tree root");
-    private_tree_ = new PrivateTree(
-        private_binding_, regions_.swcc().FromOffset(private_root));
+    if (materialize_private) {
+      private_tree_ = new PrivateTree(
+          private_binding_, regions_.swcc().FromOffset(private_root));
+      persisted_private_root_offset_ = private_root;
+    }
     mem_access::HwccAtomicLoad(&directory_.shared_root);
     shared_tree_ = new SharedTree(
         shared_binding_,
         regions_.hwcc().FromOffset(
             directory_.shared_root.load(std::memory_order_acquire)));
     shared_tree_->bind_published_root(&directory_.shared_root);
-    persisted_private_root_offset_ = private_root;
   } else {
+    if (!materialize_private)
+      throw std::logic_error("reset must materialize every private partition root");
     private_tree_ = new PrivateTree(private_binding_);
     shared_tree_ = new SharedTree(shared_binding_);
     shared_tree_->bind_published_root(&directory_.shared_root);
@@ -1074,13 +1082,11 @@ bool KVPartition::ScanOwned(
     if (rows.empty()) break;
     for (const auto &entry : rows) {
       auto *row = RowFromOffset(entry.second);
-      const auto read_deadline =
-          std::chrono::steady_clock::now() + std::chrono::seconds(5);
-      for (;;) {
+      {
         LockRow(row);
         if (row->is_tombstone) {
           UnlockRow(row);
-          break;
+          continue;
         }
         std::string value;
         bool read = true;
@@ -1100,15 +1106,12 @@ bool KVPartition::ScanOwned(
         UnlockRow(row);
         if (read) {
           items->emplace_back(KeyString(entry.first), std::move(value));
-          break;
+        } else {
+          // A shared-row lock conflict is ordinary operation contention.  Do
+          // not add a Scan-local deadline/retry policy; the facade retries the
+          // logical Scan as a whole.
+          return false;
         }
-        if (std::chrono::steady_clock::now() >= read_deadline) return false;
-        // Move-in exposes the locator behind write_locked before paying CXL
-        // delay. Release the private latch and settle this failed HWCC probe
-        // before retrying, so enabled latency neither becomes corruption nor
-        // accumulates zero-time busy probes.
-        mem_access::DelayActiveScopeNow();
-        std::this_thread::yield();
       }
       if (limit != 0 && items->size() >= limit) break;
     }
@@ -1181,12 +1184,8 @@ bool KVPartition::ScanShared(
         regions_.hwcc().FromOffset(entry.second));
     std::string value(fixed_value_size_, '\0');
     uint32_t value_len = 0;
-    bool read = false;
-    for (uint32_t attempt = 0; attempt < 64 && !read; ++attempt) {
-      read = star::TwoPLPashaHelper::kv_shared_read_value(
-          smeta, host_id, value.data(), value.size(), &value_len);
-      if (!read) std::this_thread::yield();
-    }
+    const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
+        smeta, host_id, value.data(), value.size(), &value_len);
     if (!read) {
       complete = false;
       continue;
@@ -1327,13 +1326,8 @@ KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
   for (auto &row : pinned) {
     std::string value(fixed_value_size_, '\0');
     uint32_t value_len = 0;
-    bool read = false;
-    for (uint32_t attempt = 0; attempt < 64 && !read; ++attempt) {
-      read = star::TwoPLPashaHelper::kv_shared_read_value(
-          row.smeta, host_id, value.data(), value.size(), &value_len,
-          true);
-      if (!read) std::this_thread::yield();
-    }
+    const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
+        row.smeta, host_id, value.data(), value.size(), &value_len, true);
     if (!read) {
       unpin_all();
       result.status =
@@ -1362,119 +1356,6 @@ bool KVPartition::PrivatePredecessorKey(
   }
   *predecessor = KeyString(adjacent.prev->first);
   return true;
-}
-
-bool KVPartition::ScanSharedComplete(
-    std::string_view start_key, const FixedKey &cutoff, bool exhausted,
-    bool no_predecessor, uint32_t expected_count,
-    uint32_t expected_generation, uint32_t host_id,
-    std::vector<std::pair<std::string, std::string>> *items) const {
-  EnterEbr();
-  if (items == nullptr)
-    throw std::invalid_argument("null complete shared scan output");
-  const FixedKey low = MakeKey(start_key);
-  FixedKey high{};
-  std::memset(high.bytes, 0xff, sizeof(high.bytes));
-  std::vector<SharedTree::KeyValuePair> rows;
-  shared_tree_->scan(low, cutoff, true, true, 0, rows);
-  if (!exhausted) {
-    std::vector<SharedTree::KeyValuePair> boundary;
-    shared_tree_->scan(cutoff, high, true, true, 2, boundary);
-    const auto successor = std::find_if(
-        boundary.begin(), boundary.end(),
-        [&](const auto &entry) { return entry.first.Compare(cutoff) > 0; });
-    if (successor == boundary.end()) return false;
-    rows.push_back(*successor);
-  }
-
-  struct PinnedRow {
-    FixedKey key{};
-    star::TwoPLPashaMetadataShared *smeta = nullptr;
-    bool output = false;
-  };
-  std::vector<PinnedRow> pinned;
-  pinned.reserve(rows.size());
-  auto unpin_all = [&] {
-    for (auto &row : pinned)
-      star::TwoPLPashaHelper::kv_unpin_shared_ref(row.smeta);
-    pinned.clear();
-  };
-  for (const auto &entry : rows) {
-    star::TwoPLPashaMetadataShared *smeta = nullptr;
-    if (!TryPinSharedEntry(entry.first, entry.second, &smeta)) {
-      unpin_all();
-      return false;
-    }
-    pinned.push_back(
-        {entry.first, smeta, entry.first.Compare(cutoff) <= 0});
-  }
-
-  bool complete = true;
-  const size_t output_count = static_cast<size_t>(std::count_if(
-      pinned.begin(), pinned.end(),
-      [](const PinnedRow &row) { return row.output; }));
-  if (output_count != expected_count) complete = false;
-  if (!exhausted &&
-      (pinned.empty() || pinned.back().key.Compare(cutoff) <= 0))
-    complete = false;
-  if (complete && !pinned.empty()) {
-    if (!no_predecessor && pinned.front().key.Compare(low) != 0 &&
-        !pinned.front().smeta->get_prev_key_real_bit())
-      complete = false;
-    for (size_t i = 1; complete && i < pinned.size(); ++i) {
-      if (!pinned[i - 1].smeta->get_next_key_real_bit() ||
-          !pinned[i].smeta->get_prev_key_real_bit())
-        complete = false;
-    }
-  }
-
-  items->clear();
-  if (complete) {
-    for (const auto &row : pinned) {
-      if (!row.output) continue;
-      std::string value(fixed_value_size_, '\0');
-      uint32_t value_len = 0;
-      bool read = false;
-      for (uint32_t attempt = 0; attempt < 64 && !read; ++attempt) {
-        read = star::TwoPLPashaHelper::kv_shared_read_value(
-            row.smeta, host_id, value.data(), value.size(), &value_len,
-            true);
-        if (!read) std::this_thread::yield();
-      }
-      if (!read) {
-        complete = false;
-        break;
-      }
-      value.resize(value_len);
-      items->emplace_back(KeyString(row.key), std::move(value));
-      NoteSharedAccess(row.smeta);
-    }
-  }
-  // Re-read the proof after copying values. Pins keep move-out/delete from
-  // retiring rows, while a concurrent logical insert can only clear a link.
-  if (complete && !pinned.empty()) {
-    if (!no_predecessor && pinned.front().key.Compare(low) != 0 &&
-        !pinned.front().smeta->get_prev_key_real_bit())
-      complete = false;
-    for (size_t i = 1; complete && i < pinned.size(); ++i) {
-      if (!pinned[i - 1].smeta->get_next_key_real_bit() ||
-          !pinned[i].smeta->get_prev_key_real_bit())
-        complete = false;
-    }
-  }
-  if (complete && (exhausted || no_predecessor)) {
-    const uint64_t state = SharedMutationState();
-    complete = static_cast<uint32_t>(state) == 0 &&
-               static_cast<uint32_t>(state >> 32) == expected_generation;
-  }
-  unpin_all();
-  if (!complete) items->clear();
-  return complete;
-}
-
-uint64_t KVPartition::SharedMutationState() const {
-  mem_access::HwccAtomicLoad(&directory_.shared_mutation_state);
-  return directory_.shared_mutation_state.load(std::memory_order_acquire);
 }
 
 bool KVPartition::DeletePrivate(std::string_view key) {
@@ -1677,29 +1558,29 @@ void KVPartition::ClockTrackMigratedKey(const void *key_bytes) {
   if (!row->is_migrated || row->migrated_smeta_off == kNullOffset) return;
   // Already linked?
   if (row->clock_prev_off != kNullOffset || row->clock_next_off != kNullOffset ||
-      directory_.clock_head == row_off || directory_.clock_tail == row_off) {
-    if (directory_.clock_head == row_off || directory_.clock_tail == row_off ||
+      private_arena_.clock_head == row_off || private_arena_.clock_tail == row_off) {
+    if (private_arena_.clock_head == row_off || private_arena_.clock_tail == row_off ||
         row->clock_prev_off != kNullOffset || row->clock_next_off != kNullOffset)
       return;  // idempotent re-track
   }
   RecordPrivateRowStateWrite(row);
   row->clock_prev_off = kNullOffset;
   row->clock_next_off = kNullOffset;
-  mem_access::HwccWrite(&directory_.clock_head, sizeof(directory_.clock_head));
-  mem_access::HwccWrite(&directory_.clock_tail, sizeof(directory_.clock_tail));
-  if (directory_.clock_head == kNullOffset &&
-      directory_.clock_tail == kNullOffset) {
-    directory_.clock_head = row_off;
-    directory_.clock_tail = row_off;
+  mem_access::PrivateWrite(&private_arena_.clock_head, sizeof(private_arena_.clock_head));
+  mem_access::PrivateWrite(&private_arena_.clock_tail, sizeof(private_arena_.clock_tail));
+  if (private_arena_.clock_head == kNullOffset &&
+      private_arena_.clock_tail == kNullOffset) {
+    private_arena_.clock_head = row_off;
+    private_arena_.clock_tail = row_off;
   } else {
-    auto *tail = RowFromOffset(directory_.clock_tail);
+    auto *tail = RowFromOffset(private_arena_.clock_tail);
     RecordPrivateRowStateWrite(tail);
     tail->clock_next_off = row_off;
-    row->clock_prev_off = directory_.clock_tail;
-    directory_.clock_tail = row_off;
+    row->clock_prev_off = private_arena_.clock_tail;
+    private_arena_.clock_tail = row_off;
   }
-  mem_access::HwccAtomicRmw(&directory_.migrated_key_count);
-  directory_.migrated_key_count.fetch_add(1, std::memory_order_relaxed);
+  mem_access::PrivateAtomicRmw(&private_arena_.migrated_key_count);
+  private_arena_.migrated_key_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void KVPartition::ClockUntrackMigratedKey(const void *key_bytes) {
@@ -1717,19 +1598,19 @@ void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
   if (row_off == kNullOffset) return;
   auto *row = RowFromOffset(row_off);
   const bool was_linked =
-      directory_.clock_head == row_off || directory_.clock_tail == row_off ||
+      private_arena_.clock_head == row_off || private_arena_.clock_tail == row_off ||
       row->clock_prev_off != kNullOffset || row->clock_next_off != kNullOffset;
   if (!was_linked) return;
-  mem_access::HwccWrite(&directory_.clock_head, sizeof(directory_.clock_head));
-  mem_access::HwccWrite(&directory_.clock_tail, sizeof(directory_.clock_tail));
-  mem_access::HwccWrite(&directory_.clock_cursor,
-                        sizeof(directory_.clock_cursor));
-  if (directory_.clock_cursor == row_off)
-    directory_.clock_cursor = row->clock_prev_off;
-  if (directory_.clock_head == directory_.clock_tail) {
-    if (directory_.clock_head != row_off) return;
-    directory_.clock_head = kNullOffset;
-    directory_.clock_tail = kNullOffset;
+  mem_access::PrivateWrite(&private_arena_.clock_head, sizeof(private_arena_.clock_head));
+  mem_access::PrivateWrite(&private_arena_.clock_tail, sizeof(private_arena_.clock_tail));
+  mem_access::PrivateWrite(&private_arena_.clock_cursor,
+                           sizeof(private_arena_.clock_cursor));
+  if (private_arena_.clock_cursor == row_off)
+    private_arena_.clock_cursor = row->clock_prev_off;
+  if (private_arena_.clock_head == private_arena_.clock_tail) {
+    if (private_arena_.clock_head != row_off) return;
+    private_arena_.clock_head = kNullOffset;
+    private_arena_.clock_tail = kNullOffset;
   } else {
     if (row->clock_prev_off != kNullOffset) {
       auto *prev = RowFromOffset(row->clock_prev_off);
@@ -1741,34 +1622,34 @@ void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
       RecordPrivateRowStateWrite(next);
       next->clock_prev_off = row->clock_prev_off;
     }
-    if (directory_.clock_head == row_off)
-      directory_.clock_head = row->clock_next_off;
-    if (directory_.clock_tail == row_off)
-      directory_.clock_tail = row->clock_prev_off;
+    if (private_arena_.clock_head == row_off)
+      private_arena_.clock_head = row->clock_next_off;
+    if (private_arena_.clock_tail == row_off)
+      private_arena_.clock_tail = row->clock_prev_off;
   }
   RecordPrivateRowStateWrite(row);
   row->clock_prev_off = kNullOffset;
   row->clock_next_off = kNullOffset;
-  mem_access::HwccAtomicRmw(&directory_.migrated_key_count);
-  directory_.migrated_key_count.fetch_sub(1, std::memory_order_relaxed);
+  mem_access::PrivateAtomicRmw(&private_arena_.migrated_key_count);
+  private_arena_.migrated_key_count.fetch_sub(1, std::memory_order_relaxed);
 }
 
 RegionOffset KVPartition::ClockAdvanceCursor() {
-  mem_access::HwccWrite(&directory_.clock_cursor,
-                        sizeof(directory_.clock_cursor));
-  if (directory_.clock_cursor == kNullOffset) {
-    mem_access::HwccRead(&directory_.clock_head, sizeof(directory_.clock_head));
-    directory_.clock_cursor = directory_.clock_head;
+  mem_access::PrivateWrite(&private_arena_.clock_cursor,
+                           sizeof(private_arena_.clock_cursor));
+  if (private_arena_.clock_cursor == kNullOffset) {
+    mem_access::PrivateRead(&private_arena_.clock_head, sizeof(private_arena_.clock_head));
+    private_arena_.clock_cursor = private_arena_.clock_head;
   } else {
-    auto *cur = RowFromOffset(directory_.clock_cursor);
+    auto *cur = RowFromOffset(private_arena_.clock_cursor);
     RecordPrivateRowStateRead(cur);
     const RegionOffset next = cur->clock_next_off;
     // Linear intrusive list: wrap to head so a lone node with a fresh
     // second_chance can be reconsidered in the same eviction pass.
-    directory_.clock_cursor =
-        (next == kNullOffset) ? directory_.clock_head : next;
+    private_arena_.clock_cursor =
+        (next == kNullOffset) ? private_arena_.clock_head : next;
   }
-  return directory_.clock_cursor;
+  return private_arena_.clock_cursor;
 }
 
 bool KVPartition::ClockMoveOutRow(RegionOffset row_off) {
@@ -1777,14 +1658,11 @@ bool KVPartition::ClockMoveOutRow(RegionOffset row_off) {
   return MoveOutForMigrationManager(row->kv);
 }
 
-bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget,
-                                             bool force_at_least_one) {
+bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget) {
   bool ret = false;
-  bool moved_once = false;
   ClockLock();
-  if (!force_at_least_one &&
-      star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
-          hw_cc_budget) {
+  if (star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
+      hw_cc_budget) {
     ClockUnlock();
     return false;
   }
@@ -1815,26 +1693,20 @@ bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget,
     const bool moved = MoveOutForMigrationManager(victim_key.bytes);
     ClockLock();
     if (moved) {
-      moved_once = true;
-      if (force_at_least_one ||
-          star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
-              hw_cc_budget) {
+      if (star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
+          hw_cc_budget) {
         ret = true;
         break;
       }
     }
   }
   ClockUnlock();
-  return force_at_least_one ? moved_once : ret;
+  return ret;
 }
 
-bool KVPartition::MoveOutClockVictim(uint32_t host_id, bool force_at_least_one) {
+bool KVPartition::MoveOutClockVictim(uint32_t host_id) {
   (void)host_id;
   EnterEbr();
-  if (force_at_least_one) {
-    // Payload watermark: do not rewrite CXLMemory::TOTAL_HW_CC_USAGE (§11.10).
-    return ClockEvictUntilUnderBudget(/*hw_cc_budget=*/0, true);
-  }
   if (star::migration_manager == nullptr) return false;
   // Caller syncs CXLMemory::TOTAL_HW_CC_USAGE for the HWCC over-budget path.
   return star::migration_manager->move_row_out(partition_id_);
@@ -1858,8 +1730,8 @@ uint64_t KVPartition::hwcc_used_bytes() const {
 }
 
 uint64_t KVPartition::migrated_key_count() const {
-  mem_access::HwccAtomicLoad(&directory_.migrated_key_count);
-  return directory_.migrated_key_count.load(std::memory_order_relaxed);
+  mem_access::PrivateAtomicLoad(&private_arena_.migrated_key_count);
+  return private_arena_.migrated_key_count.load(std::memory_order_relaxed);
 }
 
 
@@ -1869,9 +1741,9 @@ void KVPartition::PersistPrivateRootIfChanged() {
   const RegionOffset private_root =
       regions_.swcc().ToOffset(private_tree_->root_for_persistence());
   if (private_root == persisted_private_root_offset_) return;
-  mem_access::HwccWrite(&directory_.private_root,
-                        sizeof(directory_.private_root));
-  directory_.private_root = private_root;
+  mem_access::PrivateWrite(&private_arena_.private_root,
+                           sizeof(private_arena_.private_root));
+  private_arena_.private_root = private_root;
   persisted_private_root_offset_ = private_root;
   ++private_root_publishes_;
 }

@@ -23,6 +23,21 @@
 using namespace tigonkv;
 
 namespace {
+void SetTestRangePartitioning(Config *config) {
+  config->partition_ranges.clear();
+  std::string lower;
+  for (uint32_t partition = 0; partition < config->partition_count; ++partition) {
+    std::string upper;
+    if (partition + 1 != config->partition_count) {
+      char boundary[9];
+      std::snprintf(boundary, sizeof(boundary), "%08u",
+                    100000u * (partition + 1) / config->partition_count);
+      upper = boundary;
+    }
+    config->partition_ranges.push_back({lower, upper});
+    lower = std::move(upper);
+  }
+}
 std::string EnvOr(const char *name, const std::string &fallback) {
   const char *value = std::getenv(name);
   return value && *value ? value : fallback;
@@ -38,9 +53,10 @@ Config ConfigFor(const std::string &path, uint32_t node) {
   c.swcc_size_mb = 1024;
   c.vm_count = 2;
   c.node_id = node;
-  c.partition_count = 64;
+  c.partition_count = 16;
   c.fixed_key_size = 8;
   c.fixed_value_size = 8;
+  SetTestRangePartitioning(&c);
   return c;
 }
 std::string Key8(uint32_t i) {

@@ -42,7 +42,8 @@ class KVPartition {
   using SharedTree = PrivateTree;
 
   KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
-              uint32_t partition_id, uint32_t owner_shard, bool attach);
+              uint32_t partition_id, uint32_t owner_shard, bool attach,
+              bool materialize_private);
 
   uint32_t partition_id() const { return partition_id_; }
   uint32_t owner_shard() const { return owner_shard_; }
@@ -120,17 +121,7 @@ class KVPartition {
       uint32_t host_id, std::string_view start_key, uint64_t output_limit,
       bool owner_exhausted_for_cursor, bool cursor_is_duplicate,
       bool owner_no_predecessor_for_cursor = false) const;
-  // TwoPLPasha range proof: rows through cutoff plus one right boundary must
-  // form the logical private-tree adjacency chain.  For an exhausted range,
-  // expected_count anchors both endpoints; expected_generation linearizes
-  // logical EOF where adjacency has no right boundary.
-  bool ScanSharedComplete(
-      std::string_view start_key, const FixedKey &cutoff, bool exhausted,
-      bool no_predecessor, uint32_t expected_count,
-      uint32_t expected_generation, uint32_t host_id,
-      std::vector<std::pair<std::string, std::string>> *items) const;
   bool PrivatePredecessorKey(std::string_view key, std::string *predecessor) const;
-  uint64_t SharedMutationState() const;
   void ClockLock();
   void ClockUnlock();
   void ClockTrackMigratedKey(const void *key_bytes);
@@ -139,13 +130,9 @@ class KVPartition {
   // Returns the PrivateRow offset under the Clock cursor (or kNullOffset).
   RegionOffset ClockAdvanceCursor();
   bool ClockMoveOutRow(RegionOffset row_off);
-  // Second-chance eviction loop used by PolicyClock::move_row_out (§11.14).
-  // force_at_least_one: payload watermark eviction without rewriting the
-  // global CXLMemory HWCC counter (§11.10).
-  bool ClockEvictUntilUnderBudget(uint64_t hw_cc_budget,
-                                  bool force_at_least_one = false);
-  // When force_at_least_one, bypass PolicyClock's TOTAL_HW_CC_USAGE gate.
-  bool MoveOutClockVictim(uint32_t host_id, bool force_at_least_one = false);
+  // Second-chance eviction loop used by the original PolicyClock gate.
+  bool ClockEvictUntilUnderBudget(uint64_t hw_cc_budget);
+  bool MoveOutClockVictim(uint32_t host_id);
   uint64_t shared_payload_used_bytes() const;
   uint64_t shared_payload_capacity_bytes() const;
   uint64_t hwcc_used_bytes() const;
@@ -218,6 +205,7 @@ class KVPartition {
   const uint32_t fixed_key_size_;
   const uint32_t fixed_value_size_;
   PartitionDirectoryEntry &directory_;
+  OwnerPrivateArenaHeader &private_arena_;
   btreeolc_cxl::TreeNodeAllocation private_binding_;
   btreeolc_cxl::TreeNodeAllocation shared_binding_;
   PrivateTree *private_tree_ = nullptr;

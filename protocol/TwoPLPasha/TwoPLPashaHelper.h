@@ -10,7 +10,6 @@
 #include <tuple>
 #include <memory>
 #include <string>
-#include <thread>
 
 #include "common/CCSet.h"
 #include "common/CCHashTable.h"
@@ -124,8 +123,6 @@ struct TwoPLPashaMetadataShared {
                 tigonkv::engine::mem_access::HwccWrite(&tid, sizeof(tid));
                 tigonkv::engine::mem_access::HwccWrite(&flags, sizeof(flags));
                 tigonkv::engine::mem_access::HwccWrite(&ref_cnt, sizeof(ref_cnt));
-                tigonkv::engine::mem_access::HwccWrite(
-                    &writer_waiting, sizeof(writer_waiting));
                 tigonkv::engine::mem_access::HwccWrite(
                     &value_len, sizeof(value_len));
                 tigonkv::engine::mem_access::HwccWrite(
@@ -434,18 +431,6 @@ retry:
                 --ref_cnt;
         }
 
-        uint8_t get_writer_waiting() const {
-                tigonkv::engine::mem_access::HwccRead(
-                    &writer_waiting, sizeof(writer_waiting));
-                return writer_waiting;
-        }
-
-        void set_writer_waiting(uint8_t value) {
-                tigonkv::engine::mem_access::HwccWrite(
-                    &writer_waiting, sizeof(writer_waiting));
-                writer_waiting = value;
-        }
-
         uint32_t get_value_len() const {
                 tigonkv::engine::mem_access::HwccRead(
                     &value_len, sizeof(value_len));
@@ -473,9 +458,6 @@ retry:
         uint8_t flags{ 0 };
         // multi-host accessors pin this; move-out requires ref_cnt == 0
         uint8_t ref_cnt{ 0 };
-        // KV writer preference: readers refuse to enter while a writer waits so
-        // CXL GetShared cannot starve shared Put under YCSB-A.
-        uint8_t writer_waiting{ 0 };
         uint32_t value_len{ 0 };
         char migration_policy_meta[MigrationManager::migration_policy_meta_size]{};
 };
@@ -521,8 +503,7 @@ class TwoPLPashaHelper {
                 smeta->lock();
                 auto *scc_data = smeta->get_scc_data();
                 // ref_cnt is uint8_t; refuse saturation instead of wrapping.
-                // writer_waiting: prefer draining writers over admitting more readers.
-                if (smeta->is_write_locked() || smeta->get_writer_waiting() != 0 ||
+                if (smeta->is_write_locked() ||
                     smeta->get_reader_count() == smeta->get_reader_count_max() ||
                     smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
@@ -571,7 +552,6 @@ class TwoPLPashaHelper {
                 auto *scc_data = smeta->get_scc_data();
                 const uint32_t size = smeta->get_value_len();
                 if (size > capacity || smeta->is_write_locked() ||
-                    smeta->get_writer_waiting() != 0 ||
                     smeta->get_reader_count() == smeta->get_reader_count_max() ||
                     (!ref_already_pinned &&
                      smeta->get_ref_cnt() ==
@@ -614,65 +594,51 @@ class TwoPLPashaHelper {
                                     const void *src, std::size_t size)
         {
                 if (smeta == nullptr || scc_manager == nullptr) return false;
-                // One logical write attempt: bounded reader-drain yields, never
-                // leave writer_waiting=1 on a false return (§10.2c).
-                constexpr int kMaxReaderDrainAttempts = 256;
-                for (int attempt = 0; attempt < kMaxReaderDrainAttempts; ++attempt) {
-                        smeta->lock();
-                        auto *scc_data = smeta->get_scc_data();
-                        if (smeta->is_write_locked() ||
-                            smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
-                                smeta->set_writer_waiting(0);
-                                smeta->unlock();
-                                return false;
-                        }
-                        if (smeta->get_reader_count() != 0) {
-                                smeta->set_writer_waiting(1);
-                                smeta->unlock();
-                                std::this_thread::yield();
-                                continue;
-                        }
-                        smeta->set_writer_waiting(0);
-                        smeta->set_write_locked();
-                        smeta->increment_ref_cnt();
-                        smeta->unlock();
-                        // The write-through SCC protocol requires the writer's
-                        // cache-valid bit before finish_write invalidates all peers.
-                        const auto host_bit =
-                            host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
-                        // clflush without latch; set_bit only under latch (RMW).
-                        if (!smeta->is_bit_set(host_bit))
-                                scc_manager->invalidate_scc_data(scc_data, size);
-                        tigonkv::engine::mem_access::SharedPayloadWrite(
-                                scc_data->data, size);
-                        scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
-                        // atomic_word bit RMWs require the latch; clwb does not.
-                        // Holding the latch across clwb livelocks hot keys across
-                        // VMs — so: bits under latch, unlock, clwb, then release
-                        // the write lock. Never call finish_write unlocked (its
-                        // clear_all_scc_bits can drop another thread's latch bit).
-                        smeta->lock();
-                        if (!smeta->is_bit_set(host_bit))
-                                smeta->set_bit(host_bit);
-                        smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                        smeta->set_value_len(static_cast<uint32_t>(size));
-                        scc_manager->finish_write_bits(smeta, host_id);
-                        smeta->unlock();
-                        scc_manager->flush_scc_data(scc_data, size);
-                        // Keep write_locked/ref_cnt published until the
-                        // synthetic payload/writeback latency has elapsed.
-                        tigonkv::engine::mem_access::DelayActiveScopeNow();
-                        smeta->lock();
-                        DCHECK(smeta->get_ref_cnt() > 0);
-                        smeta->decrement_ref_cnt();
-                        smeta->clear_write_locked();
-                        smeta->unlock();
-                        return true;
-                }
                 smeta->lock();
-                smeta->set_writer_waiting(0);
+                auto *scc_data = smeta->get_scc_data();
+                // Match remote_take_write_lock_and_read: a reader or writer is
+                // ordinary contention for this logical operation, not an
+                // internal reader-drain loop.
+                if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
+                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+                        smeta->unlock();
+                        return false;
+                }
+                smeta->set_write_locked();
+                smeta->increment_ref_cnt();
                 smeta->unlock();
-                return false;
+                // The write-through SCC protocol requires the writer's
+                // cache-valid bit before finish_write invalidates all peers.
+                const auto host_bit =
+                    host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
+                // clflush without latch; set_bit only under latch (RMW).
+                if (!smeta->is_bit_set(host_bit))
+                        scc_manager->invalidate_scc_data(scc_data, size);
+                tigonkv::engine::mem_access::SharedPayloadWrite(
+                        scc_data->data, size);
+                scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
+                // atomic_word bit RMWs require the latch; clwb does not.
+                // Holding the latch across clwb livelocks hot keys across
+                // VMs — so: bits under latch, unlock, clwb, then release
+                // the write lock. Never call finish_write unlocked (its
+                // clear_all_scc_bits can drop another thread's latch bit).
+                smeta->lock();
+                if (!smeta->is_bit_set(host_bit))
+                        smeta->set_bit(host_bit);
+                smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
+                smeta->set_value_len(static_cast<uint32_t>(size));
+                scc_manager->finish_write_bits(smeta, host_id);
+                smeta->unlock();
+                scc_manager->flush_scc_data(scc_data, size);
+                // Keep write_locked/ref_cnt published until the
+                // synthetic payload/writeback latency has elapsed.
+                tigonkv::engine::mem_access::DelayActiveScopeNow();
+                smeta->lock();
+                DCHECK(smeta->get_ref_cnt() > 0);
+                smeta->decrement_ref_cnt();
+                smeta->clear_write_locked();
+                smeta->unlock();
+                return true;
         }
 
         template <typename Mutator>
@@ -682,97 +648,67 @@ class TwoPLPashaHelper {
         {
                 if (smeta == nullptr || scc_manager == nullptr || changed == nullptr)
                         return false;
-                constexpr int kMaxContentionAttempts = 256;
-                for (int attempt = 0; attempt < kMaxContentionAttempts; ++attempt) {
-                        smeta->lock();
-                        auto *scc_data = smeta->get_scc_data();
-                        const uint32_t size = smeta->get_value_len();
-                        if (size > capacity ||
-                            !smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) ||
-                            smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
-                                smeta->set_writer_waiting(0);
-                                smeta->unlock();
-                                return false;
-                        }
-                        if (smeta->is_write_locked()) {
-                                smeta->set_writer_waiting(0);
-                                smeta->unlock();
-                                std::this_thread::yield();
-                                continue;
-                        }
-                        if (smeta->get_reader_count() != 0) {
-                                smeta->set_writer_waiting(1);
-                                smeta->unlock();
-                                std::this_thread::yield();
-                                continue;
-                        }
-                        smeta->set_writer_waiting(0);
-                        smeta->set_write_locked();
-                        smeta->increment_ref_cnt();
-                        const auto host_bit =
-                            host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
-                        const bool need_fill = !smeta->is_bit_set(host_bit);
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                const uint32_t size = smeta->get_value_len();
+                if (size > capacity ||
+                    !smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) ||
+                    smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
+                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
+                        return false;
+                }
+                smeta->set_write_locked();
+                smeta->increment_ref_cnt();
+                const auto host_bit =
+                    host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
+                const bool need_fill = !smeta->is_bit_set(host_bit);
+                smeta->unlock();
 
-                        if (need_fill) {
-                                scc_manager->invalidate_scc_data(scc_data, size);
-                                smeta->lock();
-                                if (!smeta->is_bit_set(host_bit))
-                                        smeta->set_bit(host_bit);
-                                smeta->unlock();
-                        }
-                        std::string current(size, '\0');
-                        tigonkv::engine::mem_access::SharedPayloadRead(
-                                scc_data->data, size);
-                        scc_manager->do_read(smeta, host_id, current.data(),
-                                             scc_data->data, size);
-                        std::string replacement;
-                        bool write = false;
-                        try {
-                                write = mutator(current, &replacement);
-                                if (write && replacement.size() > capacity)
-                                        throw std::length_error(
-                                            "shared update exceeds value capacity");
-                        } catch (...) {
-                                tigonkv::engine::mem_access::DelayActiveScopeNow();
-                                smeta->lock();
-                                DCHECK(smeta->get_ref_cnt() > 0);
-                                smeta->decrement_ref_cnt();
-                                smeta->clear_write_locked();
-                                smeta->set_writer_waiting(0);
-                                smeta->unlock();
-                                throw;
-                        }
-                        if (write) {
-                                tigonkv::engine::mem_access::SharedPayloadWrite(
-                                        scc_data->data, replacement.size());
-                                scc_manager->do_write(smeta, host_id, scc_data->data,
-                                                      replacement.data(),
-                                                      replacement.size());
-                                smeta->lock();
-                                smeta->set_flag(
-                                    TwoPLPashaMetadataShared::valid_flag_index);
-                                smeta->set_value_len(
-                                    static_cast<uint32_t>(replacement.size()));
-                                scc_manager->finish_write_bits(smeta, host_id);
-                                smeta->unlock();
-                                scc_manager->flush_scc_data(scc_data,
-                                                            replacement.size());
-                        }
+                if (need_fill) {
+                        scc_manager->invalidate_scc_data(scc_data, size);
+                        smeta->lock();
+                        if (!smeta->is_bit_set(host_bit)) smeta->set_bit(host_bit);
+                        smeta->unlock();
+                }
+                std::string current(size, '\0');
+                tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
+                scc_manager->do_read(smeta, host_id, current.data(), scc_data->data, size);
+                std::string replacement;
+                bool write = false;
+                try {
+                        write = mutator(current, &replacement);
+                        if (write && replacement.size() > capacity)
+                                throw std::length_error("shared update exceeds value capacity");
+                } catch (...) {
                         tigonkv::engine::mem_access::DelayActiveScopeNow();
                         smeta->lock();
                         DCHECK(smeta->get_ref_cnt() > 0);
                         smeta->decrement_ref_cnt();
                         smeta->clear_write_locked();
-                        smeta->set_writer_waiting(0);
                         smeta->unlock();
-                        *changed = write;
-                        return true;
+                        throw;
                 }
+                if (write) {
+                        tigonkv::engine::mem_access::SharedPayloadWrite(
+                                scc_data->data, replacement.size());
+                        scc_manager->do_write(smeta, host_id, scc_data->data,
+                                              replacement.data(), replacement.size());
+                        smeta->lock();
+                        smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
+                        smeta->set_value_len(static_cast<uint32_t>(replacement.size()));
+                        scc_manager->finish_write_bits(smeta, host_id);
+                        smeta->unlock();
+                        scc_manager->flush_scc_data(scc_data, replacement.size());
+                }
+                tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
-                smeta->set_writer_waiting(0);
+                DCHECK(smeta->get_ref_cnt() > 0);
+                smeta->decrement_ref_cnt();
+                smeta->clear_write_locked();
                 smeta->unlock();
-                return false;
+                *changed = write;
+                return true;
         }
 
         // Explicit migration-style pin used when a requester observes an

@@ -3,9 +3,10 @@
 > 当前 `my-work` 的已实现数据路径、线程/CPU 计数和实验声明以
 > [当前对比口径.md](当前对比口径.md) 为准。本文件保留设计依据、施工历史和
 > 验收矩阵；其中以“HEAD/现版”描述的旧问题不表示当前实现仍有该缺陷。
-> Scan / 点操作 / Clock tracker 的**目标合同**以
-> [Scan原始Tigon对齐修改方案.md](Scan原始Tigon对齐修改方案.md) 为准，按该文
-> §14 顺序落地；落地前 `当前对比口径.md` 仍描述现版路径。
+> 范围分区、Scan / 点操作 / Clock tracker 的**目标合同**以
+> [partition优化方案.md](partition优化方案.md) 与
+> [Scan原始Tigon对齐修改方案.md](Scan原始Tigon对齐修改方案.md) 为准；前者的
+> 范围分区合同优先于本文遗留的 hash 叙述。
 
 本文档（`PLAN.md`）是唯一有效的完整改造计划。核心立场：**不追求与原实现隔离
 的独立 TigonKV 分支，允许直接修改原始 Tigon 源码；最终只要求扩展后的系统
@@ -19,8 +20,9 @@
 
 1. **单逻辑表**：正式 KV API 与 wire 不接受 `table_id`；唯一常量表
    `kSingleTableId=0`。partition 只是路由/并发分片，不是多张表。
-2. **Hash partition**：`partition = StablePartitionForKey(key) % partition_count`，
-   `owner = partition % vm_count`；禁止改为 range partition 或单共享树。
+2. **Range partition**：`tigon_kv.partitioning.ranges` 精确定义连续的
+   `[lower_key, upper_key)`；`owner = partition % vm_count`。禁止回退为 hash
+   partition 或单共享树。
 3. **单 key 线性一致**：Put/Get/Delete/CAS/Increment 提供可测的单 key
    线性历史；不把跨 partition 全局 Scan snapshot 写成默认强一致合同。
 4. **Scan 非全局 snapshot（目标路径）**：远端 partition CXL-first +
@@ -179,8 +181,9 @@ HEAD 上自研的 slot/全局锁引擎整体废弃；原始 Tigon 核心目录�
   HWCC（跨节点硬件缓存一致，典型 ≤ 1 GiB）与 non-HWCC/SWCC（无跨节点硬件
   缓存一致）。
 - 对外单一 KV namespace（不暴露 table 名）；任意 VM 接受任意 key 的请求。
-  **对内**按 Tigon 原设计做 `partition = hash(key) % partition_count`、
-  `owner = partition % vm_count`；不得改为单共享树。
+  **对内**按 Tigon 原设计的范围分区做
+  `partition = configured_range(key)`、`owner = partition % vm_count`；
+  不得改为单共享树或 hash 路由。
 - 只要求强一致的单 KV 操作：PUT/GET/DELETE/SCAN + 测试用 CAS/INCR；
   不做通用多 key 事务。
 - 权威基础数据在 partition owner 独占的 owner-private SWCC 区（不是节点本地
@@ -1137,8 +1140,9 @@ host 必须读到旧值"、"readable bit=true 时不得产生额外 flush"等正
      value）；响应后重扫 CXL。禁止不完整 CXL 与 owner value 混源。正式热
      路径删除 `ScanCertificate` / selected-count / mutation-generation 全局
      证书；`exhausted` 是任意 start_key 下的必要 EOF 提示（须披露）。
-  3. requester 对 16 个 partition 完整流做有界 k 路归并；每页续扫从上一
-     key 重探针；凑满全局 `limit` 早停。`limit==0` 保留 **1,048,576** 安全
+  3. requester 从 `PartitionForKey(start)` 起按连续范围顺序推进；当前范围耗尽
+     才进入下一个 partition，不做 k 路归并。续扫从上一 key 重探针；凑满全局
+     `limit` 早停。`limit==0` 保留 **1,048,576** 安全
      上限（正式对比应用显式非零 limit 或声明差异）。
   4. Scan **不**承诺跨 partition 线性一致全局快照；单 key API 仍线性一致。
      正确性优先；若 Scan 验收未通过，按 §1.5.2 标记 `ycsb_e=unsupported`

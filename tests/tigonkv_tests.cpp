@@ -38,6 +38,19 @@ bool ValidateThrows(const Config &config) {
   return false;
 }
 
+void SetTestRangePartitioning(Config *config) {
+  config->partition_ranges.clear();
+  std::string lower;
+  for (uint32_t partition = 0; partition < config->partition_count; ++partition) {
+    std::string upper;
+    if (partition + 1 != config->partition_count)
+      upper.assign(1, static_cast<char>((partition + 1) * 256 /
+                                        config->partition_count));
+    config->partition_ranges.push_back({lower, upper});
+    lower = std::move(upper);
+  }
+}
+
 std::string ReplaceOnce(std::string text, const std::string &from,
                         const std::string &to) {
   const size_t position = text.find(from);
@@ -223,6 +236,7 @@ int main() {
   uneven.node_id = 1;
   uneven.partition_count = 7;
   uneven.transport_ring_total_mb = 1;
+  SetTestRangePartitioning(&uneven);
   uneven.Validate();
   const std::string path = "/tmp/tigonkv-facade-" + std::to_string(getpid());
   std::remove(path.c_str());
@@ -239,6 +253,7 @@ int main() {
   config.fixed_value_size = 128;
   config.foreground_worker_count_per_vm = 4;
   config.transport_ring_total_mb = 1;
+  SetTestRangePartitioning(&config);
   Config insufficient_cpu = config;
   insufficient_cpu.cpu_affinity = true;
   insufficient_cpu.vm_core_count_per_vm = 4;

@@ -23,7 +23,12 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // v13: PolicyClock tracker links live in PrivateRow / PartitionDirectoryEntry
 // (owner-private SWCC), not process-heap ClockTrackerNode (§11.14).
 // v14: PartitionDirectoryEntry carries O(1) migrated_key_count (§11.16).
-constexpr uint32_t kSharedLayoutVersion = 14;
+// v15: layout identity includes the configured ordered range boundaries.
+// v16: private-tree root and Clock control state live in owner-private SWCC.
+// v17: shared metadata removes the KV-only writer-preference byte and restores
+//      the original single-attempt TwoPLPasha row-lock semantics.
+// v18: drops the unused Scan-certificate mutation generation from HWCC.
+constexpr uint32_t kSharedLayoutVersion = 18;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -31,7 +36,7 @@ constexpr uint32_t kMaxAllocatorShards = 64;
 
 // Frozen architecture contract (Scan原始Tigon对齐修改方案.md §11.1 / §14.1).
 // Formal KV API and wire protocol accept exactly one logical table; partitions
-// are hash routing shards, not additional tables. Single-key APIs are
+// are ordered range-routing shards, not additional tables. Single-key APIs are
 // linearizable; Scan is not a global cross-partition snapshot.
 constexpr uint32_t kSingleTableId = 0;
 static_assert(kSingleTableId == 0, "TigonKV exposes exactly one logical table");
@@ -107,25 +112,14 @@ static_assert(sizeof(PrivateRow) == 64,
               "PrivateRow clock links must stay inside the existing 64B header");
 
 struct alignas(64) PartitionDirectoryEntry {
-  RegionOffset private_root = kNullOffset;
   // Shared-tree live root (HWCC). Updated on makeRoot/merge; every shared
   // tree op loads this atomically so already-attached peers see splits.
   std::atomic<RegionOffset> shared_root{kNullOffset};
   RegionOffset private_arena = kNullOffset;
   std::atomic<uint64_t> migration_in_seq{0};
-  // High 32 bits count completed logical-key mutations; low 32 bits count
-  // mutations in flight. Remote CXL range readers use this only to certify an
-  // exhausted private-tree tail; shared move-in/out uses next/prev bits.
-  std::atomic<uint64_t> shared_mutation_state{0};
-  // Owner-local Clock list head/tail/cursor over PrivateRow offsets (§11.14).
-  RegionOffset clock_head = kNullOffset;
-  RegionOffset clock_tail = kNullOffset;
-  RegionOffset clock_cursor = kNullOffset;
-  // Maintained under ClockLock on track/untrack; DumpStats reads O(1) (§11.16).
-  std::atomic<uint64_t> migrated_key_count{0};
 };
-static_assert(sizeof(PartitionDirectoryEntry) == 128,
-              "v14 directory entry includes migrated_key_count (2 cache lines)");
+static_assert(sizeof(PartitionDirectoryEntry) == 64,
+              "directory contains only globally coherent shared-tree state");
 
 // The first object in the HWCC region. Fields are fixed-width so an attach in a
 // separately mapped process can validate the complete layout before dereference.

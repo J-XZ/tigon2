@@ -26,6 +26,19 @@
 
 namespace {
 
+void SetTestRangePartitioning(tigonkv::Config *config) {
+  config->partition_ranges.clear();
+  std::string lower;
+  for (uint32_t partition = 0; partition < config->partition_count; ++partition) {
+    std::string upper;
+    if (partition + 1 != config->partition_count)
+      upper.assign(1, static_cast<char>((partition + 1) * 256 /
+                                        config->partition_count));
+    config->partition_ranges.push_back({lower, upper});
+    lower = std::move(upper);
+  }
+}
+
 tigonkv::Config ConfigFor(const std::string &path, uint32_t vm_count = 1,
                            uint32_t node_id = 0) {
   tigonkv::Config config;
@@ -45,6 +58,7 @@ tigonkv::Config ConfigFor(const std::string &path, uint32_t vm_count = 1,
   config.fixed_value_size = 128;
   config.foreground_worker_count_per_vm = 1;
   config.transport_ring_total_mb = 1;
+  SetTestRangePartitioning(&config);
   return config;
 }
 
@@ -354,13 +368,16 @@ int main() {
       const std::string value(entry.second, 'v');
       assert(node0->Put(entry.first, value).ok());
       expected_tx += tigonkv::engine::WireSize(tigonkv::engine::MakeRequest(
+          tigonkv::engine::KvMessageType::kMigrate, 0, 1, 1, entry.first, {}));
+      expected_tx += tigonkv::engine::WireSize(tigonkv::engine::MakeRequest(
           tigonkv::engine::KvMessageType::kPut, 0, 1, 1, entry.first, value));
     }
     node0->ReleaseWorker();
     assert(node0->NetworkTxBytes() - tx_before == expected_tx);
-    // Responses are received on node0; each empty ack is exactly the header.
+    // A create first checks/migrates the row, then performs owner insert; both
+    // replies are header-only.
     assert(node0->NetworkRxBytes() ==
-           remote_puts.size() * tigonkv::engine::WireHeaderBytes());
+           remote_puts.size() * 2 * tigonkv::engine::WireHeaderBytes());
     int peer_status = 0;
     assert(waitpid(peer, &peer_status, 0) == peer);
     assert(WIFEXITED(peer_status) && WEXITSTATUS(peer_status) == 0);
@@ -423,7 +440,7 @@ int main() {
       assert(mem.owner_migration_dynamic_budget_bytes > 0);
       assert(mem.allocator_local_dram_bytes == 0);
     }
-    // §14.7 / §11.5: hash partition routing is stable and index-aligned.
+    // Range partition routing is stable and owner assignment remains index-aligned.
     for (uint32_t i = 0; i < 4096; ++i) {
       const std::string key = "route-oracle-" + std::to_string(i);
       const uint32_t partition = engine->PartitionForKey(key);
@@ -448,7 +465,7 @@ int main() {
     assert(scan.items[1].key == "counter" && scan.items[1].value == "3");
     {
       const auto rt = engine->EngineRuntime();
-      assert(rt.scan_partition_probes >= single_owner.partition_count);
+      assert(rt.scan_partition_probes >= 1);
       assert(rt.scan_migrate_rpcs == 0);
     }
     assert(engine->Delete("alpha").ok());
@@ -540,6 +557,7 @@ int main() {
     const std::string oracle_path(oracle_template);
     auto oracle_config = ConfigFor(oracle_path);
     oracle_config.partition_count = 16;
+    SetTestRangePartitioning(&oracle_config);
     auto engine = tigonkv::engine::KVEngine::Open(oracle_config, true);
     std::vector<std::string> keys;
     for (int i = 0; i < 64; ++i) {
@@ -590,34 +608,23 @@ int main() {
   {
     auto engine = tigonkv::engine::KVEngine::Open(node_zero, true);
     assert(star::CXLMemory::bound_owner_shard() == 0);
-    for (uint32_t i = 0; i < 100; ++i) {
-      const std::string key = "route-" + std::to_string(i);
+    for (const std::string_view key : {"H-route", "a-route"}) {
       const uint32_t partition = engine->PartitionForKey(key);
       assert(engine->OwnerForKey(key) == partition % node_zero.vm_count);
-      if (engine->OwnerForKey(key) == 1) break;
     }
     // Constructing every partition (owners 0 and 1) must not rebind the
     // process-level allocator owner away from this VM (§11.3).
     assert(star::CXLMemory::bound_owner_shard() == 0);
 
-    std::string owner_zero_key;
-    for (uint32_t i = 0; i < 100; ++i) {
-      const std::string key = "cross-node-" + std::to_string(i);
-      if (engine->OwnerForKey(key) == 0) { owner_zero_key = key; break; }
-    }
-    assert(!owner_zero_key.empty());
-    std::string owner_one_key;
-    for (uint32_t i = 0; i < 100; ++i) {
-      const std::string key = "scan-node-one-" + std::to_string(i);
-      if (engine->OwnerForKey(key) == 1) { owner_one_key = key; break; }
-    }
-    assert(!owner_one_key.empty());
+    const std::string owner_zero_key = "H-owner-zero";
+    const std::string owner_one_key = "a-owner-one";
+    assert(engine->OwnerForKey(owner_zero_key) == 0);
+    assert(engine->OwnerForKey(owner_one_key) == 1);
     assert(engine->Put(owner_zero_key, "owner-zero").ok());
     constexpr uint32_t kRemoteScanRows = 1024;
     uint32_t remote_scan_rows = 0;
     for (uint32_t i = 0; remote_scan_rows < kRemoteScanRows; ++i) {
-      const std::string key = "scan-bulk-" + std::to_string(i);
-      if (engine->OwnerForKey(key) != 0) continue;
+      const std::string key = "H0-bulk-" + std::to_string(i);
       assert(engine->Put(key, "bulk").ok());
       ++remote_scan_rows;
     }
@@ -628,8 +635,7 @@ int main() {
     uint32_t promoted_partition = UINT32_MAX;
     for (uint32_t i = 0; promoted_scan_keys.size() < 130; ++i) {
       char key[32];
-      std::snprintf(key, sizeof(key), "hybrid-%08u", i);
-      if (engine->OwnerForKey(key) != 0) continue;
+      std::snprintf(key, sizeof(key), "H-hybrid-%08u", i);
       const uint32_t partition = engine->PartitionForKey(key);
       if (promoted_partition == UINT32_MAX) promoted_partition = partition;
       if (partition != promoted_partition) continue;
@@ -639,9 +645,8 @@ int main() {
     std::vector<std::string> concurrent_insert_keys;
     for (uint32_t i = 0; concurrent_insert_keys.size() < 4; ++i) {
       const std::string key =
-          "hybrid-00000000-insert-" + std::to_string(i);
-      if (engine->OwnerForKey(key) == 0)
-        concurrent_insert_keys.push_back(key);
+          "H-hybrid-00000000-insert-" + std::to_string(i);
+      concurrent_insert_keys.push_back(key);
     }
     int scan_ready[2];
     assert(pipe2(scan_ready, O_CLOEXEC | O_NONBLOCK) == 0);
@@ -657,7 +662,7 @@ int main() {
         if (!promoted.status.ok() || promoted.value != "owner-authority") _exit(14);
       }
       const uint64_t tx_before_authoritative_scan = node_one->NetworkTxBytes();
-      const auto authoritative_scan = node_one->Scan("hybrid-", 100);
+      const auto authoritative_scan = node_one->Scan("H-hybrid-", 100);
       const uint64_t authoritative_scan_tx =
           node_one->NetworkTxBytes() - tx_before_authoritative_scan;
       if (!authoritative_scan.status.ok() || authoritative_scan.items.size() != 100)
@@ -684,7 +689,7 @@ int main() {
       for (size_t i = 0; i < boundary_scan.items.size(); ++i)
         if (boundary_scan.items[i].key != promoted_scan_keys[63 + i])
           _exit(30);
-      const auto complete_hybrid_scan = node_one->Scan("hybrid-", 130);
+      const auto complete_hybrid_scan = node_one->Scan("H-hybrid-", 130);
       if (!complete_hybrid_scan.status.ok() ||
           complete_hybrid_scan.items.size() != promoted_scan_keys.size())
         _exit(31);
@@ -701,7 +706,7 @@ int main() {
           node_one->BindWorker(worker);
           while (!start_concurrent_scans.load(std::memory_order_acquire))
             std::this_thread::yield();
-          const auto scan = node_one->Scan("hybrid-", 100);
+          const auto scan = node_one->Scan("H-hybrid-", 100);
           if (!scan.status.ok() || scan.items.size() != 100) {
             concurrent_scan_failed.store(true, std::memory_order_release);
           } else {
@@ -751,11 +756,7 @@ int main() {
       // The GET above promoted this row.  Both CAS operations must use the
       // non-owner shared fast path rather than send another fixed transport frame.
       if (node_one->NetworkTxBytes() != tx_after_promotion) _exit(11);
-      std::string counter_key;
-      for (uint32_t i = 0; i < 100; ++i) {
-        const std::string candidate = "cross-counter-" + std::to_string(i);
-        if (node_one->OwnerForKey(candidate) == 0) { counter_key = candidate; break; }
-      }
+      const std::string counter_key = "H-counter";
       if (counter_key.empty() || !node_one->Put(counter_key, "1").ok()) _exit(7);
       const auto increment = node_one->Increment(counter_key, 2);
       if (!increment.status.ok() || increment.value != 3) _exit(8);
@@ -763,27 +764,13 @@ int main() {
       const auto promoted_counter = node_one->Get(counter_key);
       if (!promoted_counter.status.ok() || promoted_counter.value != "3") _exit(22);
       if (node_one->NetworkTxBytes() != tx_after_remote_increment) _exit(23);
-      std::string cas_create_key;
-      for (uint32_t i = 0; i < 100; ++i) {
-        const std::string candidate = "cross-cas-create-" + std::to_string(i);
-        if (node_one->OwnerForKey(candidate) == 0) {
-          cas_create_key = candidate;
-          break;
-        }
-      }
+      const std::string cas_create_key = "H-cas-create";
       const auto cas_create =
           node_one->CompareExchange(cas_create_key, "", "created");
       if (!cas_create.status.ok() || !cas_create.exchanged) _exit(25);
       const auto created = node_one->Get(cas_create_key);
       if (!created.status.ok() || created.value != "created") _exit(26);
-      std::string cas_race_key;
-      for (uint32_t i = 0; i < 100; ++i) {
-        const std::string candidate = "cross-cas-race-" + std::to_string(i);
-        if (node_one->OwnerForKey(candidate) == 0) {
-          cas_race_key = candidate;
-          break;
-        }
-      }
+      const std::string cas_race_key = "H-cas-race";
       std::atomic<uint32_t> cas_winners{0};
       std::atomic<bool> cas_protocol_failed{false};
       std::vector<std::thread> cas_threads;
@@ -966,15 +953,10 @@ int main() {
       node1_cfg.foreground_worker_count_per_vm = 2;
       auto engine0 = tigonkv::engine::KVEngine::Open(node0_cfg, true);
 
-      std::string owned0;
-      std::string owned1;
-      for (uint32_t i = 0; i < 2000 && (owned0.empty() || owned1.empty());
-           ++i) {
-        const std::string k = "hist-x-" + std::to_string(i);
-        if (engine0->OwnerForKey(k) == 0 && owned0.empty()) owned0 = k;
-        if (engine0->OwnerForKey(k) == 1 && owned1.empty()) owned1 = k;
-      }
-      assert(!owned0.empty() && !owned1.empty());
+      const std::string owned0 = "H-hist-owner0";
+      const std::string owned1 = "a-hist-owner1";
+      assert(engine0->OwnerForKey(owned0) == 0);
+      assert(engine0->OwnerForKey(owned1) == 1);
       assert(engine0->Put(owned0, "owner0-v1").ok());
 
       // child→parent: phase1 done; parent→child: parent done (EOF on close).

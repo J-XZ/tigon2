@@ -160,14 +160,13 @@ int main() {
   assert(meta->ref_cnt == 0 && meta->get_reader_count() == 0 &&
          !meta->is_write_locked());
 
-  // §10.2c: every false return path clears writer_waiting so readers recover.
+  // A contended shared writer is a single failed attempt; it must not leave
+  // any writer-preference state that blocks later readers.
   {
     meta->lock();
-    meta->set_writer_waiting(1);
     meta->set_write_locked();
     meta->unlock();
     assert(!star::TwoPLPashaHelper::kv_shared_write(meta, 0, "x", 1));
-    assert(meta->get_writer_waiting() == 0);
     meta->lock();
     meta->clear_write_locked();
     meta->unlock();
@@ -180,7 +179,6 @@ int main() {
       simulator.BeginScope(latency_sim::ScopeKind::kForeground);
       writer_started.store(true, std::memory_order_release);
       assert(!star::TwoPLPashaHelper::kv_shared_write(meta, 0, "y", 1));
-      assert(meta->get_writer_waiting() == 0);
       simulator.EndScopeAndDelay();
     });
     while (!writer_started.load(std::memory_order_acquire))
@@ -189,7 +187,6 @@ int main() {
     meta->lock();
     meta->decrease_reader_count();
     meta->unlock();
-    assert(meta->get_writer_waiting() == 0);
     char readable[16] = {};
     uint32_t readable_size = 0;
     assert(star::TwoPLPashaHelper::kv_shared_read_value(
@@ -197,18 +194,14 @@ int main() {
     assert(readable_size > 0);
 
     meta->lock();
-    meta->set_writer_waiting(1);
     meta->set_write_locked();
     meta->unlock();
     bool changed = false;
     assert(!star::TwoPLPashaHelper::kv_shared_update(
         meta, 0, 16,
         [](const std::string &, std::string *) { return false; }, &changed));
-    // write_locked path yields then may still fail; waiting must be clear.
-    assert(meta->get_writer_waiting() == 0);
     meta->lock();
     meta->clear_write_locked();
-    meta->set_writer_waiting(0);
     meta->unlock();
   }
 

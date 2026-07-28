@@ -21,6 +21,21 @@
 using namespace tigonkv;
 
 namespace {
+void SetTestRangePartitioning(Config *config) {
+  config->partition_ranges.clear();
+  std::string lower;
+  for (uint32_t partition = 0; partition < config->partition_count; ++partition) {
+    std::string upper;
+    if (partition + 1 != config->partition_count) {
+      char boundary[32];
+      std::snprintf(boundary, sizeof(boundary), "key-%08u",
+                    100000u * (partition + 1) / config->partition_count);
+      upper = boundary;
+    }
+    config->partition_ranges.push_back({lower, upper});
+    lower = std::move(upper);
+  }
+}
 std::string EnvOr(const char *name, const std::string &fallback) {
   const char *value = std::getenv(name);
   return value && *value ? value : fallback;
@@ -36,12 +51,17 @@ Config ConfigFor(const std::string &path, uint32_t node) {
   c.swcc_size_mb = 1024;
   c.vm_count = 2;
   c.node_id = node;
-  c.partition_count = 64;
+  c.partition_count = 16;
   c.fixed_key_size = 32;
   c.fixed_value_size = 1000;
+  SetTestRangePartitioning(&c);
   return c;
 }
-std::string Key(uint32_t i) { return "key-" + std::to_string(i); }
+std::string Key(uint32_t i) {
+  char key[32];
+  std::snprintf(key, sizeof(key), "key-%08u", i);
+  return key;
+}
 std::string Value(uint32_t generation, uint32_t i) {
   std::string value(1000, static_cast<char>('a' + generation));
   std::string suffix = std::to_string(i);

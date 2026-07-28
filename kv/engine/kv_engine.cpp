@@ -10,7 +10,6 @@
 
 #include <stdexcept>
 #include <thread>
-#include <chrono>
 #include <charconv>
 #include <cerrno>
 #include <cstring>
@@ -19,9 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <deque>
 #include <functional>
-#include <queue>
 #include <sstream>
 #include <fstream>
 #include <sched.h>
@@ -30,10 +27,31 @@
 namespace tigonkv::engine {
 namespace {
 
-uint64_t Hash(std::string_view key) {
+// Layout identity only.  RangePartitionDigest is the routing identity; this
+// digest covers the backing-file name without reintroducing hash routing.
+uint64_t LayoutTextDigest(std::string_view key) {
   uint64_t h = 1469598103934665603ULL;
   for (unsigned char c : key) { h ^= c; h *= 1099511628211ULL; }
   return h;
+}
+
+uint64_t RangePartitionDigest(const Config &config) {
+  uint64_t hash = 1469598103934665603ULL;
+  auto mix = [&](std::string_view text) {
+    for (unsigned char c : text) {
+      hash ^= c;
+      hash *= 1099511628211ULL;
+    }
+    // An explicit separator prevents {"ab", "c"} from aliasing
+    // {"a", "bc"}.  This is layout identity, never key routing.
+    hash ^= 0xff;
+    hash *= 1099511628211ULL;
+  };
+  for (const auto &range : config.partition_ranges) {
+    mix(range.lower_key);
+    mix(range.upper_key);
+  }
+  return hash;
 }
 
 // Multiple foreground KVEngine instances can coexist in one VM. Transport
@@ -174,9 +192,10 @@ DualRegionConfig RegionConfig(const Config &config) {
   region.hwcc_size_bytes = config.hwcc_size_mb * 1024ULL * 1024ULL;
   region.swcc_offset_bytes = config.swcc_offset_mb * 1024ULL * 1024ULL;
   region.swcc_size_bytes = config.swcc_size_mb * 1024ULL * 1024ULL;
-  region.config_hash = Hash(config.shared_memory_path) ^
+  region.config_hash = LayoutTextDigest(config.shared_memory_path) ^
                        (static_cast<uint64_t>(config.partition_count) << 32) ^
-                       config.vm_count ^ config.fixed_value_size;
+                       config.vm_count ^ config.fixed_value_size ^
+                       RangePartitionDigest(config);
   region.vm_count = config.vm_count;
   region.partition_count = config.partition_count;
   region.fixed_key_size = config.fixed_key_size;
@@ -255,20 +274,18 @@ std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
   engine->rings_ = rings;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     const auto &directory = engine->pool_->allocator().layout().partitions[partition];
-    // All VMs reconstruct the persistent roots so a non-owner can use the
-    // shared-tree fast path after promotion.  Only the owner is allowed to
-    // invoke private-row operations; binding the partition to its stable owner
-    // keeps its private arena and tree nodes in the correct allocation shard.
-    mem_access::HwccRead(&directory.private_root,
-                         sizeof(directory.private_root));
-    const RegionOffset private_root = directory.private_root;
+    // Non-owners reconstruct only the shared CXL tree.  The private root and
+    // Clock state are deliberately owner-private SWCC; reset materializes all
+    // roots once before Ready, later attach materializes a private tree only
+    // for the partition's owner.
     mem_access::HwccAtomicLoad(&directory.shared_root);
-    const bool attach = private_root != kNullOffset &&
-                        directory.shared_root.load(std::memory_order_acquire) !=
-                            kNullOffset;
+    const bool attach = directory.shared_root.load(std::memory_order_acquire) !=
+                        kNullOffset;
+    const bool materialize_private =
+        reset || engine->OwnerForPartition(partition) == config.node_id;
     engine->partitions_.emplace_back(std::make_unique<KVPartition>(
         engine->pool_->allocator(), *engine->ebr_, partition,
-        engine->OwnerForPartition(partition), attach));
+        engine->OwnerForPartition(partition), attach, materialize_private));
   }
   if (star::CXLMemory::bound_owner_shard() != config.node_id)
     throw std::runtime_error(
@@ -347,8 +364,7 @@ uint32_t KVEngine::OwnerForPartition(uint32_t partition) const {
 
 KVEngine::KeyRoute KVEngine::RouteForKey(std::string_view key) const {
   KeyRoute route;
-  route.partition_id =
-      static_cast<uint32_t>(Hash(key) % config_.partition_count);
+  route.partition_id = config_.PartitionForKey(key);
   route.owner = route.partition_id % config_.vm_count;
   route.owned_by_this_node = (route.owner == config_.node_id);
   if (route.partition_id < partitions_.size())
@@ -369,12 +385,9 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
   MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
-    bool saw_missing = false;
-    for (int attempt = 0; attempt < 8; ++attempt) {
-      if (route.partition == nullptr) {
-        saw_missing = true;
-        break;
-      }
+    if (route.partition == nullptr)
+      return Status::Error(StatusCode::kCorruption, "missing visible partition");
+    const auto write_shared = [&] {
       const SharedAccessState state =
           route.partition->PutShared(key, config_.node_id, value);
       if (state == SharedAccessState::kDone) {
@@ -382,119 +395,111 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
         shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
         return Status::Ok();
       }
-      if (state == SharedAccessState::kRetry) {
-        std::this_thread::yield();
-        continue;
-      }
-      saw_missing = true;
-      break;  // kMissing → Forward
-    }
-    if (!saw_missing)
-      return Status::Error(StatusCode::kBusy, "shared put retry budget exceeded");
-    return Forward(KvMessageType::kPut, key, value, nullptr, route.owner);
+      return Status::Error(state == SharedAccessState::kRetry
+                               ? StatusCode::kBusy
+                               : StatusCode::kNotFound,
+                           "shared row unavailable");
+    };
+    const Status first = write_shared();
+    if (first.code != StatusCode::kNotFound) return first;
+    // Existing remote rows follow the original TwoPLPasha path: owner moves
+    // the row in, then the requester performs the shared write itself.
+    const Status migrated =
+        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+    if (migrated.ok()) return write_shared();
+    if (migrated.code != StatusCode::kNotFound) return migrated;
+    // A true create needs the original owner-side placeholder/insert step.
+    // kPut publishes the new row to CXL before ack; this requester then does
+    // the write through that shared authority rather than treating the RPC as
+    // the final write path.
+    const Status inserted =
+        Forward(KvMessageType::kPut, key, value, nullptr, route.owner);
+    if (!inserted.ok()) return inserted;
+    return write_shared();
   }
-  // Owner migrated write can contend on shared row locks; one helper attempt
-  // returns Busy (§10.2). Retry at the logical Put boundary like shared path.
-  for (int attempt = 0; attempt < 8; ++attempt) {
-    try {
-      route.partition->PutPrivate(key, value);
-      return Status::Ok();
-    } catch (const std::bad_alloc &) {
-      return Status::Error(StatusCode::kOutOfMemory, "private arena exhausted");
-    } catch (const std::runtime_error &e) {
-      if (std::string_view(e.what()).find("busy") != std::string_view::npos) {
-        PollTransport();
-        std::this_thread::yield();
-        continue;
-      }
-      return Status::Error(StatusCode::kCorruption, e.what());
-    } catch (const std::exception &e) {
-      return Status::Error(StatusCode::kCorruption, e.what());
-    }
+  try {
+    route.partition->PutPrivate(key, value);
+    return Status::Ok();
+  } catch (const std::bad_alloc &) {
+    return Status::Error(StatusCode::kOutOfMemory, "private arena exhausted");
+  } catch (const std::runtime_error &e) {
+    return Status::Error(std::string_view(e.what()).find("busy") !=
+                                 std::string_view::npos
+                             ? StatusCode::kBusy
+                             : StatusCode::kCorruption,
+                         e.what());
+  } catch (const std::exception &e) {
+    return Status::Error(StatusCode::kCorruption, e.what());
   }
-  return Status::Error(StatusCode::kBusy, "owner put retry budget exceeded");
 }
 
 GetResult KVEngine::Get(std::string_view key) {
-  MarkLayoutDirty();  // A remote miss may perform the original move-in.
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     auto *visible = route.partition;
-    for (int attempt = 0; attempt < 8; ++attempt) {
-      std::string shared;
-      if (visible == nullptr) break;
-      const SharedAccessState state =
-          visible->GetShared(key, config_.node_id, &shared);
-      if (state == SharedAccessState::kDone) {
-        shared_gets_.fetch_add(1, std::memory_order_relaxed);
-        return {Status::Ok(), std::move(shared)};
-      }
-      if (state == SharedAccessState::kRetry) {
-        std::this_thread::yield();
-        continue;
-      }
-      // kMissing → migrate then retry shared.
-      const Status migrated =
-          Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
-      if (migrated.code == StatusCode::kNotFound)
-        return {Status::Error(StatusCode::kNotFound, "key not found"), {}};
-      if (!migrated.ok() && migrated.code != StatusCode::kOutOfMemory)
-        return {migrated, {}};
-      if (migrated.code == StatusCode::kOutOfMemory && attempt == 7)
-        return {migrated, {}};
+    if (visible == nullptr)
+      return {Status::Error(StatusCode::kCorruption, "missing visible partition"), {}};
+    std::string shared;
+    const SharedAccessState first =
+        visible->GetShared(key, config_.node_id, &shared);
+    if (first == SharedAccessState::kDone) {
+      shared_gets_.fetch_add(1, std::memory_order_relaxed);
+      return {Status::Ok(), std::move(shared)};
     }
-    return {Status::Error(StatusCode::kBusy, "shared get retry budget exceeded"),
-            {}};
-  }
-  for (int attempt = 0; attempt < 8; ++attempt) {
-    try {
-      std::string value;
-      return route.partition->GetPrivate(key, &value)
-                 ? GetResult{Status::Ok(), std::move(value)}
-                 : GetResult{Status::Error(StatusCode::kNotFound, "key not found"),
-                             {}};
-    } catch (const std::runtime_error &e) {
-      if (std::string_view(e.what()).find("busy") != std::string_view::npos) {
-        PollTransport();
-        std::this_thread::yield();
-        continue;
-      }
-      return {Status::Error(StatusCode::kCorruption, e.what()), {}};
+    if (first == SharedAccessState::kRetry)
+      return {Status::Error(StatusCode::kBusy, "shared get contention"), {}};
+    const Status migrated =
+        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+    if (!migrated.ok()) return {migrated, {}};
+    const SharedAccessState second =
+        visible->GetShared(key, config_.node_id, &shared);
+    if (second == SharedAccessState::kDone) {
+      shared_gets_.fetch_add(1, std::memory_order_relaxed);
+      return {Status::Ok(), std::move(shared)};
     }
+    return {Status::Error(second == SharedAccessState::kRetry
+                              ? StatusCode::kBusy
+                              : StatusCode::kCorruption,
+                          "owner acknowledged migration without readable shared row"), {}};
   }
-  return {Status::Error(StatusCode::kBusy, "owner get retry budget exceeded"), {}};
+  try {
+    std::string value;
+    return route.partition->GetPrivate(key, &value)
+               ? GetResult{Status::Ok(), std::move(value)}
+               : GetResult{Status::Error(StatusCode::kNotFound, "key not found"),
+                           {}};
+  } catch (const std::runtime_error &e) {
+    return {Status::Error(std::string_view(e.what()).find("busy") !=
+                                   std::string_view::npos
+                               ? StatusCode::kBusy
+                               : StatusCode::kCorruption,
+                         e.what()), {}};
+  }
 }
 
 Status KVEngine::Delete(std::string_view key) {
   MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
-    // Delete remains owner-authoritative (private locator + EBR). Retry Busy
-    // on the Forward path so YCSB matches e2e Busy absorption.
-    for (int attempt = 0; attempt < 8; ++attempt) {
-      const Status status =
-          Forward(KvMessageType::kDelete, key, {}, nullptr, route.owner);
-      if (status.code != StatusCode::kBusy) return status;
-      PollTransport();
-      std::this_thread::yield();
-    }
-    return Status::Error(StatusCode::kBusy, "forward delete retry budget exceeded");
+    // Establish the original shared reference before asking the owner to do
+    // its private-table delete/adjacency update.  The delete request remains
+    // owner-authoritative, but does not bypass the migration discipline.
+    const Status migrated =
+        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+    if (!migrated.ok()) return migrated;
+    return Forward(KvMessageType::kDelete, key, {}, nullptr, route.owner);
   }
-  for (int attempt = 0; attempt < 8; ++attempt) {
-    try {
-      return route.partition->DeletePrivate(key)
-                 ? Status::Ok()
-                 : Status::Error(StatusCode::kNotFound, "key not found");
-    } catch (const std::runtime_error &e) {
-      if (std::string_view(e.what()).find("busy") != std::string_view::npos) {
-        PollTransport();
-        std::this_thread::yield();
-        continue;
-      }
-      return Status::Error(StatusCode::kCorruption, e.what());
-    }
+  try {
+    return route.partition->DeletePrivate(key)
+               ? Status::Ok()
+               : Status::Error(StatusCode::kNotFound, "key not found");
+  } catch (const std::runtime_error &e) {
+    return Status::Error(std::string_view(e.what()).find("busy") !=
+                                 std::string_view::npos
+                             ? StatusCode::kBusy
+                             : StatusCode::kCorruption,
+                         e.what());
   }
-  return Status::Error(StatusCode::kBusy, "owner delete retry budget exceeded");
 }
 
 ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
@@ -503,12 +508,9 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
   TlsScanDiag = {};
   ScanTlsFlushGuard flush_guard{&scan_partition_probes_, &scan_migrate_rpcs_};
-  constexpr uint64_t kPageSize = 64;
   const uint64_t target = limit == 0 ? kScanSafetyLimit : limit;
-  const auto scan_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
-  struct Source {
+  struct PartitionCursor {
     uint32_t partition_id = 0;
     uint32_t owner = 0;
     bool local = false;
@@ -516,43 +518,34 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     bool has_cursor = false;
     bool owner_exhausted_for_cursor = false;
     bool owner_no_predecessor_for_cursor = false;
-    uint32_t migration_attempts = 0;
     bool more = false;
-    std::vector<ScanItem> items;
-    size_t next = 0;
   };
 
-  auto load_items = [&](Source *source,
-                        std::vector<std::pair<std::string, std::string>> raw,
-                        bool more) {
-    source->items.clear();
-    source->next = 0;
+  auto append_items = [&](PartitionCursor *cursor,
+                          std::vector<std::pair<std::string, std::string>> raw,
+                          bool more, ScanResult *result) {
     for (auto &item : raw) {
-      if (source->has_cursor && item.first <= source->cursor) continue;
-      source->items.push_back({std::move(item.first), std::move(item.second)});
-      if (source->items.size() == kPageSize) break;
+      if (cursor->has_cursor && item.first <= cursor->cursor) continue;
+      cursor->cursor = item.first;
+      cursor->has_cursor = true;
+      result->items.push_back({std::move(item.first), std::move(item.second)});
+      if (result->items.size() == target) break;
     }
-    // If every returned key was a cursor duplicate, this source made no
-    // progress; clearing more prevents an infinite refill loop (§6).
-    source->more = more && !source->items.empty();
+    cursor->more = more && result->items.size() < target;
   };
 
-  auto probe_remote = [&](Source *source) -> Status {
+  auto probe_remote = [&](PartitionCursor *source, uint64_t page_limit,
+                          ScanResult *result) -> Status {
     auto *partition = partitions_[source->partition_id].get();
-    constexpr uint32_t kMaxMigrations = 4;
+    bool migrated_once = false;
     for (;;) {
-      if (std::chrono::steady_clock::now() >= scan_deadline)
-        return Status::Error(StatusCode::kBusy, "CXL scan retry deadline exceeded");
-      const uint64_t page_cap = std::min<uint64_t>(
-          kPageSize, std::max<uint64_t>(1, (target + config_.partition_count - 1) /
-                                               config_.partition_count));
       const std::string_view cursor =
           source->has_cursor ? std::string_view(source->cursor) : start_key;
       KVPartition::SharedScanProbeResult probe;
       {
         RequestServeDepthGuard depth_guard;
         probe = partition->ProbeSharedScanPage(
-            config_.node_id, cursor, page_cap,
+            config_.node_id, cursor, page_limit,
             source->owner_exhausted_for_cursor, source->has_cursor,
             source->owner_no_predecessor_for_cursor);
       }
@@ -560,24 +553,21 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       PollTransport();
       source->owner_exhausted_for_cursor = false;
       source->owner_no_predecessor_for_cursor = false;
-      if (!probe.status.ok()) {
-        if (probe.status.code == StatusCode::kBusy) {
-          std::this_thread::yield();
-          continue;
-        }
-        return probe.status;
-      }
+      if (!probe.status.ok()) return probe.status;
       if (probe.migration_required) {
-        if (source->migration_attempts >= kMaxMigrations)
+        // One remote partition primitive is probe → optional move-in →
+        // reprobe.  A second incomplete reprobe is contention/incompleteness
+        // for the facade to retry, not a hidden Scan deadline or busy loop.
+        if (migrated_once)
           return Status::Error(StatusCode::kBusy,
-                               "partition scan migration attempt limit");
-        ++source->migration_attempts;
+                               "CXL scan remains incomplete after move-in");
+        migrated_once = true;
         bool exhausted = false;
         bool no_predecessor = false;
         const uint32_t flags =
             source->has_cursor ? kScanMigrateFlagCursorDuplicate : 0;
         const auto payload =
-            EncodeScanMigrateRequest(source->partition_id, flags, page_cap);
+            EncodeScanMigrateRequest(source->partition_id, flags, page_limit);
         const uint64_t request_id = NextRequestId(config_.node_id);
         auto pending = RegisterPendingResponse(request_id);
         try {
@@ -592,14 +582,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
         std::string response_value;
         const Status migrated =
             AwaitResponse(request_id, pending, &response_value);
-        if (!migrated.ok()) {
-          if (migrated.code == StatusCode::kBusy) {
-            PollTransport();
-            std::this_thread::yield();
-            continue;
-          }
-          return migrated;
-        }
+        if (!migrated.ok()) return migrated;
         uint32_t resp_part = 0;
         if (!DecodeScanMigrateResponse(response_value, &resp_part, &exhausted,
                                        &no_predecessor) ||
@@ -612,18 +595,15 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       }
       if (!probe.scan_success)
         return Status::Error(StatusCode::kCorruption, "CXL probe incomplete");
-      load_items(source, std::move(probe.items), probe.more);
-      source->migration_attempts = 0;
+      append_items(source, std::move(probe.items), probe.more, result);
       return Status::Ok();
     }
   };
 
-  auto probe_local = [&](Source *source) -> Status {
+  auto probe_local = [&](PartitionCursor *source, uint64_t page_limit,
+                         ScanResult *result) -> Status {
     auto *partition = partitions_[source->partition_id].get();
-    const uint64_t page_cap = std::min<uint64_t>(
-        kPageSize, std::max<uint64_t>(1, (target + config_.partition_count - 1) /
-                                             config_.partition_count));
-    const uint64_t fetch = page_cap + 1;
+    const uint64_t fetch = page_limit + 1;
     const std::string_view cursor =
         source->has_cursor ? std::string_view(source->cursor) : start_key;
     std::vector<std::pair<std::string, std::string>> items;
@@ -640,58 +620,36 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
                            "owner scan contention/retry budget");
     const bool more = items.size() == fetch;
     if (more && !items.empty()) items.pop_back();
-    load_items(source, std::move(items), more);
+    append_items(source, std::move(items), more, result);
     return Status::Ok();
   };
 
-  std::vector<Source> sources;
-  sources.reserve(config_.partition_count);
-  for (uint32_t partition_id = 0; partition_id < config_.partition_count;
-       ++partition_id) {
-    Source source;
-    source.partition_id = partition_id;
-    source.owner = OwnerForPartition(partition_id);
-    source.local = (source.owner == config_.node_id);
-    Status status = source.local ? probe_local(&source) : probe_remote(&source);
-    if (!status.ok()) return {status, {}};
-    sources.push_back(std::move(source));
-  }
-
-  auto refill = [&](Source *source) -> Status {
-    if (!source->more) return Status::Ok();
-    return source->local ? probe_local(source) : probe_remote(source);
-  };
-
-  struct HeapItem { std::string_view key; size_t source; };
-  auto compare = [](const HeapItem &left, const HeapItem &right) {
-    return left.key > right.key;
-  };
-  std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(compare)> heap(
-      compare);
-  for (size_t i = 0; i < sources.size(); ++i) {
-    if (!sources[i].items.empty()) heap.push({sources[i].items[0].key, i});
-  }
   ScanResult result{Status::Ok(), {}};
-  while (!heap.empty() && result.items.size() < target) {
-    const HeapItem item = heap.top();
-    heap.pop();
-    Source &source = sources[item.source];
-    ScanItem row = std::move(source.items[source.next++]);
-    source.cursor = row.key;
-    source.has_cursor = true;
-    if (result.items.empty() || result.items.back().key != row.key)
-      result.items.push_back(std::move(row));
-    if (source.next == source.items.size()) {
-      const Status status = refill(&source);
+  // Range partitioning preserves global key order.  Follow the original
+  // per-partition TwoPLPasha CXL-first/move-in path, then advance only to the
+  // next range once the current range is exhausted; no k-way merge treats CXL
+  // and owner results as independent authorities.
+  uint32_t partition_id = config_.PartitionForKey(start_key);
+  for (; partition_id < config_.partition_count && result.items.size() < target;
+       ++partition_id) {
+    PartitionCursor cursor;
+    cursor.partition_id = partition_id;
+    cursor.owner = OwnerForPartition(partition_id);
+    cursor.local = cursor.owner == config_.node_id;
+    cursor.cursor = partition_id == config_.PartitionForKey(start_key)
+                        ? std::string(start_key)
+                        : config_.partition_ranges[partition_id].lower_key;
+    for (;;) {
+      const uint64_t remaining = target - result.items.size();
+      if (remaining == 0) break;
+      const Status status = cursor.local
+          ? probe_local(&cursor, remaining, &result)
+          : probe_remote(&cursor, remaining, &result);
       if (!status.ok()) return {status, {}};
+      if (!cursor.more) break;
     }
-    if (source.next < source.items.size())
-      heap.push({source.items[source.next].key, item.source});
   }
-  if (limit == 0 && result.items.size() == kScanSafetyLimit &&
-      (!heap.empty() ||
-       std::any_of(sources.begin(), sources.end(),
-                   [](const Source &source) { return source.more; })))
+  if (limit == 0 && result.items.size() == kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument,
                           "scan result exceeds safety cap"),
             {}};
@@ -706,7 +664,6 @@ Status KVEngine::PreparePartitionSharedScan(
     return Status::Error(StatusCode::kInvalidArgument, "null exhausted_out");
   *exhausted_out = false;
   if (no_predecessor_out != nullptr) *no_predecessor_out = false;
-  constexpr uint64_t kPageSize = 64;
   if (partition_id >= partitions_.size() ||
       partition_id >= config_.partition_count)
     return Status::Error(StatusCode::kInvalidArgument,
@@ -714,7 +671,7 @@ Status KVEngine::PreparePartitionSharedScan(
   if (OwnerForPartition(partition_id) != config_.node_id)
     return Status::Error(StatusCode::kOwnerViolation,
                          "scan migrate routed to non-owner");
-  if (output_limit == 0 || output_limit > kPageSize)
+  if (output_limit == 0 || output_limit > 1024 * 1024)
     return Status::Error(StatusCode::kInvalidArgument,
                          "scan migrate output_limit out of range");
   auto *partition = partitions_[partition_id].get();
@@ -775,60 +732,43 @@ CasResult KVEngine::CompareExchange(std::string_view key,
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     auto *visible = route.partition;
-    bool saw_missing = false;
-    for (int attempt = 0; attempt < 8; ++attempt) {
-      bool exchanged = false;
-      if (visible == nullptr) {
-        saw_missing = true;
-        break;
+    if (visible == nullptr)
+      return {Status::Error(StatusCode::kCorruption, "missing visible partition"), false};
+    bool exchanged = false;
+    const SharedAccessState state = visible->CompareExchangeShared(
+        key, config_.node_id, expected, desired, &exchanged);
+    if (state == SharedAccessState::kDone) {
+      if (exchanged) {
+        shared_puts_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
       }
-      const SharedAccessState state = visible->CompareExchangeShared(
-          key, config_.node_id, expected, desired, &exchanged);
-      if (state == SharedAccessState::kDone) {
-        if (exchanged) {
-          shared_puts_.fetch_add(1, std::memory_order_relaxed);
-          shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-        }
-        return {exchanged ? Status::Ok()
-                          : Status::Error(StatusCode::kCompareFailed,
-                                          "expected value differs"),
-                exchanged};
-      }
-      if (state == SharedAccessState::kRetry) {
-        std::this_thread::yield();
-        continue;
-      }
-      saw_missing = true;
-      break;  // kMissing
+      return {exchanged ? Status::Ok()
+                        : Status::Error(StatusCode::kCompareFailed,
+                                        "expected value differs"), exchanged};
     }
-    if (!saw_missing)
-      return {Status::Error(StatusCode::kBusy, "shared cas retry budget exceeded"),
-              false};
+    if (state == SharedAccessState::kRetry)
+      return {Status::Error(StatusCode::kBusy, "shared cas contention"), false};
     // Shared miss: single CAS_FWD with combined payload (§10.5).
     return ForwardCompareExchange(key, expected, desired);
   }
-  for (int attempt = 0; attempt < 8; ++attempt) {
-    try {
-      bool exchanged = false;
-      if (!route.partition->CompareExchangePrivate(key, expected, desired, &exchanged))
-        return {Status::Error(StatusCode::kNotFound, "key not found"), false};
-      return {exchanged ? Status::Ok()
-                        : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
-              exchanged};
-    } catch (const std::bad_alloc &) {
-      return {Status::Error(StatusCode::kOutOfMemory, "allocator exhausted"), false};
-    } catch (const std::runtime_error &e) {
-      if (std::string_view(e.what()).find("busy") != std::string_view::npos) {
-        PollTransport();
-        std::this_thread::yield();
-        continue;
-      }
-      return {Status::Error(StatusCode::kInvalidArgument, e.what()), false};
-    } catch (const std::exception &e) {
-      return {Status::Error(StatusCode::kInvalidArgument, e.what()), false};
-    }
+  try {
+    bool exchanged = false;
+    if (!route.partition->CompareExchangePrivate(key, expected, desired, &exchanged))
+      return {Status::Error(StatusCode::kNotFound, "key not found"), false};
+    return {exchanged ? Status::Ok()
+                      : Status::Error(StatusCode::kCompareFailed, "expected value differs"),
+            exchanged};
+  } catch (const std::bad_alloc &) {
+    return {Status::Error(StatusCode::kOutOfMemory, "allocator exhausted"), false};
+  } catch (const std::runtime_error &e) {
+    return {Status::Error(std::string_view(e.what()).find("busy") !=
+                                  std::string_view::npos
+                              ? StatusCode::kBusy
+                              : StatusCode::kInvalidArgument,
+                          e.what()), false};
+  } catch (const std::exception &e) {
+    return {Status::Error(StatusCode::kInvalidArgument, e.what()), false};
   }
-  return {Status::Error(StatusCode::kBusy, "owner cas retry budget exceeded"), false};
 }
 
 IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
@@ -836,31 +776,18 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     auto *visible = route.partition;
-    bool saw_missing = false;
-    for (int attempt = 0; attempt < 8; ++attempt) {
-      int64_t shared = 0;
-      if (visible == nullptr) {
-        saw_missing = true;
-        break;
-      }
-      const SharedAccessState state =
-          visible->IncrementShared(key, config_.node_id, delta, &shared);
-      if (state == SharedAccessState::kDone) {
-        shared_puts_.fetch_add(1, std::memory_order_relaxed);
-        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-        return {Status::Ok(), shared};
-      }
-      if (state == SharedAccessState::kRetry) {
-        std::this_thread::yield();
-        continue;
-      }
-      saw_missing = true;
-      break;
+    if (visible == nullptr)
+      return {Status::Error(StatusCode::kCorruption, "missing visible partition"), 0};
+    int64_t shared = 0;
+    const SharedAccessState state =
+        visible->IncrementShared(key, config_.node_id, delta, &shared);
+    if (state == SharedAccessState::kDone) {
+      shared_puts_.fetch_add(1, std::memory_order_relaxed);
+      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+      return {Status::Ok(), shared};
     }
-    if (!saw_missing)
-      return {Status::Error(StatusCode::kBusy,
-                            "shared increment retry budget exceeded"),
-              0};
+    if (state == SharedAccessState::kRetry)
+      return {Status::Error(StatusCode::kBusy, "shared increment contention"), 0};
     std::string value;
     const auto status = Forward(KvMessageType::kIncrement, key,
                                 std::to_string(delta), &value, route.owner);
@@ -871,27 +798,22 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
       return {Status::Error(StatusCode::kCorruption, "malformed forwarded increment response"), 0};
     return {Status::Ok(), result};
   }
-  for (int attempt = 0; attempt < 8; ++attempt) {
-    try {
-      int64_t value = 0;
-      if (!route.partition->IncrementPrivate(key, delta, &value))
-        return {Status::Error(StatusCode::kNotFound, "key not found"), 0};
-      return {Status::Ok(), value};
-    } catch (const std::invalid_argument &e) {
-      return {Status::Error(StatusCode::kInvalidArgument, e.what()), 0};
-    } catch (const std::runtime_error &e) {
-      if (std::string_view(e.what()).find("busy") != std::string_view::npos) {
-        PollTransport();
-        std::this_thread::yield();
-        continue;
-      }
-      return {Status::Error(StatusCode::kCorruption, e.what()), 0};
-    } catch (const std::exception &e) {
-      return {Status::Error(StatusCode::kCorruption, e.what()), 0};
-    }
+  try {
+    int64_t value = 0;
+    if (!route.partition->IncrementPrivate(key, delta, &value))
+      return {Status::Error(StatusCode::kNotFound, "key not found"), 0};
+    return {Status::Ok(), value};
+  } catch (const std::invalid_argument &e) {
+    return {Status::Error(StatusCode::kInvalidArgument, e.what()), 0};
+  } catch (const std::runtime_error &e) {
+    return {Status::Error(std::string_view(e.what()).find("busy") !=
+                                  std::string_view::npos
+                              ? StatusCode::kBusy
+                              : StatusCode::kCorruption,
+                          e.what()), 0};
+  } catch (const std::exception &e) {
+    return {Status::Error(StatusCode::kCorruption, e.what()), 0};
   }
-  return {Status::Error(StatusCode::kBusy, "owner increment retry budget exceeded"),
-          0};
 }
 
 MemoryStats KVEngine::Memory() const {
@@ -1445,28 +1367,12 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
   };
   if (message.type == KvMessageType::kPut) {
     try {
-      bool inserted = false;
-      bool busy = false;
-      for (int attempt = 0; attempt < 8; ++attempt) {
-        try {
-          inserted = partition->PutPrivate(key, value);
-          busy = false;
-          break;
-        } catch (const std::runtime_error &e) {
-          if (std::string_view(e.what()).find("busy") == std::string_view::npos)
-            throw;
-          busy = true;
-          // Nested Poll only applies responses; still yields so peers progress.
-          PollTransport();
-          std::this_thread::yield();
-        }
-      }
-      if (busy) {
-        response.status = static_cast<uint32_t>(StatusCode::kBusy);
-      } else {
-        if (!inserted) promote_updated_row();
-        response.status = static_cast<uint32_t>(StatusCode::kOk);
-      }
+      (void)partition->PutPrivate(key, value);
+      // Remote create is the original owner-side insert/move-in handshake;
+      // the requester writes the acknowledged shared row after this reply.
+      // Existing rows also move in here only as a race fallback.
+      promote_updated_row();
+      response.status = static_cast<uint32_t>(StatusCode::kOk);
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
     } catch (const std::runtime_error &e) {
@@ -1563,20 +1469,15 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
 void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
   // Use the Open-time clamp after static domains (§11.10), not raw config.
   const uint64_t hw_budget = owner_migration_dynamic_budget_bytes_;
-  const bool payload_high = partition.shared_payload_used_bytes() * 10 >=
-      partition.shared_payload_capacity_bytes() * 9;
   const uint64_t hw_used = partition.hwcc_used_bytes();
-  if (hw_used < hw_budget && !payload_high) return;
-  // HWCC over-budget: sync the real counter for PolicyClock's gate.
-  // Payload watermark: force one eviction without rewriting TOTAL_HW_CC_USAGE
-  // (§11.10) — that shared counter must not be used as a signaling channel.
-  const bool force_at_least_one = payload_high && hw_used < hw_budget;
-  if (!force_at_least_one) KvMigrationRuntime::SyncHwCcUsage(partition);
+  if (hw_used < hw_budget) return;
+  // PolicyClock's original policy is governed solely by its HWCC accounting.
+  KvMigrationRuntime::SyncHwCcUsage(partition);
   for (uint32_t pass = 0; pass < 2; ++pass) {
     for (auto &candidate : partitions_) {
       if (OwnerForPartition(candidate->partition_id()) != config_.node_id)
         continue;
-      if (candidate->MoveOutClockVictim(config_.node_id, force_at_least_one)) {
+      if (candidate->MoveOutClockVictim(config_.node_id)) {
         migration_out_.fetch_add(1, std::memory_order_relaxed);
         return;
       }

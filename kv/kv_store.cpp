@@ -30,7 +30,10 @@
 namespace tigonkv {
 namespace {
 
-constexpr size_t kMaxKey = 256;
+// BTreeOLC_CXL's persisted FixedKey is 32 bytes.  Keep the public parser in
+// lock-step with that original on-media limit instead of accepting keys that
+// the tree will reject later.
+constexpr size_t kMaxKey = 32;
 constexpr size_t kMaxValue = 4096;
 // Match e2e_trace_runner: Busy is contention, retry at the logical op boundary
 // so YCSB and API callers share one contract with the engine's inner budgets.
@@ -448,9 +451,33 @@ std::string ParseStrictString(std::string_view text,
   if (value.size() < 2 || value.front() != '"' || value.back() != '"')
     JsonStructureError("invalid string value");
   if (value.find('\\') != std::string_view::npos)
-    throw std::invalid_argument("escaped latency string is not supported: " +
+    throw std::invalid_argument("escaped config string is not supported: " +
                                 std::string(path));
   return std::string(value.substr(1, value.size() - 2));
+}
+
+std::vector<JsonMemberSpan> ParseJsonArrayElements(std::string_view text,
+                                                    size_t array_begin) {
+  if (array_begin >= text.size() || text[array_begin] != '[')
+    JsonStructureError("expected array");
+  size_t position = array_begin + 1;
+  std::vector<JsonMemberSpan> elements;
+  SkipJsonWhitespace(text, &position);
+  if (position < text.size() && text[position] == ']') return elements;
+  for (;;) {
+    JsonMemberSpan element;
+    element.value_begin = position;
+    element.value_end = SkipJsonValue(text, position, &element.kind);
+    elements.push_back(std::move(element));
+    position = elements.back().value_end;
+    SkipJsonWhitespace(text, &position);
+    if (position >= text.size()) JsonStructureError("unterminated array");
+    if (text[position] == ']') return elements;
+    if (text[position++] != ',') JsonStructureError("expected ',' in array");
+    SkipJsonWhitespace(text, &position);
+    if (position < text.size() && text[position] == ']')
+      JsonStructureError("trailing comma in array");
+  }
 }
 
 size_t CountJsonKey(std::string_view text, std::string_view name) {
@@ -601,6 +628,62 @@ void ParseStrictLatencyConfig(const std::string &text, Config *config) {
                 config->hwcc_atomic_rmw_ns});
 }
 
+void ParsePartitioningConfig(const std::string &text, Config *config) {
+  size_t root_begin = 0;
+  SkipJsonWhitespace(text, &root_begin);
+  const auto root = ParseJsonObjectMembers(text, root_begin);
+  const auto &tigon = RequireUniqueMember(root, "tigon_kv", "$");
+  if (tigon.kind != JsonValueKind::kObject)
+    throw std::invalid_argument("config field must be object: tigon_kv");
+  const auto tigon_members = ParseJsonObjectMembers(text, tigon.value_begin);
+  const auto &partitioning =
+      RequireUniqueMember(tigon_members, "partitioning", "tigon_kv");
+  if (partitioning.kind != JsonValueKind::kObject)
+    throw std::invalid_argument(
+        "config field must be object: tigon_kv.partitioning");
+  const auto partitioning_members =
+      ParseJsonObjectMembers(text, partitioning.value_begin);
+  static const std::unordered_set<std::string> allowed = {"strategy", "ranges"};
+  for (const auto &member : partitioning_members) {
+    if (!allowed.count(member.key))
+      throw std::invalid_argument(
+          "unknown tigon_kv.partitioning field: " + member.key);
+  }
+  const auto &strategy = RequireUniqueMember(
+      partitioning_members, "strategy", "tigon_kv.partitioning");
+  if (ParseStrictString(text, strategy, "tigon_kv.partitioning.strategy") != "range")
+    throw std::invalid_argument(
+        "tigon_kv.partitioning.strategy must be 'range'");
+  const auto &ranges = RequireUniqueMember(
+      partitioning_members, "ranges", "tigon_kv.partitioning");
+  if (ranges.kind != JsonValueKind::kArray)
+    throw std::invalid_argument(
+        "config field must be array: tigon_kv.partitioning.ranges");
+  config->partition_ranges.clear();
+  for (const auto &element : ParseJsonArrayElements(text, ranges.value_begin)) {
+    if (element.kind != JsonValueKind::kObject)
+      throw std::invalid_argument(
+          "each tigon_kv.partitioning.ranges item must be an object");
+    const auto members = ParseJsonObjectMembers(text, element.value_begin);
+    static const std::unordered_set<std::string> range_allowed = {
+        "lower_key", "upper_key"};
+    for (const auto &member : members) {
+      if (!range_allowed.count(member.key))
+        throw std::invalid_argument(
+            "unknown tigon_kv.partitioning.ranges field: " + member.key);
+    }
+    const auto &lower = RequireUniqueMember(
+        members, "lower_key", "tigon_kv.partitioning.ranges");
+    const auto &upper = RequireUniqueMember(
+        members, "upper_key", "tigon_kv.partitioning.ranges");
+    config->partition_ranges.push_back(
+        {ParseStrictString(text, lower,
+                           "tigon_kv.partitioning.ranges.lower_key"),
+         ParseStrictString(text, upper,
+                           "tigon_kv.partitioning.ranges.upper_key")});
+  }
+}
+
 template <typename T>
 bool JsonNumberInObject(const std::string &s, const char *object, const char *name, T *out) {
   std::string body;
@@ -631,6 +714,7 @@ void ValidateKnownKeys(const std::string &s) {
       "ssh_base_port",
       "network", "base_ssh_port", "sriov_nic", "outside_nic", "sync", "e2e",
       "foreground_worker_count_per_vm", "tigon_kv", "partition_count",
+      "partitioning", "strategy", "ranges", "lower_key", "upper_key",
       "timeout_sec", "vm_ssh_user", "vm_direct_ssh_port", "host_rsync_dest",
       "host_ssh_port", "host_ssh_extra", "project_root_on_targets", "vm_ssh_extra",
       "fixed_key_size", "fixed_value_size", "hw_cc_budget_mb",
@@ -693,6 +777,7 @@ Config Config::FromJsonc(const std::string &path) {
   JsonNumberInObject(text, "swcc", "offset_mb", &c.swcc_offset_mb);
   JsonNumberInObject(text, "swcc", "size_mb", &c.swcc_size_mb);
   ParseStrictLatencyConfig(text, &c);
+  ParsePartitioningConfig(text, &c);
   if (c.shared_memory_path == "/mnt/xz_shared_mem" || c.shared_memory_path == "/mnt/xz_shared_mem/")
     c.shared_memory_path = "/mnt/xz_shared_mem/ivshmem_shared_mem";
   struct stat device_stat {};
@@ -716,6 +801,35 @@ void Config::Validate() const {
       network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0 ||
       foreground_worker_count_per_vm > 64 || vm_count > 8)
     throw std::invalid_argument("invalid KV configuration");
+  if (partition_ranges.size() != partition_count)
+    throw std::invalid_argument(
+        "tigon_kv.partitioning.ranges must contain partition_count ranges");
+  for (uint32_t partition = 0; partition < partition_count; ++partition) {
+    const auto &range = partition_ranges[partition];
+    if (range.lower_key.size() > fixed_key_size ||
+        range.upper_key.size() > fixed_key_size)
+      throw std::invalid_argument(
+          "partition range boundary exceeds fixed_key_size");
+    if (partition == 0) {
+      if (!range.lower_key.empty())
+        throw std::invalid_argument("first partition lower_key must be empty");
+    } else {
+      const auto &previous = partition_ranges[partition - 1];
+      if (range.lower_key.empty() || previous.upper_key.empty() ||
+          previous.upper_key != range.lower_key)
+        throw std::invalid_argument(
+            "partition ranges must be contiguous half-open intervals");
+    }
+    if (partition + 1 == partition_count) {
+      if (!range.upper_key.empty())
+        throw std::invalid_argument("last partition upper_key must be empty");
+    } else if (range.upper_key.empty()) {
+      throw std::invalid_argument("only final partition may have empty upper_key");
+    }
+    if (!range.lower_key.empty() && !range.upper_key.empty() &&
+        range.lower_key >= range.upper_key)
+      throw std::invalid_argument("partition range must have lower_key < upper_key");
+  }
   if (cpu_affinity && vm_core_count_per_vm != 0 &&
       vm_core_count_per_vm < foreground_worker_count_per_vm + 1)
     throw std::invalid_argument(
@@ -784,6 +898,17 @@ void Config::Validate() const {
   }
 }
 
+uint32_t Config::PartitionForKey(std::string_view key) const {
+  // Validate() establishes a total, contiguous partitioning.  This loop is
+  // intentionally simple: original Tigon's range partitioner makes the same
+  // ordered-boundary decision and partition_count is small (16 by default).
+  for (uint32_t partition = 0; partition < partition_ranges.size(); ++partition) {
+    const std::string &upper = partition_ranges[partition].upper_key;
+    if (upper.empty() || key < std::string_view(upper)) return partition;
+  }
+  throw std::logic_error("validated partition map does not cover key");
+}
+
 
 std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
   auto store = std::unique_ptr<KVStore>(new KVStore(config));
@@ -849,9 +974,7 @@ void KVStore::Close() {
 }
 
 uint32_t KVStore::StablePartitionForKey(std::string_view key) const {
-  uint64_t hash = 1469598103934665603ULL;
-  for (unsigned char c : key) { hash ^= c; hash *= 1099511628211ULL; }
-  return static_cast<uint32_t>(hash % config_.partition_count);
+  return config_.PartitionForKey(key);
 }
 
 uint32_t KVStore::OwnerForKey(std::string_view key) const {

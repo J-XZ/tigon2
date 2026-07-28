@@ -95,7 +95,7 @@ class KvPartitionTable final : public star::ITable {
   std::size_t field_size() override { return value_size_; }
   std::size_t tableID() override { return 0; }
   std::size_t partitionID() override { return partition_->partition_id(); }
-  int tableType() override { return ITable::HASHMAP; }
+  int tableType() override { return ITable::BTREE; }
 
  private:
   KVPartition *partition_;

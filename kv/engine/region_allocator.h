@@ -147,7 +147,7 @@ struct DualRegionConfig {
 // a lock-protected bump path; reclamation is added through EBR in M4.
 struct alignas(64) OwnerPrivateArenaHeader {
   uint64_t magic = 0x5449474f4e41524eULL;  // TIGONARN
-  uint32_t version = 1;
+  uint32_t version = 2;
   uint32_t partition_id = 0;
   uint32_t owner_shard = 0;
   uint32_t reserved = 0;
@@ -157,6 +157,14 @@ struct alignas(64) OwnerPrivateArenaHeader {
   std::atomic<uint32_t> lock{0};
   std::atomic<uint64_t> allocated_bytes{0};
   std::atomic<RegionOffset> free_head{kNullOffset};
+  // Original-compute-node state: the private B+tree root and Clock control
+  // words belong with this owner's non-coherent SWCC arena, never in the
+  // globally coherent partition directory.
+  RegionOffset private_root = kNullOffset;
+  RegionOffset clock_head = kNullOffset;
+  RegionOffset clock_tail = kNullOffset;
+  RegionOffset clock_cursor = kNullOffset;
+  std::atomic<uint64_t> migrated_key_count{0};
 };
 
 struct alignas(64) DualRegionPersistentHeader {

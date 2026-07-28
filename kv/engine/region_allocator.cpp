@@ -474,7 +474,7 @@ bool DualRegionAllocator::IsHwccDomain(AllocationDomain domain) {
 DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
                                                     const DualRegionConfig &config) {
   if (pool == nullptr || config.total_pool_bytes == 0 || config.vm_count == 0 ||
-      config.partition_count == 0 || config.partition_count % config.vm_count != 0 ||
+      config.partition_count == 0 ||
       config.hwcc_size_bytes <= sizeof(DualRegionPersistentHeader) ||
       config.swcc_size_bytes <= sizeof(RegionAllocatorHeader) ||
       config.hwcc_offset_bytes + config.hwcc_size_bytes > config.total_pool_bytes ||
@@ -684,7 +684,7 @@ OwnerPrivateArenaHeader *DualRegionAllocator::Arena(uint32_t partition_id) const
       header_->owner_private_arenas_offset +
       partition_id * header_->owner_private_arena_stride));
   mem_access::PrivateRead(arena, offsetof(OwnerPrivateArenaHeader, owner_shard));
-  if (arena->magic != 0x5449474f4e41524eULL || arena->version != 1 ||
+  if (arena->magic != 0x5449474f4e41524eULL || arena->version != 2 ||
       arena->partition_id != partition_id)
     throw std::runtime_error("owner-private arena attachment validation failed");
   return arena;
@@ -903,7 +903,21 @@ bool DualRegionAllocator::IsInOwnerPrivateArena(const void *pointer,
 }
 
 RegionOffset DualRegionAllocator::OwnerPrivateArenaOffset(uint32_t partition_id) const {
-  return swcc_.ToOffset(Arena(partition_id));
+  // This address calculation is safe for every VM because its inputs are
+  // layout metadata in HWCC.  Do not call Arena() here: that validates the
+  // SWCC header and would make a non-owner attach read another owner's
+  // non-coherent private arena merely to construct a shared-tree handle.
+  mem_access::HwccRead(&header_->layout.partition_count,
+                       sizeof(header_->layout.partition_count));
+  if (partition_id >= header_->layout.partition_count)
+    throw std::invalid_argument("owner-private arena partition outside layout");
+  mem_access::HwccRead(&header_->owner_private_arenas_offset,
+                       sizeof(header_->owner_private_arenas_offset));
+  mem_access::HwccRead(&header_->owner_private_arena_stride,
+                       sizeof(header_->owner_private_arena_stride));
+  return swcc_.ToOffset(swcc_.FromOffset(
+      header_->owner_private_arenas_offset +
+      partition_id * header_->owner_private_arena_stride));
 }
 
 uint64_t DualRegionAllocator::SharedPayloadCapacityBytes() const {

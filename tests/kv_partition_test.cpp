@@ -84,7 +84,7 @@ int main() {
   void *private_reuse = regions.AllocateOwnerPrivate(128, 5, 1);
   regions.FreeOwnerPrivate(private_reuse, 128, 5, 1);
   assert(regions.AllocateOwnerPrivate(128, 5, 1) == private_reuse);
-  tigonkv::engine::KVPartition partition(regions, ebr, 5, 1, false);
+  tigonkv::engine::KVPartition partition(regions, ebr, 5, 1, false, true);
   assert(star::CXLMemory::bound_owner_shard() == 1);
   assert(regions.OwnerPrivateArenaOffset(5) ==
          regions.layout().partitions[5].private_arena);
@@ -110,8 +110,10 @@ int main() {
   assert(!partition.PutPrivate("alpha", "two"));
   assert(!partition.PutPrivate("alpha", "three"));
   assert(partition.PrivateRootPublishCount() == root_pubs_after_create);
-  assert(regions.layout().partitions[5].private_root !=
-         tigonkv::engine::kNullOffset);
+  const auto private_arena_offset = regions.OwnerPrivateArenaOffset(5);
+  auto *private_arena = static_cast<tigonkv::engine::OwnerPrivateArenaHeader *>(
+      regions.swcc().FromOffset(private_arena_offset));
+  assert(private_arena->private_root != tigonkv::engine::kNullOffset);
   // §10.9: concurrent create races must free the unpublished loser and upsert.
   {
     std::atomic<uint32_t> ready{0};
@@ -156,16 +158,10 @@ int main() {
     assert(partition.DeletePrivate("race-cas"));
     assert(partition.DeletePrivate("race-incr"));
   }
-  const uint64_t mutation_before_insert = partition.SharedMutationState();
   assert(partition.PutPrivate("beta", "two"));
-  // Certificate-era shared_mutation_state RMW removed (§10.6); inserts no
-  // longer bump the HWCC generation counter.
-  assert(partition.SharedMutationState() == mutation_before_insert);
-  const uint64_t mutation_before_update = partition.SharedMutationState();
   assert(!partition.PutPrivate("alpha", "updated"));
-  assert(partition.SharedMutationState() == mutation_before_update);
   assert(regions.IsInOwnerPrivateArena(
-      regions.swcc().FromOffset(regions.layout().partitions[5].private_root), 5));
+      regions.swcc().FromOffset(private_arena->private_root), 5));
   std::string value;
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   for (uint32_t i = 0; i < 256; ++i) {
@@ -230,8 +226,6 @@ int main() {
   assert(partition.DeletePrivate("latency-only"));
   const uint64_t migration_in_before_alpha =
       regions.layout().partitions[5].migration_in_seq.load();
-  const uint64_t mutation_before_alpha =
-      regions.layout().partitions[5].shared_mutation_state.load();
   assert(partition.PromotePrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "updated");
   // Once migrated, PUT must update the shared SCC authority rather than the
@@ -246,10 +240,6 @@ int main() {
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load();
   assert(partition.MoveOutPrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
-  // Shared visibility changes are proven by next/prev bits; the generation is
-  // reserved for logical insertion/deletion and EOF certificates.
-  assert(regions.layout().partitions[5].shared_mutation_state.load() ==
-         mutation_before_alpha);
   assert(ebr.drain_quiescent() > 0);
   assert(regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load() < hwcc_before_moveout);
@@ -257,12 +247,7 @@ int main() {
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load() < swcc_before_moveout);
   assert(partition.PutPrivate("delete-shared", "value"));
   assert(partition.PromotePrivate("delete-shared", 1));
-  const uint64_t mutation_before_delete =
-      regions.layout().partitions[5].shared_mutation_state.load();
   assert(partition.DeletePrivate("delete-shared"));
-  // Logical-delete no longer bumps shared_mutation_state (§10.6).
-  assert(regions.layout().partitions[5].shared_mutation_state.load() ==
-         mutation_before_delete);
   star::scc_manager = nullptr;
   assert(partition.DeletePrivate("beta"));
   assert(!partition.GetPrivate("beta", &value));
@@ -440,58 +425,6 @@ int main() {
   }
   assert(partition.MoveOutPrivate("alpha", 1));
 
-  // A partial CXL row set is not an authoritative range. Original
-  // TwoPLPasha completeness comes from logical next/prev adjacency.
-  assert(partition.PutPrivate("adj-a", "a"));
-  assert(partition.PutPrivate("adj-b", "b"));
-  assert(partition.PutPrivate("adj-c", "c"));
-  assert(partition.PromotePrivate("adj-a", 1));
-  assert(partition.PromotePrivate("adj-c", 1));
-  const auto adjacency_generation = [&] {
-    return static_cast<uint32_t>(partition.SharedMutationState() >> 32);
-  };
-  std::vector<std::pair<std::string, std::string>> complete_shared;
-  const auto adj_c =
-      tigonkv::engine::FixedKey::From(
-          "adj-c", regions.layout().fixed_key_size);
-  assert(!partition.ScanSharedComplete(
-      "adj-a", adj_c, true, false, 3, adjacency_generation(),
-      /*host_id=*/1, &complete_shared));
-  assert(partition.PromotePrivate("adj-b", 1));
-  assert(partition.ScanSharedComplete(
-      "adj-a", adj_c, true, false, 3, adjacency_generation(),
-      /*host_id=*/1, &complete_shared));
-  assert((complete_shared ==
-          std::vector<std::pair<std::string, std::string>>{
-              {"adj-a", "a"}, {"adj-b", "b"}, {"adj-c", "c"}}));
-  assert(partition.MoveOutPrivate("adj-b", 1));
-  assert(!partition.ScanSharedComplete(
-      "adj-a", adj_c, true, false, 3, adjacency_generation(),
-      /*host_id=*/1, &complete_shared));
-  assert(partition.PromotePrivate("adj-b", 1));
-  assert(partition.DeletePrivate("adj-b"));
-  assert(partition.ScanSharedComplete(
-      "adj-a", adj_c, true, false, 2, adjacency_generation(),
-      /*host_id=*/1, &complete_shared));
-  assert((complete_shared ==
-          std::vector<std::pair<std::string, std::string>>{
-              {"adj-a", "a"}, {"adj-c", "c"}}));
-
-  // Adjacency has no row on an empty tail, so its endpoint certificate must
-  // still reject a tail row evicted after the owner prepared the range.
-  assert(partition.PutPrivate("zz-endpoint", "tail"));
-  assert(partition.PromotePrivate("zz-endpoint", 1));
-  const auto endpoint_cutoff = tigonkv::engine::FixedKey::From(
-      "zz-endpoint", regions.layout().fixed_key_size);
-  const uint32_t endpoint_mutation = adjacency_generation();
-  assert(partition.ScanSharedComplete(
-      "zz-endpoint", endpoint_cutoff, true, false, 1, endpoint_mutation,
-      /*host_id=*/1, &complete_shared));
-  assert(partition.MoveOutPrivate("zz-endpoint", 1));
-  assert(!partition.ScanSharedComplete(
-      "zz-endpoint", endpoint_cutoff, true, false, 1, endpoint_mutation,
-      /*host_id=*/1, &complete_shared));
-
   // Bounded dual-tree merge: migrated shared authority + later private rows,
   // without collecting the full remaining keyspace before applying limit.
   assert(partition.PutPrivate("m1", "shared-m1"));
@@ -532,7 +465,14 @@ int main() {
   });
   uint32_t scan_rounds = 0;
   do {
-    assert(partition.ScanOwned("scan-race-", 32, &scan));
+    // KVPartition is the one-attempt primitive; model the facade's logical
+    // Busy retry here instead of restoring an internal Scan retry budget.
+    bool scanned = false;
+    for (uint32_t attempt = 0; attempt < 1024 && !scanned; ++attempt) {
+      scanned = partition.ScanOwned("scan-race-", 32, &scan);
+      if (!scanned) std::this_thread::yield();
+    }
+    assert(scanned);
     assert(scan.size() == moving_keys.size());
     for (size_t i = 0; i < scan.size(); ++i) {
       assert(scan[i].first == moving_keys[i]);
@@ -565,7 +505,7 @@ int main() {
     attached_ebr.thread_init_ebr_meta(0, 0);
     PassthroughScc attached_scc;
     star::scc_manager = &attached_scc;
-    tigonkv::engine::KVPartition attached(attached_regions, attached_ebr, 5, 1, true);
+    tigonkv::engine::KVPartition attached(attached_regions, attached_ebr, 5, 1, true, true);
     std::string child_value;
     if (!attached.GetPrivate("alpha", &child_value) || child_value != "shared-update") _exit(1);
     if (attached.GetPrivate("beta", &child_value)) _exit(1);

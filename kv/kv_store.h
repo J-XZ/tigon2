@@ -111,6 +111,12 @@ struct MemoryStats {
 };
 
 struct Config {
+  struct PartitionRange {
+    // Empty lower/upper are respectively -infinity/+infinity.  Non-empty
+    // bounds are external string keys and describe [lower_key, upper_key).
+    std::string lower_key;
+    std::string upper_key;
+  };
   std::string shared_memory_path = "/mnt/xz_shared_mem/ivshmem_shared_mem";
   std::string device_path = "/dev/ivpci0";
   uint64_t size_mb = 4096;
@@ -131,6 +137,11 @@ struct Config {
   uint32_t foreground_worker_count_per_vm = 1;
   uint32_t node_id = 0;
   uint32_t partition_count = 16;
+  // The experiment interface has one logical table, range partitioned in the
+  // same order as the original Tigon YCSB partitioner.  Config files must
+  // supply exactly partition_count contiguous ranges; this vector is also
+  // deliberately available to small in-process test configurations.
+  std::vector<PartitionRange> partition_ranges;
   uint32_t fixed_key_size = 32;
   uint32_t fixed_value_size = 1000;
   uint64_t hw_cc_budget_mb = 1024;
@@ -170,6 +181,7 @@ struct Config {
 
   static Config FromJsonc(const std::string &path);
   void Validate() const;
+  uint32_t PartitionForKey(std::string_view key) const;
 };
 
 class KVStore {
