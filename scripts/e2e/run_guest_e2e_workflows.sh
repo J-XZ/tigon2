@@ -66,7 +66,7 @@ reset_pool() {
 }
 
 run_remote() {
-  local suite=$1 phase=$2 vm=$3 reset=$4 log=$5
+  local suite=$1 phase=$2 vm=$3 reset=$4 log=$5 release_file=${6:-}
   local extra=""
   local total_env
   if [[ "$suite" == 08 ]]; then
@@ -80,18 +80,43 @@ run_remote() {
   if [[ "$phase" == init ]]; then
     extra="$extra TIGONKV_E2E_MULTI_VM_INIT_ONLY=1"
   fi
-  local command="env TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' $extra '$remote_root/build/e2e_${suite}'"
+  local command="env TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra '$remote_root/build/e2e_${suite}'"
   timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" root@127.0.0.1 "$command" >"$log" 2>&1
 }
 
 run_phase() {
   local suite=$1 phase=$2 round=$3
   local phase_dir="$log_root/round${round}/e2e_${suite}/${phase}"
+  local release_file="$remote_root/e2e-guest-release/round${round}-e2e_${suite}-${phase}"
   mkdir -p "$phase_dir"
   pids=()
   for ((vm = 0; vm < vm_count; vm++)); do
-    run_remote "$suite" "$phase" "$vm" 0 "$phase_dir/vm${vm}.log" &
+    remote "$vm" "mkdir -p '$remote_root/e2e-guest-release'; rm -f '$release_file' '$release_file.waiting'"
+    run_remote "$suite" "$phase" "$vm" 0 "$phase_dir/vm${vm}.log" "$release_file" &
     pids+=("$!")
+  done
+  local deadline=$((SECONDS + timeout_sec))
+  while :; do
+    local replayed=1
+    for ((vm = 0; vm < vm_count; vm++)); do
+      if ! rg -q "E2E_${suite}_STAGE node=${vm} phase=${phase} stage=replay_done" \
+          "$phase_dir/vm${vm}.log" 2>/dev/null; then
+        replayed=0
+        break
+      fi
+    done
+    if (( replayed )); then
+      for ((vm = 0; vm < vm_count; vm++)); do
+        remote "$vm" "touch '$release_file'"
+      done
+      break
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "timeout waiting for replay completion: suite=$suite round=$round phase=$phase" >&2
+      for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+      return 1
+    fi
+    sleep 0.05
   done
   local failed=0
   for pid in "${pids[@]}"; do

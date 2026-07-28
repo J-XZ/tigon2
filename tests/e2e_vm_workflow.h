@@ -5,8 +5,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -80,25 +83,38 @@ inline char Base36(uint64_t value) {
 }
 
 inline std::string Key08(uint64_t index) {
-  std::string key(8, '0');
+  // Keep both guest E2E suites on the same fixed-width `user` key domain as
+  // the YCSB traces.  The four fixture split points below are sampled from
+  // this encoding, so the 4VM run exercises all four range owners instead of
+  // accidentally directing every key to one successor-lock chain.
+  std::string key(32, '0');
   uint64_t value = index;
-  for (size_t pos = key.size(); pos-- > 0;) {
+  for (size_t pos = key.size(); pos-- > 4;) {
     key[pos] = Base36(value % 36);
     value /= 36;
   }
-  key[0] = 'k';
+  key.replace(0, 4, "user");
   return key;
 }
 
 inline std::string Key09(uint64_t index) {
   std::string key(32, '0');
   uint64_t value = index;
-  for (size_t pos = key.size(); pos-- > 1;) {
+  for (size_t pos = key.size(); pos-- > 4;) {
     key[pos] = Base36(value % 36);
     value /= 36;
   }
-  key[0] = 'u';
+  key.replace(0, 4, "user");
   return key;
+}
+
+inline std::string Value08(std::string_view key) {
+  // The guest E2E overlay deliberately uses 1000B values. Keep the key
+  // visible in the deterministic payload while satisfying the fixed-value
+  // public API contract.
+  std::string value(1000, '\0');
+  std::memcpy(value.data(), key.data(), key.size());
+  return value;
 }
 
 inline std::string Value09(uint64_t index, uint64_t generation) {
@@ -236,6 +252,33 @@ inline void DrainTransport(KVStore &store) {
   }
 }
 
+// Reuse the trace-runner host-release protocol for the standalone guest E2E
+// suites. Guests do not share a filesystem; the host creates the same marker
+// locally on every VM only after every replay has completed. Until then this
+// VM must keep serving peers that issue a late remote request.
+inline void WaitForHostRelease(const std::string &phase, KVStore &store) {
+  const std::string release_file = Env("TIGONKV_E2E_RELEASE_FILE");
+  if (release_file.empty()) return;
+  {
+    std::ofstream waiting(release_file + ".waiting");
+    if (!waiting)
+      throw std::runtime_error("cannot publish host-release wait marker");
+    waiting << "waiting\n";
+  }
+  const uint64_t timeout = PositiveEnv("TIGONKV_E2E_RELEASE_TIMEOUT_SEC", 600);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(timeout);
+  while (!std::filesystem::exists(release_file)) {
+    const Status status = store.PollTransport();
+    if (!status.ok())
+      throw std::runtime_error(
+          "transport poll failed while waiting for host release: " + status.message);
+    if (std::chrono::steady_clock::now() >= deadline)
+      throw std::runtime_error("host release timeout for phase " + phase);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
 inline int RunE2E08MultiVm() {
   Config config = LoadConfig();
   const bool init_only = Env("TIGONKV_E2E_MULTI_VM_INIT_ONLY") == "1";
@@ -251,7 +294,7 @@ inline int RunE2E08MultiVm() {
   if (phase == "fill") {
     result = RunWorkers(*main_store, config, total, [](KVStore &store, uint64_t, uint64_t index, uint64_t) {
       const std::string key = Key08(index);
-      const Status status = store.Put(key, key);
+      const Status status = store.Put(key, Value08(key));
       if (!status.ok()) throw std::runtime_error("e2e08 fill PUT failed: " + status.message);
     });
   } else if (phase == "read") {
@@ -261,7 +304,7 @@ inline int RunE2E08MultiVm() {
           ((worker + 1) << 16U) ^ i) % total;
       const std::string key = Key08(index);
       const GetResult got = store.Get(key);
-      if (!got.status.ok() || got.value != key)
+      if (!got.status.ok() || got.value != Value08(key))
         throw std::runtime_error("e2e08 read verification failed for index " + std::to_string(index) +
                                  " status=" + std::to_string(static_cast<uint32_t>(got.status.code)) +
                                  " message=" + got.status.message +
@@ -270,6 +313,9 @@ inline int RunE2E08MultiVm() {
   } else {
     throw std::invalid_argument("e2e08 phase must be fill or read");
   }
+  std::cerr << "E2E_08_STAGE node=" << config.node_id << " phase=" << phase
+            << " stage=replay_done\n" << std::flush;
+  WaitForHostRelease(phase, *main_store);
   DrainTransport(*main_store);
   std::cout << "E2E_08_PHASE_TIME_US node=" << config.node_id << " phase=" << phase
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";
@@ -318,6 +364,9 @@ inline int RunE2E09MultiVm() {
   } else {
     throw std::invalid_argument("e2e09 phase must be fill, update, read, or mixed");
   }
+  std::cerr << "E2E_09_STAGE node=" << config.node_id << " phase=" << phase
+            << " stage=replay_done\n" << std::flush;
+  WaitForHostRelease(phase, *main_store);
   DrainTransport(*main_store);
   std::cout << "E2E_09_PHASE_TIME_US node=" << config.node_id << " phase=" << phase
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";
