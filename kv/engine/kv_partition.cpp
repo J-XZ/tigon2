@@ -788,7 +788,8 @@ SharedAccessState KVPartition::GetShared(std::string_view key, uint32_t host_id,
 }
 
 SharedAccessState KVPartition::PutShared(std::string_view key, uint32_t host_id,
-                                         std::string_view value) {
+                                         std::string_view value,
+                                         bool record_clock_access) {
   EnterEbr();
   if (value.size() > fixed_value_size_)
     throw std::invalid_argument("shared value exceeds fixed value size");
@@ -802,9 +803,10 @@ SharedAccessState KVPartition::PutShared(std::string_view key, uint32_t host_id,
   RegionOffset smeta_offset = kNullOffset;
   const SharedAccessState pin = TryPinShared(fixed_key, &smeta, &smeta_offset);
   if (pin != SharedAccessState::kDone) return pin;
+  if (record_clock_access) NoteSharedAccess(smeta);
   const bool written = star::TwoPLPashaHelper::kv_shared_write(
-      smeta, host_id, value.data(), fixed_value_size_);
-  if (written) NoteSharedAccess(smeta);
+      smeta, host_id, value.data(), fixed_value_size_,
+      /*ref_already_pinned=*/true);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   return written ? SharedAccessState::kDone : SharedAccessState::kRetry;
 }
@@ -853,7 +855,7 @@ void KVPartition::AbortRemoteDelete(
 
 SharedAccessState KVPartition::CompareExchangeShared(
     std::string_view key, uint32_t host_id, std::string_view expected,
-    std::string_view desired, bool *exchanged) {
+    std::string_view desired, bool *exchanged, bool record_clock_access) {
   EnterEbr();
   if (exchanged == nullptr) throw std::invalid_argument("null shared CAS result");
   if (desired.size() > fixed_value_size_)
@@ -874,6 +876,7 @@ SharedAccessState KVPartition::CompareExchangeShared(
   RegionOffset smeta_offset = kNullOffset;
   const SharedAccessState pin = TryPinShared(fixed_key, &smeta, &smeta_offset);
   if (pin != SharedAccessState::kDone) return pin;
+  if (record_clock_access) NoteSharedAccess(smeta);
   bool changed = false;
   const bool updated = star::TwoPLPashaHelper::kv_shared_update(
       smeta, host_id, fixed_value_size_,
@@ -882,20 +885,20 @@ SharedAccessState KVPartition::CompareExchangeShared(
         replacement->assign(desired);
         return true;
       },
-      &changed);
+      &changed, /*ref_already_pinned=*/true);
   if (!updated) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return SharedAccessState::kRetry;
   }
   *exchanged = changed;
-  NoteSharedAccess(smeta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   return SharedAccessState::kDone;
 }
 
 SharedAccessState KVPartition::IncrementShared(std::string_view key,
                                                uint32_t host_id, int64_t delta,
-                                               int64_t *value) {
+                                               int64_t *value,
+                                               bool record_clock_access) {
   EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared increment output");
   const FixedKey fixed_key = MakeKey(key);
@@ -903,6 +906,7 @@ SharedAccessState KVPartition::IncrementShared(std::string_view key,
   RegionOffset smeta_offset = kNullOffset;
   const SharedAccessState pin = TryPinShared(fixed_key, &smeta, &smeta_offset);
   if (pin != SharedAccessState::kDone) return pin;
+  if (record_clock_access) NoteSharedAccess(smeta);
   int64_t next = 0;
   bool changed = false;
   bool invalid = false;
@@ -923,7 +927,7 @@ SharedAccessState KVPartition::IncrementShared(std::string_view key,
         }
         return true;
       },
-      &changed);
+      &changed, /*ref_already_pinned=*/true);
   if (invalid) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     throw std::invalid_argument(
@@ -935,7 +939,6 @@ SharedAccessState KVPartition::IncrementShared(std::string_view key,
   }
   DCHECK(changed);
   *value = next;
-  NoteSharedAccess(smeta);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   return SharedAccessState::kDone;
 }

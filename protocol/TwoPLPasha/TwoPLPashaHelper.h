@@ -644,6 +644,7 @@ class TwoPLPashaHelper {
 
         static bool kv_shared_write(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
                                     const void *src, std::size_t size,
+                                    bool ref_already_pinned = false,
                                     KvSharedResult *result = nullptr)
         {
                 if (result != nullptr) *result = KvSharedResult::kBusy;
@@ -654,12 +655,13 @@ class TwoPLPashaHelper {
                 // ordinary contention for this logical operation, not an
                 // internal reader-drain loop.
                 if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
-                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+                    (!ref_already_pinned &&
+                     smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max())) {
                     smeta->unlock();
                     return false;
                 }
                 smeta->set_write_locked();
-                smeta->increment_ref_cnt();
+                if (!ref_already_pinned) smeta->increment_ref_cnt();
                 scc_manager->prepare_read(smeta, host_id, scc_data, size);
                 tigonkv::engine::mem_access::SharedPayloadWrite(
                         scc_data->data, size);
@@ -675,8 +677,10 @@ class TwoPLPashaHelper {
                 // synthetic payload/writeback latency has elapsed.
                 tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
-                DCHECK(smeta->get_ref_cnt() > 0);
-                smeta->decrement_ref_cnt();
+                if (!ref_already_pinned) {
+                        DCHECK(smeta->get_ref_cnt() > 0);
+                        smeta->decrement_ref_cnt();
+                }
                 smeta->clear_write_locked();
                 smeta->unlock();
                 if (result != nullptr) *result = KvSharedResult::kDone;
@@ -687,6 +691,7 @@ class TwoPLPashaHelper {
         static bool kv_shared_update(TwoPLPashaMetadataShared *smeta,
                                      std::size_t host_id, std::size_t capacity,
                                      Mutator &&mutator, bool *changed,
+                                     bool ref_already_pinned = false,
                                      KvSharedResult *result = nullptr)
         {
                 if (result != nullptr) *result = KvSharedResult::kBusy;
@@ -701,12 +706,13 @@ class TwoPLPashaHelper {
                         return false;
                 }
                 if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
-                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+                    (!ref_already_pinned &&
+                     smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max())) {
                         smeta->unlock();
                         return false;
                 }
                 smeta->set_write_locked();
-                smeta->increment_ref_cnt();
+                if (!ref_already_pinned) smeta->increment_ref_cnt();
                 scc_manager->prepare_read(smeta, host_id, scc_data, size);
                 smeta->unlock();
 
@@ -722,8 +728,10 @@ class TwoPLPashaHelper {
                 } catch (...) {
                         tigonkv::engine::mem_access::DelayActiveScopeNow();
                         smeta->lock();
-                        DCHECK(smeta->get_ref_cnt() > 0);
-                        smeta->decrement_ref_cnt();
+                        if (!ref_already_pinned) {
+                                DCHECK(smeta->get_ref_cnt() > 0);
+                                smeta->decrement_ref_cnt();
+                        }
                         smeta->clear_write_locked();
                         smeta->unlock();
                         throw;
@@ -745,8 +753,10 @@ class TwoPLPashaHelper {
                 }
                 tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
-                DCHECK(smeta->get_ref_cnt() > 0);
-                smeta->decrement_ref_cnt();
+                if (!ref_already_pinned) {
+                        DCHECK(smeta->get_ref_cnt() > 0);
+                        smeta->decrement_ref_cnt();
+                }
                 smeta->clear_write_locked();
                 smeta->unlock();
                 *changed = write;

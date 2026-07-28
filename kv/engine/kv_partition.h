@@ -108,13 +108,16 @@ class KVPartition {
                               std::string *value,
                               bool record_clock_access = true) const;
   SharedAccessState PutShared(std::string_view key, uint32_t host_id,
-                              std::string_view value);
+                              std::string_view value,
+                              bool record_clock_access = true);
   SharedAccessState CompareExchangeShared(std::string_view key, uint32_t host_id,
                                           std::string_view expected,
                                           std::string_view desired,
-                                          bool *exchanged);
+                                          bool *exchanged,
+                                          bool record_clock_access = true);
   SharedAccessState IncrementShared(std::string_view key, uint32_t host_id,
-                                    int64_t delta, int64_t *value);
+                                    int64_t delta, int64_t *value,
+                                    bool record_clock_access = true);
   // Original REMOTE_DELETE requester half: hold the shared write lock and
   // ref while publishing invalid; owner deletion consumes both on success.
   SharedAccessState PrepareRemoteDelete(

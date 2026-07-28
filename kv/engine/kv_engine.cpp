@@ -553,9 +553,10 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
   if (!route.owned_by_this_node) {
     if (route.partition == nullptr)
       return Status::Error(StatusCode::kCorruption, "missing visible partition");
-    const auto write_shared = [&] {
+    const auto write_shared = [&](bool record_clock_access = true) {
       const SharedAccessState state =
-          route.partition->PutShared(key, config_.node_id, value);
+          route.partition->PutShared(key, config_.node_id, value,
+                                     record_clock_access);
       if (state == SharedAccessState::kDone) {
         shared_puts_.fetch_add(1, std::memory_order_relaxed);
         shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
@@ -572,7 +573,7 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
     // the row in, then the requester performs the shared write itself.
     const Status migrated =
         Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
-    if (migrated.ok()) return write_shared();
+    if (migrated.ok()) return write_shared(/*record_clock_access=*/false);
     if (migrated.code != StatusCode::kNotFound) return migrated;
     // A true create uses the original REMOTE_INSERT ownership split: the owner
     // inserts an invalid placeholder and copies it into CXL with a requester
@@ -880,9 +881,10 @@ CasResult KVEngine::CompareExchange(std::string_view key,
     if (visible == nullptr)
       return {Status::Error(StatusCode::kCorruption, "missing visible partition"), false};
     bool exchanged = false;
-    auto compare_shared = [&] {
+    auto compare_shared = [&](bool record_clock_access = true) {
       return visible->CompareExchangeShared(key, config_.node_id, expected,
-                                            desired, &exchanged);
+                                            desired, &exchanged,
+                                            record_clock_access);
     };
     SharedAccessState state = compare_shared();
     if (state == SharedAccessState::kDone) {
@@ -901,7 +903,7 @@ CasResult KVEngine::CompareExchange(std::string_view key,
     const Status migrated =
         Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
     if (migrated.ok()) {
-      state = compare_shared();
+      state = compare_shared(/*record_clock_access=*/false);
       if (state == SharedAccessState::kDone) {
         if (exchanged) {
           shared_puts_.fetch_add(1, std::memory_order_relaxed);
@@ -961,8 +963,9 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
     if (visible == nullptr)
       return {Status::Error(StatusCode::kCorruption, "missing visible partition"), 0};
     int64_t shared = 0;
-    auto increment_shared = [&] {
-      return visible->IncrementShared(key, config_.node_id, delta, &shared);
+    auto increment_shared = [&](bool record_clock_access = true) {
+      return visible->IncrementShared(key, config_.node_id, delta, &shared,
+                                      record_clock_access);
     };
     SharedAccessState state = increment_shared();
     if (state == SharedAccessState::kDone) {
@@ -975,7 +978,7 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
     const Status migrated =
         Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
     if (migrated.ok()) {
-      state = increment_shared();
+      state = increment_shared(/*record_clock_access=*/false);
       if (state == SharedAccessState::kDone) {
         shared_puts_.fetch_add(1, std::memory_order_relaxed);
         shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
