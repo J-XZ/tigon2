@@ -1202,7 +1202,6 @@ std::string KVStore::DumpStats() const {
   out += "unclassified_shared_bytes=" + std::to_string(memory.unclassified_shared_bytes) + "\n";
   out += "retired_pending_bytes=" + std::to_string(memory.retired_pending_bytes) + "\n";
   out += "reclaimed_total_bytes=" + std::to_string(memory.reclaimed_total_bytes) + "\n";
-  out += "active_shared_rows=" + std::to_string(memory.active_shared_rows) + "\n";
   out += "physical_hwcc_capacity_bytes=" +
          std::to_string(memory.physical_hwcc_capacity_bytes) + "\n";
   out += "owner_migration_dynamic_budget_bytes=" +

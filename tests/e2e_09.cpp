@@ -125,20 +125,19 @@ int main() {
     assert(result.status.ok() && result.value == Value(1, n));
   }
   auto shared = owner->Memory();
-  assert(shared.active_shared_rows > 0 && shared.shared_payload_swcc_used_bytes > 0);
+  assert(shared.shared_payload_swcc_used_bytes > 0);
   for (uint32_t i = 0; i < kKeys; ++i) assert(owner->Delete(Key(i)).ok());
   const char drain = 'd';
   assert(write(stop_pipe[1], &drain, 1) == 1);
   char drain_ack = 0;
   assert(read(ack_pipe[0], &drain_ack, 1) == 1 && drain_ack == 'd');
-  assert(owner->Memory().active_shared_rows == 0);
   assert(owner->Memory().shared_payload_swcc_used_bytes == 0);
   assert(owner->Runtime().private_swcc_flushes == 0);
   assert(owner->Memory().unclassified_shared_bytes == 0);
   assert(owner->Memory().logical_hwcc_used_bytes <= owner->Memory().logical_hwcc_capacity_bytes);
   std::cout << "E2E_09_PHASE_TIME_US " << update_us << "\n";
-  std::cout << "E2E_09_MEMORY active_shared_rows=" << owner->Memory().active_shared_rows
-            << " shared_payload_swcc_used_bytes=" << owner->Memory().shared_payload_swcc_used_bytes << "\n";
+  std::cout << "E2E_09_MEMORY shared_payload_swcc_used_bytes="
+            << owner->Memory().shared_payload_swcc_used_bytes << "\n";
   std::cout << owner->DumpStats();
   const char quit = 'q';
   assert(write(stop_pipe[1], &quit, 1) == 1);

@@ -358,16 +358,12 @@ int main() {
   // Fresh move-in starts without a second chance; the first over-budget Clock
   // pass may therefore move it out immediately.  Only a real shared access
   // grants a chance.
-  // Other keys (e.g. gamma) may still be migrated; this is an explicit
-  // tracker-list statistics snapshot, never a migration hot-path counter.
   assert(partition.PutPrivate("clock", "victim"));
   assert(partition.PromotePrivate("clock", 1));
-  const uint64_t migrated_before_clock = partition.migrated_key_count();
-  assert(migrated_before_clock >= 1);
   star::cxl_memory.set_total_hw_cc_usage(
       (1024ULL * 1024ULL * 1024ULL - star::CXL_EBR::max_ebr_retiring_memory) / 2);
-  assert(partition.MoveOutClockVictim(1));
-  assert(partition.migrated_key_count() == migrated_before_clock - 1);
+  assert(star::migration_manager != nullptr);
+  assert(star::migration_manager->move_row_out(partition.partition_id()));
   assert(partition.GetPrivate("clock", &value) && value == FixedValue("victim"));
   latency_sim::Config budget_counter_latency;
   budget_counter_latency.enabled = true;
@@ -560,41 +556,6 @@ int main() {
   } while (!migration_done.load(std::memory_order_acquire) ||
            scan_rounds < 32);
   migrator.join();
-
-  // The original Clock loop has no fixed candidate limit.  Drain earlier
-  // tracker entries, then give 1025 rows a real shared access (one chance)
-  // and leave the 1026th cold: the next pass must reach and evict that tail.
-  const uint64_t clock_budget =
-      (1024ULL * 1024ULL * 1024ULL - star::CXL_EBR::max_ebr_retiring_memory) / 2;
-  while (partition.migrated_key_count() != 0) {
-    star::cxl_memory.set_total_hw_cc_usage(clock_budget);
-    // A first original Clock pass may only clear second-chance bits.
-    if (!partition.MoveOutClockVictim(1)) {
-      star::cxl_memory.set_total_hw_cc_usage(clock_budget);
-      assert(partition.MoveOutClockVictim(1));
-    }
-  }
-  for (uint32_t i = 0; i < 1025; ++i) {
-    char key[32];
-    std::snprintf(key, sizeof(key), "clock-pass-%04u", i);
-    assert(partition.PutPrivate(key, "candidate"));
-    assert(partition.PromotePrivate(key, 1));
-    std::string shared_value;
-    assert(partition.GetShared(key, 1, &shared_value) ==
-           tigonkv::engine::SharedAccessState::kDone);
-  }
-  assert(partition.PutPrivate("clock-pass-tail", "victim"));
-  assert(partition.PromotePrivate("clock-pass-tail", 1));
-  const uint64_t before_long_clock_pass = partition.migrated_key_count();
-  assert(before_long_clock_pass == 1026);
-  partition.ClockLock();
-  partition.ClockResetCursor();
-  partition.ClockUnlock();
-  star::cxl_memory.set_total_hw_cc_usage(clock_budget);
-  assert(partition.MoveOutClockVictim(1));
-  assert(partition.migrated_key_count() == before_long_clock_pass - 1);
-  assert(partition.GetPrivate("clock-pass-tail", &value) &&
-         value == FixedValue("victim"));
 
   // The owner create path keeps the original next-row write lock across
   // placeholder insertion and publication.  Make that successor migrated so

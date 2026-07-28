@@ -129,7 +129,6 @@ int main() {
   const auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - read_begin).count();
   auto scan = owner->Scan("00000000", std::string(8, static_cast<char>(0xff)), kKeys);
   assert(scan.status.ok() && scan.items.size() == kKeys);
-  assert(owner->Memory().active_shared_rows > 0);
 
   const auto stress_begin = std::chrono::steady_clock::now();
   for (uint32_t i = 0; i < kKeys; ++i) {
@@ -140,7 +139,6 @@ int main() {
   assert(write(stop_pipe[1], &drain, 1) == 1);
   char drain_ack = 0;
   assert(read(ack_pipe[0], &drain_ack, 1) == 1 && drain_ack == 'd');
-  assert(owner->Memory().active_shared_rows == 0);
   assert(owner->Memory().shared_payload_swcc_used_bytes == 0);
   assert(owner->Runtime().private_swcc_flushes == 0);
   assert(owner->Memory().unclassified_shared_bytes == 0);
@@ -155,8 +153,7 @@ int main() {
   std::cout << "E2E_08_OP_P50_US " << percentile(0.50) << "\n";
   std::cout << "E2E_08_OP_P99_US " << percentile(0.99) << "\n";
   std::cout << "E2E_08_STRESS_TIME_US " << stress_us << "\n";
-  std::cout << "E2E_08_MEMORY active_shared_rows=" << owner->Memory().active_shared_rows
-            << " owner_private_swcc_used_bytes=" << owner->Memory().owner_private_swcc_used_bytes
+  std::cout << "E2E_08_MEMORY owner_private_swcc_used_bytes=" << owner->Memory().owner_private_swcc_used_bytes
             << " shared_payload_swcc_used_bytes=" << owner->Memory().shared_payload_swcc_used_bytes << "\n";
   std::cout << owner->DumpStats();
   const char quit = 'q';

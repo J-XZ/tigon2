@@ -1015,10 +1015,6 @@ MemoryStats KVEngine::Memory() const {
       stats.owner_private_swcc_used_bytes +
       stats.shared_payload_swcc_used_bytes +
       stats.allocator_swcc_metadata_bytes;
-  for (const auto &partition : partitions_) {
-    if (partition->owner_shard() == config_.node_id)
-      stats.active_shared_rows += partition->migrated_key_count();
-  }
   // Physical capacity vs Clock dynamic limit (§11.10). Clock links live in
   // owner-private SWCC after §11.14, so process-heap tracker DRAM is zero.
   stats.physical_hwcc_capacity_bytes = config_.hwcc_size_mb * 1024ULL * 1024ULL;
@@ -1463,7 +1459,8 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
   if (hw_used < hw_budget) return;
   // PolicyClock's original policy is governed solely by its HWCC accounting.
   KvMigrationRuntime::SyncHwCcUsage(partition);
-  if (partition.MoveOutClockVictim(config_.node_id)) {
+  if (star::migration_manager != nullptr &&
+      star::migration_manager->move_row_out(partition.partition_id())) {
     migration_out_.fetch_add(1, std::memory_order_relaxed);
   }
   // An original Clock pass may consume only second chances, or find pinned
@@ -1480,13 +1477,9 @@ Status KVEngine::MoveOut(std::string_view key) {
   if (!route.owned_by_this_node)
     return Status::Error(StatusCode::kOwnerViolation, "remote owner requires forwarding");
   auto *partition = route.partition;
-  auto *clock = KvMigrationRuntime::Instance().clock();
-  auto *table =
-      KvMigrationRuntime::Instance().TableFor(partition->partition_id());
-  const FixedKey fixed_key =
-      FixedKey::From(key, config_.fixed_key_size);
-  if (clock != nullptr && table != nullptr &&
-      clock->move_specific_row_out(table, fixed_key.bytes)) {
+  // Test/fixture-only deterministic move-out. Production eviction continues
+  // through PolicyClock::move_row_out from EnforceMigrationBudget.
+  if (partition->MoveOutPrivate(key, config_.node_id)) {
     migration_out_.fetch_add(1, std::memory_order_relaxed);
     return Status::Ok();
   }

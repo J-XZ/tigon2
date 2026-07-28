@@ -2214,12 +2214,6 @@ RegionOffset KVPartition::ClockAdvanceCursor() {
   return private_arena_.clock_cursor;
 }
 
-void KVPartition::ClockResetCursor() {
-  mem_access::PrivateWrite(&private_arena_.clock_cursor,
-                           sizeof(private_arena_.clock_cursor));
-  private_arena_.clock_cursor = kNullOffset;
-}
-
 bool KVPartition::ClockVictim(
     RegionOffset node_off, FixedKey *key,
     star::TwoPLPashaMetadataShared **smeta) const {
@@ -2234,14 +2228,6 @@ bool KVPartition::ClockVictim(
   return true;
 }
 
-bool KVPartition::MoveOutClockVictim(uint32_t host_id) {
-  (void)host_id;
-  EnterEbr();
-  if (star::migration_manager == nullptr) return false;
-  // Caller syncs CXLMemory::TOTAL_HW_CC_USAGE for the HWCC over-budget path.
-  return star::migration_manager->move_row_out(partition_id_);
-}
-
 uint64_t KVPartition::shared_payload_used_bytes() const {
   return regions_.SharedPayloadUsedBytes(owner_shard_);
 }
@@ -2253,21 +2239,6 @@ uint64_t KVPartition::shared_payload_capacity_bytes() const {
 uint64_t KVPartition::hwcc_used_bytes() const {
   return regions_.DynamicHwccUsedBytes(owner_shard_);
 }
-
-uint64_t KVPartition::migrated_key_count() const {
-  auto *self = const_cast<KVPartition *>(this);
-  self->ClockLock();
-  uint64_t count = 0;
-  for (RegionOffset node_off = private_arena_.clock_head; node_off != kNullOffset;) {
-    auto *node = ClockNodeFromOffset(node_off);
-    if (node == nullptr) break;
-    ++count;
-    node_off = node->next_off;
-  }
-  self->ClockUnlock();
-  return count;
-}
-
 
 void KVPartition::PersistPrivateRootIfChanged() {
   // Shared live root is published only by BPlusTree::store_root through

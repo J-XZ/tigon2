@@ -49,21 +49,6 @@ void PolicyClock::access_row(void *migration_policy_meta, uint64_t partition_id)
   (void)partition_id;
 }
 
-bool PolicyClock::move_specific_row_out(ITable *table, const void *key) {
-  auto *partition = PartitionOf(table);
-  if (partition == nullptr) return false;
-  partition->ClockLock();
-  try {
-    const bool moved = move_from_shared_region_to_partition(table, key, empty_row_);
-    if (moved) partition->ClockUntrackMigratedKey(key);
-    partition->ClockUnlock();
-    return moved;
-  } catch (...) {
-    partition->ClockUnlock();
-    throw;
-  }
-}
-
 migration_result PolicyClock::move_row_in(
     ITable *table, const void *key,
     const std::tuple<MetaDataType *, void *> &row, bool inc_ref_cnt) {

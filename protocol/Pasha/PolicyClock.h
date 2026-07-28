@@ -39,8 +39,6 @@ class PolicyClock : public MigrationManager {
 
         void access_row(void *migration_policy_meta, uint64_t partition_id) override;
 
-        bool move_specific_row_out(ITable *table, const void *key);
-
         migration_result move_row_in(ITable *table, const void *key, const std::tuple<MetaDataType *, void *> &row, bool inc_ref_cnt) override;
 
         bool move_row_out(uint64_t partition_id) override;
