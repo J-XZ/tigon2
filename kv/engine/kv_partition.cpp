@@ -1751,6 +1751,7 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
   bool stop = false;
   FixedKey last_emitted{};
   bool has_last_emitted = false;
+  const bool max_is_internal_sentinel = IsInternalMaxSentinel(max_key);
 
   ScanSharedForUpdate(min_key, [&](const FixedKey &key, RegionOffset smeta_off,
                                    bool is_last_tuple) {
@@ -1760,7 +1761,12 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
 
     const bool is_limit_boundary =
         output_limit != 0 && pinned.size() == output_limit;
-    const bool is_range_boundary = key.Compare(max_key) > 0;
+    // The original callback locks, but does not return, the first key past a
+    // finite range.  That boundary need not prove a real successor: only its
+    // predecessor protects the requested interval.  For an unbounded range,
+    // the owner-private maximum sentinel is that same boundary.
+    const bool is_range_boundary = key.Compare(max_key) > 0 ||
+        (max_is_internal_sentinel && key.Compare(max_key) == 0);
     const bool locking_next_tuple =
         is_last_tuple || is_limit_boundary || is_range_boundary;
     auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
@@ -1773,7 +1779,8 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
     smeta->lock();
     const bool key_equals_min = key.Compare(min_key) == 0;
     bool adj_ok = star::TwoPLPashaHelper::scan_row_adjacency_ok(
-        key_equals_min, is_limit_boundary, smeta->get_prev_key_real_bit(),
+        key_equals_min, is_limit_boundary || is_range_boundary,
+        smeta->get_prev_key_real_bit(),
         smeta->get_next_key_real_bit());
     smeta->unlock();
     if (!adj_ok) {

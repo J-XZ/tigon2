@@ -470,11 +470,15 @@ int main() {
       // KVEngine exposes one-shot primitives.  Mirror the production
       // KVStore boundary here rather than restoring an Engine-local Scan
       // retry after a successful range move-in.
+      const std::string global_scan_end = ScanEndKey();
       auto scan_with_facade_retry = [&](std::string_view start,
-                                        uint64_t limit) {
+                                        uint64_t limit,
+                                        std::string_view end = {}) {
         tigonkv::ScanResult result;
         for (uint32_t attempt = 0; attempt != 64; ++attempt) {
-          result = node_one->Scan(start, ScanEndKey(), limit);
+          result = node_one->Scan(
+              start, end.empty() ? std::string_view(global_scan_end) : end,
+              limit);
           if (result.status.code != tigonkv::StatusCode::kBusy) return result;
           std::this_thread::yield();
         }
@@ -492,6 +496,37 @@ int main() {
         if (item.key != promoted_scan_keys[i] ||
             item.value != FixedValue("owner-authority"))
           _exit(16);
+      }
+      // The original CXL tree starts at lower_bound(min_key), rather than
+      // requiring min_key itself to exist.  Keep this probe in the same
+      // non-empty remote partition: a scan beginning at the global minimum
+      // would first visit an empty partition, outside the original
+      // executor's "every remote scan returns one value" assumption.
+      std::string missing_start = promoted_scan_keys.front();
+      missing_start.resize(node_one_config.fixed_key_size, '\0');
+      missing_start[promoted_scan_keys.front().size()] = '\1';
+      std::string promoted_partition_end =
+          node_one_config.partition_ranges[promoted_partition].upper_key;
+      promoted_partition_end.resize(node_one_config.fixed_key_size, '\0');
+      const auto missing_start_scan = scan_with_facade_retry(
+          missing_start, 3, promoted_partition_end);
+      if (!missing_start_scan.status.ok() || missing_start_scan.items.size() != 3)
+        _exit(31);
+      for (size_t i = 0; i < missing_start_scan.items.size(); ++i) {
+        if (missing_start_scan.items[i].key != promoted_scan_keys[i + 1])
+          _exit(32);
+      }
+      // limit=0 is the original unbounded range request.  It must move the
+      // remaining owner range, then return a CXL-only fragment without an
+      // owner-value stream or pagination state.
+      const auto unbounded_scan = scan_with_facade_retry(
+          missing_start, 0, promoted_partition_end);
+      if (!unbounded_scan.status.ok()) _exit(33);
+      if (unbounded_scan.items.size() < promoted_scan_keys.size() - 1)
+        _exit(35);
+      for (size_t i = 0; i + 1 < promoted_scan_keys.size(); ++i) {
+        if (unbounded_scan.items[i].key != promoted_scan_keys[i + 1])
+          _exit(34);
       }
       // A complete CXL range does not send an owner-value RPC.  If migration
       // was needed, the only frame remains the original scan-migration one.
