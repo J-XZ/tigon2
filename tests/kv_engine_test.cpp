@@ -205,8 +205,14 @@ int main() {
     (void)setrlimit(RLIMIT_CORE, &no_core);
     auto full_config = ConfigFor(full_template, 2, 0);
     full_config.sync_timeout_sec = 1;
-    auto peer = JoiningPeer(ConfigFor(full_template, 2, 1));
-    auto engine = tigonkv::engine::KVEngine::Open(full_config, true);
+    std::unique_ptr<tigonkv::engine::KVEngine> engine;
+    {
+      // Join the owner-startup barrier, then stop its demuxer before filling
+      // its inbound ring.  A live owner demuxer would consume the exact ring
+      // this test intentionally keeps full.
+      auto peer = JoiningPeer(ConfigFor(full_template, 2, 1));
+      engine = tigonkv::engine::KVEngine::Open(full_config, true);
+    }
     void *root = nullptr;
     star::CXLMemory::wait_and_retrieve_cxl_shared_data(
         star::CXLMemory::cxl_transport_root_index, &root);
