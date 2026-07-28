@@ -8,12 +8,15 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace tigonkv::engine {
 
 // All allocator metadata is part of the mapped region.  The fixed upper bound
 // keeps the on-region format inspectable and avoids a process-local directory.
 constexpr uint32_t kAllocatorSizeClasses = 32;
+constexpr uint32_t kOwnerPrivateEbrWorkers = 5;
+constexpr uint32_t kOwnerPrivateEbrEpochs = 3;
 
 struct alignas(64) RegionFreeBlock {
   std::atomic<RegionOffset> next{kNullOffset};
@@ -155,6 +158,21 @@ struct alignas(64) OwnerPrivateArenaHeader {
   RegionOffset clock_tail = kNullOffset;
   RegionOffset clock_cursor = kNullOffset;
   std::atomic<uint64_t> migrated_key_count{0};
+  // Original EBR keeps one retire list per worker/epoch.  The lists are
+  // owner-private SWCC offsets so their allocator metadata never becomes a
+  // cross-VM synchronization object.
+  std::atomic<RegionOffset>
+      retire_heads[kOwnerPrivateEbrWorkers][kOwnerPrivateEbrEpochs]{};
+  std::atomic<uint64_t>
+      retire_counts[kOwnerPrivateEbrWorkers][kOwnerPrivateEbrEpochs]{};
+};
+
+struct OwnerPrivateRetireRecord {
+  RegionOffset object_offset = kNullOffset;
+  uint64_t bytes = 0;
+  AllocationDomain domain = AllocationDomain::kHwccIndex;
+  uint32_t private_partition = UINT32_MAX;
+  RegionOffset next = kNullOffset;
 };
 
 struct alignas(64) DualRegionPersistentHeader {
@@ -192,6 +210,14 @@ class DualRegionAllocator {
                         uint32_t owner_shard);
   void Free(void *pointer, uint64_t bytes, AllocationDomain domain,
             uint32_t owner_shard, uint32_t current_shard);
+  void Retire(uint32_t owner_shard, uint32_t queue_partition,
+              uint32_t worker_id, uint32_t epoch, void *pointer,
+              uint64_t bytes, AllocationDomain domain,
+              uint32_t private_partition);
+  uint64_t RetireCount(uint32_t owner_shard, uint32_t worker_id,
+                       uint32_t epoch) const;
+  std::vector<OwnerPrivateRetireRecord> TakeRetired(
+      uint32_t owner_shard, uint32_t worker_id, uint32_t epoch);
   bool IsHwccAddress(const void *pointer) const;
   bool IsSwccAddress(const void *pointer) const;
   uint64_t ToPoolOffset(const void *pointer) const;

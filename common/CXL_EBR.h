@@ -28,33 +28,14 @@ class CXL_EBR {
         // try to advance global epoch when we have more than this number of garbage
         static constexpr uint64_t epoch_advance_threshold = 100;
 
-        struct retired_object {
-                retired_object(void *ptr, uint64_t size, uint64_t category, uint32_t owner_shard,
-                               uint32_t private_partition)
-                        : ptr(ptr)
-                        , size(size)
-                        , category(category)
-                        , owner_shard(owner_shard)
-                        , private_partition(private_partition)
-                {}
-
-                void *ptr;
-                uint64_t size;
-                uint64_t category;
-                uint32_t owner_shard;
-                uint32_t private_partition;
-        };
-
-        // per-thread EBR metadata in local DRAM
+        // Per-thread identity/statistics remain local, as in Tigon. Retire
+        // records themselves are owner-private SWCC RegionOffset chains.
         struct EBRMetaLocal {
                 uint64_t coordinator_id;
                 uint64_t thread_id;
                 uint64_t coordinator_count;
                 uint64_t thread_count;
-
                 uint64_t last_freed_epoch;
-
-                std::vector<retired_object> retired_objects[max_epoch];
 
                 // statistics
                 Percentile<uint64_t> garbage_size;
@@ -103,10 +84,6 @@ class CXL_EBR {
 
                 local_ebr_meta.last_freed_epoch = 0;
 
-                for (uint64_t i = 0; i < max_epoch; i++) {
-                        local_ebr_meta.retired_objects[i].clear();
-                }
-
                 local_ebr_meta.garbage_size.clear();
                 local_ebr_meta.max_garbage_size = 0;
 
@@ -114,7 +91,8 @@ class CXL_EBR {
 
         void add_retired_object(void *ptr, uint64_t size, uint64_t category,
                                 uint32_t owner_shard = 0,
-                                uint32_t private_partition = UINT32_MAX)
+                                uint32_t private_partition = UINT32_MAX,
+                                uint32_t queue_partition = UINT32_MAX)
         {
                 EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
                 uint64_t coordinator_id = local_ebr_meta.coordinator_id;
@@ -124,10 +102,14 @@ class CXL_EBR {
                 tigonkv::engine::mem_access::HwccAtomicLoad(&cxl_ebr_meta.local_epoch);
                 uint64_t cur_local_epoch = cxl_ebr_meta.local_epoch.load(std::memory_order_acquire);
 
-                // add the object to the list of the current local epoch
-                std::vector<retired_object> &cur_retired_object_list = local_ebr_meta.retired_objects[cur_local_epoch % max_epoch];
-                retired_object object(ptr, size, category, owner_shard, private_partition);
-                cur_retired_object_list.push_back(object);
+                auto *regions = bound_regions();
+                CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
+                if (queue_partition == UINT32_MAX)
+                        queue_partition = private_partition == UINT32_MAX
+                                              ? owner_shard : private_partition;
+                regions->Retire(owner_shard, queue_partition, thread_id,
+                                cur_local_epoch % max_epoch, ptr, size,
+                                allocation_domain(category), private_partition);
         }
 
         void enter_critical_section()
@@ -145,10 +127,13 @@ class CXL_EBR {
                 uint64_t cur_global_epoch = global_epoch.load(std::memory_order_acquire);
 
                 if (cur_global_epoch == cur_local_epoch) {
-                        std::vector<retired_object> &cur_retired_object_list = local_ebr_meta.retired_objects[cur_local_epoch % max_epoch];
+                        auto *regions = bound_regions();
+                        CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
 
                         // try to advance the global epoch
-                        if (cur_retired_object_list.size() >= epoch_advance_threshold) {
+                        if (regions->RetireCount(coordinator_id, thread_id,
+                                                 cur_local_epoch % max_epoch) >=
+                            epoch_advance_threshold) {
                                 bool advance_global_ebr = true;
 
                                 // check if all other threads have entered the current epoch
@@ -193,32 +178,35 @@ class CXL_EBR {
                 if (cur_global_epoch >= 2) {
                         uint64_t epoch_to_reclaim = cur_global_epoch - 2;
                         if (epoch_to_reclaim > local_ebr_meta.last_freed_epoch) {
-                                CHECK(epoch_to_reclaim == local_ebr_meta.last_freed_epoch + 1);
                                 uint64_t gc_size = 0;
-                                std::vector<retired_object> &retired_object_list_to_reclaim = local_ebr_meta.retired_objects[epoch_to_reclaim % max_epoch];
-
                                 auto *regions = bound_regions();
-                                for (uint64_t i = 0; i < retired_object_list_to_reclaim.size(); i++) {
-                                        const retired_object &object = retired_object_list_to_reclaim[i];
-                                        CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
-                                        if (object.private_partition != UINT32_MAX) {
-                                                regions->FreeOwnerPrivate(object.ptr, object.size,
+                                CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
+                                const auto retired = regions->TakeRetired(
+                                    coordinator_id, thread_id,
+                                    epoch_to_reclaim % max_epoch);
+                                for (const auto &object : retired) {
+                                        void *ptr = object.private_partition != UINT32_MAX
+                                            ? regions->swcc().FromOffset(object.object_offset)
+                                            : (object.domain == tigonkv::engine::AllocationDomain::kHwccIndex ||
+                                               object.domain == tigonkv::engine::AllocationDomain::kHwccMetadata ||
+                                               object.domain == tigonkv::engine::AllocationDomain::kHwccEbr ||
+                                               object.domain == tigonkv::engine::AllocationDomain::kTransport
+                                                   ? regions->hwcc().FromOffset(object.object_offset)
+                                                   : regions->swcc().FromOffset(object.object_offset));
+                                        if (object.private_partition != UINT32_MAX)
+                                                regions->FreeOwnerPrivate(ptr, object.bytes,
                                                                           object.private_partition,
-                                                                          object.owner_shard);
-                                        } else {
-                                                regions->Free(object.ptr, object.size,
-                                                              allocation_domain(object.category),
-                                                              object.owner_shard, coordinator_id);
-                                        }
-                                        gc_size += retired_object_list_to_reclaim[i].size;
+                                                                          coordinator_id);
+                                        else
+                                                regions->Free(ptr, object.bytes, object.domain,
+                                                              coordinator_id, coordinator_id);
+                                        gc_size += object.bytes;
                                 }
-
                                 local_ebr_meta.garbage_size.add(gc_size);
                                 if (gc_size > local_ebr_meta.max_garbage_size) {
                                         local_ebr_meta.max_garbage_size = gc_size;
                                 }
                                 local_ebr_meta.last_freed_epoch = epoch_to_reclaim;
-                                retired_object_list_to_reclaim.clear();
                         }
                 }
         }

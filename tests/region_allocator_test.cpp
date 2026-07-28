@@ -365,6 +365,23 @@ void TestAllocatorLatencyAccounting() {
   simulator.Configure(latency_sim::Config{});
 }
 
+void TestOwnerPrivateRetireQueue() {
+  Mapping mapping(true);
+  DualRegionConfig config = TestDualConfig();
+  auto dual = DualRegionAllocator::Initialize(mapping.base, config);
+  dual.InitializeOwnerPrivateArenas(0);
+  dual.InitializeOwnerPrivateArenas(1);
+  void *object = dual.Allocate(96, AllocationDomain::kHwccIndex, 0);
+  dual.Retire(0, 0, 0, 0, object, 96, AllocationDomain::kHwccIndex,
+              UINT32_MAX);
+  assert(dual.RetireCount(0, 0, 0) == 1);
+  const auto retired = dual.TakeRetired(0, 0, 0);
+  assert(retired.size() == 1);
+  assert(retired[0].object_offset == dual.hwcc().ToOffset(object));
+  assert(dual.RetireCount(0, 0, 0) == 0);
+  dual.Free(object, 96, AllocationDomain::kHwccIndex, 0, 0);
+}
+
 }  // namespace
 
 int main() {
@@ -375,5 +392,6 @@ int main() {
   TestDualPhysicalRegions();
   TestMappedPoolAttach();
   TestAllocatorLatencyAccounting();
+  TestOwnerPrivateRetireQueue();
   return 0;
 }

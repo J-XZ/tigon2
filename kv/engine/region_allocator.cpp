@@ -853,6 +853,85 @@ void DualRegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain d
   }
 }
 
+void DualRegionAllocator::Retire(uint32_t owner_shard, uint32_t queue_partition,
+                                 uint32_t worker_id, uint32_t epoch,
+                                 void *pointer, uint64_t bytes,
+                                 AllocationDomain domain,
+                                 uint32_t private_partition) {
+  if (pointer == nullptr || bytes == 0 || worker_id >= kOwnerPrivateEbrWorkers ||
+      epoch >= kOwnerPrivateEbrEpochs)
+    throw std::invalid_argument("invalid owner-private EBR retire record");
+  auto *arena = Arena(queue_partition);
+  if (arena->owner_shard != owner_shard)
+    throw std::runtime_error("EBR retire queue belongs to another owner");
+  auto *record = static_cast<OwnerPrivateRetireRecord *>(
+      AllocateOwnerPrivate(sizeof(OwnerPrivateRetireRecord), queue_partition,
+                           owner_shard));
+  new (record) OwnerPrivateRetireRecord;
+  record->bytes = bytes;
+  record->domain = domain;
+  record->private_partition = private_partition;
+  record->object_offset =
+      private_partition != UINT32_MAX
+          ? swcc_.ToOffset(pointer)
+          : (IsHwccDomain(domain) ? hwcc_.ToOffset(pointer)
+                                  : swcc_.ToOffset(pointer));
+  auto &head = arena->retire_heads[worker_id][epoch];
+  RegionOffset previous = head.load(std::memory_order_relaxed);
+  do {
+    record->next = previous;
+  } while (!head.compare_exchange_weak(previous, swcc_.ToOffset(record),
+                                        std::memory_order_release,
+                                        std::memory_order_relaxed));
+  arena->retire_counts[worker_id][epoch].fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t DualRegionAllocator::RetireCount(uint32_t owner_shard,
+                                          uint32_t worker_id,
+                                          uint32_t epoch) const {
+  if (worker_id >= kOwnerPrivateEbrWorkers || epoch >= kOwnerPrivateEbrEpochs)
+    throw std::invalid_argument("EBR retire count outside worker/epoch range");
+  uint64_t count = 0;
+  for (uint32_t partition = 0; partition < header_->layout.partition_count;
+       ++partition) {
+    if (partition % header_->layout.vm_count != owner_shard) continue;
+    auto *arena = Arena(partition);
+    count += arena->retire_counts[worker_id][epoch].load(std::memory_order_acquire);
+  }
+  return count;
+}
+
+std::vector<OwnerPrivateRetireRecord> DualRegionAllocator::TakeRetired(
+    uint32_t owner_shard, uint32_t worker_id, uint32_t epoch) {
+  if (worker_id >= kOwnerPrivateEbrWorkers || epoch >= kOwnerPrivateEbrEpochs)
+    throw std::invalid_argument("EBR reclaim outside worker/epoch range");
+  std::vector<OwnerPrivateRetireRecord> retired;
+  for (uint32_t partition = 0; partition < header_->layout.partition_count;
+       ++partition) {
+    if (partition % header_->layout.vm_count != owner_shard) continue;
+    auto *arena = Arena(partition);
+    const size_t before_take = retired.size();
+    RegionOffset offset = arena->retire_heads[worker_id][epoch].exchange(
+        kNullOffset, std::memory_order_acq_rel);
+    while (offset != kNullOffset) {
+      auto *record = static_cast<OwnerPrivateRetireRecord *>(swcc_.FromOffset(offset));
+      const RegionOffset next = record->next;
+      retired.push_back(*record);
+      FreeOwnerPrivate(record, sizeof(OwnerPrivateRetireRecord), partition,
+                       owner_shard);
+      offset = next;
+    }
+    const uint64_t removed = retired.size() - before_take;
+    if (removed != 0) {
+      const uint64_t before = arena->retire_counts[worker_id][epoch].fetch_sub(
+          removed, std::memory_order_relaxed);
+      if (before < removed)
+        throw std::runtime_error("owner-private EBR retire accounting underflow");
+    }
+  }
+  return retired;
+}
+
 bool DualRegionAllocator::IsHwccAddress(const void *pointer) const {
   return hwcc_.Contains(pointer);
 }
