@@ -839,8 +839,21 @@ int main() {
       for (auto &thread : scan_threads) thread.join();
       if (concurrent_scan_failed.load(std::memory_order_acquire)) _exit(18);
 
-      const auto distributed_scan = node_one->Scan("", ScanEndKey(), 0);
-      const auto limited_scan = node_one->Scan("", ScanEndKey(), 17);
+      // The parent deliberately races move-out/insert with the preceding
+      // scans.  Busy is the documented operation-boundary retry result, not
+      // a partial Scan result; retry here so the remainder of this child also
+      // exercises the independent remote point-operation paths.
+      auto scan_after_contention = [&](std::string_view start, uint64_t limit) {
+        tigonkv::ScanResult result;
+        for (uint32_t attempt = 0; attempt != 128; ++attempt) {
+          result = node_one->Scan(start, ScanEndKey(), limit);
+          if (result.status.code != tigonkv::StatusCode::kBusy) return result;
+          std::this_thread::yield();
+        }
+        return result;
+      };
+      const auto distributed_scan = scan_after_contention("", 0);
+      const auto limited_scan = scan_after_contention("", 17);
       bool saw_owner_zero = false;
       bool saw_owner_one = false;
       for (const auto &item : distributed_scan.items) {
@@ -903,8 +916,17 @@ int main() {
       for (uint32_t worker = 0; worker < 4; ++worker) {
         cas_threads.emplace_back([&, worker] {
           node_one->BindWorker(worker);
-          const auto result =
-              node_one->CompareExchange(cas_race_key, "", "winner");
+          tigonkv::CasResult result;
+          // KVEngine is the one-shot primitive; KVStore is the only
+          // production Busy-retry facade.  Exercise the same bounded retry
+          // here so a remote-create loser observes the published winner and
+          // becomes CompareFailed rather than being misclassified as a wire
+          // protocol failure.
+          for (uint32_t attempt = 0; attempt != 64; ++attempt) {
+            result = node_one->CompareExchange(cas_race_key, "", "winner");
+            if (result.status.code != tigonkv::StatusCode::kBusy) break;
+            std::this_thread::yield();
+          }
           if (result.status.ok() && result.exchanged)
             cas_winners.fetch_add(1, std::memory_order_relaxed);
           else if (result.status.code != tigonkv::StatusCode::kCompareFailed)
