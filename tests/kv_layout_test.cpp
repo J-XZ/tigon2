@@ -89,7 +89,6 @@ int main() {
   alignas(PrivateRow) std::byte storage[sizeof(PrivateRow) + 16]{};
   auto *row = new (storage) PrivateRow;
   row->key_len = 3;
-  row->value_len = 5;
   row->version = 9;
   std::memcpy(row->kv, "keyvalue", 8);
   assert(std::memcmp(row->kv, "keyvalue", 8) == 0);

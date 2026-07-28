@@ -66,9 +66,10 @@ std::string ScanEndKey(uint32_t fixed_key_size = 32) {
   return std::string(fixed_key_size, static_cast<char>(0xff));
 }
 
-std::string FixedDecimal(std::string_view decimal, uint32_t fixed_value_size = 128) {
+std::string FixedValue(std::string_view value_text,
+                       uint32_t fixed_value_size = 128) {
   std::string value(fixed_value_size, '\0');
-  std::memcpy(value.data(), decimal.data(), decimal.size());
+  std::memcpy(value.data(), value_text.data(), value_text.size());
   return value;
 }
 
@@ -365,7 +366,10 @@ int main() {
       for (const auto &entry : remote_puts) {
         const auto got = node1->Get(entry.first);
         assert(got.status.ok());
-        assert(got.value.size() == entry.second);
+        assert(got.value.size() == node1_cfg.fixed_value_size);
+        assert(got.value.substr(0, entry.second) == std::string(entry.second, 'v'));
+        assert(std::all_of(got.value.begin() + entry.second, got.value.end(),
+                           [](char byte) { return byte == '\0'; }));
       }
       node1->ReleaseWorker();
       _exit(0);
@@ -461,19 +465,20 @@ int main() {
     assert(engine->Put("alpha", "one").ok());
     assert(engine->Put("alpha", "updated").ok());
     const auto found = engine->Get("alpha");
-    assert(found.status.ok() && found.value == "updated");
+    assert(found.status.ok() && found.value == FixedValue("updated"));
     const auto cas = engine->CompareExchange("alpha", "updated", "cas-value");
     assert(cas.status.ok() && cas.exchanged);
     const auto cas_failed = engine->CompareExchange("alpha", "updated", "ignored");
     assert(cas_failed.status.code == tigonkv::StatusCode::kCompareFailed && !cas_failed.exchanged);
-    assert(engine->Put("counter", FixedDecimal("1")).ok());
+    assert(engine->Put("counter", FixedValue("1")).ok());
     const auto incremented = engine->Increment("counter", 2);
     assert(incremented.status.ok() && incremented.value == 3);
     const auto scan = engine->Scan("alpha", ScanEndKey(), 0);
     assert(scan.status.ok() && scan.items.size() == 2);
-    assert(scan.items[0].key == "alpha" && scan.items[0].value == "cas-value");
+    assert(scan.items[0].key == "alpha" &&
+           scan.items[0].value == FixedValue("cas-value"));
     assert(scan.items[1].key == "counter" &&
-           scan.items[1].value == FixedDecimal("3"));
+           scan.items[1].value == FixedValue("3"));
     {
       const auto rt = engine->EngineRuntime();
       assert(rt.scan_partition_probes >= 1);
@@ -507,7 +512,7 @@ int main() {
   {
     auto attached = tigonkv::engine::KVEngine::Open(single_owner, false);
     const auto found = attached->Get("persist");
-    assert(found.status.ok() && found.value == "value");
+    assert(found.status.ok() && found.value == FixedValue("value"));
   }
   {
     auto changed_contract = single_owner;
@@ -606,7 +611,7 @@ int main() {
       assert(got.items.size() == expected.size());
       for (size_t i = 0; i < expected.size(); ++i) {
         assert(got.items[i].key == expected[i]);
-        assert(got.items[i].value == std::string("v") + expected[i]);
+        assert(got.items[i].value == FixedValue(std::string("v") + expected[i]));
       }
     };
     expect_scan("", 0);
@@ -686,7 +691,9 @@ int main() {
       if (!node_one->Put(owner_one_key, "owner-one").ok()) _exit(1);
       for (const auto &key : promoted_scan_keys) {
         const auto promoted = node_one->Get(key);
-        if (!promoted.status.ok() || promoted.value != "owner-authority") _exit(14);
+        if (!promoted.status.ok() ||
+            promoted.value != FixedValue("owner-authority"))
+          _exit(14);
       }
       const uint64_t tx_before_authoritative_scan = node_one->NetworkTxBytes();
       const auto authoritative_scan = node_one->Scan("H-hybrid-", ScanEndKey(), 100);
@@ -697,7 +704,7 @@ int main() {
       for (size_t i = 0; i < authoritative_scan.items.size(); ++i) {
         const auto &item = authoritative_scan.items[i];
         if (item.key != promoted_scan_keys[i] ||
-            item.value != "owner-authority")
+            item.value != FixedValue("owner-authority"))
           _exit(16);
       }
       // Values travel through CXL; requester sends only ScanMigrate frames
@@ -754,12 +761,16 @@ int main() {
       bool saw_owner_zero = false;
       bool saw_owner_one = false;
       for (const auto &item : distributed_scan.items) {
-        saw_owner_zero = saw_owner_zero || (item.key == owner_zero_key && item.value == "owner-zero");
-        saw_owner_one = saw_owner_one || (item.key == owner_one_key && item.value == "owner-one");
+        saw_owner_zero = saw_owner_zero ||
+                         (item.key == owner_zero_key &&
+                          item.value == FixedValue("owner-zero"));
+        saw_owner_one = saw_owner_one ||
+                        (item.key == owner_one_key &&
+                         item.value == FixedValue("owner-one"));
       }
       uint32_t bulk_seen = 0;
       for (const auto &item : distributed_scan.items)
-        bulk_seen += item.value == "bulk";
+        bulk_seen += item.value == FixedValue("bulk");
       if (!distributed_scan.status.ok() || !saw_owner_zero || !saw_owner_one ||
           bulk_seen != kRemoteScanRows) _exit(2);
       if (!limited_scan.status.ok() || limited_scan.items.size() != 17) _exit(12);
@@ -769,11 +780,13 @@ int main() {
       if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(3);
       const uint64_t tx_after_remote_update = node_one->NetworkTxBytes();
       const auto read = node_one->Get(owner_zero_key);
-      if (!read.status.ok() || read.value != "forwarded") _exit(4);
+      if (!read.status.ok() || read.value != FixedValue("forwarded")) _exit(4);
       if (node_one->NetworkTxBytes() != tx_after_remote_update) _exit(24);
       const uint64_t tx_after_promotion = node_one->NetworkTxBytes();
       const auto shared_read = node_one->Get(owner_zero_key);
-      if (!shared_read.status.ok() || shared_read.value != "forwarded") _exit(19);
+      if (!shared_read.status.ok() ||
+          shared_read.value != FixedValue("forwarded"))
+        _exit(19);
       if (!node_one->Put(owner_zero_key, "shared-put").ok()) _exit(20);
       if (node_one->NetworkTxBytes() != tx_after_promotion) _exit(21);
       const auto cas = node_one->CompareExchange(owner_zero_key, "shared-put", "cas-forwarded");
@@ -785,20 +798,21 @@ int main() {
       if (node_one->NetworkTxBytes() != tx_after_promotion) _exit(11);
       const std::string counter_key = "H-counter";
       if (counter_key.empty() ||
-          !node_one->Put(counter_key, FixedDecimal("1")).ok()) _exit(7);
+          !node_one->Put(counter_key, FixedValue("1")).ok()) _exit(7);
       const auto increment = node_one->Increment(counter_key, 2);
       if (!increment.status.ok() || increment.value != 3) _exit(8);
       const uint64_t tx_after_remote_increment = node_one->NetworkTxBytes();
       const auto promoted_counter = node_one->Get(counter_key);
       if (!promoted_counter.status.ok() ||
-          promoted_counter.value != FixedDecimal("3")) _exit(22);
+          promoted_counter.value != FixedValue("3")) _exit(22);
       if (node_one->NetworkTxBytes() != tx_after_remote_increment) _exit(23);
       const std::string cas_create_key = "H-cas-create";
       const auto cas_create =
           node_one->CompareExchange(cas_create_key, "", "created");
       if (!cas_create.status.ok() || !cas_create.exchanged) _exit(25);
       const auto created = node_one->Get(cas_create_key);
-      if (!created.status.ok() || created.value != "created") _exit(26);
+      if (!created.status.ok() || created.value != FixedValue("created"))
+        _exit(26);
       const std::string cas_race_key = "H-cas-race";
       std::atomic<uint32_t> cas_winners{0};
       std::atomic<bool> cas_protocol_failed{false};
@@ -893,7 +907,7 @@ int main() {
               get_illegal.store(true, std::memory_order_relaxed);
               break;
             }
-            if (g.value != "v0" && g.value != "v1") {
+            if (g.value != FixedValue("v0") && g.value != FixedValue("v1")) {
               get_illegal.store(true, std::memory_order_relaxed);
               break;
             }
@@ -901,7 +915,8 @@ int main() {
           }
           const auto after = engine->Get(key);
           if (after.status.ok() &&
-              (after.value == "v0" || after.value == "v1"))
+              (after.value == FixedValue("v0") ||
+               after.value == FixedValue("v1")))
             get_ok.fetch_add(1, std::memory_order_relaxed);
           else
             get_illegal.store(true, std::memory_order_relaxed);
@@ -913,7 +928,7 @@ int main() {
       for (auto &t : readers) t.join();
       assert(!get_illegal.load());
       assert(get_ok.load() == 4);
-      assert(engine->Get(key).value == "v1");
+      assert(engine->Get(key).value == FixedValue("v1"));
 
       // CAS: exactly one winner from empty expected on a fresh key.
       const std::string cas_key = "hist-cas-private";
@@ -934,11 +949,11 @@ int main() {
       for (auto &t : casters) t.join();
       assert(!cas_bad.load());
       assert(winners.load() == 1);
-      assert(engine->Get(cas_key).value == "won");
+      assert(engine->Get(cas_key).value == FixedValue("won"));
 
       // Increment: N concurrent +1 from "0" → final == N.
       const std::string inc_key = "hist-inc-private";
-      assert(engine->Put(inc_key, FixedDecimal("0")).ok());
+      assert(engine->Put(inc_key, FixedValue("0")).ok());
       constexpr uint32_t kIncWorkers = 4;
       constexpr uint32_t kIncPerWorker = 25;
       std::atomic<bool> inc_bad{false};
@@ -965,13 +980,13 @@ int main() {
       const auto final_inc = engine->Get(inc_key);
       assert(final_inc.status.ok());
       assert(final_inc.value ==
-             FixedDecimal(std::to_string(kIncWorkers * kIncPerWorker)));
+             FixedValue(std::to_string(kIncWorkers * kIncPerWorker)));
 
       // Delete then Put: Get after delete is NotFound; after put sees new value.
       assert(engine->Delete(key).ok());
       assert(engine->Get(key).status.code == tigonkv::StatusCode::kNotFound);
       assert(engine->Put(key, "v2").ok());
-      assert(engine->Get(key).value == "v2");
+      assert(engine->Get(key).value == FixedValue("v2"));
     }
 
     // --- Cross-node: Forward, move-in, shared read, move-out, remote Increment ---
@@ -1001,9 +1016,9 @@ int main() {
         auto engine1 = tigonkv::engine::KVEngine::Open(node1_cfg, false);
         // Remote Get → Forward migrate-in → shared authority.
         const auto g1 = engine1->Get(owned0);
-        if (!g1.status.ok() || g1.value != "owner0-v1") _exit(41);
+        if (!g1.status.ok() || g1.value != FixedValue("owner0-v1")) _exit(41);
         const auto g2 = engine1->Get(owned0);
-        if (!g2.status.ok() || g2.value != "owner0-v1") _exit(42);
+        if (!g2.status.ok() || g2.value != FixedValue("owner0-v1")) _exit(42);
 
         // Concurrent CAS on the migrated key: at most one exchange succeeds.
         std::atomic<uint32_t> shared_winners{0};
@@ -1047,9 +1062,9 @@ int main() {
         if (shared_bad.load() || shared_winners.load() > 1) _exit(43);
         const auto after_cas = engine1->Get(owned0);
         if (!after_cas.status.ok()) _exit(44);
-        if (after_cas.value != "cas-remote" &&
-            after_cas.value != "cas-remote-b" &&
-            after_cas.value != "owner0-v1")
+        if (after_cas.value != FixedValue("cas-remote") &&
+            after_cas.value != FixedValue("cas-remote-b") &&
+            after_cas.value != FixedValue("owner0-v1"))
           _exit(45);
 
         // Seed a key this node owns for parent's Forward Increment history.
@@ -1108,9 +1123,9 @@ int main() {
       assert(moved);
       const auto after_moveout = engine0->Get(owned0);
       assert(after_moveout.status.ok());
-      assert(after_moveout.value == "cas-remote" ||
-             after_moveout.value == "cas-remote-b" ||
-             after_moveout.value == "owner0-v1");
+      assert(after_moveout.value == FixedValue("cas-remote") ||
+             after_moveout.value == FixedValue("cas-remote-b") ||
+             after_moveout.value == FixedValue("owner0-v1"));
 
       // Forward Increment on node1-owned key: returns form serial 1..10.
       for (int expected = 1; expected <= 10; ++expected) {
@@ -1125,7 +1140,7 @@ int main() {
         }
       }
       const auto inc_get = engine0->Get(owned1);
-      assert(inc_get.status.ok() && inc_get.value == FixedDecimal("10"));
+      assert(inc_get.status.ok() && inc_get.value == FixedValue("10"));
 
       close(parent_to_child[1]);  // wake child EOF
       int status = 0;

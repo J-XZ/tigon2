@@ -309,6 +309,17 @@ int main() {
   auto store = KVStore::Create(config, true);
   const auto key = [&](std::string_view text) { return Fixed(text, config.fixed_key_size); };
   const auto value = [&](std::string_view text) { return Fixed(text, config.fixed_value_size); };
+  // Public KV calls keep the fixed-width storage contract explicit.  The
+  // engine's short-value tolerance exists only for legacy internal tests.
+  assert(store->Put("short", value("one")).code == StatusCode::kInvalidArgument);
+  assert(store->Put(key("alpha"), "short").code == StatusCode::kInvalidArgument);
+  assert(store->Get("short").status.code == StatusCode::kInvalidArgument);
+  assert(store->Scan("", MaxKey(config.fixed_key_size), 0).status.code ==
+         StatusCode::kInvalidArgument);
+  assert(store->Scan(key("alpha"), "short", 0).status.code ==
+         StatusCode::kInvalidArgument);
+  assert(store->CompareExchange(key("alpha"), "short", value("one"))
+             .status.code == StatusCode::kInvalidArgument);
   assert(store->Put(key("alpha"), value("one")).ok());
   assert(store->Put(key("beta"), value("two")).ok());
   const auto scan = store->Scan(key("alpha"), MaxKey(config.fixed_key_size), 0);

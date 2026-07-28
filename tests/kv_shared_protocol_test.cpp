@@ -1,4 +1,5 @@
 #include "common/CXLMemory.h"
+#include "kv/engine/fixed_value.h"
 #include "protocol/TwoPLPasha/TwoPLPashaHelper.h"
 
 #ifdef NDEBUG
@@ -105,13 +106,19 @@ int main() {
     }
   }
 
-  assert(star::TwoPLPashaHelper::kv_shared_write(meta, 0, "shared-value", 12));
+  const auto fixed = [](std::string_view text) {
+    std::string value(16, '\0');
+    std::memcpy(value.data(), text.data(), text.size());
+    return value;
+  };
+  const std::string shared_value = fixed("shared-value");
+  assert(star::TwoPLPashaHelper::kv_shared_write(
+      meta, 0, shared_value.data(), shared_value.size()));
   assert(meta->ref_cnt == 0);
-  assert(meta->value_len == 12);
   assert(meta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index));
-  char out[13] = {};
-  assert(star::TwoPLPashaHelper::kv_shared_read(meta, 1, out, 12));
-  assert(std::string(out, 12) == "shared-value");
+  char out[16] = {};
+  assert(star::TwoPLPashaHelper::kv_shared_read(meta, 1, out, sizeof(out)));
+  assert(std::string(out, sizeof(out)) == shared_value);
   assert(meta->ref_cnt == 0);
   assert(fake.writes == 1 && fake.finish_bits == 1 && fake.finishes == 0 &&
          fake.prepares == 0 && fake.reads == 1);
@@ -124,7 +131,8 @@ int main() {
   star::TwoPLPashaHelper::kv_unpin_shared_ref(meta);
   assert(meta->ref_cnt == 0);
 
-  assert(star::TwoPLPashaHelper::kv_shared_write(meta, 0, "0", 1));
+  const std::string zero = fixed("0");
+  assert(star::TwoPLPashaHelper::kv_shared_write(meta, 0, zero.data(), zero.size()));
   std::vector<std::thread> incrementers;
   for (std::size_t host = 0; host < 4; ++host) {
     incrementers.emplace_back([&, host] {
@@ -135,12 +143,10 @@ int main() {
           if (star::TwoPLPashaHelper::kv_shared_update(
                   meta, host % 2, 16,
                   [](const std::string &current, std::string *replacement) {
-                    int value = 0;
-                    const auto parsed = std::from_chars(
-                        current.data(), current.data() + current.size(), value);
-                    assert(parsed.ec == std::errc{} &&
-                           parsed.ptr == current.data() + current.size());
-                    *replacement = std::to_string(value + 1);
+                    int64_t value = 0;
+                    assert(tigonkv::engine::DecodeCanonicalFixedDecimal(current, &value));
+                    assert(tigonkv::engine::EncodeCanonicalFixedDecimal(
+                        value + 1, current.size(), replacement));
                     return true;
                   },
                   &changed))
@@ -153,10 +159,9 @@ int main() {
   }
   for (auto &thread : incrementers) thread.join();
   char incremented[16] = {};
-  uint32_t incremented_size = 0;
   assert(star::TwoPLPashaHelper::kv_shared_read_value(
-      meta, 0, incremented, sizeof(incremented), &incremented_size));
-  assert(std::string(incremented, incremented_size) == "1000");
+      meta, 0, incremented, sizeof(incremented)));
+  assert(std::string(incremented, sizeof(incremented)) == fixed("1000"));
   assert(meta->ref_cnt == 0 && meta->get_reader_count() == 0 &&
          !meta->is_write_locked());
 
@@ -166,7 +171,8 @@ int main() {
     meta->lock();
     meta->set_write_locked();
     meta->unlock();
-    assert(!star::TwoPLPashaHelper::kv_shared_write(meta, 0, "x", 1));
+    const std::string x = fixed("x");
+    assert(!star::TwoPLPashaHelper::kv_shared_write(meta, 0, x.data(), x.size()));
     meta->lock();
     meta->clear_write_locked();
     meta->unlock();
@@ -178,7 +184,8 @@ int main() {
     std::thread stalled_writer([&] {
       simulator.BeginScope(latency_sim::ScopeKind::kForeground);
       writer_started.store(true, std::memory_order_release);
-      assert(!star::TwoPLPashaHelper::kv_shared_write(meta, 0, "y", 1));
+      const std::string y = fixed("y");
+      assert(!star::TwoPLPashaHelper::kv_shared_write(meta, 0, y.data(), y.size()));
       simulator.EndScopeAndDelay();
     });
     while (!writer_started.load(std::memory_order_acquire))
@@ -188,10 +195,9 @@ int main() {
     meta->decrease_reader_count();
     meta->unlock();
     char readable[16] = {};
-    uint32_t readable_size = 0;
     assert(star::TwoPLPashaHelper::kv_shared_read_value(
-        meta, 0, readable, sizeof(readable), &readable_size));
-    assert(readable_size > 0);
+        meta, 0, readable, sizeof(readable)));
+    assert(std::string(readable, sizeof(readable)) == fixed("1000"));
 
     meta->lock();
     meta->set_write_locked();

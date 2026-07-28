@@ -100,7 +100,6 @@ struct alignas(64) PrivateRow {
   uint8_t is_migrated = 0;
   uint8_t is_tombstone = 0;
   uint16_t key_len = 0;
-  uint32_t value_len = 0;
   uint64_t version = 0;
   RegionOffset migrated_smeta_off = kNullOffset;
   // Intrusive PolicyClock list links in owner-private SWCC (§11.14).

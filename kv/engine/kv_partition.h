@@ -37,8 +37,8 @@ class KVPartition {
                                               FixedKeyComparator,
                                               std::equal_to<RegionOffset>>;
   // Shared leaf = smeta RegionOffset only (PLAN / TwoPLPasha CXL table). Length
-  // Shared leaf stores RegionOffset to HWCC smeta. Logical length lives in
-  // TwoPLPashaMetadataShared::value_len (HWCC) for non-owner CXL access.
+  // Shared leaf stores RegionOffset to HWCC smeta. Payload width is the
+  // partition's fixed_value_size_, so no logical value length is persisted.
   using SharedTree = PrivateTree;
 
   KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,

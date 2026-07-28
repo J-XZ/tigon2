@@ -124,8 +124,6 @@ struct TwoPLPashaMetadataShared {
                 tigonkv::engine::mem_access::HwccWrite(&flags, sizeof(flags));
                 tigonkv::engine::mem_access::HwccWrite(&ref_cnt, sizeof(ref_cnt));
                 tigonkv::engine::mem_access::HwccWrite(
-                    &value_len, sizeof(value_len));
-                tigonkv::engine::mem_access::HwccWrite(
                     migration_policy_meta, sizeof(migration_policy_meta));
         }
 
@@ -431,18 +429,6 @@ retry:
                 --ref_cnt;
         }
 
-        uint32_t get_value_len() const {
-                tigonkv::engine::mem_access::HwccRead(
-                    &value_len, sizeof(value_len));
-                return value_len;
-        }
-
-        void set_value_len(uint32_t value) {
-                tigonkv::engine::mem_access::HwccWrite(
-                    &value_len, sizeof(value_len));
-                value_len = value;
-        }
-
         // bit 63: latch bit
         // bit 62 - 47: software cache-coherence metadata
         // bit 46 - 42: read lock bits
@@ -458,7 +444,6 @@ retry:
         uint8_t flags{ 0 };
         // multi-host accessors pin this; move-out requires ref_cnt == 0
         uint8_t ref_cnt{ 0 };
-        uint32_t value_len{ 0 };
         char migration_policy_meta[MigrationManager::migration_policy_meta_size]{};
 };
 
@@ -543,15 +528,14 @@ class TwoPLPashaHelper {
         static bool kv_shared_read_value(TwoPLPashaMetadataShared *smeta,
                                          std::size_t host_id, void *dest,
                                          std::size_t capacity,
-                                         uint32_t *value_size,
                                          bool ref_already_pinned = false)
         {
-                if (smeta == nullptr || scc_manager == nullptr ||
-                    value_size == nullptr) return false;
+                if (smeta == nullptr || scc_manager == nullptr || capacity == 0)
+                        return false;
                 smeta->lock();
                 auto *scc_data = smeta->get_scc_data();
-                const uint32_t size = smeta->get_value_len();
-                if (size > capacity || smeta->is_write_locked() ||
+                const uint64_t size = capacity;
+                if (smeta->is_write_locked() ||
                     smeta->get_reader_count() == smeta->get_reader_count_max() ||
                     (!ref_already_pinned &&
                      smeta->get_ref_cnt() ==
@@ -586,7 +570,6 @@ class TwoPLPashaHelper {
                 }
                 smeta->decrease_reader_count();
                 smeta->unlock();
-                if (valid) *value_size = size;
                 return valid;
         }
 
@@ -626,7 +609,6 @@ class TwoPLPashaHelper {
                 if (!smeta->is_bit_set(host_bit))
                         smeta->set_bit(host_bit);
                 smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                smeta->set_value_len(static_cast<uint32_t>(size));
                 scc_manager->finish_write_bits(smeta, host_id);
                 smeta->unlock();
                 scc_manager->flush_scc_data(scc_data, size);
@@ -650,9 +632,8 @@ class TwoPLPashaHelper {
                         return false;
                 smeta->lock();
                 auto *scc_data = smeta->get_scc_data();
-                const uint32_t size = smeta->get_value_len();
-                if (size > capacity ||
-                    !smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) ||
+                const uint64_t size = capacity;
+                if (!smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) ||
                     smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
                     smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
@@ -678,8 +659,8 @@ class TwoPLPashaHelper {
                 bool write = false;
                 try {
                         write = mutator(current, &replacement);
-                        if (write && replacement.size() > capacity)
-                                throw std::length_error("shared update exceeds value capacity");
+                        if (write && replacement.size() != capacity)
+                                throw std::length_error("shared update requires fixed value size");
                 } catch (...) {
                         tigonkv::engine::mem_access::DelayActiveScopeNow();
                         smeta->lock();
@@ -696,7 +677,6 @@ class TwoPLPashaHelper {
                                               replacement.data(), replacement.size());
                         smeta->lock();
                         smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                        smeta->set_value_len(static_cast<uint32_t>(replacement.size()));
                         scc_manager->finish_write_bits(smeta, host_id);
                         smeta->unlock();
                         scc_manager->flush_scc_data(scc_data, replacement.size());

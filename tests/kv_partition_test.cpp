@@ -49,9 +49,9 @@ tigonkv::engine::DualRegionConfig Config() {
   return config;
 }
 
-std::string FixedDecimal(std::string_view decimal) {
+std::string FixedValue(std::string_view text) {
   std::string value(128, '\0');
-  std::memcpy(value.data(), decimal.data(), decimal.size());
+  std::memcpy(value.data(), text.data(), text.size());
   return value;
 }
 
@@ -148,7 +148,7 @@ int main() {
     assert(done.load(std::memory_order_acquire) == 2);
     std::string raced;
     assert(partition.GetPrivate("race-key", &raced));
-    assert(raced == "a" || raced == "b");
+    assert(raced == FixedValue("a") || raced == FixedValue("b"));
     bool cas_exchanged = false;
     bool cas_inserted = false;
     assert(partition.CompareExchangePrivate("race-cas", "", "created",
@@ -169,7 +169,7 @@ int main() {
   assert(regions.IsInOwnerPrivateArena(
       regions.swcc().FromOffset(private_arena->private_root), 5));
   std::string value;
-  assert(partition.GetPrivate("alpha", &value) && value == "updated");
+  assert(partition.GetPrivate("alpha", &value) && value == FixedValue("updated"));
   for (uint32_t i = 0; i < 256; ++i) {
     char key[32];
     std::snprintf(key, sizeof(key), "tree-split-%08u", i);
@@ -178,7 +178,7 @@ int main() {
   for (uint32_t i = 0; i < 256; ++i) {
     char key[32];
     std::snprintf(key, sizeof(key), "tree-split-%08u", i);
-    assert(partition.GetPrivate(key, &value) && value == "tree-value");
+    assert(partition.GetPrivate(key, &value) && value == FixedValue("tree-value"));
     assert(partition.DeletePrivate(key));
   }
   PassthroughScc scc;
@@ -210,10 +210,10 @@ int main() {
   simulator.Configure(latency);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   assert(partition.PutPrivate("latency-only", "payload"));
-  assert(partition.GetPrivate("latency-only", &value) && value == "payload");
+  assert(partition.GetPrivate("latency-only", &value) && value == FixedValue("payload"));
   std::vector<std::pair<std::string, std::string>> latency_scan;
   assert(partition.ScanOwned("latency-only", 1, &latency_scan));
-  assert(latency_scan.size() == 1 && latency_scan[0].second == "payload");
+  assert(latency_scan.size() == 1 && latency_scan[0].second == FixedValue("payload"));
   std::vector<std::string> latency_scan_keys;
   assert(partition.ScanOwnedKeys("latency-only", 1, &latency_scan_keys));
   assert(latency_scan_keys.size() == 1 &&
@@ -233,11 +233,11 @@ int main() {
   const uint64_t migration_in_before_alpha =
       regions.layout().partitions[5].migration_in_seq.load();
   assert(partition.PromotePrivate("alpha", 1));
-  assert(partition.GetPrivate("alpha", &value) && value == "updated");
+  assert(partition.GetPrivate("alpha", &value) && value == FixedValue("updated"));
   // Once migrated, PUT must update the shared SCC authority rather than the
   // retained private locator row.
   assert(!partition.PutPrivate("alpha", "shared-update"));
-  assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
+  assert(partition.GetPrivate("alpha", &value) && value == FixedValue("shared-update"));
   assert(regions.layout().partitions[5].migration_in_seq.load() ==
          migration_in_before_alpha + 1);
   const auto hwcc_before_moveout = regions.layout().domains[
@@ -245,7 +245,7 @@ int main() {
   const auto swcc_before_moveout = regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load();
   assert(partition.MoveOutPrivate("alpha", 1));
-  assert(partition.GetPrivate("alpha", &value) && value == "shared-update");
+  assert(partition.GetPrivate("alpha", &value) && value == FixedValue("shared-update"));
   assert(ebr.drain_quiescent() > 0);
   assert(regions.layout().domains[
       static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load() < hwcc_before_moveout);
@@ -267,7 +267,7 @@ int main() {
   assert(!partition.GetPrivate("gamma", &value));
   assert(ebr.drain_quiescent() > 0);
   assert(partition.PutPrivate("gamma", "replacement"));
-  assert(partition.GetPrivate("gamma", &value) && value == "replacement");
+  assert(partition.GetPrivate("gamma", &value) && value == FixedValue("replacement"));
   bool exchanged = false;
   assert(partition.CompareExchangePrivate("gamma", "replacement", "cas-private", &exchanged));
   assert(exchanged);
@@ -276,15 +276,15 @@ int main() {
   assert(partition.PromotePrivate("gamma", 1));
   assert(partition.CompareExchangePrivate("gamma", "cas-private", "cas-shared", &exchanged));
   assert(exchanged);
-  assert(partition.GetPrivate("gamma", &value) && value == "cas-shared");
-  assert(partition.PutPrivate("counter", FixedDecimal("1")));
+  assert(partition.GetPrivate("gamma", &value) && value == FixedValue("cas-shared"));
+  assert(partition.PutPrivate("counter", FixedValue("1")));
   int64_t incremented = 0;
   assert(partition.IncrementPrivate("counter", 2, &incremented) && incremented == 3);
-  assert(partition.GetPrivate("counter", &value) && value == FixedDecimal("3"));
+  assert(partition.GetPrivate("counter", &value) && value == FixedValue("3"));
   assert(partition.IncrementPrivate("new-counter", -2, &incremented) && incremented == -2);
-  assert(partition.GetPrivate("new-counter", &value) && value == FixedDecimal("-2"));
+  assert(partition.GetPrivate("new-counter", &value) && value == FixedValue("-2"));
   assert(partition.CompareExchangePrivate("new-cas", "", "created", &exchanged));
-  assert(exchanged && partition.GetPrivate("new-cas", &value) && value == "created");
+  assert(exchanged && partition.GetPrivate("new-cas", &value) && value == FixedValue("created"));
 
   // Fresh move-in starts with second_chance=1; ClockAdvanceCursor wraps so the
   // same eviction pass can clear the chance then move the victim out.
@@ -297,7 +297,7 @@ int main() {
       (1024ULL * 1024ULL * 1024ULL - star::CXL_EBR::max_ebr_retiring_memory) / 2);
   assert(partition.MoveOutClockVictim(1));
   assert(partition.migrated_key_count() == migrated_before_clock - 1);
-  assert(partition.GetPrivate("clock", &value) && value == "victim");
+  assert(partition.GetPrivate("clock", &value) && value == FixedValue("victim"));
   latency_sim::Config budget_counter_latency;
   budget_counter_latency.enabled = true;
   budget_counter_latency.foreground_enabled = true;
@@ -323,7 +323,7 @@ int main() {
   assert(!partition.MoveOutPrivate("pinned", 1));
   star::TwoPLPashaHelper::kv_unpin_shared_ref(pinned);
   assert(partition.MoveOutPrivate("pinned", 1));
-  assert(partition.GetPrivate("pinned", &value) && value == "hold");
+  assert(partition.GetPrivate("pinned", &value) && value == FixedValue("hold"));
 
   // Pin failure (write_locked) must leave *pinned_existing null so Serve
   // cannot mismatched-unpin and wrap uint8_t ref_cnt under NDEBUG.
@@ -374,14 +374,14 @@ int main() {
   std::vector<std::pair<std::string, std::string>> scan;
   assert(partition.ScanOwned("alpha", 0, &scan));
   assert(scan.size() == 8);
-  assert(scan[0] == std::make_pair(std::string("alpha"), std::string("shared-update")));
-  assert(scan[1] == std::make_pair(std::string("clock"), std::string("victim")));
-  assert(scan[2] == std::make_pair(std::string("counter"), FixedDecimal("3")));
-  assert(scan[3] == std::make_pair(std::string("gamma"), std::string("cas-shared")));
-  assert(scan[4] == std::make_pair(std::string("new-cas"), std::string("created")));
-  assert(scan[5] == std::make_pair(std::string("new-counter"), FixedDecimal("-2")));
-  assert(scan[6] == std::make_pair(std::string("pinfail"), std::string("x")));
-  assert(scan[7] == std::make_pair(std::string("pinned"), std::string("hold")));
+  assert(scan[0] == std::make_pair(std::string("alpha"), FixedValue("shared-update")));
+  assert(scan[1] == std::make_pair(std::string("clock"), FixedValue("victim")));
+  assert(scan[2] == std::make_pair(std::string("counter"), FixedValue("3")));
+  assert(scan[3] == std::make_pair(std::string("gamma"), FixedValue("cas-shared")));
+  assert(scan[4] == std::make_pair(std::string("new-cas"), FixedValue("created")));
+  assert(scan[5] == std::make_pair(std::string("new-counter"), FixedValue("-2")));
+  assert(scan[6] == std::make_pair(std::string("pinfail"), FixedValue("x")));
+  assert(scan[7] == std::make_pair(std::string("pinned"), FixedValue("hold")));
   assert(partition.ScanOwned("alpha", 2, &scan));
   assert(scan.size() == 2);
   assert(scan[0].first == "alpha" && scan[1].first == "clock");
@@ -444,9 +444,9 @@ int main() {
   }
   assert(partition.ScanOwned("m1", 3, &scan));
   assert(scan.size() == 3);
-  assert(scan[0] == std::make_pair(std::string("m1"), std::string("shared-m1")));
-  assert(scan[1] == std::make_pair(std::string("m2"), std::string("priv-m2")));
-  assert(scan[2] == std::make_pair(std::string("m3"), std::string("priv-m3")));
+  assert(scan[0] == std::make_pair(std::string("m1"), FixedValue("shared-m1")));
+  assert(scan[1] == std::make_pair(std::string("m2"), FixedValue("priv-m2")));
+  assert(scan[2] == std::make_pair(std::string("m3"), FixedValue("priv-m3")));
 
   // Migration is not a logical mutation: repeated owner scans must retain
   // every stable key exactly once while rows move between private and shared.
@@ -482,7 +482,7 @@ int main() {
     assert(scan.size() == moving_keys.size());
     for (size_t i = 0; i < scan.size(); ++i) {
       assert(scan[i].first == moving_keys[i]);
-      assert(scan[i].second == "stable");
+      assert(scan[i].second == FixedValue("stable"));
       if (i != 0) assert(scan[i - 1].first < scan[i].first);
     }
     ++scan_rounds;
@@ -513,7 +513,8 @@ int main() {
     star::scc_manager = &attached_scc;
     tigonkv::engine::KVPartition attached(attached_regions, attached_ebr, 5, 1, true, true);
     std::string child_value;
-    if (!attached.GetPrivate("alpha", &child_value) || child_value != "shared-update") _exit(1);
+    if (!attached.GetPrivate("alpha", &child_value) ||
+        child_value != FixedValue("shared-update")) _exit(1);
     if (attached.GetPrivate("beta", &child_value)) _exit(1);
     _exit(0);
   }
