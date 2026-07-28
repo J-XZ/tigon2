@@ -18,9 +18,9 @@ enum class KvMessageType : uint8_t {
   kPut = 1,
   kGet = 2,
   kDelete = 3,
-  kIncrement = 4,
-  // Single-packet CAS_FWD (§10.5). Value carries expected||desired sizes.
-  kCas = 5,
+  // Values 4 and 5 were current-only forwarded Increment/CAS messages.
+  // They remain intentionally unused so the original wire slots are not
+  // repurposed; receiving either is malformed.
   // Former two-phase CAS commit; reserved / malformed if received.
   kCasCommitReserved = 6,
   kResponse = 7,
@@ -170,36 +170,6 @@ inline bool DecodeScanMigrateResponse(std::string_view value, uint32_t *partitio
   if (!ConsumeLe32(&value, partition_id) || value.size() != 2) return false;
   *exhausted = value[0] != 0;
   if (no_predecessor != nullptr) *no_predecessor = value[1] != 0;
-  return true;
-}
-
-// Single-packet CAS_FWD payload (§10.5).
-inline bool EncodeCasRequest(std::string_view expected, std::string_view desired,
-                             std::string *out) {
-  if (out == nullptr) return false;
-  constexpr size_t kMax = 1024;
-  if (8 + expected.size() + desired.size() > kMax) return false;
-  out->clear();
-  out->reserve(8 + expected.size() + desired.size());
-  AppendLe32(out, static_cast<uint32_t>(expected.size()));
-  AppendLe32(out, static_cast<uint32_t>(desired.size()));
-  out->append(expected);
-  out->append(desired);
-  return true;
-}
-
-inline bool DecodeCasRequest(std::string_view value, std::string_view *expected,
-                             std::string_view *desired) {
-  if (expected == nullptr || desired == nullptr) return false;
-  uint32_t expected_size = 0;
-  uint32_t desired_size = 0;
-  if (!ConsumeLe32(&value, &expected_size) || !ConsumeLe32(&value, &desired_size))
-    return false;
-  if (value.size() !=
-      static_cast<size_t>(expected_size) + static_cast<size_t>(desired_size))
-    return false;
-  *expected = value.substr(0, expected_size);
-  *desired = value.substr(expected_size);
   return true;
 }
 

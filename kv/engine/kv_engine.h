@@ -91,8 +91,6 @@ class KVEngine {
                  std::string *response_value, uint32_t owner);
   // TwoPLPasha DATA_MIGRATION: ask owner to move_row_in, then requester CXL-accesses.
   Status RequestMigrate(std::string_view key);
-  CasResult ForwardCompareExchange(std::string_view key, std::string_view expected,
-                                   std::string_view desired);
   struct PendingResponse {
     std::mutex mutex;
     std::condition_variable cv;

@@ -412,10 +412,11 @@ StatusCode KVPartition::InsertRemotePlaceholder(std::string_view key,
         const auto clear_adjacent = [&](std::atomic<uint64_t> *slot,
                                         bool clear_next) {
           if (slot == nullptr) return true;
-          auto *metadata = reinterpret_cast<PrivateMetadataLocal *>(slot);
-          // KvPartitionTable supplies resolved metadata for adjacent callbacks;
-          // its search() slot is never used here.
-          if (metadata == nullptr) return false;
+          // insert_and_process_adjacent_tuples follows the original ITable
+          // contract and supplies ValueStruct::meta, unlike the resolved
+          // local-metadata arguments of search_and_update_next_key_info.
+          auto *value = reinterpret_cast<PrivateValueStruct *>(slot);
+          auto *metadata = MetadataFromValue(value);
           LockRow(metadata);
           bool ok = true;
           if (metadata->is_migrated) {

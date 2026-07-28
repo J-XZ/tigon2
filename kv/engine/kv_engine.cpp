@@ -1,5 +1,7 @@
 #include "kv/engine/kv_engine.h"
 
+#include "kv/engine/fixed_value.h"
+
 #include "common/CXL_EBR.h"
 #include "common/MPSCRingBuffer.h"
 #include "kv/engine/kv_partition.h"
@@ -199,8 +201,6 @@ bool ValidMessageType(KvMessageType type) {
   switch (type) {
     case KvMessageType::kPut:
     case KvMessageType::kDelete:
-    case KvMessageType::kIncrement:
-    case KvMessageType::kCas:
     case KvMessageType::kResponse:
     case KvMessageType::kMigrate:
     case KvMessageType::kScanMigrate:
@@ -869,8 +869,11 @@ CasResult KVEngine::CompareExchange(std::string_view key,
     if (visible == nullptr)
       return {Status::Error(StatusCode::kCorruption, "missing visible partition"), false};
     bool exchanged = false;
-    const SharedAccessState state = visible->CompareExchangeShared(
-        key, config_.node_id, expected, desired, &exchanged);
+    auto compare_shared = [&] {
+      return visible->CompareExchangeShared(key, config_.node_id, expected,
+                                            desired, &exchanged);
+    };
+    SharedAccessState state = compare_shared();
     if (state == SharedAccessState::kDone) {
       if (exchanged) {
         shared_puts_.fetch_add(1, std::memory_order_relaxed);
@@ -882,8 +885,40 @@ CasResult KVEngine::CompareExchange(std::string_view key,
     }
     if (state == SharedAccessState::kRetry)
       return {Status::Error(StatusCode::kBusy, "shared cas contention"), false};
-    // Shared miss: single CAS_FWD with combined payload (§10.5).
-    return ForwardCompareExchange(key, expected, desired);
+    // Match original remote write acquisition: owner only moves an existing
+    // row in; requester then takes the shared write/ref path itself.
+    const Status migrated =
+        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+    if (migrated.ok()) {
+      state = compare_shared();
+      if (state == SharedAccessState::kDone) {
+        if (exchanged) {
+          shared_puts_.fetch_add(1, std::memory_order_relaxed);
+          shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return {exchanged ? Status::Ok()
+                          : Status::Error(StatusCode::kCompareFailed,
+                                          "expected value differs"),
+                exchanged};
+      }
+      return {Status::Error(state == SharedAccessState::kRetry
+                                ? StatusCode::kBusy
+                                : StatusCode::kCorruption,
+                            "migrated shared CAS unavailable"),
+              false};
+    }
+    if (migrated.code != StatusCode::kNotFound || !expected.empty())
+      return {migrated, false};
+    // The established empty-expected create sentinel shares REMOTE_INSERT;
+    // it does not revive a separate owner-side CAS protocol.
+    const Status inserted =
+        Forward(KvMessageType::kPut, key, desired, nullptr, route.owner);
+    if (!inserted.ok()) return {inserted, false};
+    if (!visible->PublishRemotePlaceholder(key, config_.node_id))
+      return {Status::Error(StatusCode::kBusy,
+                            "remote CAS placeholder publication failed"),
+              false};
+    return {Status::Ok(), true};
   }
   try {
     bool exchanged = false;
@@ -916,8 +951,10 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
     if (visible == nullptr)
       return {Status::Error(StatusCode::kCorruption, "missing visible partition"), 0};
     int64_t shared = 0;
-    const SharedAccessState state =
-        visible->IncrementShared(key, config_.node_id, delta, &shared);
+    auto increment_shared = [&] {
+      return visible->IncrementShared(key, config_.node_id, delta, &shared);
+    };
+    SharedAccessState state = increment_shared();
     if (state == SharedAccessState::kDone) {
       shared_puts_.fetch_add(1, std::memory_order_relaxed);
       shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
@@ -925,15 +962,35 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
     }
     if (state == SharedAccessState::kRetry)
       return {Status::Error(StatusCode::kBusy, "shared increment contention"), 0};
-    std::string value;
-    const auto status = Forward(KvMessageType::kIncrement, key,
-                                std::to_string(delta), &value, route.owner);
-    if (!status.ok()) return {status, 0};
-    int64_t result = 0;
-    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
-    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
-      return {Status::Error(StatusCode::kCorruption, "malformed forwarded increment response"), 0};
-    return {Status::Ok(), result};
+    const Status migrated =
+        Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
+    if (migrated.ok()) {
+      state = increment_shared();
+      if (state == SharedAccessState::kDone) {
+        shared_puts_.fetch_add(1, std::memory_order_relaxed);
+        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
+        return {Status::Ok(), shared};
+      }
+      return {Status::Error(state == SharedAccessState::kRetry
+                                ? StatusCode::kBusy
+                                : StatusCode::kCorruption,
+                            "migrated shared increment unavailable"),
+              0};
+    }
+    if (migrated.code != StatusCode::kNotFound) return {migrated, 0};
+    std::string initial;
+    if (!EncodeCanonicalFixedDecimal(delta, config_.fixed_value_size, &initial))
+      return {Status::Error(StatusCode::kInvalidArgument,
+                            "increment value exceeds fixed value size"),
+              0};
+    const Status inserted =
+        Forward(KvMessageType::kPut, key, initial, nullptr, route.owner);
+    if (!inserted.ok()) return {inserted, 0};
+    if (!visible->PublishRemotePlaceholder(key, config_.node_id))
+      return {Status::Error(StatusCode::kBusy,
+                            "remote increment placeholder publication failed"),
+              0};
+    return {Status::Ok(), delta};
   }
   try {
     int64_t value = 0;
@@ -1224,28 +1281,6 @@ Status KVEngine::AwaitResponse(
   }
 }
 
-CasResult KVEngine::ForwardCompareExchange(std::string_view key,
-                                           std::string_view expected,
-                                           std::string_view desired) {
-  const uint32_t owner = RouteForKey(key).owner;
-  std::string payload;
-  if (!EncodeCasRequest(expected, desired, &payload))
-    return {Status::Error(StatusCode::kInvalidArgument,
-                          "CAS payload exceeds single-packet capacity"),
-            false};
-  const uint64_t request_id = NextRequestId(config_.node_id);
-  auto pending = RegisterPendingResponse(request_id);
-  try {
-    SendTransportMessage(MakeRequest(KvMessageType::kCas, config_.node_id, owner,
-                                     request_id, key, payload));
-  } catch (...) {
-    RemovePendingResponse(request_id);
-    throw;
-  }
-  const Status status = AwaitResponse(request_id, pending, nullptr);
-  return {status, status.ok()};
-}
-
 void KVEngine::StartInboundDemuxer() {
   inbound_demuxer_worker_id_ = config_.foreground_worker_count_per_vm;
   inbound_demuxer_stop_.store(false, std::memory_order_release);
@@ -1500,29 +1535,11 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
   if (message.type == KvMessageType::kPut ||
       message.type == KvMessageType::kDelete ||
       message.type == KvMessageType::kMigrate ||
-      message.type == KvMessageType::kScanMigrate ||
-      message.type == KvMessageType::kIncrement ||
-      message.type == KvMessageType::kCas)
+      message.type == KvMessageType::kScanMigrate)
     MarkLayoutDirty();
   if (partition == nullptr) {
     throw std::runtime_error("request routed to a non-owner node");
   }
-  bool check_migration_budget = false;
-  auto promote_updated_row = [&] {
-    bool moved_in = false;
-    const StatusCode migrated =
-        partition->EnsureInShared(key, config_.node_id, &moved_in);
-    if (migrated == StatusCode::kNotFound)
-      throw std::runtime_error(
-          "updated owner row disappeared before move-in");
-    if (migrated == StatusCode::kOk) {
-      check_migration_budget = true;
-      if (moved_in) {
-        migration_in_.fetch_add(1, std::memory_order_relaxed);
-        shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-      }
-    }
-  };
   if (message.type == KvMessageType::kPut) {
     try {
       response.status = static_cast<uint32_t>(
@@ -1565,59 +1582,10 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
     }
-  } else if (message.type == KvMessageType::kIncrement) {
-    int64_t delta = 0;
-    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), delta);
-    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) {
-      response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
-    } else {
-      try {
-        int64_t result = 0;
-        bool inserted = false;
-        if (!partition->IncrementPrivate(key, delta, &result, &inserted)) {
-          response.status = static_cast<uint32_t>(StatusCode::kNotFound);
-        } else {
-          if (!inserted) promote_updated_row();
-          const std::string encoded = std::to_string(result);
-          response.status = static_cast<uint32_t>(StatusCode::kOk);
-          response.value_size = static_cast<uint32_t>(encoded.size());
-          std::memcpy(response.value.data(), encoded.data(), encoded.size());
-        }
-      } catch (const std::invalid_argument &) {
-        response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
-      }
-    }
-  } else if (message.type == KvMessageType::kCas) {
-    std::string_view expected;
-    std::string_view desired;
-    if (!DecodeCasRequest(value, &expected, &desired)) {
-      response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
-    } else {
-      try {
-        bool exchanged = false;
-        bool inserted = false;
-        if (!partition->CompareExchangePrivate(key, expected, desired, &exchanged,
-                                               &inserted))
-          response.status = static_cast<uint32_t>(StatusCode::kNotFound);
-        else {
-          if (!inserted) promote_updated_row();
-          response.status = static_cast<uint32_t>(
-              exchanged ? StatusCode::kOk : StatusCode::kCompareFailed);
-        }
-      } catch (const std::invalid_argument &) {
-        response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
-      } catch (const std::runtime_error &e) {
-        response.status = static_cast<uint32_t>(
-            std::string_view(e.what()).find("busy") != std::string_view::npos
-                ? StatusCode::kBusy
-                : StatusCode::kCorruption);
-      }
-    }
   } else {
     throw std::runtime_error("unsupported request message type");
   }
   SendTransportMessage(response);
-  if (check_migration_budget) EnforceMigrationBudget(*partition);
 }
 
 void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
