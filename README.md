@@ -31,9 +31,10 @@ results, never as real CXL hardware performance.
 The default experiment paths come from `experiment_config.jsonc`
 (`shared_memory.path` / `device_path`, `vm.storage_path`). `scripts/vm/*` only
 inspects or reuses an existing topology and deliberately refuses to start/reboot
-VMs, configure networking, or change host tuning. The authoritative redesign plan
-is [PLAN.md](PLAN.md); do not treat older slot-layout notes (if found in git
-history) as the current target architecture.
+VMs, configure networking, or change host tuning. The authoritative next-step
+construction plan is [partition优化方案.md](partition优化方案.md); it describes
+the target, not features already completed. Do not treat older slot-layout notes
+(if found in git history) as the current target architecture.
 
 Build and local verification:
 

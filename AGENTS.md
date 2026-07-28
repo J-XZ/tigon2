@@ -7,14 +7,15 @@ SCC、Clock/MigrationManager 和 EBR；不要把它重写成另一套 KV。
 
 ## 先读什么
 
-1. `当前对比口径.md`：当前已实现路径和正式实验口径，优先级最高。
-2. `PLAN.md`：冻结的设计决策和验收要求。
-3. `Scan原始Tigon对齐修改方案.md`：架构审计、Scan/点操作方案和原实现位置。
-4. `延迟插入审计报告.md`：修改内存访问或延迟模拟前必读。
-5. `YCSB指南.md`：正式 4VM 实验入口。
+1. `partition优化方案.md`：下一步唯一施工合同；其中目标不能误报为已实现。
+2. `当前对比口径.md`：当前已实现路径和现有实验口径。
+3. `延迟插入审计报告.md`：修改内存访问或延迟模拟前必读。
+4. `YCSB指南.md`：正式 4VM 实验入口。
 
 旧日志、旧分支叙事和 legacy benchmark 不能覆盖源码与上述当前真值。
 跨仓比较或修改一致性/延迟规则前，同时阅读 `../cxlkv/AGENTS.md`。
+原始 Tigon 的唯一代码基准是本仓当前 `master` 分支头部；施工时直接用
+`git show master:<path>` 和 `git diff master...HEAD` 对照，不使用历史硬编码 SHA。
 
 ## 当前架构
 
@@ -40,8 +41,11 @@ SCC、Clock/MigrationManager 和 EBR；不要把它重写成另一套 KV。
 
 - HWCC 承担跨 VM 同步；所有跨 VM latch/ref/state/root 必须使用正确的原子、
   锁和 `mem_access` wrapper。
-- SWCC 不具备跨 VM coherence。非 owner 不得直接读取 owner-private SWCC；
-  shared SWCC payload 只能经 SCC 状态、flush/invalidate 和 HWCC 元数据保护。
+- shared SWCC 不具备跨 VM CPU cache coherence或原子性；跨节点同步字段不得
+  放在其中，shared payload只能经SCC状态、flush/invalidate和HWCC元数据保护。
+- owner-private SWCC只由所属VM访问，同VM多CPU核心具备正常硬件cache coherence
+  和CPU原子性；原本地OLC/atomic/spinlock应保留，仅把持久指针改为RegionOffset。
+  非owner不得读取该区域，也不得给它额外套SCC或跨节点锁。
 - 共享布局只保存 `RegionOffset`，禁止发布进程虚拟地址。
 - private/shared/migration 任一时刻只有一个权威版本；move-in/out 必须保持
   locator、pin、reader/writer、adjacency 和 EBR 回收顺序。
@@ -81,6 +85,11 @@ SCC、Clock/MigrationManager 和 EBR；不要把它重写成另一套 KV。
   内容，不做无关重构。
 - 优先用 `rg` 定位，并用最小修改复用现有代码。生产代码新增量应克制；清理只删
   已被新路径完全替代的脚手架和死状态。
+- 修 bug 必须先取得最小复现或 Debug/GDB 证据，并对照 `master` 同一函数。只修
+  直接根因；不得由一个 bug 扩散为消息骨架、并发模型、allocator、恢复机制或
+  相邻模块的重写。若补丁需要新增平行状态机，应停止并回到原路径做薄适配。
+- `master` 中生产相关的内存放置 TODO 必须在新布局兑现；只能机械移动字段和
+  调整访问域，不能借 TODO 发明缓存、镜像或后台同步协议。
 - 并发 stall/死锁必须用 Debug 构建和 gdb 确认线程与锁位置，不能靠猜测。
 - 修 bug 后先重复触发项和相邻协议测试，再跑标准测试；若改了延迟相关路径，
   先完成延迟审计再进入性能/综合测试。

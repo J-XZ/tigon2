@@ -1,1255 +1,1172 @@
-# TigonKV 最小化范围分区与原架构对齐方案
+# TigonKV 后续原架构对齐施工方案
 
-## 1. 目标
+## 1. 文档用途
 
-本项目不是重新设计一个新的 CXL KV，也不追求工业级容错。目标是在尽量保留
-原始 Tigon 数据面实现的前提下，完成以下最小改造：
+本文只记录当前 `my-work` 在下一步仍需完成的修改，不再保留已完成工作、历史
+审计过程或旧架构方案。工作 agent 应逐项完成本文，不能把“方案中已有描述”
+误报成“代码已经实现”。
 
-1. 去除昂贵的通用 transaction、读写集、commit/abort 消息和多表调度；
-2. 对外提供与 cxlkv 可对齐的单表 KV 接口：
-   `Put/Get/Delete/Scan/CAS/Increment`，支持字符串 key；
-3. 将原来位于计算节点本地 DRAM、且随数据量增长的私有数据结构，移动到
-   SWCC 无一致性共享内存区域中该节点的私有部分；
-4. 保留原始 Tigon 的 owner-private、CXL shared、按需 move-in/out、
-   TwoPLPasha、SCC、Clock、EBR 和 B+Tree；
-5. 将当前分支新增的 FNV hash key 分区改回原始 Tigon YCSB 默认的范围分区；
-6. 与 cxlkv 使用相同的 trace、字符串 key bytes、KV 大小、VM/worker、
-   内存容量、NUMA 和延迟配置，保证比较口径公平。
-
-优先级为：
-
-```text
-复用原始实现 > 最小薄适配 > 新增独立实现
-```
-
-如果原 Tigon 已有对应算法或状态机，应直接调用或做很薄的 RegionOffset/SWCC
-适配，不重新实现一份“等价”版本。原始实现本身存在的性能特点不属于本项目的
-优化对象。
-
-允许新增代码的职责仅限：
-
-- 单表字符串 KV 门面；
-- 字符串 key到原 `FixedKey` 的编码；
-- range配置和 `key → partition`；
-- process pointer到 `RegionOffset` 的持久化适配；
-- 双区域 allocator绑定；
-- 去事务层后所需的最小请求/响应编排。
-
-其余职责优先落回原 `common/btree_olc*`、`TwoPLPashaHelper`、
-`TwoPLPashaSCCWriteThrough`、`PolicyClock/MigrationManager` 和 `CXL_EBR`。
-
-### 1.1 原始 Tigon 的唯一对照提交
-
-本项目认定的原始 Tigon 代码基线是：
-
-```text
-ccd567a50116b7bada06df71a3bf0a07c424572e
-Author: cszjyang
-Date:   2026-07-13
-Title:  Fix CXL B+Tree page-size accounting
-```
-
-工作 agent 不能凭当前代码注释猜测“原始语义”。每次改动前必须直接查看该
-提交，至少使用：
-
-```bash
-git show ccd567a50116b7bada06df71a3bf0a07c424572e:protocol/TwoPLPasha/TwoPLPashaExecutor.h
-git show ccd567a50116b7bada06df71a3bf0a07c424572e:protocol/TwoPLPasha/TwoPLPashaHelper.h
-git show ccd567a50116b7bada06df71a3bf0a07c424572e:protocol/TwoPLPasha/TwoPLPashaMessage.h
-git show ccd567a50116b7bada06df71a3bf0a07c424572e:protocol/Pasha/PolicyClock.h
-git diff ccd567a50116b7bada06df71a3bf0a07c424572e -- <本次修改文件>
-```
-
-原路径的职责来源固定如下：
-
-1. `TwoPLPashaExecutor::setupHandlers()`：owner/remote 点查、写锁请求和
-   单-partition Scan；
-2. `TwoPLPasha::{write_and_replicate,release_lock,release_migrated_rows}`：
-   update、锁释放和迁移 pin 生命周期；
-3. `TwoPLPashaMessage::data_migration_request_for_scan_handler()`：
-   owner range move-in（包含右边界）；
-4. `TwoPLPashaHelper`：local/remote row lock、SCC read/write、
-   move-in/out及 adjacency维护；
-5. `PolicyClock`：second-chance、cursor、budget和迁移 tracker；
-6. `TableBTreeOLC`、`CXLTableBTreeOLC`、`BTreeOLC_CXL`：本地/共享索引和
-   Scan遍历。
-
-若本文与基线代码冲突，以基线的算法和时序为准；只有 SWCC/HWCC 内存纪律、
-外部单表字符串接口和与 cxlkv 的共同实验合同可以覆盖基线。
-
-### 1.2 本轮关键路径审计结论与方案冻结
-
-本轮从前台 GET/PUT/DELETE/SCAN 入口逐层对照上述提交。审计确认当前代码中
-仍有四类不应保留为目标架构的自研路径：
-
-1. remote PUT miss当前是“owner先写，再 promote”；原始路径是“owner
-   move-in，requester再走shared write”；
-2. `KVPartition`自行实现了neighborhood/adjacency状态机，未直接复用原
-   `ITable`相邻元组回调和`TwoPLPashaHelper`分支；
-3. `TwoPLPashaHelper::kv_*`加入了`writer_waiting`和多层固定次数自旋，
-   改变了原行锁策略；
-4. Scan重新实现了owner/CXL扫描、分页证明和锁生命周期，复用原
-   `TwoPLPashaExecutor`/migration handler不充分。
-
-本文后续章节已经将这些缺口改成“抽取并复用原路径”的施工要求。最终目标仍是：
-
-- 外部单表字符串 KV 接口；
-- 原计算节点私有结构迁入节点私有 SWCC；
-- 去除通用事务和多表热路径；
-- 恢复原始 RANGE partition；
-- 复用原 B+Tree/TwoPLPasha/SCC/Clock/EBR；
-- 只为 cxlkv 接口增加顺序跨 partition Scan编排；
-- 功能稳定后再审计软件延迟。
-
-方案在此冻结。实现阶段不再主动增加缓存、索引、线程、证书、恢复协议或通用
-抽象。只有测试或 GDB 证明本文的某项假设与真实代码冲突时，才对对应小节做
-局部修正，不能借机扩大架构。
-
-冻结前的最后一轮复核重新逐项检查了：
-
-```text
-facade → range route → owner/remote index → row lock/ref
-→ SCC/private value → migration/Clock → transport response
-→ unlock/unpin/EBR → stats/layout dirty → latency settlement
-```
-
-GET、PUT（含remote insert）、DELETE（含remote delete）和Scan（含缺失start、
-空partition及跨partition）均能落到本文指定的原始primitive或明确的最小适配；
-本轮未再发现需要补充的架构分支。这里“冻结”的是实施方案，不表示当前代码已经
-完成这些修改。
-
-## 2. 目标架构
-
-### 2.1 单逻辑表，保留多个 partition
-
-对外只暴露一个 KV namespace，固定：
-
-```text
-table_id = 0
-```
-
-内部仍保留多个 partition。partition 是原 Tigon 的数据放置、owner、B+Tree、
-Clock 和迁移单位，不是多张逻辑表。不能为了简化接口把所有数据改成一棵全局
-共享树。
-
-### 2.2 内存区域
-
-保持当前双区域设计：
-
-```text
-节点私有 SWCC：
-  private B+Tree node
-  private B+Tree root offset
-  PrivateRow / private value
-  private allocator 状态
-  Clock tracker link/head/tail/cursor/count
-
-HWCC：
-  shared B+Tree
-  shared metadata / smeta
-  root publication
-  EBR metadata
-  transport ring
-  全局布局和必要的跨 VM 原子状态
-
-共享 SWCC：
-  move-in 后的 shared payload
-  通过原 WriteThrough SCC 维护跨 VM 可见性
-
-进程本地 DRAM：
-  有界 handle、线程状态、临时消息和临时结果
-  不保存随 KV 数量或迁移行数增长的第二份索引/行/Clock tracker
-```
-
-这里的“节点私有 SWCC”表示内存物理上位于共享映射的 SWCC 区，但只允许 owner
-节点访问。它替代原始 Tigon 的节点本地 DRAM，不因此变成跨 VM 共享权威源。
-
-每个 partition使用一个持久 `OwnerPrivateControl`（可直接扩展现有
-`OwnerPrivateArenaHeader`，不新增平行对象）保存：
-
-```text
-private_root
-clock_head
-clock_tail
-clock_cursor
-migrated_key_count
-private arena allocator state
-```
-
-HWCC `PartitionDirectoryEntry` 只保留 remote确实需要的 shared root、迁移发布
-序号、arena offset和布局状态，不保存上述 owner-only mutable状态的第二份
-镜像。owner attach时从自己的private control重建private tree handle；non-owner
-只构造shared tree handle，不遍历private SWCC。
-
-这是对当前实现仍需完成的一项架构对齐，不是额外优化。它直接复用现有
-owner-private arena header和RegionOffset，只移动字段和绑定位置，不新增
-allocator、索引或锁。
-
-初始化继续复用现有layout state/ready barrier：transport、shared roots及每个
-owner的private root/control全部发布前保持`kInitializing`；全部partition ready
-后才标`kClean`。attach进程只等待该现有屏障，不增加恢复协议。不能在root尚未
-发布时先标clean，也不能让non-owner代建private tree。
-
-### 2.3 去除事务层时保留的数据规则
-
-删除的是通用 transaction 外壳，不是底层并发控制：
-
-- 不再构造通用 transaction、读写集和 commit protocol；
-- 一个 KV API 调用就是一个逻辑操作；
-- 保留 B+Tree OLC、row latch、TwoPLPasha metadata、SCC、EBR；
-- 单 key 操作仍提供强一致语义；
-- Scan 沿用原 Tigon 的逐 partition 并发语义，不额外承诺跨 partition
-  全局 snapshot。
-
-Busy 对应原 transaction abort/retry。只在 KV API 逻辑边界保留一层重试，
-不要在 helper、engine、owner handler和 trace runner分别套多层重试。
-
-checkpoint/layout dirty是改造层会计，不得成为每次前台读的固定成本。只在实际
-发生private/shared写、insert/delete或move-in/out时，将本进程local dirty
-gate从false切到true并发布一次layout dirty；纯owner GET、warm shared GET和
-无需迁移的Scan不调用`MarkLayoutDirty()`。若一次读触发cold move-in，由owner
-的migration primitive在真正修改布局时标记，不由requester预先标记。
-
-### 2.4 复用边界：不再维护“功能等价”的第二套协议
-
-施工时按以下顺序选择实现，不能直接跳到第3级：
-
-1. **直接调用原函数**：原签名能用时，不加包装；
-2. **从原调用者抽取公共函数**：逻辑目前内嵌在
-   `TwoPLPashaExecutor`或`TwoPLPashaMessage`时，将原函数体原样抽成公共
-   primitive，让legacy调用者和KV门面都调用它；不要复制一份到
-   `KVPartition`；
-3. **机械薄适配**：只允许把raw pointer改成`RegionOffset`、把allocator
-   绑定到owner-private SWCC/HWCC、把YCSB key换成`FixedKey`，以及去掉
-   Transaction参数。每处必须注释对应的基线文件和函数。
-
-只有前三种都不可行时才允许自己实现。新增前必须在commit message或施工记录中
-写出一段“不可复用证明”，明确：
-
-1. 已检查的基线函数和调用点；
-2. 直接调用为什么不可行；
-3. 抽取公共primitive为什么仍不可行；
-4. 薄适配为什么不能表达；
-5. 新代码只补哪个最小缺口，以及如何逐分支对照基线。
-
-缺少这五项时，review应直接拒绝新增实现。不能以“当前KV代码已经能跑”、
-“原接口麻烦”或“新写更清楚”作为无法复用的理由。
-
-禁止以下做法：
-
-- 在`KVPartition`重新写一套相邻行锁定、adjacency刷新或Scan完整性算法；
-- 在`kv_engine.cpp`重新写Clock victim选择；
-- 用新的`kv_shared_*`大函数复制原remote lock/read/update/release状态机；
-- 为减少RPC把原“move-in后requester访问CXL”合并成owner代做读写；
-- 因原函数签名不方便就保留两套长期并行实现。
-
-允许保留的新增模块只有：
-
-```text
-RangePartitioner          字符串范围路由
-SingleTableKvFacade       Put/Get/Delete/Scan 外部接口和唯一 Busy retry
-RegionAllocatorBinding    原树/行/Clock对象的内存域绑定与offset解析
-KvTransportAdapter        原migration请求在当前ring上的定长封装
-GlobalScanSequencer       顺序调用原单-partition Scan
-```
-
-`KVEngine`只做上述编排，`KVPartition`最终只做partition handle、offset解析和
-原primitive调用。若一个成员函数同时包含B+Tree遍历、row协议、迁移决策和
-重试循环，说明它仍在重复造轮子，应继续下沉到原组件。
-
-### 2.5 私有表的最小内存适配
-
-原`TableBTreeOLC`依赖进程heap和raw pointer，不能原样持久化到任意地址映射的
-owner-private SWCC。这里不新写树，使用仓库原有的
-`BTreeOLC_CXL`/`CXLTableBTreeOLC`作为offset-safe载体，并绑定
-owner-private allocator。它与shared tree的区别只有allocation domain和
-访问权限。
-
-这是一个明确的不可直接复用点：load和run可能由不同进程attach同一pool，
-`mmap(nullptr,...)`地址不保证相同；原`BTreeOLC`的child/row raw pointer会
-失效。为它新增固定虚拟地址合同或attach时全树rebase，比复用仓库已有
-offset-safe树改动更大，也会引入额外实验约束，所以不采用。这里复用的是原
-Tigon本来就用于CXL的树，不允许再写第三棵树。
-
-如果`BTreeOLC_CXL`缺少原`BTreeOLC`的
-`insert_and_process_adjacent_tuples`、`remove_and_process_adjacent_keys`
-或`lookupForNextKeyUpdate`，只能从基线`BTreeOLC.h`机械移植对应函数，保持
-同一leaf锁范围、回调时点和返回语义；禁止用树外
-`lookupAdjacent + 多把row latch + 重新确认`替代。
-
-私有行元数据保留原`TwoPLPashaMetadataLocal`语义字段：
-
-```text
-tid / valid / migrated / modified_since_move_out / latch
-```
-
-其中`migrated_row`和Clock链改成`RegionOffset`；不保存跨进程raw pointer。
-key/value仍为实验配置规定的定长bytes。外部字符串key经`FixedKey::From`
-零填充；正式trace本身使用32B space-padded key。Put/CAS的value必须恰好等于
-`fixed_value_size`，Get/Scan返回同样定长的value。不要为短value另存长度，
-因为cxlkv共同实验也使用定长KV。
-
-不要为了当前门面另发明`tombstone/version/value_len/writer_waiting`状态；若
-某字段确因EBR或原协议无法表达，必须先完成§2.4的不可复用证明。
-
-shared metadata仍以原`TwoPLPashaMetadataShared`位布局和SCC为主体。因SWCC
-不能提供跨VM原子一致性，跨VM reader/ref等同步状态必须留在HWCC；这是对
-原布局的必要内存域修正，不授权改变锁策略。
-
-## 3. 恢复原始范围分区
-
-### 3.1 原始实现依据
-
-原始 Tigon YCSB 默认使用：
-
-```text
-partition = key / keysPerPartition       // RANGE
-```
-
-ROUND_ROBIN 才是：
-
-```text
-partition = key % partition_count
-```
-
-`HashReplicatedPartitioner` 中的 Hash 只描述 partition 到 coordinator 的映射：
-
-```text
-owner = partition_id % coordinator_count
-```
-
-它不负责对 key 做 hash。当前：
-
-```text
-FNV1a(key) % partition_count
-```
-
-是改造分支新增的偏差，应删除。
-
-### 3.2 配置
-
-在全局 `experiment_config.jsonc` 中增加：
-
-```jsonc
-"tigon_kv": {
-  "partition_count": 4,
-  "partitioning": {
-    "strategy": "range",
-    "ranges": [
-      { "lower_key": "",  "upper_key": "g" },
-      { "lower_key": "",  "upper_key": "n" },
-      { "lower_key": "n", "upper_key": "t" },
-      { "lower_key": "t", "upper_key": ""  }
-    ]
-  }
-}
-```
-
-每个数组元素对应一个稳定 `partition_id`，表示前闭后开区间：
-
-```text
-[lower_key, upper_key)
-```
-
-空边界规则：
-
-- 第一个 `lower_key=""` 表示负无穷；
-- 最后一个 `upper_key=""` 表示正无穷；
-- 内部相邻边界只有一侧为空时，复制另一侧的值；
-- 内部相邻边界两侧都为空时配置无效；
-- 两侧都非空时必须相等。
-
-启动时只做必要校验：
-
-1. range 数量等于 `partition_count`；
-2. 首尾覆盖完整 keyspace；
-3. 内部边界连续；
-4. canonical 边界严格递增；
-5. key 长度不超过 `fixed_key_size`；
-6. `partition_count <= 256` 且能被 `vm_count` 整除。
-
-配置错误直接停止启动。不增加自动修复、动态学习、在线 split/merge 或 hash
-fallback。
-
-### 3.3 字符串 key 顺序
-
-外部接口继续接受 `std::string_view`。内部复用当前 `FixedKey`：
-
-```text
-FixedKey::From(key, fixed_key_size)
-FixedKey::Compare()  // bytewise memcmp
-```
-
-范围路由和 private/shared B+Tree 必须使用完全相同的 bytewise 顺序。禁止：
-
-- 在 Tigon 一侧解析 `user<数字>` 后缀；
-- trim space；
-- locale/natural sort；
-- 为路由重新 hash；
-- 使用与 B+Tree 不同的 comparator。
-
-正式 YCSB 与 cxlkv共同使用右填 space 的 32B trace key。范围配置记录的是实际
-字节顺序中的 split sentinel，不要求边界本身一定是已存在 key。配置和实验
-metadata应记录 canonical hex，便于确认不可见尾随字节。
-
-### 3.4 唯一路由实现
-
-只保留一个很小的范围路由 helper：
-
-```text
-partition = upper_bound(canonical_split_points, FixedKey(key))
-owner     = partition % vm_count
-```
-
-边界 key等于 split point时进入右侧 partition，符合 `[lower, upper)`。
-
-`KVEngine::RouteForKey`、`KVStore::StablePartitionForKey`、owner handler、
-Forward、migration、MoveOut和 Scan都复用该 helper。不要添加 route cache、
-radix tree、per-worker route table或第二份 Python 路由算法。
-
-canonical split points 在启动时从配置构造，运行时放在进程本地只读内存。
-每次操作不读取共享 route table，也不插入软件 CXL 延迟。
-
-### 3.5 持久布局身份
-
-范围配置改变了 key的 owner，旧 hash pool不能继续 attach。做最小处理：
-
-1. bump shared layout version；
-2. 在 layout header记录 strategy、partition count和 canonical range digest；
-3. reset节点在发布 ready前写入；
-4. attach节点比较 digest，不匹配则要求 reset。
-
-这是实验室项目，不必为了理论 hash碰撞再持久化一套完整 8KiB split表。各 VM
-使用同一份同步配置文件，digest用于防止明显的配置错配；运行时真正的范围仍以
-本地解析后的配置为准。
-
-## 4. GET/PUT/DELETE：逐条复用原始点操作
-
-范围修改只替换`key → partition`，不能顺便改点操作协议。所有下述操作在
-`SingleTableKvFacade`进入一次`LatencyScope`和一次Busy retry；engine/helper/
-owner handler不再叠加8次、64次、256次等独立预算。原函数内部为完成一次CAS、
-取锁或SCC步骤所需的短循环不属于API重试，但不得演化成等待整次操作成功。
-
-### 4.1 共用行访问 primitive
-
-不要继续扩张`TwoPLPashaHelper::kv_shared_read/write/update`。应把原函数组合
-成四个很薄的单操作primitive：
-
-```text
-LocalRead:
-  take_read_lock_and_read → copy result → read_lock_release
-
-LocalWrite:
-  take_write_lock_and_read → update → write_lock_release
-
-RemoteRead:
-  get/pin migrated row → remote_take_read_lock_and_read
-  → copy result → remote_read_lock_release → decrease ref
-
-RemoteWrite:
-  get/pin migrated row → remote_take_write_lock_and_read
-  → remote_update → remote_write_lock_release → decrease ref
-```
-
-API调用就是原transaction边界，所以锁从取到结果/写入完成后释放，不能跨API
-保留。实现方式优先为给原Helper增加`PrivateRowView/RegionOffset`薄重载，并让
-新旧入口共享同一内部函数；不复制SCC bit、reader/write lock和finish-write
-顺序。
-
-写操作仍保留原TID推进，而不是用新`version++`替代。每个worker只保存一个
-有界DRAM `max_tid`；单key操作取得行原tid后，按原`generate_tid`的单行退化式
-生成`max(row_tid, worker_max_tid)+1`，再调用原带`new_value/commit_tid`的
-write-lock release。原`generate_epoch_version`依赖已明确剥离的logger/global
-transaction epoch，不为单key KV恢复；这是去事务层的薄化，不是另起版本协议。
-不能恢复transaction read/write set，也不能静默停止更新tid。
-
-必须删除当前新增策略：
-
-- `TwoPLPashaMetadataShared::writer_waiting`；
-- shared helper内部等待reader drain的256次循环；
-- engine内8次循环和trace runner的额外Busy循环；
-- Scan value read的64次循环和5秒deadline。
-
-这些不是原TwoPLPasha锁语义，会改变竞争分布和实验耗时。竞争失败统一返回
-Busy，由唯一KV API边界重试并调用`PollTransport`；corrupt/malformed仍
-hard-fail，不能转成Busy。
-
-### 4.2 GET 施工卡
-
-原始依据是基线`TwoPLPashaExecutor.h`中的`lock_request_handler`以及
-`TwoPLPashaHelper::{take_read_lock_and_read,
-remote_take_read_lock_and_read,remote_read_lock_release}`。
-
-owner路径：
-
-1. `RangePartitioner`定位partition并确认本VM为owner；
-2. 原private B+Tree查找；
-3. 未迁移行走`LocalRead`；
-4. 已迁移行沿private locator中的smeta offset走同一个Helper的migrated分支；
-5. 在API返回前释放读锁；NotFound只来自稳定的private tree miss/invalid。
-
-non-owner路径：
-
-1. 只访问该partition的原`CXLTable`；
-2. shared hit时pin，走`RemoteRead`，release/unpin后返回；
-3. 竞争、正在move-out或不稳定entry返回Busy，不能误判为miss；
-4. 稳定shared miss时发送原`DATA_MIGRATION_REQUEST`语义的`kMigrate`；
-5. owner只调用`MigrationManager::move_row_in(..., inc_ref=false)`，不返回value；
-6. requester收到成功响应后从步骤1重试CXL；owner NotFound才返回NotFound；
-7. OnDemand move-out保持基线handler的
-   `move-in → 构造/入队response → move_row_out`顺序，不增加等待requester
-   probe完成的额外保护。
-
-不得增加owner-read RPC fallback、shared/owner双读或本地value cache。
-
-针对性验收：owner private hit、remote cold miss→move-in→CXL read、warm CXL
-hit、move-out竞争返回Busy后重试、真实NotFound。
-
-### 4.3 PUT 施工卡
-
-原始依据是同一`lock_request_handler(write_lock=true)`，以及基线
-`TwoPLPasha::{write_and_replicate,release_lock,release_migrated_rows}`中的
-`update/remote_update`顺序。
-
-owner路径：
-
-1. private树miss时按原`insert_and_update_next_key_info`语义锁住next key、
-   插入placeholder、更新相邻bit，再发布valid并在本次API结束前释放next-key
-   write lock；
-2. private树hit且未迁移时走`LocalWrite`；
-3. private locator显示已迁移时走原Helper的migrated write/SCC分支；
-4. 保持upsert外部语义，但不为普通owner update主动move-in。
-
-non-owner shared hit直接走`RemoteWrite`。shared miss不能再直接
-`Forward(kPut)`并由owner“写完后promote”，而必须：
-
-```text
-kMigrate(existing key)
-  ├─ Ok       → requester重新probe并RemoteWrite
-  ├─ NotFound → 原 REMOTE_INSERT_REQUEST/RESPONSE
-  └─ Busy/OOM → 返回到唯一API retry/错误处理
-```
-
-remote insert必须复用基线message handler：
-
-1. owner用`insert_and_update_next_key_info(..., require_lock_next=false)`插入
-   invalid placeholder；
-2. owner立即`move_row_in(..., inc_ref=true)`；
-3. requester收到response后在shared tuple上发布valid；
-4. 本次API结束时释放迁移ref；
-5. 如果NotFound判定后发生并发insert，owner返回Busy/AlreadyExists让唯一API
-   边界重试，不能改成owner覆盖后promote。
-
-因此要删除`ServeTransportRequest(kPut)`中的`promote_updated_row()`，并把
-`kPut`收敛为上述原remote insert framing；普通existing update不再进入该
-handler。
-
-这会恢复原Tigon“remote write在requester的CXL路径执行”的网络和CXL开销，
-避免用少一次原始步骤的捷径美化TigonKV。
-
-针对性验收：owner insert/update、remote warm shared update、remote cold
-existing key必须出现move-in后shared update、remote新key placeholder→move-in
-→requester valid publication、
-同key并发upsert以及SCC跨VM可见性。
-
-### 4.4 DELETE 施工卡
-
-原始依据是基线
-`TwoPLPashaHelper::delete_and_update_next_key_info()`和
-`PolicyClock::delete_specific_row_and_move_out()`。外部单keyDelete是原
-Tigon不单独提供的必要门面，因此只增加owner转发，不新建删除协议。
-
-owner本地路径：
-
-1. 按原“read and delete”规则对目标行取得write lock；未找到返回NotFound，
-   竞争返回Busy；
-2. 通过`KvPartitionTable`调用
-   `PolicyClock::delete_specific_row_and_move_out(table,key,true)`；
-3. 被删除行的write lock随对象删除结束，不再对退休对象调用unlock；失败路径
-   必须释放已取得的write lock。
-
-non-owner路径复用原remote scan-delete的顺序，而不是让owner代做全部工作：
-
-1. shared miss先走`kMigrate`，NotFound直接返回；
-2. requester对shared row取得原remote write lock和ref；
-3. requester按`remote_modify_tuple_valid_bit(...,false)`发布无效；
-4. 发送原`REMOTE_DELETE_REQUEST`语义的`kDelete`；
-5. owner调用
-   `PolicyClock::delete_specific_row_and_move_out(table,key,false)`，完成private
-   locator、shared index、Clock和EBR清理；
-6. 原消息没有完成响应；为单API强一致只增加一个ack，owner清理完成后才返回。
-   ack不携带value或额外状态。
-
-两条路径最终都进入原delete callback，在B+Tree相邻元组回调的原锁范围内更新
-prev/next real bit、使tuple无效、删除索引并退休对象。当前
-`KVPartition::DeletePrivate()`绕过PolicyClock的路径应删除。adapter只把raw
-pointer替换为offset，并把原先`CHECK(existing)`改成外部Delete所需的NotFound；
-Busy异常原样上浮。
-
-不允许用通用`BreakAdjacency/RefreshAdjacency`重新推导bit。删除时每个bit的
-置/清必须与基线callback逐分支一致。non-owner也不能直接从shared tree完成
-物理删除，因为owner private tree仍是唯一locator和Clock/EBR权威。
-
-针对性验收：private行删除、migrated行删除、remote删除、NotFound、Delete与
-Get/Put/move-out并发，以及删除后相邻range Scan。
-
-### 4.5 Insert、move-in/out与adjacency复用
-
-当前`LockNeighborhood/BreakAdjacencyLocked/RefreshAdjacencyLocked`属于平行
-状态机，应由以下原路径替代：
-
-- insert：`TwoPLPashaHelper::insert_and_update_next_key_info`；
-- move-in：`move_from_btree_to_shared_region`；
-- move-out：`move_from_btree_to_partition`；
-- delete：`delete_and_update_next_key_info`；
-- 树结构原子范围：`ITable`的insert/remove/search adjacent callbacks。
-
-为owner-private SWCC使用`BTreeOLC_CXL`时，按§2.5机械补齐缺失的树回调，
-然后让`KvPartitionTable`真正delegate这些**生产路径需要**的方法。只有仍不被
-生产路径使用的多表/serialize接口才hard-fail。`tableType()`必须返回
-`ITable::BTREE`。
-
-不得保留“原callback一套 + KVPartition neighborhood一套”作为fallback。
-迁移、insert和delete全部切换并通过测试后，一次性删除旧neighborhood实现及
-仅覆盖它的测试。
-
-### 4.6 Clock/ITable 薄适配
-
-Clock的intrusive tracker、head/tail/cursor/count放在owner-private SWCC，
-链指针改为RegionOffset；这是必要的地址适配。算法仍由原`PolicyClock`拥有：
-
-- per-row`ClockMeta::second_chance`会被remote reader写，必须随smeta留在HWCC；
-- `move_row_in/move_row_out/access_row/delete_specific_row_and_move_out`
-  保留原入口；
-- budget gate、second-chance清零、cursor前进、victim move-out和停止条件按
-  基线顺序；
-- `KVPartition::ClockEvictUntilUnderBudget`整段策略循环删除；
-- 删除shared-payload 90% watermark触发的`force_at_least_one`淘汰；基线在
-  SCC enabled时`DATA_ALLOCATION`不计入`TOTAL_HW_CC_USAGE`，不能新增第二个
-  policy gate；
-- `KVPartition`只提供offset版tracker容器操作和move callback；
-- 不恢复进程heap的`ClockTrackerNode`，也不增加第二份tracker。
-
-原Clock在持tracker lock时执行move-in/out/delete callback，这是原始并发和
-性能特征，应保留。KV callback内部不得再次取得Clock lock或自行untrack；
-callback返回后仍由PolicyClock按原顺序track/untrack。只有Debug+GDB证明
-offset适配造成无法消除的锁重入时，才可按§2.4提交不可复用证明并做最小两阶段
-调整，不能先以“缩短临界区”为由优化。second-chance、cursor和budget行为始终
-不能改变。
-
-Clock输入会计必须复用基线类别：shared index、smeta及基线本来计入的misc进入
-`TOTAL_HW_CC_USAGE`；SCC payload、transport、owner-private和纯allocator
-control不因为物理上有容量限制就混入policy counter。物理HWCC/SWCC完整用量
-仍单独统计并与cxlkv披露。shared payload真实分配失败返回OOM，不能以隐藏
-watermark改变Clock；正式配置应保证共同工作集落在双方相同物理容量内。
-
-### 4.7 CAS/Increment的继承规则
-
-本轮不另行设计CAS/Increment。它们必须继承PUT的route、shared hit、cold
-move-in、唯一Busy retry和SCC写入规则，仅在持原write lock期间执行定长值
-变换。禁止为它们保留另一套`kv_shared_update`竞争策略。
-
-## 5. Scan：从原始单-partition路径做最薄的跨区拼接
-
-### 5.1 原始语义和唯一允许的提取
-
-原始 `TwoPLPashaExecutor` 的一个 Scan request只处理一个 `partition_id`：
-
-1. 本地 owner扫描 private table；
-2. 远端先扫描 CXL shared tree；
-3. 用 next/prev adjacency bit判断范围是否完整；
-4. 不完整时向该 partition owner请求 range move-in；
-5. owner只 move-in行和右边界，不返回 value；
-6. requester收到响应后重新扫描 CXL。
-
-当前正式代码不应继续以`ScanOwned/ScanOwnedKeys/ProbeSharedScanPage`重新表达
-这套算法。施工时从基线做一次机械提取：
-
-```text
-TwoPLPashaScanPrimitive::ScanLocalPartition
-  ← 原 TwoPLPashaExecutor local_scan_processor
-
-TwoPLPashaScanPrimitive::ScanRemotePartition
-  ← 原 TwoPLPashaExecutor remote_scan_processor
-
-TwoPLPashaScanPrimitive::MoveInRange
-  ← 原 data_migration_request_for_scan_handler
-```
-
-legacy executor/message handler和新KV门面都调用这三个primitive；不能只复制
-给KV目标。提取时保留：
-
-- 原`table->scan`/`CXLTable::scan`入口；
-- 原`is_last_tuple`、limit和右边界判断；
-- `key==min → next_real`、limit boundary `→ prev_real`、中间行
-  `→ prev_real && next_real`的分支顺序；
-- local/remote read lock和remote ref pin；
-- incomplete/Busy时对已取得锁和pin的完整清理；
-- owner扫描结果和`limit + 1`右边界、逐行
-  `move_row_in(...,false)`，允许删除竞态；
-- OnDemand `move_row_out(partition)`调用位置。
-
-只因外部接口没有`max_key`，partition内的`max_key`使用当前partition的
-exclusive upper boundary；最后一partition使用正无穷sentinel。不得增加
-generation certificate、owner value流或CXL/owner双源归并。
-
-原benchmark通常用已存在的`min_key`，而cxlkv接口允许start落在两个key之间。
-对此只增加一个边界适配：owner range move-in先查找并迁入`start`左侧最近的
-predecessor anchor（若存在），再迁入结果和右边界。这样第一个结果行仍由原
-`prev_real`证明，不需要新证书。若该partition确实没有predecessor，owner响应
-只带一个`at_partition_begin`位，remote predicate把它视为`key==min`同等的
-左边界。该位只对本次重试有效，不持久化、不参与mutation generation。
-
-### 5.2 当前全局 KV Scan
-
-cxlkv/YCSB-cpp对外接口是：
-
-```text
-Scan(start_key, limit)
-```
-
-它没有显式 partition参数。因此只增加一层顺序编排：
-
-```text
-p = PartitionForKey(start_key)
-scan partition p from start_key
-while result不足且 p exhausted:
-    p = p + 1
-    scan partition p from its lower boundary
-```
-
-范围 partition互不重叠且全局有序，所以结果直接 append：
-
-- 不创建所有 partition的 Source；
-- 不预先 probe全部 partition；
-- 不使用 priority queue；
-- 不静默去重；
-- 不把部分 CXL行与 owner返回行混合。
-
-每个partition primitive直接接收`remaining_limit`，与原Scan request一致。
-不能保留固定64行分页，也不能使用hash k路归并时期的
-`ceil(limit / partition_count)`；二者都会人为增加range-migration RPC并改变
-原锁生命周期。`limit==0`只受外部合同已有的1,048,576安全上限约束。
-
-这层跨 partition顺序拼接是兼容 cxlkv接口的必要薄适配，不宣称是原始 Tigon
-单个 Scan primitive。它仍不提供跨 partition全局 snapshot。
-
-每次进入下一个partition时，start直接取配置中的canonical lower boundary。
-不要用“上一条key + 1”、字符串后缀解析或heap去重。单partition primitive只
-需返回`exhausted`；不存在生产路径分页cursor或continuation证书。
-
-### 5.3 Scan锁和一致性边界
-
-原Scan对结果行以及右侧next tuple取read lock，并在transaction结束时释放。
-去掉transaction后，一次`Scan(start,limit)`就是事务边界：
-
-1. 单partition primitive在构造该partition结果期间保留原result-row和
-   next-key锁；
-2. 该partition结果已复制到调用者DRAM后统一释放锁和remote ref；
-3. incomplete、Busy、迁移重试或异常必须通过RAII guard释放已取得资源；
-4. 为避免重新引入跨partition transaction，进入下一partition前释放上一
-   partition资源；
-5. 因而仍不承诺跨partition全局snapshot，但每个单partition片段保留原
-   next-key/phantom边界。
-
-不能像当前实现一样逐行读完立即释放后继续遍历，也不能持有全部partition的锁
-直到全局Scan返回。前者弱于原单partition语义，后者又人为增强并放大锁开销。
-
-### 5.4 远端Scan的完整状态机
-
-对每个remote partition只允许以下循环：
-
-```text
-CXLTable::scan
-  ├─ complete + rows → 返回本partition结果
-  ├─ complete + EOF  → partition exhausted
-  ├─ incomplete      → kScanMigrate(owner MoveInRange) → 重新 CXLTable::scan
-  └─ contention      → Busy，交给唯一API retry
-```
-
-`kScanMigrate`响应不带value，owner不得在响应中返回部分row。response和
-move-out严格保持基线message handler的
-`move-in rows → 构造/入队response → OnDemand move_row_out`顺序。不能为了
-减少重试增加“等requester probe完成再淘汰”的新pin或确认消息；ring只负责把
-原response framing映射到当前transport。
-
-一次range move-in迁入predecessor anchor、最多`remaining_limit`条结果和一条
-右边界，与原handler的limit语义一致。原始逻辑对空range假定较强，新外部接口
-必须支持空partition；最小适配是在owner的原private scan响应中返回
-`exhausted`和上述`at_partition_begin`，而不是创建分页cursor、generation或
-mutation-state证明协议。
-
-### 5.5 删除被替代的改造代码
-
-范围 Scan落地时删除直接被替代的代码：
-
-- FNV key routing；
-- all-partition Source和heap merge；
-- `ScanSharedComplete`；
-- `SharedMutationState/shared_mutation_state` certificate路径；
-- 仅为旧 certificate存在的测试；
-- 不走 adjacency正式路径的旧 `ScanShared` helper。
-- `ScanOwned/ScanOwnedKeys/ProbeSharedScanPage`中被抽取的平行状态机；
-- 当前宽松`no_predecessor`、owner generation、固定64行分页、5秒deadline和
-  64次value read循环；若需要边界位，只保留§5.1严格定义的
-  `at_partition_begin`。
-
-保留原始实现文件以及正式路径仍使用的 helper。不要以“清理”为由重构
-B+Tree、SCC、Clock、EBR或其他未参与比较的原始源码。
-
-## 6. 公平比较约束
-
-### 6.1 主实验
-
-TigonKV和cxlkv必须使用：
-
-- 完全相同的 YCSB-cpp trace文件；
-- 相同的实际字符串 key bytes；
-- 相同 fixed key/value大小，正式口径为 32B/32B；
-- 相同 4VM×4 foreground worker；
-- 相同共享内存、HWCC/SWCC容量和NUMA位置；
-- 相同 build type、CPU绑定和软件延迟配置；
-- 相同 load/run计时边界。
-
-TigonKV额外的 inbound demuxer必须作为额外 CPU资源披露：
-
-```text
-foreground=4
-demuxer=1
-```
-
-不能通过减少 worker、关闭SCC、关闭migration、关闭Clock或改变trace分配来提高
-通过率或吞吐。
-
-### 6.2 范围选择
-
-范围边界是 Tigon原设计所需的先验知识，由用户在实验前确定。允许在
-prepare-only阶段统计 load trace在各范围中的 key数量，用于发现明显倾斜，但：
-
-- 不根据 run访问频率优化边界；
-- 不在每轮自动重新生成；
-- 不按 owner重排 worker trace；
-- 不在 Tigon一侧使用cxlkv没有的 key解析捷径。
-
-当前 owner-private SWCC仍按 partition固定分配 arena。为最小化改造，本方案
-不重写 allocator；正式范围应使 load key数量大致均衡，并在报告中披露
-per-partition key数量。若某个 arena会明显溢出，调整实验范围，不在本次改造中
-新增动态 extent借用器。
-
-### 6.3 原始 Tigon native结果
-
-如果需要额外展示原始 `key / keysPerPartition` 语义，可以生成
-order-preserving定宽 key trace作为附录，但同一 trace也必须提供给cxlkv。
-native附录与共同 YCSB-cpp主实验分开报告。
-
-## 7. 工作 agent 施工顺序
-
-以下是依赖顺序，不是可任选的待办列表。每一步只提交本步骤需要的改动；先通过
-针对性功能测试，再进入下一步。不得在旧自研路径上继续修补，最后才尝试切换。
-
-### 7.1 第0步：建立对照清单
-
-1. 记录开始时HEAD和`git status --short`，保留用户已有dirty文件；
-2. 用§1.1命令将基线四条路径保存为本次审查依据；
-3. 对当前生产调用图运行：
-
-```bash
-rg -n "KVStore::(Get|Put|Delete|Scan)|KVEngine::(Get|Put|Delete|Scan)"
-rg -n "kv_shared_|LockNeighborhood|RefreshAdjacency|ClockEvict|ScanOwned|ProbeShared"
-```
-
-4. 为每个待删除的current-only函数记录调用者；无调用者后才删除；
-5. 此时软件延迟保持disabled，不修改埋点。
-
-### 7.2 第1步：固定内存和表适配层
-
-1. 扩展现有`OwnerPrivateArenaHeader`，移入private root和Clock control；
-2. 从HWCC `PartitionDirectoryEntry`删除这些owner-only mutable字段；
-3. private tree继续使用原`BTreeOLC_CXL`代码，allocator binding改为
-   owner-private SWCC；
-4. 按§2.5从基线`BTreeOLC`机械补齐缺失的adjacent callback，逐函数核对
-   leaf lock范围；
-5. 把`PrivateRow`收敛为原`TwoPLPashaMetadataLocal`语义+offset字段；
-6. `KvPartitionTable`的生产所需`search/scan/insert/remove/adjacent`方法委托
-   给真实tree/row，`tableType=BTREE`；其余接口hard-fail；
-7. non-owner attach只构造shared `CXLTable`，不解析private root。
-
-完成后只测试allocator attach、private tree CRUD、相邻callback和多worker
-private操作。不进入迁移/Scan。
-
-### 7.3 第2步：替换唯一路由
-
-1. 在配置解析阶段canonicalize ranges并构造一个`RangePartitioner`；
-2. `KVStore`不再实现`StablePartitionForKey`；所有调用转发同一个router；
-3. 删除`KVEngine::Hash`及FNV实现；
-4. owner handler收到message后重新用同一router验证partition/owner；
-5. bump layout version并写range digest；
-6. 用split point左/等于/右、prefix和space-padded key做小测试。
-
-### 7.4 第3步：恢复原行primitive
-
-1. 给`TwoPLPashaHelper`增加最小offset/private-row入口，内部调用原
-   lock/read/update/release主体；
-2. 用原primitive替换`GetPrivate/GetShared/PutPrivate/PutShared`中的协议体；
-3. 删除`writer_waiting`字段和访问器；
-4. 删除helper、engine、handler的内层操作级retry，只留facade一层；
-5. 保留miss/Busy/corruption三态，写一处统一转换；
-6. 将`MarkLayoutDirty`移到实际mutation/migration primitive；
-7. 通过§4.2/§4.3针对性测试后，删除不再被调用的`kv_shared_*`复制代码。
-
-此步骤不能顺带优化原锁、公平队列、SCC flush或迁移budget。
-
-### 7.5 第4步：按原顺序切换migration和Clock
-
-1. 让move-in/out调用基线`TwoPLPashaHelper`的BTREE分支；
-2. tree/row/raw pointer差异只经table/offset adapter解决；
-3. 将Clock victim循环移回`PolicyClock`，tracker存储操作改成offset；
-4. 用原`PolicyClock::move_row_in/move_row_out/access_row`作为唯一入口；
-5. 删除`KVPartition::ClockEvictUntilUnderBudget`、payload watermark、
-   `force_at_least_one`及engine中的平行策略判断；
-6. 按基线CXLMemory类别核对Clock policy counter，物理域counter只用于报告；
-7. 验证second chance、budget crossing、move-in/out和pin阻止淘汰。
-
-### 7.6 第5步：切换GET和PUT完整路径
-
-1. GET按§4.2接线，确认cold remote miss只收到migration ack，value来自CXL；
-2. PUT按§4.3接线：existing remote miss先`kMigrate`再shared write；
-3. 删除`promote_updated_row()`和owner代写existing remote row的shortcut；
-4. remote新key的`kPut`只封装原REMOTE_INSERT
-   placeholder→move-in→requester-valid路径；
-5. 对GET/PUT各跑owner、cold remote、warm remote和move-out竞争测试；
-6. 检查统计只计一次logical op，RPC/migration/shared命中分类与真实路径一致。
-
-### 7.7 第6步：切换DELETE
-
-1. owner本地Delete按read-and-delete进入
-   `PolicyClock::delete_specific_row_and_move_out(...,true)`；
-2. remote Delete恢复migrate→remote write lock→shared invalid→
-   `REMOTE_DELETE_REQUEST(...,false)`，只为同步API增加完成ack；
-3. 复用原delete adjacency callback，只适配NotFound和offset；
-4. 删除`DeletePrivateForMigrationManager`内自行推导的neighborhood协议；
-5. 验证private/migrated/remote/NotFound和Delete并发；
-6. 确认shared/private索引、Clock link和EBR对象各只移除一次。
-
-### 7.8 第7步：提取并切换原Scan
-
-1. 按§5.1从基线抽取三个公共primitive，并先让legacy调用点编译通过；
-2. 单partition local/remote测试通过后，KV facade改调相同primitive；
-3. 增加`GlobalScanSequencer`顺序跨range partition append；
-4. 保留原result/next-key锁到单partition片段完成；
-5. 删除heap、多Source、certificate、owner value和旧Probe/ScanOwned状态机；
-6. 测单区、跨区、空区、cold/warm remote、Scan与迁移/删除并发。
-
-### 7.9 第8步：清理和文档同步
-
-运行production目标的link map/`rg`确认以下current-only实现已无调用并删除：
-
-```text
-FNV route
-LockNeighborhood/BreakAdjacency/RefreshAdjacency
-writer_waiting
-promote_updated_row
-KVPartition Clock victim policy loop
-payload watermark/force_at_least_one
-Scan heap/Source/certificate/generation/no_predecessor
-engine/helper/runner重复Busy预算
-纯读入口的MarkLayoutDirty
-```
-
-清理不是可选优化，而是最终交付的一部分。还必须删除：
-
-- 已被原primitive替换的声明、实现、状态字段、wire flag和统计项；
-- 只为旧hash/k路Scan/certificate/neighborhood路径存在的测试与fixture；
-- 临时GDB诊断、故障注入、硬编码deadline、debug-only sleep/yield和一次性
-  环境变量；
-- hot path中的进度刷屏、`std::cout`、注释掉的日志以及过时
-  “DISABLED/TODO”脚手架；
-- CMake中重复或已无源码调用者的current-only target/source条目；
-- 不再使用的include、forward declaration和配置键。
-
-不能为了让`rg`结果好看而删除基线提交已有的参考源码；只删除当前改造引入且已
-被正式路径替代的内容。故意保留的原兼容空钩必须在声明处标明“legacy
-compatibility, not production path”，不能伪装成已实现功能。
-
-完成清理后必须：
-
-1. production目标在Debug和RelWithDebInfo下无新增warning；
-2. 对被删符号运行全仓`rg`，结果只能出现在历史文档或明确的负向测试中；
-3. 检查`git status --short`，只保留本任务预期源码/文档，不能提交日志、
-   core、临时trace、GDB脚本或构建产物；
-4. 检查正式可执行文件的调用图，确认没有legacy transaction、旧Scan或平行
-   Clock路径被链接为生产热路径。
-
-原始提交已存在的源文件不删除。同步更新：
-
-- `PLAN.md`中的Hash partition、k路Scan、writer_waiting等旧合同；
-- `当前对比口径.md`；
-- `AGENTS.md`；
-- `YCSB指南.md`；
-- `内存布局.md`；
-- `延迟插入审计报告.md`（仅在§8阶段C后）。
-
-历史`修改日志.md`只追加，不改写旧记录。
-
-## 8. 功能修改与软件延迟审计顺序
-
-软件延迟埋点依赖最终的数据路径、内存归属、锁范围和发布顺序。如果功能代码仍
-有 bug，此时修改延迟埋点只会围绕错误路径重复工作，甚至可能用额外等待掩盖
-竞态。因此施工顺序必须固定如下。
-
-### 8.1 阶段 A：实现和功能修复，软件延迟关闭
-
-1. 完成一个架构/实现调整；
-2. 使用 `latency_inject.enabled=false` 运行该调整的针对性测试；
-3. 遇到失败先修复功能代码；
-4. 遇到 stall使用 Debug构建和GDB定位真实阻塞点；
-5. 重新运行受影响测试，直到没有已知功能 bug；
-6. 此阶段不为了通过测试修改延迟数值、增加延迟、移动 delay settlement或增加
-   sleep/yield。
-
-允许在调试时只读检查现有延迟埋点，但不应在错误数据路径上完成或宣称延迟
-审计。
-
-### 8.2 阶段 B：功能路径稳定
-
-只有同时满足以下条件，才能进入延迟审计：
-
-- 相关单元测试通过；
-- 相关点操作或 Scan测试通过；
-- 必要的4VM×4 worker小规模测试通过；
-- 没有未解释的 stall、Busy风暴、错误 owner、错误 Scan结果或 protocol abort；
-- 数据路径、锁范围和跨 VM发布顺序不再计划修改。
-
-如果仍存在残留 bug，继续停留在阶段 A。
-
-### 8.3 阶段 C：软件延迟插入审计
-
-对最终稳定代码逐项检查实际内存访问：
-
-```text
-进程本地配置、range split和临时容器：
-  不插入 CXL 延迟
-
-节点私有 SWCC：
-  复用 mem_access::PrivateRead/Write/Atomic*
-  private root和Clock control从原Hwcc wrapper改为Private wrapper
-
-共享 SWCC payload：
-  复用 SharedPayloadRead/Write
-  SCC clwb/clflush复用 SwccWriteback/Invalidate
-
-HWCC index/smeta/root/EBR/layout：
-  复用 HwccRead/Write/Atomic*
-
-HWCC transport：
-  复用现有 TransportRead/Write和ring atomic埋点
-```
-
-按四条最终路径逐段走查，不能只按文件名判断内存域：
-
-```text
-GET:
-  range router=DRAM
-  private tree/row=owner-private SWCC
-  shared tree/smeta=HWCC
-  SCC payload=shared SWCC
-  migrate ring=HWCC transport
-
-PUT:
-  GET的全部定位/锁访问
-  private value write=owner-private SWCC
-  shared SCC write/flush=shared SWCC
-  smeta lock/tid/valid/ref=HWCC
-  remote insert request/ack=HWCC transport
-
-DELETE:
-  private tree/row/Clock tracker=owner-private SWCC
-  shared tree/smeta/second_chance/EBR=HWCC
-  payload只在原协议确实读取/失效时计shared SWCC
-
-SCAN:
-  local tree/row及predecessor scan=owner-private SWCC
-  remote CXLTable/smeta/adjacency=HWCC
-  返回值读取=shared SWCC SCC
-  range-migrate request/ack=HWCC transport
-```
-
-同一个`BTreeOLC_CXL`类实例可能绑定private SWCC或HWCC，延迟域必须取实例的
-allocator binding，不能因为类名含CXL就全部记为HWCC。
-
-审计原则：
-
-1. 优先复用原 helper和现有 `mem_access` wrapper，不另建第二套 latency API；
-2. 只记录真实发生的访问范围，不按整个对象、整个页面或最大 value容量估算；
-3. facade、adapter和原 helper不能对同一访问重复计费；
-4. range router读取进程本地 immutable split points，不计SWCC/HWCC延迟；
-5. 删除 hash/heap/certificate代码时同步删除仅属于旧路径的埋点；
-6. 新 Scan只按实际触及的 partition、B+Tree node、smeta和payload计费；
-7. settlement默认由现有 `LatencyScope` 完成；只有跨 VM因果发布需要提前
-   `DelayActiveScopeNow/DelayIsolatedScopeNow`；
-8. 提前 settlement必须位于原协议安全点，不能持有B+Tree leaf latch、smeta
-   latch、Clock spinlock或allocator lock等待；
-9. 不用 `sleep_for` 充当软件延迟，不增加校准失败回退；
-10. `enabled=false` 时继续走现有 fast gate，不读TSC、不进入cache model、
-    不产生TLS pending delay。
-
-审计完成后更新 `延迟插入审计报告.md`，记录本次改动新增、删除或保持不变的
-访问路径。
-
-### 8.4 阶段 D：延迟验证和最终 smoke
-
-延迟审计完成后才运行：
-
-1. disabled模式确认统计为零且功能结果与阶段 B一致；
-2. enabled focused test确认owner-private、shared payload、HWCC metadata和
-   transport分别进入正确pool；
-3. 检查 `raw = hits + misses`，无明显重复计费或遗漏；
-4. RelWithDebInfo下运行小规模YCSB-A和YCSB-E；
-5. 最后运行标准smoke。
-
-延迟验收必须同时满足：
-
-- `enabled=false`时不读TSC、不更新cache filter/TLS pending、不执行
-  busy-spin/sleep，除一个可预测fast gate外没有按cacheline增长的额外工作；
-- `enabled=true`时TSC校准失败、Debug构建、verbose或extra-check开启均
-  hard-fail，不允许退化到`sleep_for`；
-- 每个真实cacheline访问只由最靠近访问的原tree/helper或transport wrapper
-  记录一次，facade/adapter不重复计费；
-- private `BTreeOLC_CXL`实例按owner-private SWCC计费，shared实例按HWCC
-  计费，不能按类名统一归类；
-- SCC invalidate/writeback只计算实际value范围和真实flush cacheline；
-- delay settlement不持有B+Tree leaf、private row、smeta、Clock、allocator、
-  EBR或ring关键锁；
-- response/root/valid/ring等跨VM发布前所需延迟已经结算，普通本地控制流不
-  提前结算或重复结算；
-- raw/hit/miss/delayed-ns统计在GET/PUT/DELETE/Scan、move-in/out和transport
-  focused测试中分别可解释，`raw = hits + misses`。
-
-任一项无法解释时，延迟审计不通过；不能以吞吐接近预期作为正确性证据。
-
-### 8.5 审计失效和回退规则
-
-延迟审计后若又修改以下任一内容：
-
-- private/shared/HWCC对象的内存归属；
-- B+Tree、row、smeta、SCC、Clock、EBR或transport访问；
-- 锁的取得/释放位置；
-- move-in/out、response、root或ring的发布顺序；
-- Scan实际触及的partition或range状态机；
-
-则原审计对相关路径失效。必须：
-
-```text
-先关闭延迟
-→ 重新通过受影响功能测试
-→ 确认bug修复完成
-→ 重新审计相关延迟路径
-→ 再运行enabled验证
-```
-
-仅修改文档、错误文字或不触及共享访问的本地控制代码，不要求重做完整延迟审计。
-任何情况下都不能在已知功能 bug尚未修复时，通过调整软件延迟来让测试“稳定”。
-
-## 9. 简化测试方案
-
-本项目只做足以证明架构改造正确的测试，不建立工业级异常矩阵。
-除第8.4节明确的enabled focused验证外，本节测试全部先以
-`latency_inject.enabled=false` 运行。
-
-### 9.1 单元测试
-
-1. 2～4个range的正常解析；
-2. gap、overlap、逆序和range数量不匹配会拒绝启动；
-3. split point左右及等于边界的路由；
-4. `owner == partition % vm_count`；
-5. 字符串key、prefix key和32B space-padded YCSB key；
-6. layout digest相同可attach、不同拒绝attach。
-
-### 9.2 点操作
-
-选择边界两侧的少量key，验证：
-
-- Put/Get/Delete；
-- CAS/Increment；
-- owner-private hit；
-- non-owner shared miss→move-in→shared hit；
-- remote existing Put为move-in→shared write，remote new Put为原placeholder
-  →move-in→requester-valid；
-- remote Delete为shared invalid→owner delete ack；
-- move-out后仍路由到原owner。
-
-### 9.3 Scan
-
-用一个小型有序oracle验证：
-
-- 单partition Scan；
-- start不存在但有/没有predecessor；
-- start等于split point；
-- 跨一个和多个partition；
-- 空中间partition；
-- cold move-in与warm CXL-first；
-- `limit>64`仍是一次单partition primitive，不出现固定分页；
-- 结果严格递增且数量不超过limit。
-
-### 9.4 简短多VM验证
-
-1. Debug 4VM×4 worker小数据load；
-2. 小规模YCSB-A点操作；
-3. 小规模YCSB-E Scan；
-4. RelWithDebInfo、软件延迟关闭，重复上述关键项；
-5. 最后各跑一轮标准单元、E2E和YCSB A/E smoke。
-
-若出现stall，使用Debug构建和GDB定位，不通过降低并发度或增加sleep绕过。
-无需为没有出现的工业级故障扩展大量测试轮次。
-
-## 10. 明确不做
-
-1. 不重新实现B+Tree、OLC、TwoPLPasha、SCC、Clock或EBR；
-2. 不新增第二份private/shared索引；
-3. 不保留hash/range双模式；
-4. 不做动态range学习、在线repartition或split/merge；
-5. 不做route cache、预取器或后台迁移线程；
-6. 不新增Scan certificate、全局snapshot或全局Scan锁；
-7. 不为每种畸形wire输入建立复杂恢复和fallback；
-8. 不为了容量倾斜重写private allocator；
-9. 不为了提高E吞吐关闭一致性、迁移或并发；
-10. 不修改cxlkv来迁就TigonKV的数据面；
-11. 不维护原transaction benchmark和新KV接口两套并行热路径。
-12. 不在已知功能bug、错误Scan或stall未解决时调整软件延迟埋点；
-13. 不用额外软件延迟、sleep或yield掩盖竞态；
-14. 不在延迟审计后继续改共享数据路径而不使审计失效。
-
-最终代码应当仍能清楚看出它是：
+本项目的目标保持不变：
 
 ```text
 原始 Tigon/TwoPLPasha 数据面
-+ 节点私有 SWCC 内存适配
-+ 单表字符串 KV 门面
-+ 最小 transport/RegionOffset 适配
-+ 原始 RANGE partition
-- 通用 transaction/multi-table 外壳
++ owner-private 数据结构迁入节点私有 SWCC
++ 单表定长字符串 KV 门面
++ 最小 RegionOffset、双区域 allocator 和去事务完成通知适配
++ 原始范围分区
+- 通用 transaction、读写集、commit/abort 和多表热路径
 ```
 
-## 11. 最终完成条件
+原始 Tigon 的唯一对照是当前仓库 `master` 分支头部。施工开始和最终提交前都要
+记录实际基准：
 
-只有以下条件全部满足，才认为本方案实现完成且不再需要继续改动：
+```bash
+git rev-parse master
+git diff --stat master...HEAD -- common core protocol kv
+```
 
-1. 代码仍可清楚对应原 Tigon的B+Tree、TwoPLPasha、SCC、Clock和EBR；
-2. 原节点私有B+Tree/row/allocator/Clock状态（含root和tracker control）位于
-   owner-private SWCC，不在进程heap或HWCC保留第二份mutable状态；
-3. 外部单表字符串Put/Get/Delete/Scan/CAS/Increment可用；
-4. key按配置的连续范围路由，owner仍为partition取模；
-5. 点操作、move-in/out和跨partition顺序Scan通过第9节简化测试；
-6. 与cxlkv的trace、KV大小、VM/worker、内存、NUMA、构建和延迟配置一致；
-7. 功能测试是在软件延迟关闭状态先通过的；
-8. 最终数据路径完成第8节软件延迟审计和enabled focused验证；
-9. 没有通过降低并发度、关闭SCC/Clock/migration或增加等待换取通过；
-10. 已删除被替代的current-only死代码、调试脚手架、过时输出和配置，正式
-    调用图没有双路径；
-11. 工作树中没有意外日志、core、trace、临时脚本或构建产物；
-12. 软件延迟通过§8.3/§8.4逐路径审计，disabled开销最小、enabled分类/
-    范围/结算正确且没有sleep fallback；
-13. 文档已更新为实际代码状态。
+不得修改、移动或重置 `master`；不得把历史硬编码 SHA 当作长期合同。修改任何点
+操作、Scan、migration、Clock、transport 或 common 支撑代码前，必须直接对照
+`master` 头部中的：
 
-满足上述条件后，除非后续测试发现可复现bug或实验合同改变，否则不再新增架构
-调整或性能优化。
+```text
+protocol/TwoPLPasha/TwoPLPashaExecutor.h
+protocol/TwoPLPasha/TwoPLPashaHelper.h
+protocol/TwoPLPasha/TwoPLPashaMessage.h
+protocol/TwoPLPasha/TwoPLPasha.h
+protocol/Pasha/PolicyClock.h
+protocol/Pasha/SCCManager.h
+core/Table.h
+core/Message.h
+core/Dispatcher.h
+common/BufferedReader.h
+common/LockfreeQueue.h
+common/MPSCRingBuffer.h
+common/CXL_EBR.h
+common/btree_olc/BTreeOLC.h
+common/btree_olc_cxl/BTreeOLC_CXL.h
+benchmark/ycsb/Context.h
+scripts/run.sh
+```
+
+优先级固定为：
+
+```text
+复用原始实现 > 对原实现做薄的 RegionOffset/SWCC 适配 > 新增独立实现
+```
+
+不得为了提高性能而修改原 Tigon 本来存在的锁范围、Clock 行为、SCC 纪律或
+migration 开销，也不得用更差的新策略人为拖慢 Tigon。SWCC/HWCC 使用规则以
+`../cxlkv/AGENTS.md` 为共同实验约束。
+
+## 2. 固定施工规则
+
+1. 所有功能修改先在 `latency_inject.enabled=false` 下完成。
+2. 每完成一项，先运行该项的 focused Debug 测试；发现 stall 时使用 Debug
+   构建和 GDB 定位，不增加 sleep、无界等待或降低 worker 数量。
+3. 功能路径仍有 bug 时，不修改软件延迟埋点。
+4. 只有最终数据路径、锁范围和发布顺序稳定后，才进行完整延迟插入审计。
+5. 不恢复通用 transaction executor、多表 registry 或多 key transaction。
+6. 不新增第二份索引、邻接状态机、Clock policy、Scan certificate、后台迁移
+   线程、路由 cache 或 hash fallback。
+7. 每个 current-only 实现只能在替代路径通过测试后删除；最终不能保留生产双
+   路径作为 fallback。
+8. 原提交的分布式 YCSB 入口 `scripts/run.sh` 明确使用
+   `PARTITION_NUM=HOST_NUM`；因此正式 4VM 比较固定为 4 个 range partition、
+   每 VM 恰好 owner 一个 partition、`owner=partition_id%vm_count`，
+   4VM×4 foreground worker，并披露每 VM 的 demuxer CPU。不能把通用 gflag
+   的单机缺省值 1 或当前分支自行采用的 16 当成原始四机 YCSB 口径。
+   原脚本的 `--partitioner=hash` 只负责
+   `master_coordinator=partition_id%HOST_NUM`，key→partition仍由
+   `benchmark/ycsb/Context.h` 的默认 `PartitionStrategy::RANGE` 决定；禁止把
+   这两个层次混为 hash key routing。
+9. “复用”必须落实到同一函数/模板/类实现，而不是复制一份原代码后改名。优先
+   直接调用原 helper；原 executor lambda 无法直接调用的，先在原文件中提取一个
+   legacy 与 KV 共用的 primitive；只有 raw pointer、allocator、字符串 key 或
+   wire 类型不兼容时才增加薄 adapter。不得为了减少少量 adapter 代码重构整个
+   原始框架。
+10. 所有不得不新增的控制状态必须标明为何不能由原 metadata、B+Tree callback、
+    Clock tracker 或消息状态表达；没有明确证据不得保留。
+11. 只在当前分支施工，不新建分支、不提 PR。每个问题完成且 focused测试通过后
+    按该问题边界提交并推送；最终综合测试、延迟审计和根目录文档终检全部通过
+    前，不得做“项目完成”的最终提交/推送。
+12. 修 bug 前必须先得到最小复现、Debug/GDB 栈或违反的不变量，并在同一函数
+    对照 `master`。修复只覆盖直接根因和不可分割的清理；不能因为一个 bug 顺手
+    重写调用链、消息骨架、并发模型、allocator、恢复机制或相邻模块。
+13. 每个 bug 补丁在提交说明或施工记录中固定写出：
+
+    ```text
+    复现与证据
+    master 对应函数及原控制流
+    直接根因
+    最小修改范围
+    明确不修改的相邻行为
+    focused 测试
+    ```
+
+    如果无法填写其中任一项，不得开始扩展性修改。
+14. 如果一个修复需要新增第二种请求队列、第二套锁/重试、通用 timeout、tombstone、
+    recovery/checkpoint 或三处以上无直接因果关系的协议改动，应先判定为“方案
+    扩散”，停止施工并改为从 `master` 原路径重新套薄 adapter。测试通过不能作为
+    过度修改的正当理由。
+15. 允许修复在 `master` 中确认存在、且会被本单表生产路径触发的原始 bug，但
+    只能逐行修正错误条件、长度或状态；不得借此清理/现代化整个原文件。当前已
+    确认的两个例子是：
+
+    ```text
+    remote_insert_response_handler 的消息类型 DCHECK 应检查
+    REMOTE_INSERT_RESPONSE，而不是 REMOTE_DELETE_REQUEST；
+
+    data_migration_request_for_scan_handler 的长度 DCHECK 必须包含第二个 key
+    与 limit；只修正长度表达式，不重写 scan wire。
+    ```
+
+16. “彻底删除死代码”只针对当前分支新增后又被替代的生产路径、空 adapter、
+    调试脚手架和未使用状态。`master` 保留但未链接的 legacy transaction、
+    benchmark 和参考实现不属于清理对象，禁止为了整洁修改或删除。
+17. 每项实现后先看 `git diff master...HEAD`。原函数若出现与 offset、内存域、
+    transaction 剥离、字符串 KV 或上述已证实 bug 无关的控制流差异，必须在
+    继续测试前恢复；不能把它留给最终审计。
+18. `master` 中关于内存放置的 TODO 和明确注释属于原架构意图，不得以“原代码
+    尚未完成”为由忽略。尤其
+    `TwoPLPashaSharedDataSCC::migration_policy_meta` 上的
+    “should be moved to HWcc ultimately” 必须在新版本兑现。执行方式只能是
+    把原字段机械迁到正确区域并保持原访问算法，不能借 TODO 新增缓存、镜像、
+    后台同步或另一套 metadata。
+19. 本文是封闭施工清单，不给工作 agent自行选择替代架构的空间。未列出的生产
+    重构默认禁止；发现本文与源码证据冲突时，先停止该项并用最小证据修正文档，
+    不能边施工边扩大设计。实现细节若有多种选择，固定选择与 `master` 控制流
+    差异最小、附加状态最少的一种，而不是“更通用”或“更安全”的一种。
+20. SWCC 必须严格区分访问者，而不能一概按“无硬件一致性”处理：
+
+    ```text
+    shared SWCC：
+      可能被多个节点访问；跨节点没有CPU cache coherence，也不能依赖CPU原子
+      RMW。这里只放payload，跨节点读写必须走SCC flush/invalidate，所有锁、
+      ref、valid、tid、root和publication状态都在HWCC。
+
+    owner-private SWCC：
+      只有所属节点访问；同一VM内多个CPU核心具有正常硬件cache coherence和CPU
+      原子性。原本地OLC、atomic、pthread spinlock和锁范围继续有效，不走SCC，
+      不需要远端原子模拟；相对本地DRAM的主要结构改动是持久指针/链接改为
+      RegionOffset并使用owner-private allocator。
+    ```
+
+    host物理cache coherence可能让错误的shared-SWCC代码在VM实验中侥幸通过，
+    不能据此使用shared-SWCC原子；也不能反过来给owner-private SWCC增加SCC、
+    clwb握手或跨节点锁而人为拖慢本地多核。
+
+## 3. 待修改问题、解决方案与测试方法
+
+### 3.0 先建立原始差分闸门，不在 current-only 骨架上继续打补丁
+
+问题：
+
+1. 当前 `common/`、`protocol/TwoPLPasha/`、`protocol/Pasha/` 已累积多轮为修复
+   ring、latch、Clock 和 Scan 问题而产生的控制流改动。部分代码虽能运行，但已
+   形成与原 Tigon 并列的 helper、消息状态、请求调度和迁移算法。
+2. 在这些 current-only 骨架上逐个修 bug，会迫使后续补丁继续维护其隐含约束，
+   最终把一次必要适配扩散成协议重写。
+3. “与 master 功能相似”不足以证明尊重原实现；必须检查原函数的锁范围、状态
+   转换、消息顺序和失败清理是否仍为同一个控制流。
+
+解决方案：
+
+1. 施工前生成按文件和函数分类的 `git diff master...HEAD` allowlist。每个差异
+   只能属于以下五类之一：
+
+   ```text
+   A. owner-private DRAM 指针/可增长结构 → owner-private SWCC RegionOffset；
+   B. 跨 VM 同步字段 → HWCC，并补 mem_access；
+   C. 去 transaction 后的单操作锁生命周期与最小完成 ack；
+   D. 单表定长字符串 facade、range routing、配置与实验入口；
+   E. 有复现证据的原始 bug 最小修正。
+   ```
+
+   无法归类的差异先恢复成 `master`，不得先为其补测试或兜底。
+2. 对原文件采取“reset-first、mechanical-adapt”方法：以 `master:path` 的函数
+   为主体，逐处重新施加 RegionOffset、allocator binding、内存域和
+   `mem_access`；不要从 current-only 实现反向猜测原算法。
+3. 新 `kv/` 只负责 facade、range 编排、配置、定长编码和调用原 primitive。
+   锁循环、SCC 发布、Clock victim 选择、B+Tree adjacency、消息接收分发不得
+   在 `kv/` 再实现一遍。
+4. 每切换一条原路径，先跑其 focused 测试，再删除被替代的 current-only 路径；
+   不保留运行时 fallback。若 focused 测试暴露 bug，只修该原路径中的直接原因，
+   不恢复被删的平行路径。
+5. 在 allowlist 中单列原始内存放置合同，并逐字段落实：
+
+   ```text
+   原 shared row 的 tid/valid/ref_cnt/migration_policy_meta
+     → 都参与跨 VM 协议，放 HWCC smeta；
+       其中 migration_policy_meta 明确兑现 master 的 HWcc TODO。
+
+   原 shared row 的 data[]
+     → shared SWCC payload，仍只经 SCC flush/invalidate 访问。
+
+   TwoPLPashaMetadataLocal、private B+Tree/root、PolicyClock tracker/node
+     → owner-private SWCC；仅 owner VM 访问，内部链接使用 RegionOffset；
+       同VM多核继续直接使用原本地OLC/atomic/spinlock，不走SCC。
+
+   EBR global epoch/跨 VM active epoch
+     → HWCC；
+   owner 的 retire record/可增长 retire 队列
+     → owner-private SWCC；同VM worker间同步使用原本地CPU原子/锁；
+   只在一次调用内存在的 view、RAII guard、栈变量和 TLS 快速引用
+     → 可留进程 DRAM，但不得持有权威 row、Clock membership 或持久链接。
+   ```
+
+   不把 owner-private 数据误放到全局 shared SWCC，也不因其位于可映射文件就
+   允许非 owner 读取。shared SWCC上的任何跨节点同步字段都是错误；owner-private
+   SWCC上的SCC或远端原子适配同样是错误。每个结构只保留一个权威副本。
+
+测试方法：
+
+1. 用 `git diff --function-context master...HEAD` 人工核对本节 allowlist；这是
+   代码评审闸门，不新增运行时校验。
+2. 对协议/树/Clock/transport 每个被修改原函数，至少有一个 focused 测试覆盖
+   正常路径和原本已有的失败返回。
+3. 用 `rg` 确认生产调用图只有一份 helper、Clock、adjacency、Scan 和消息分发
+   实现。
+4. 对照 `git grep -n -i 'TODO\\|local DRAM\\|HWcc' master -- common protocol`
+   生成内存放置核对项；对每个生产相关项记录最终区域和访问者。测试只做必要的
+   address-range/domain 断言，不增加运行时冗余校验。
+
+### 3.1 shared metadata 协议外读写竞态
+
+问题：
+
+1. `TwoPLPashaHelper::kv_shared_write()` 已在 smeta latch 内更新
+   `value_len`，`KVPartition::PutShared()` 返回后又在无 latch 状态写一次。
+2. owner 对 migrated row 的 `PutPrivate()` 也在 helper 返回后无保护写
+   `value_len`。
+3. `GetShared()` 在 helper 已释放 reader lock 后再次无保护读取 `valid`。
+4. 并发 writer/delete 可与这些普通 HWCC 字段访问交错；前一个 writer 甚至
+   可能覆盖后一个 writer 发布的长度。
+
+解决方案：
+
+1. 立即删除 helper 外层所有重复 `set_value_len()`。
+2. 不在 helper 释放行锁后重新读取 `valid`、长度或其它非原子复合状态。
+3. 将 shared primitive 的结果收敛为 `Done/Missing/Busy`，该结果必须在原
+   smeta latch/reader/write-lock 协议内确定并一次性返回。
+4. 本文 §3.8 完成后删除 `value_len`；在过渡阶段也必须保证它只在 smeta
+   latch 或原 write lock 内访问。
+5. 不为修复竞态增加新的 metadata 位或第二个锁。
+
+测试方法：
+
+1. 扩充 `kv_shared_protocol_test`：两个 writer 使用不同长度交错时不能出现旧
+   长度覆盖；完成定长改造后改为检查不存在长度字段。
+2. 增加 Get/Put/Delete/move-out 同 key 并发，结果只能是合法值、NotFound 或
+   Busy，不能出现损坏长度、越界或错误 NotFound。
+3. Debug 下重复：
+
+   ```bash
+   ctest --test-dir build-debug --output-on-failure \
+     -R '^(kv_shared_protocol_test|kv_partition_test|kv_engine_test)$'
+   ```
+
+### 3.2 range 配置、路由顺序和正式边界
+
+问题：
+
+1. 根配置使用 `b,d,...,t,v,...` 作为边界，而正式 YCSB key 全部以 `user`
+   开头。当前 100,000 条 load trace 全部路由到 partition 10，15 个 partition
+   空闲，owner 固定为 VM2。
+2. `partition_count` 未检查 `<= kMaxPartitions(256)`，错误配置可越过共享目录
+   数组。
+3. 当前正式配置使用 16 个 partition，偏离原始四机 YCSB 的
+   `PARTITION_NUM=HOST_NUM=4`；这同时改变每个 Clock tracker、owner tree 和
+   跨区 Scan 的数量。
+4. 内部相邻边界一侧为空时没有按合同自适应复制另一侧，而是直接拒绝。
+5. 路由使用 `std::string_view` 比较，B+Tree 使用零填充后的
+   `FixedKey::Compare()`；两者不是同一个显式 comparator。
+6. 当前没有一个确定、轻量且可重复的办法从实际 YCSB trace 得到基本均衡边界，
+   后续测试很容易再次使用与 key 编码无关的手写字母边界。
+
+解决方案：
+
+1. 启动时将所有非无限边界转换为只读 `FixedKey` split points；路由、严格递增
+   校验和 B+Tree 统一使用 `FixedKey::Compare()`。
+2. 内部相邻边界只有一侧为空时复制非空侧；两侧都空时报错；两侧非空但不相等
+   时报错。
+3. 增加 `partition_count <= 256` hard-fail。通用配置不强制
+   `partition_count % vm_count == 0`，因为原 `HashPartitioner` 的 owner 映射本身
+   支持任意 partition 数；只在正式四机实验 preflight 中要求
+   `partition_count == vm_count == 4`。
+4. 保持线性扫描或 `upper_bound` 均可；正式只有 4 个 partition，不新增复杂
+   索引。边界等于 split point 时进入右侧 partition。
+5. 给现有 trace 准备流程增加一个最小、确定性的边界采样步骤，不引入运行时
+   学习器：默认每个文件每隔64条有效 PUT取一个 key，从全部 16 个
+   `load/worker*.txt` 等量采样，
+   使用与 runner 相同的 `FixedTraceKey` 规则补齐为完整 32B key，按
+   `FixedKey::Compare()` 排序去重，选择 1/4、1/2、3/4 三个样本作为 split
+   sentinel，写入根 `experiment_config.jsonc` 的四个半开区间。采样只根据
+   load 数据集分布，不根据 A–E 的访问热度调边界，避免针对某个 workload
+   特化优化。
+6. 尽量复用 `e2e_trace_runner` 的 trace 解析/定长 key 规范；若共享 C++ parser
+   会造成明显重构，可在 `prepare_ycsb_traces.sh` 邻近增加一个很小的离线工具，
+   但只能负责采样、排序、输出 split 和计数，不能进入生产运行时。
+7. 生成边界后对完整 load trace 做一次只读分布核对，输出每 partition 和每
+   owner 的 key 数；这只是发现采样偏差，不自动改边界。TigonKV 和 CXLKV 使用
+   完全相同的原始 trace，split、采样 stride、计数和 trace digest写入实验
+   metadata。
+
+测试方法：
+
+1. `unit_tests` 覆盖：首尾无穷、单侧空边界自适应、双侧空、冲突、非递增、
+   超长边界、257 partitions、key 等于 split point，以及非整除 partition 数仍
+   按原 modulo owner 规则工作。
+2. 对定长 key 中的前缀、空格和零字节，断言 route comparator 与 private/shared
+   B+Tree comparator 给出相同顺序和相同 partition。
+3. 用同一批 trace 连续运行两次采样，必须得到相同三个 split；完整 load 核对中
+   四个 partition 均非空且 `max_partition_keys/min_partition_keys <= 1.25`。
+   若不满足，只提高固定采样密度并重新固化配置，不添加运行时自适应或 hash
+   fallback。
+4. 运行：
+
+   ```bash
+   ctest --test-dir build-debug --output-on-failure \
+     -R '^(unit_tests|kv_layout_test|kv_engine_test|ycsb_scripts_test)$'
+   ```
+
+### 3.3 复用原 TwoPLPasha Get、行锁与 TID
+
+问题：
+
+1. `PrivateRow` 使用新写的单一独占 latch，owner GET 也被串行化。
+2. 原 TwoPLPasha 允许多个 read lock，并用 write bit/reader count表达 2PL
+   行状态。
+3. private 写使用 `version++`；shared `kv_shared_*` 没有按原语义推进 `tid`。
+4. 当前实现既可能因独占读锁比原版更慢，又可能因跳过 TID 工作比原版更快，
+   不适合作为公平基线。
+5. 方案若只恢复锁位而不固定 Get 的调用链，owner/private、owner/migrated 和
+   non-owner/shared 仍可能继续走三套平行 primitive。
+
+解决方案：
+
+1. 直接复用原 `take_read_lock_and_read`、`take_write_lock_and_read`、
+   `remote_take_read_lock_and_read`、`remote_take_write_lock_and_read` 及
+   release 函数；若现有参数类型不能承载 offset row，给这些原函数增加
+   `PrivateRowView/RegionOffset` 薄重载，并让 legacy 与 KV 重载调用同一个函数
+   体，禁止把锁循环复制进 `kv_shared_*`。
+2. private metadata仍在 owner
+   SWCC，但 reader count、write bit、valid、migrated 和 TID 语义保持原算法。
+3. 一次 KV API 是去事务后的锁生命周期边界：取得原行锁，复制/修改，随后释放；
+   不恢复 transaction read/write set。
+4. 每 worker 只保留一个有界 DRAM `max_tid`。写成功时用单行退化规则
+   `max(row_tid, worker_max_tid)+1`，再走原带新 TID 的 write release。
+5. 删除 `PrivateRow::latch`、`version` 和能由原 metadata表达的 tombstone
+   状态；若 EBR 暂时需要删除标记，应证明原 valid/delete callback不能表达，
+   且只允许一个最小过渡字段。
+6. `kv_shared_read/write/update` 不再扩张为另一套锁协议；KV 与 legacy入口调用
+   同一个内部 primitive。
+7. Get 调用链固定为原 TwoPLPasha 顺序：
+
+   ```text
+   owner: table.search
+          → take_read_lock_and_read（内部按 is_migrated 选择 private 或 SCC）
+          → read_lock_release
+
+   non-owner: get_migrated_row(ref=true)
+              → 命中则 remote_take_read_lock_and_read(ref=false)
+              → 释放 read lock/ref
+              → 稳定 miss 才发 DATA_MIGRATION_REQUEST
+              → owner move_row_in 后重新走同一 remote read
+   ```
+
+   owner 不额外探测另一份索引，non-owner 不增加 owner-value GET RPC；Busy 只
+   上浮到 facade。
+
+测试方法：
+
+1. 多 reader 同 key 必须能同时进入，writer 与任一 reader互斥。
+2. owner-private 与 migrated shared 分别验证 read/read、read/write、
+   write/write、delete/write 竞争。
+3. 连续写、move-in、remote write、move-out后 TID 单调且 lock bits 已清除。
+4. 分别验证 owner/private、owner/migrated、remote warm、remote cold Get 的
+   调用计数与锁/ref 释放；cold Get 的 owner 响应不携带 value。
+5. 使用线性化小历史验证 Get/Put/CAS/Increment。
+6. 运行 `kv_partition_test`、`kv_shared_protocol_test`、`kv_engine_test`。
+
+### 3.4 ITable、B+Tree 相邻回调和 adjacency
+
+问题：
+
+1. `KvPartitionTable` 的 production 所需 `search/scan/insert/remove/adjacent`
+   方法仍抛 `logic_error`。
+2. `KVPartition` 另写了
+   `LockNeighborhood/BreakAdjacencyLocked/RefreshAdjacencyLocked`。
+3. 该状态机在树外重查邻居、锁三行并无界 yield，不能保证与原 B+Tree leaf
+   callback 相同的结构原子范围。
+4. `BTreeOLC_CXL::lookupAdjacent()` 是 current-only 读后重验实现，没有复用原
+   `BTreeOLC` 的 insert/remove/search adjacent callbacks。
+
+解决方案：
+
+1. `BTreeOLC_CXL` 已因 offset pointer 和 CXL allocator 不能直接实例化本地
+   `BTreeOLC`；这是允许机械适配而不是重新设计算法的边界。从原
+   `common/btree_olc/BTreeOLC.h` 逐函数移植生产所需的：
+
+   ```text
+   insert_and_process_adjacent_tuples
+   remove_and_process_adjacent_tuples
+   search_and_update_next_key_info
+   scan callback
+   ```
+
+   到 offset-safe `BTreeOLC_CXL`，保持控制流、leaf latch范围、回调时机和返回
+   语义不变，只改 pointer/allocator/访问 wrapper；能写成两者共用的小模板时
+   共用，但不为消除机械差异重构整棵树。
+2. `KvPartitionTable` 对其保留的每个 `ITable` virtual 都必须真实 delegate
+   原 table/tree primitive，或按定长 key/value 合同真实 serialize/deserialize。
+   单表生产路径确实不需要的方法应从该 adapter 的接口/继承关系和调用点删除，
+   而不是留下 `logic_error`、`CHECK(0)`、无条件 `false` 或空函数。不能为消除
+   空壳而另建一套 table interface；优先让原 `ITable` adapter 完整工作。
+3. insert、move-in、move-out、delete统一调用原
+   `TwoPLPashaHelper` 的 BTREE 分支。
+4. 新路径通过测试后删除 `Neighborhood`、`lookupAdjacent()` 及其专用测试。
+5. 不同时保留“原 callback”和“KVPartition neighborhood”两套实现。
+
+测试方法：
+
+1. 对 leaf 内、leaf 边界、split 前后、merge 前后分别检查 prev/next bit。
+2. 并发 insert/delete/move-in/move-out 后，用 private tree oracle重新计算相邻
+   migrated 行，逐行核对 shared adjacency。
+3. 运行 `btree_binding_test`、`kv_partition_test`、`kv_engine_test`。
+4. 用 `rg` 确认 production 不再调用
+   `LockNeighborhood|BreakAdjacency|RefreshAdjacency|lookupAdjacent`。
+
+### 3.5 remote PUT、CAS 和 Increment
+
+问题：
+
+1. true-create `kPut` 当前在 owner private 写完整值、promote 到 shared后，
+   requester又 shared 写一次。最后一次 requester 写并不属于原
+   `REMOTE_INSERT_REQUEST/RESPONSE`：原实现是 owner 用请求携带的 value插入并
+   move-in，requester收到 response后只发布 shared valid。
+2. CAS/Increment shared miss由 owner更新并 promote，绕过原 requester remote
+   write-lock路径。
+3. `promote_updated_row()` 是 current-only shortcut。
+
+解决方案：
+
+1. owner PUT不保留 current-only `PutPrivate` 状态机：
+
+   ```text
+   existing → table.search
+            → take_write_lock_and_read
+            → 原 update（内部按 is_migrated 写 private或SCC）
+            → 带新TID的 write_lock_release
+
+   new → insert_and_update_next_key_info(key,value)
+       → 按原 local insert顺序发布 valid
+   ```
+
+   owner new row不因单纯本地 Put被额外 promote；只有原 remote insert或
+   migration policy要求时才 move-in。
+2. remote existing PUT：
+
+   ```text
+   get_migrated_row(ref=true)
+   → shared hit则 remote_take_write_lock_and_read(ref=false)
+   → shared miss则 kMigrate后重新取得同一ref/write lock
+   → remote_update
+   → 带新TID的 remote_write_lock_release
+   → release ref
+   ```
+
+3. remote new PUT严格恢复原 remote insert framing和数据所有权：
+
+   ```text
+   requester发送 key + 完整定长 value
+   → owner insert_and_update_next_key_info(key,value)
+   → owner move_row_in(inc_ref=true)
+   → ack
+   → requester按原 remote_modify_tuple_valid_bit 发布 valid=true
+   → release ref
+   ```
+
+   该路径会先写 owner-private value、再由原 move-in复制到 shared；这是原 Tigon
+   insert/migration成本，不能以“少一次 copy”为由改成 requester直接写 payload。
+4. 处理并发 create race时返回 Busy/AlreadyExists到唯一 API retry，不允许 owner
+   覆盖后再走 current-only promote；失败路径必须按原 insert/move-in顺序撤销
+   placeholder和 ref。
+5. CAS/Increment继承同一路由、move-in、RemoteWrite和TID release，仅在持原
+   write lock时执行值变换。
+6. 删除 `promote_updated_row()`、`PutPrivate` 平行协议体及仅为它们存在的
+   统计/状态；`KVPartition` 最多保留调用原 helper所需的薄 row/table adapter。
+
+测试方法：
+
+1. PUT覆盖 owner、warm remote、cold existing remote、new remote、create
+   race和move-out race。
+2. 用计数断言 existing remote只发生一次最终 payload update；new remote必须是
+   owner private insert + 原 move-in copy，requester不得再写第二次 payload。
+3. CAS/Increment覆盖 warm/cold shared、CompareFailed、NotFound和并发 writer。
+4. 运行 `kv_partition_test`、`kv_engine_test`，再做 4VM×4 worker小规模 YCSB-A。
+
+### 3.6 remote 与 local Delete
+
+问题：
+
+1. non-owner Delete当前只执行 migrate→owner delete。
+2. requester没有取得原 remote write lock/ref，也没有先发布 shared invalid。
+3. `KvDeleteAndUpdateNextKeyInfo(..., is_delete_local=false)` 直接失败。
+4. `DeletePrivateForMigrationManager` 自行执行 neighborhood、shared/private tree
+   remove、Clock untrack和 EBR，重复原 delete callback。
+
+解决方案：
+
+1. owner local Delete统一进入：
+
+   ```text
+   PolicyClock::delete_specific_row_and_move_out(table,key,true)
+   ```
+
+2. remote Delete恢复：
+
+   ```text
+   shared miss → kMigrate
+   → requester remote write lock + ref
+   → requester按原helper发布valid=false
+   → kDelete（原REMOTE_DELETE_REQUEST语义）
+   → owner PolicyClock delete callback(...,false)
+   → owner完成private/shared index、Clock和EBR清理
+   → ack
+   ```
+
+3. 原消息是事务 commit 内的单向请求；单操作 facade为保证 Delete 返回时清理已
+   完成，只增加一个完成 ack。这是必要的事务剥离适配，ack不携带 value或新状态，
+   也不改变 invalid→owner callback→EBR 的原顺序。
+4. 严格保留原提交对被删远端行的生命周期：owner callback已将 shared row/index
+   删除并交给 EBR，requester持有的 write lock/ref 随该行删除而消费；ack 后不得
+   再对旧指针执行 unlock、decrement 或任何访问。用一个只保存 request id、
+   不保存 row pointer 的 pending token 等待 ack。
+5. 邻接更新必须在原 B+Tree remove adjacent callback内逐分支完成。
+6. 新路径通过后删除 `DeletePrivate()` 绕行和
+   `DeletePrivateForMigrationManager` 的平行协议体。
+
+测试方法：
+
+1. private、migrated、remote、NotFound、删除后重新 Put。
+2. Delete与 Get/Put/move-out/Scan 并发；删除后不能留下 shared index、
+   Clock link或未退休 payload；remote delete ack 后不得再访问已退休的
+   shared row。
+3. 验证 remote invalid发生在 owner ack前，ack后 Get稳定 NotFound。
+4. 在 Debug focused测试中记录 remote delete旧 row offset及
+   unlock/ref-decrement调用计数，确认请求发出后 requester不再操作旧 row，
+   EBR grace period 前该空间不会被复用。
+5. 运行 `kv_partition_test`、`kv_engine_test` 和 Debug 4VM delete focused trace。
+
+### 3.7 恢复原 PolicyClock 算法所有权
+
+问题：
+
+1. Clock victim循环被下沉到 `KVPartition::ClockEvictUntilUnderBudget()`。
+2. current循环增加1024步上限，可能在仍有合法 victim时错误失败。
+3. Engine对所有 owner partition做额外两轮扫描。
+4. `PolicyClock::move_row_in/out` 把重型 callback移到 tracker lock外，单方面
+   改善了原 Tigon 的临界区。
+5. current `ClockMeta::second_chance` 初值为1，而原提交初值为0；这会让每个新
+   move-in 行无条件多存活一轮，改变 Clock 命中率和迁移成本。
+
+解决方案：
+
+1. tracker的 head/tail/cursor/count继续位于 owner-private SWCC，指针使用
+   `RegionOffset`；这是必要内存适配。实现一个保持原
+   `track/untrack/move_forward_and_get_cursor/reset_cursor` 接口的薄 offset
+   storage adapter，让 `PolicyClock::move_row_in/out/delete` 的主体尽量恢复
+   原函数，而不是把算法回调到 `KVPartition::Clock*` 再实现一遍。
+2. victim选择、second chance清零、cursor推进、budget gate、move-out和停止
+   条件全部移回 `PolicyClock`，保持基线顺序。
+3. 保留原 tracker lock覆盖 move-in/out/delete callback 的范围；不得先以性能
+   理由缩短。若 Debug+GDB证明 offset callback存在不可消除的锁重入，先记录
+   具体栈和锁依赖，再做最小两阶段适配。
+4. callback不自行再次取得 Clock lock或 untrack；由 PolicyClock按原顺序
+   track/untrack。
+5. 删除 `ClockEvictUntilUnderBudget`、Engine两轮候选扫描和固定步数上限。
+6. Clock policy counter只使用原 `TOTAL_HW_CC_USAGE`类别；物理池用量只用于
+   报告和OOM，不增加第二个迁移水位。
+7. `ClockMeta::second_chance` 恢复原初值0；只有原 `access_row()` 在真实访问时
+   将其设为1。若跨 VM 访问要求原子 wrapper，只把该字节做 HWCC 原子适配，不
+   改变状态转换。
+
+测试方法：
+
+1. fresh move-in 未经访问时 second-chance=0，可按原策略成为 victim；调用
+   `access_row()` 后变成1，第一次扫描清零，下一次才成为 victim。
+2. 超过1024个候选时仍能按budget正确驱逐。
+3. 多 partition分别维护cursor，不由Engine跨区替policy选victim。
+4. ref/reader/writer pin存在时不能move-out；释放后能继续。
+5. 运行 `kv_partition_test`、`kv_engine_test`，并在 Debug 下对 move-in/out
+   并发测试使用GDB确认不存在锁重入。
+
+### 3.8 强制定长字符串 key/value
+
+问题：
+
+1. API只检查 `key/value.size() <= fixed_*_size`，但底层 `FixedKey` 不保存逻辑
+   长度；短 key `"a"` 与含尾零的 key `"a\0"` 可被同一零填充字节串表示。
+2. `PrivateRow` 和 shared metadata 保存 current-only `value_len`。
+3. copy、SCC和延迟计费按短 value执行，与正式 CXLKV 定长 KV合同不一致。
+
+解决方案：
+
+1. 外部类型仍是 `std::string_view`，但生产 Get/Put/Delete/Scan/CAS/Increment
+   的 key必须恰好等于 `fixed_key_size`，Put/CAS desired value必须恰好等于
+   `fixed_value_size`；Get/Scan返回相同定长。YCSB runner继续复用 cxlkv 的
+   `FixedTraceKey` 空格补齐规则后再调用 KV API。
+2. private/shared row始终分配、复制和flush `fixed_value_size`。
+3. 删除 `PrivateRow::value_len`、`TwoPLPashaMetadataShared::value_len` 及全部长度
+   分支。
+4. Increment是测试接口，但仍要在定长 buffer内编码；解析/格式约定固定在门面，
+   不让 shared协议重新支持变长值。
+5. wire仍可按消息种类使用实际 framing长度；“定长 value”不要求控制消息填满。
+
+测试方法：
+
+1. 短/超长 key和 value均返回 InvalidArgument；恰好定长成功；尾零是定长 key
+   的普通字节，不再与另一长度的 key发生别名。
+2. move-in/out、GET/PUT/CAS/Increment/Scan均验证完整定长字节。
+3. 延迟关闭时检查逻辑；最终延迟审计检查每次 payload copy/flush覆盖固定长度。
+4. 运行 `unit_tests`、`kv_shared_protocol_test`、`kv_partition_test`、
+   `kv_engine_test` 和 YCSB trace value生成测试。
+
+### 3.9 从原 Tigon 提取单-partition Scan
+
+问题：
+
+1. 当前 `ScanOwned/ScanOwnedKeys/ProbeSharedScanPage/PrivatePredecessorKey` 是
+   重新实现的 Scan 状态机。
+2. 方案此前误把 remote `scanForUpdate` 当成 current-only 重锁；原提交的
+   `CXLTableBTreeOLC::scan()` 本来就直接调用 `scanForUpdate`，本地
+   `ITable::scan()` 也使用原 scan callback。改成乐观只读 scan反而会偏离原版。
+3. local结果行读完立即释放独占行锁；remote也仅保留ref、逐行短持 reader
+   lock，弱于原“结果行和右边界锁保持到单-partition片段结束”。
+4. public `Scan(start,limit)` 允许 start不存在并需要顺序跨 partition，而原
+   transaction scan通常从所属 partition内的已知 key/range工作；必要的边界结果
+   尚未与原 next-key逻辑清晰分开。
+
+解决方案：
+
+1. 从基线原位置提取三个公共 primitive，legacy和KV门面共同调用；不得把三个
+   lambda复制到 `KVPartition` 后形成“看起来相同”的第二套实现：
+
+   ```text
+   ScanLocalPartition
+     ← TwoPLPashaExecutor local_scan_processor
+
+   ScanRemotePartition
+     ← TwoPLPashaExecutor remote_scan_processor + CXLTable::scan
+
+   MoveInRange
+     ← TwoPLPashaMessage::data_migration_request_for_scan_handler
+   ```
+
+2. `ScanLocalPartition` 保留原 `ITable::scan` callback，
+   `ScanRemotePartition` 保留原 `CXLTable::scan → scanForUpdate`，同时保留原
+   `is_last_tuple`、limit、右边界、prev/next real bit判断、行锁、remote ref、
+   失败清理和 `limit+1` move-in行为；禁止以性能理由换成新的只读树遍历。
+3. 一次单-partition primitive完成并复制结果前，保持结果行和右边界的原 read
+   locks；随后统一RAII释放。进入下一partition前释放上一partition资源。
+4. 只为 public facade补原 transaction API没有的最小边界适配。start不存在且
+   CXL adjacency不足时，owner继续用原 `ITable::scan(start, callback)` 找到并
+   move-in第一个 `>= start` 的真实键及原本的 `limit+1` 行；响应仅额外返回该
+   `resolved_min` key，requester以它作为原 `ScanRemotePartition` 的 min key
+   重试。该 partition没有任何 `>= start` 的行时返回瞬时 `Exhausted`。
+   `resolved_min/Exhausted` 只存在于本次请求 framing，不保存到共享内存，不
+   携带 value，也不迁入一个仅用于证明的 predecessor。
+5. 全局 Scan只保留必要的顺序拼接：
+
+   ```text
+   p = PartitionForKey(start)
+   scan p from start
+   结果不足且p耗尽 → p++，从该range lower boundary继续
+   ```
+
+6. 不做 k路归并、固定64行分页、owner value返回、partial CXL混源、全局snapshot
+   或Scan certificate。
+7. 新 primitive通过后删除现有四个 Scan状态机及其 current-only分页/状态字段；
+   只保留上述 facade确实需要的瞬时 `resolved_min/Exhausted` framing。
+
+测试方法：
+
+1. 单partition local/remote cold/warm、空range、start存在/不存在、start等于
+   split、limit边界和右侧next tuple。
+2. 跨一个/多个partition、空中间partition，结果严格递增且不超过limit。
+3. Scan与Put/Delete/move-in/out并发，单partition片段不能出现phantom、重复或
+   漏掉已被锁语义覆盖的行。
+4. `limit>64` 不产生current-only分页；owner不返回 value。
+5. 运行 `kv_partition_test`、`kv_engine_test`、`e2e_09_test`，然后 Debug
+   4VM×4 worker小规模YCSB-E。
+
+### 3.10 收敛为唯一 Busy retry
+
+问题：
+
+1. facade有64次 Busy retry。
+2. `PutPrivate`另有最多1024次create-race循环。
+3. `LockNeighborhood`存在无界yield；当前 Scan/Engine也包含自己的操作级重试
+   语义。
+
+解决方案：
+
+1. 只在单表 facade逻辑操作边界保留一个明确、可统计的 Busy retry。
+2. 原 B+Tree OLC restart、单次 CAS、自旋锁取得等完成一个 primitive所需的短
+   循环继续保留。
+3. helper、partition、engine和transport handler遇到整次操作竞争时立即返回
+   Busy，不等待“最终成功”。
+4. §3.4 删除 Neighborhood 后一并删除其无界yield。
+5. create race失败释放未发布行并返回 Busy，由 facade重试。
+6. 不使用 sleep或降低并发度改善通过率。
+
+测试方法：
+
+1. 注入确定性行锁冲突，断言一次内部失败只增加一次 facade retry。
+2. 高竞争 create/Put/Delete不能无限stall；超出 facade预算返回Busy并有统计。
+3. 检查 helper/engine/runner不存在第二个固定操作级retry预算。
+4. 运行 `unit_tests`、`kv_partition_test`、`kv_engine_test`。
+
+### 3.11 软件延迟插入最终审计
+
+问题：
+
+1. TSC hard-fail、RelWithDebInfo门禁和disabled fast gate方向正确，但当前审计
+   覆盖的是仍将被替换的 shared helper、Clock和Scan路径。
+2. 重复 `value_len` 写会多计HWCC write，变长value会少计固定payload。
+3. Clock/Scan锁范围改变后，当前 delay settlement位置不再能作为最终证明。
+4. `TreeAccessIsHwcc` 使用可变 thread-local上下文选择树访问域；原 adjacent
+   callback可能在private leaf锁内进入shared tree，返回后必须保证private leaf
+   unlock仍按SWCC计费。
+
+解决方案：
+
+1. 只有 §3.1–§3.10 功能稳定、§3.12 生产代码清理完成且 focused 4VM通过后
+   开始本项。
+2. 按最终 Get/Put/Delete/Scan、move-in/out、Clock、transport、EBR逐段记录真实
+   地址、访问域、字节范围、锁/pin和发布点。
+3. owner-private tree/row/allocator/Clock control计入private SWCC；
+   shared tree/smeta/root/EBR/transport计入HWCC；shared payload及SCC
+   clwb/clflush计入shared SWCC。
+4. 所有跨VM可见发布前先结算累计延迟；不得持B+Tree leaf latch、smeta latch或
+   Clock lock busy-wait。允许在仍持协议reader/ref/write pin但已释放latch时结算。
+5. 给 B+Tree latch/access wrapper传递稳定的 tree allocation binding，不依赖
+   “最近一次访问了哪棵树”的可变TLS状态。
+6. disabled模式保持一次可预测fast gate，不读TSC、不建TLS map、不更新filter；
+   enabled校准失败hard-fail，禁止sleep fallback。
+7. 更新 `延迟插入审计报告.md`，删除旧路径结论。
+
+测试方法：
+
+1. `latency_modes_test`覆盖 disabled、TSC门禁、cache_model=none、统计恒等式和
+   settlement。
+2. focused点路径分别断言 SWCC/HWCC raw变化符合实际访问域。
+3. 构造private Scan callback内进入shared tree的嵌套访问，检查返回后的private
+   leaf unlock仍计SWCC。
+4. RelWithDebInfo、`verbose=false`、`extra_check=false`、小延迟值运行
+   `kv_shared_protocol_test`、`kv_partition_test`、`kv_engine_test`。
+5. 与CXLKV只在两边完全相同的 `cache_model=none`、容量、NUMA和延迟参数下
+   对比；raw次数无需相等，但不能错分池或重复收费。
+
+### 3.12 删除死代码和 current-only 双路径
+
+问题：
+
+当前生产源码仍保留以下应被原 primitive替换的实现：
+
+```text
+PrivateRow::latch/version/value_len
+TwoPLPashaMetadataShared::value_len
+kv_shared_* 平行锁协议
+LockNeighborhood/BreakAdjacency/RefreshAdjacency
+BTreeOLC_CXL::lookupAdjacent
+promote_updated_row
+PutPrivate/GetPrivate 中被原 helper替代的平行锁/更新协议体
+DeletePrivateForMigrationManager 平行协议体
+KVPartition::ClockEvictUntilUnderBudget/MoveOutClockVictim 及其 current-only Clock 算法体
+ScanOwned/ScanOwnedKeys/ProbeSharedScanPage/PrivatePredecessorKey
+只为上述路径存在的wire flag、统计和测试
+KvPartitionTable production方法空壳
+```
+
+解决方案：
+
+1. 每个替代路径测试通过后删除对应旧声明、实现、include、wire字段和专用测试。
+2. 不删除原始 Tigon参考源码；未链接的 legacy transaction代码保留作基线。
+   Clock 只删除 current-only 调度/候选算法，保留 §3.7 所需的 offset tracker
+   薄存储适配，实际 second-chance/cursor/victim 控制流必须继续由原
+   `PolicyClock` 唯一实现。
+3. production adapter保留的每个 virtual 都必须实现。单表路径不需要的方法应
+   删除对应 adapter 能力或使其直接复用原 `ITable` 的真实定长实现；禁止以
+   `logic_error`、`CHECK(0)`、无条件 `false` 或空函数作为“不会调用”的证明。
+   `master` 中未链接的 legacy 类可原样保留，不为了这条规则全仓现代化。
+4. 删除临时GDB脚本、故障注入、硬编码deadline、debug sleep/yield、注释掉的
+   日志和非结构化进度输出。
+5. CMake只保留一份同源测试目标；正式输出只保留stage marker、heartbeat、
+   topology、最终时间和统计。
+
+测试方法：
+
+1. 对上面符号逐项 `rg`；结果只能位于历史文档、明确负向测试或完全保留的原始
+   legacy文件。
+2. Debug和RelWithDebInfo production目标无新增warning。
+3. 检查正式可执行文件调用图，确认没有同时链接两套点操作、Scan或Clock热路径。
+4. `git status --short` 不包含日志、core、临时trace、GDB脚本或构建产物。
+
+### 3.13 同步当前文档与实验口径
+
+问题：
+
+1. 代码 layout version是18，文档仍分别写11和14。
+2. `YCSB指南.md` 仍描述 hash partition k路归并。
+3. `内存布局.md` 仍描述 owner更新后promote和旧Scan。
+4. `当前对比口径.md` 把 current-only Scan/Clock适配写成当前真值，但完成本文后
+   将失效。
+5. 历史focused/local-fork测试不能证明合理range边界下的4VM公平性能。
+6. 根目录文档之间已有指向删除/过时方案的链接；只更新预先列出的几份文件会
+   再次留下互相冲突的 agent施工合同。
+
+解决方案：
+
+1. 所有代码修改、focused测试、四机功能测试和最终延迟审计完成后，枚举项目
+   根目录全部 `*.md`，逐份检查是否仍准确；不仅限于已知文件。只更新受影响
+   内容，第三方声明等无关文档保持不动。
+2. 至少必须检查当前存在的：
+
+   ```text
+   AGENTS.md
+   README.md
+   YCSB指南.md
+   allocator审计.md
+   partition优化方案.md
+   修改日志.md
+   内存布局.md
+   延迟插入审计报告.md
+   当前对比口径.md
+   搬运清单.md
+   缓存一致性设计.md
+   THIRD_PARTY_NOTICES.md
+   ```
+
+   若施工期间根目录新增/删除文档，也必须纳入检查；删除的文档不能再被链接。
+3. `当前对比口径.md` 只写最终实际调用图，不再同时描述“目标”和“现版”两套
+   真值；`修改日志.md` 只更新当前基线与验证状态，不重新堆积逐提交历史。
+4. 文档统一说明：4个原式range partition、单partition原Scan、顺序跨区拼接、
+   非全局snapshot、foreground=4+demuxer=1、定长32B字符串KV、
+   owner-private SWCC和shared HWCC/SWCC边界。
+5. `YCSB指南.md` 必须写明 trace采样生成三个split的命令/入口、采样规则、
+   full-load分布核对、A–E trace显式生成方式和最终四机运行命令。
+6. 正式实验报告记录 trace digest、sample stride、split points、每
+   partition/owner行数、额外service CPU、physical capacity、Clock budget、
+   构建、NUMA和延迟配置。
+
+测试方法：
+
+1. `find . -maxdepth 1 -name '*.md'` 得到检查清单；用 `rg` 检查旧 layout
+   version、16-partition正式口径、hash partition、k路Scan、promote、旧函数名、
+   已删除文件名和失效相对链接。
+2. 文档中的命令使用当前真实 target和脚本名，并至少抽查执行 YCSB trace准备、
+   分布核对和最终 runner命令。
+3. 文档描述的正式配置通过配置解析、VM preflight和trace分布检查。
+
+### 3.14 恢复原 IncomingDispatcher/Message 分发骨架
+
+问题：
+
+1. demuxer 独占 inbound MPSC 的方向与原 `IncomingDispatcher` 一致，但当前
+   后半段另写了全局 `deque<KvMessage>`、mutex、任意 foreground worker
+   stealing、全局 pending map/CV、abandoned tombstone、全 pending wake、
+   `TlsRequestServeDepth` 和多处 timeout/sleep。
+2. 这些状态来自连续修复 stall/嵌套 serve 的补丁链，不是原协议要求；它们改变
+   请求归属、CPU 开销和顺序，也会把 peer fatal 伪装成 Busy/timeout。
+3. `kv_messages.h` 又定义一套完整 wire/header/scan 编码，绕过原 `Message`、
+   `MessagePiece`、TwoPLPasha message factories/handlers 和 header 中已有的
+   worker/transaction 标识。继续修它等于自行维护第二个协议。
+
+解决方案：
+
+1. 保留每 VM 一个 demuxer 且只有它消费本机 MPSC；其主体直接恢复原
+   `core/Dispatcher.h::IncomingDispatcher`：
+
+   ```text
+   BufferedReader 读一个原 Message
+   → 校验 framing
+   → 按 Message header 的 worker_id
+   → 投递到该 foreground worker 的原 LockfreeQueue<Message *>
+   ```
+
+   队列保持原 fixed-capacity SPSC 和原 yield/backpressure；不改为共享 MPMC
+   FIFO，不允许其它 worker stealing。报告仍计
+   `foreground=N + demuxer=1`。
+2. foreground worker在自己的 KV 操作边界复用原
+   `Executor::process_request` 的“drain own queue → dispatch MessagePiece
+   handler → flush response”控制流。等待远端响应时只协作处理自己的 inbox，
+   不扫描其它 worker状态，不唤醒全局 pending。
+3. pending关联只保存在发起 worker的进程本地状态中，无 mutex/CV。使用原
+   Message header已有的 worker id及 transaction/request标识；若事务剥离后
+   需要计数，只允许每 worker一个单调 request sequence，不增加进程全局序列。
+   支持该 worker已有的少量并发请求即可，不能做通用 session管理器。
+4. 优先删除 `KvMessage` 和自定义通用消息枚举，直接复用原 TwoPLPasha
+   migration、remote insert、scan-migration request/response factory和handler。
+   仅允许以下不可由原事务完成阶段表达的最小 wire扩展：
+
+   ```text
+   remote delete completion ack；
+   public Scan start 不存在时的瞬时 resolved_min/Exhausted；
+   必要的定长字符串字节 framing。
+   ```
+
+   CAS/Increment不新增 owner RPC：它们先走原 migration取得 shared row，再在
+   原 remote write lock下变换。不得新增通用 kGet/kPut/kCas/kIncrement owner
+   协议。
+5. 删除 shared deferred deque、全局 pending mutex/CV、wake-all、abandoned
+   response集合、请求 timeout、tombstone、nested-depth guard以及 transport
+   `sleep_for`。peer崩溃在 Debug 中表现为等待并用GDB定位；malformed/corrupt
+   在 demuxer边界进程级 fatal，不能转成 Busy或丢弃。
+6. 所有 RPC 发出前必须已释放 B+Tree leaf latch和仅保护结构修改的短锁；原协议
+   明确跨消息持有的 row read/write/ref pin继续按原顺序持有。不得为了简化
+   dispatcher缩短或延长这些协议锁。
+7. `MPSCRingBuffer` 从 `master` 恢复 reservation/head/tail/ready算法，仅保留
+   双区域 allocator binding、正确 `mem_access` 和对实际损坏的简洁 fatal诊断。
+   不增加恢复扫描、丢包重试、deadline或状态快照作为正常协议。一个原 Message
+   必须满足一个 ring entry的原 framing，不自行发明分片/批包。
+
+测试方法：
+
+1. 单元测试验证 demuxer按 worker id投递、每 worker响应乱序关联、队列背压和
+   malformed framing fatal；不构造大规模故障恢复矩阵。
+2. 4VM×4 worker分别运行小规模 remote Get/Put/Delete、migration和Scan，
+   确认请求只由目标worker处理且没有 shared FIFO/steal。
+3. 针对原 MPSC fatal 的 Debug压力复测；若stall，使用GDB记录所有worker、
+   demuxer和ring head/tail/ready，再只修已确认的ring直接根因。
+4. 用 `rg` 确认生产路径不存在
+   `deferred_transport_requests_|WakePendingForwarders|abandoned_request_ids_|
+   TlsRequestServeDepth|sleep_for`。
+
+### 3.15 恢复原 SCC 发布序列，禁止为一次 latch bug 拆协议
+
+问题：
+
+1. 当前为了规避一次跨 VM smeta latch活锁，把原 `finish_write` 拆成
+   `finish_write_bits`、`flush_scc_data`、`invalidate_scc_data`，又增加
+   `unlock_for_publication` 和多处 CAS bit RMW。
+2. 这改变了原 WriteThrough 在 smeta latch下更新valid/cache bits并完成clwb的
+   顺序，后续每个竞态又需要新的补丁；它属于由单个 bug引发的协议扩散。
+3. 原始算法与软件延迟结算混在一起时，持锁busy-spin会放大活锁，但这不代表应
+   修改真实 SCC 发布协议。
+
+解决方案：
+
+1. 以 `master` 的 `SCCManager::finish_write` 和
+   `TwoPLPashaSCCWriteThrough` 为唯一主体，恢复原 bit更新、clwb/clflush、
+   latch取得/释放和 memory-order顺序。删除上述拆分API和
+   `unlock_for_publication`。
+2. `TwoPLPashaSharedDataSCC` 的跨VM字段按 §3.0移到HWCC smeta；所有普通 bit
+   RMW继续由原 smeta latch串行化。只在原代码确实存在无锁跨VM字段时使用最小
+   atomic wrapper，不把所有字段泛化成CAS状态机。
+3. 软件延迟只在原访问点记录，真实锁释放后在现有安全点结算；不得在持smeta
+   latch时执行TSC busy-spin。延迟结算位置与SCC发布顺序分开解决。
+4. 若恢复后仍出现 Helper latch fatal，必须用Debug+GDB证明具体拥有者、字段和
+   指令交错；补丁只改该原子/锁直接根因。禁止再次拆分finish_write或增加第二个
+   publication状态。
+
+测试方法：
+
+1. `scc_protocol_test`/`kv_shared_protocol_test`覆盖双reader、writer、valid
+   发布、跨host invalidate和move-in/out，检查最终bits与原状态机一致。
+2. Debug下重复曾触发latch fatal的同key并发，不降低worker数。
+3. enabled latency focused测试确认结算时不持smeta latch；disabled路径不多出
+   CAS/clock读取。
+4. 对 `master...HEAD` 的SCC diff逐函数检查，除metadata地址域和
+   `mem_access` 外不得存在协议控制流差异。
+
+### 3.16 收敛 common、allocator 与 EBR 为必要的内存适配
+
+问题：
+
+1. current `BTreeOLC_CXL`、`CXL_EBR` 和 allocator混入了
+   `lookupAdjacent`、orphan retirement、handoff/drain、remote-free stack、
+   collective checkpoint/timeout等 current-only机制；这些并非把本地结构迁入
+   SWCC的必要条件。
+2. 本地 `common/btree_olc/BTreeOLC.h` 也被修改，但 TigonKV生产私有/共享树均
+   应通过原算法的offset-safe绑定，修改未链接的本地基线会降低可审计性。
+3. `TreeAccessIsHwcc` 依赖“最近访问的节点”这一可变TLS状态；private callback
+   嵌套shared树后可能把private unlock错误计入HWCC。
+4. `CXL_EBR::leave_critical_section()` 和多个 `KvPartitionTable` 方法为空壳或
+   hard-fail；生产调用图不应靠“预计不会调用”维持。
+
+解决方案：
+
+1. `common/btree_olc/BTreeOLC.h` 恢复为 `master` 原样；不要顺手修显示函数、
+   输出或风格。`BTreeOLC_CXL.h` 也从 `master` 主体重新机械施加：
+
+   ```text
+   raw pointer → RegionOffset/offset_ptr；
+   cxl_memory分配 → 显式HWCC或owner-private-SWCC allocator binding；
+   原public tree operation入口 → RAII TreeAccessScope；
+   原真实访问点 → mem_access；
+   原adjacent callback → 同控制流offset版本。
+   ```
+
+   保持 split/merge/restart、leaf锁范围和返回值不变。`TreeAccessScope`由该树
+   实例的固定allocation binding初始化，并在嵌套调用后恢复旧TLS；禁止把域参数
+   扩散到每个node算法。
+2. CXL tree进程内handle设为明确的non-owning handle；persistent node由
+   allocator/EBR拥有。删除不可调用的递归 `destroy()` 空壳，允许正常析构handle，
+   并由 `KVPartition`析构进程内handle；不递归释放共享树。保留/恢复 `master`
+   中未链接的 `EBR_CXL.h` 参考文件，不把删除原文件当清理。
+3. 双区域allocator保留最小必要能力：init/attach ready屏障、RegionOffset、
+   每owner bump+size-class freelist、区域会计与EBR reclaim。由于所有partition
+   修改和free都在owner执行，删除remote-free/reap；实验使用fresh pool，删除
+   clean-exit collective checkpoint、恢复epoch、timeout和crash-recovery状态。
+   不用另一个新allocator替换它，也不添加工业级校验。
+4. EBR恢复 `master` epoch算法和临界区语义，只机械增加：
+
+   ```text
+   显式foreground worker id绑定；
+   global/active epoch放HWCC；
+   owner retire records/queue放owner-private SWCC；
+   retired object保存RegionOffset并按对象allocator域free；
+   mem_access。
+   ```
+
+   demuxer不访问树，不占EBR worker slot。删除orphan map、handoff、
+   `drain_quiescent`和空 `leave_critical_section`；KV只调用原实际存在的
+   enter/exit语义，若原版本没有可用leave调用就删除KV的伪配对调用，而不是留空
+   hook。
+5. `CXLMemory`只保留类别→HWCC/shared-SWCC/owner-private-SWCC allocator的薄
+   binding与会计，不增加fallback。所有权和free域由对象类型决定，不做远端free。
+6. `KvPartitionTable`按 §3.4完整delegate；删掉生产adapter中的所有空壳。对
+   `master` 未链接legacy代码中的原有 `CHECK(0)` 不做全仓清理。
+
+测试方法：
+
+1. B+Tree focused测试覆盖lookup/insert/remove/split/merge、原adjacency callback、
+   private→shared嵌套访问域和offset reattach。
+2. allocator/EBR只测init/attach、owner allocate/free、grace-period reclaim和
+   HWCC/SWCC会计；不新增crash-recovery/timeout组合测试。
+3. 用 `rg` 确认生产路径无 `remote_free|checkpoint_ready|orphaned_retirements|
+   drain_quiescent|lookupAdjacent|leave_critical_section` 和adapter空壳。
+4. `git diff master...HEAD -- common`逐函数核对；非必要算法差异必须恢复。
+
+## 4. 实施顺序
+
+依赖顺序固定如下，避免在错误路径上重复修补：
+
+1. §3.0：记录 `master` 头部并建立逐函数差分allowlist。先恢复无法归类的
+   current-only协议控制流；此后每个提交都执行差分闸门。
+2. §3.2：修range canonicalization、配置校验和trace采样边界，把正式四机
+   口径恢复为4个partition，保证后续4VM测试真正覆盖所有partition/owner。
+3. §3.1、§3.8：消除shared竞态、收敛定长字符串key/value，并按§3.0兑现
+   `master` 的内存放置TODO。
+4. §3.16：从master机械恢复B+Tree、allocator和EBR主体，只施加必要offset、
+   双区域及owner-private-SWCC适配。
+5. §3.15：恢复原SCC发布序列，把延迟结算移到安全点，不继续维护拆分协议。
+6. §3.14：恢复IncomingDispatcher/Message/worker SPSC骨架和原TwoPLPasha wire，
+   只保留事务剥离必需的最小ack/边界字段。
+7. §3.4：补齐offset-safe B+Tree/ITable adjacent callback。
+8. §3.3：切换原local/remote行锁和TID primitive。
+9. §3.5：切换remote PUT/CAS/Increment。
+10. §3.6：切换local/remote Delete。
+11. §3.7：恢复原PolicyClock算法所有权。
+12. §3.9：提取并切换原单partition Scan，最后接顺序跨partition编排。
+13. §3.10：删除内部重复Busy策略。
+14. 重新运行全部focused功能测试和简短4VM Get/Put/Delete/Scan、A/E；有bug则
+    回到对应功能项，修复后重新执行受影响路径测试。
+15. §3.12：删除死代码，再重新构建和运行受影响测试，确保清理没有移除生产依赖。
+16. §3.11：只在全部功能修改和代码清理稳定后完成最终软件延迟审计；审计后若
+    又修改任何生产数据路径，必须先通过相应功能测试，再重审受影响埋点。
+17. 执行 §5 的完整四机 E2E及 YCSB load/A/B/C/D/E；全部通过后才执行 §3.13，
+    检查并更新根目录所有 Markdown。若文档核对发现实现/命令不符，修正代码或
+    文档后重新运行受影响测试，再做一次根目录文档终检。
+
+如果某项发现原实现无法直接复用，工作 agent必须先记录：
+
+```text
+master 头部中的原文件、函数和控制流
+无法复用的具体类型/地址/锁约束
+最小薄适配为何不足
+拟新增状态或代码的最小范围
+对并发和公平比较的影响
+```
+
+没有上述证据，不允许另写“语义等价”的新状态机。
+
+## 5. 最终验证
+
+本文不要求在每个小修改后盲目运行全部长测；先运行各节列出的focused测试。
+全部功能路径稳定后，执行一次最终验证：
+
+1. Debug 全部 CTest（不得硬编码测试数量）：
+
+   ```bash
+   ctest --test-dir build-debug --output-on-failure
+   ```
+
+2. RelWithDebInfo重新构建并运行核心测试：
+
+   ```bash
+   ctest --test-dir build-relwithdebinfo --output-on-failure \
+     -R '^(unit_tests|latency_modes_test|kv_layout_test|btree_binding_test|kv_partition_test|kv_engine_test|scc_protocol_test|kv_shared_protocol_test|region_allocator_test)$'
+   ```
+
+3. 显式生成 load和A/B/C/D/E全部 trace（不能依赖当前准备脚本可能只生成A–D
+   的默认值），按 §3.2 对 load trace做确定性采样，把得到的三个split写入正式
+   配置，并保存 trace digest、sample stride、split和完整load分布计数。
+4. 采样工具同时输出每个 partition 至少一个确定存在的代表 key。在独立的
+   throwaway pool 完成一次四机 load 后，分别从 owner 和 non-owner 对这些 key
+   执行 Get，断言均为 Found、key/value 长度和字节完全正确；完成后删除该 pool，
+   不把预热后的迁移状态带入正式 YCSB。该小检查用于避免 runner 仅凭进程退出或
+   把错误 NotFound 当成功而掩盖路由/编码错误，不新增生产热路径。
+5. 使用该配置运行 Debug 4VM×4 worker短 load、YCSB-A和YCSB-E。任何stall必须
+   用GDB定位。
+6. 软件延迟关闭，运行一轮标准4VM E2E，然后运行完整四机 YCSB：
+
+   ```text
+   workload A: fresh pool → load → A run
+   workload B: fresh pool → load → B run
+   workload C: fresh pool → load → C run
+   workload D: fresh pool → load → D run
+   workload E: fresh pool → load → E run
+   ```
+
+   必须使用同一组已固化range边界和4VM×4 worker；每个 load及A/B/C/D/E run
+   的四个 VM都出现pass marker，完成的总操作数与对应trace一致。E还必须返回
+   有序、不重复、不超过limit的结果，并设置
+   `TIGONKV_E2E_SCAN_EXPECT_NONEMPTY=1`，至少观察到一个非空Scan结果。任何一个工作流
+   失败都不算最终完成；先针对性修复和复测，再从本条开头重新跑五组工作流。
+7. 软件延迟启用，仅用RelWithDebInfo和小规模focused A/E验证访问分类、TSC
+   spin及无sleep fallback；它不是性能结论。
+8. 上述代码和测试全部完成后，按 §3.13 检查并适当更新根目录全部 Markdown，
+   再执行最后检查：
+
+   ```bash
+   git diff --check
+   git status --short
+   ```
+
+   确认工作树只包含预期内容后，才提交并推送最终文档/验收状态；不创建分支或
+   PR。仅文档准确性修订无需重跑代码长测，但若文档核对暴露了代码或配置错误，
+   修复后必须重跑受影响测试和本节第6项全部 YCSB。
+
+只有同时满足以下条件，才能宣布完成：
+
+1. production热路径直接调用原B+Tree、TwoPLPasha、SCC、Clock和EBR primitive；
+2. owner-private可增长状态只在该owner的SWCC私有区域；
+3. shared同步状态在HWCC，shared payload只经SCC访问；
+4. 正式trace按原四机YCSB口径分布到4个range partition和4个owner，split由
+   固定采样得到并已记录；
+5. remote PUT/Delete、Clock和单partition Scan与基线顺序一致；
+6. 不存在current-only双路径、内部重复retry或无保护metadata访问；
+7. 软件延迟是在最终功能路径稳定后审计，disabled开销最小，enabled分类和结算
+   正确；
+8. load/A/B/C/D/E均以4VM×4 worker在最终代码和同一正式配置上正确完成；
+9. 项目根目录每个 Markdown都已在最终测试后检查，受影响内容、命令、链接、
+   layout version和公平比较口径与实际代码一致。
+10. `master` 中生产相关的内存放置TODO已逐项兑现，尤其migration policy
+    metadata位于HWCC，owner-only可增长结构位于owner-private SWCC；
+11. demuxer/worker队列、Message/MessagePiece和TwoPLPasha wire继续使用原协议
+    骨架，不存在shared deferred/pending/timeout/tombstone平行框架；
+12. 每个原始文件的剩余diff都能归入§3.0 allowlist，且没有由一个bug引出的
+    无关重构或防御性扩散。
