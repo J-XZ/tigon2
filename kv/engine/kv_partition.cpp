@@ -928,12 +928,37 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   if (star::scc_manager == nullptr) return star::migration_result::FAIL_OOM;
   const FixedKey fixed_key = MakeKey(std::string_view(
       static_cast<const char *>(key), fixed_key_size_));
-  Neighborhood neighborhood;
-  LockNeighborhood(fixed_key, &neighborhood);
-  if (!neighborhood.has_current) {
-    UnlockNeighborhood(&neighborhood);
-    return star::migration_result::FAIL_OOM;
-  }
+  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
+  if (table == nullptr) return star::migration_result::FAIL_OOM;
+  star::migration_result result = star::migration_result::FAIL_OOM;
+  const bool found = table->search_and_update_next_key_info(
+      &fixed_key,
+      [&](const void *prev_key, void *prev_meta, void *prev_data,
+          const void *cur_key, void *cur_meta, void *cur_data,
+          const void *next_key, void *next_meta, void *next_data) {
+        Neighborhood neighborhood;
+        const auto fill = [&](const void *row_key, void *row_meta,
+                              void *row_data, bool *present, RowRef *row) {
+          if (row_key == nullptr || row_meta == nullptr || row_data == nullptr)
+            return;
+          *present = true;
+          row->key = *static_cast<const FixedKey *>(row_key);
+          row->metadata = static_cast<PrivateMetadataLocal *>(row_meta);
+          row->value = reinterpret_cast<PrivateValueStruct *>(
+              static_cast<char *>(row_data) - sizeof(PrivateValueStruct));
+          row->offset = regions_.swcc().ToOffset(row->value);
+        };
+        fill(prev_key, prev_meta, prev_data, &neighborhood.has_prev,
+             &neighborhood.prev);
+        fill(cur_key, cur_meta, cur_data, &neighborhood.has_current,
+             &neighborhood.current);
+        fill(next_key, next_meta, next_data, &neighborhood.has_next,
+             &neighborhood.next);
+        if (!neighborhood.has_current) return;
+        if (neighborhood.has_prev) LockRow(neighborhood.prev.metadata);
+        LockRow(neighborhood.current.metadata);
+        if (neighborhood.has_next) LockRow(neighborhood.next.metadata);
+        auto run = [&]() -> star::migration_result {
   auto *private_value = neighborhood.current.value;
   auto *metadata = neighborhood.current.metadata;
   if (!metadata->is_valid) {
@@ -1064,6 +1089,10 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   directory_.migration_in_seq.fetch_add(1, std::memory_order_relaxed);
   star::num_data_move_in.fetch_add(1, std::memory_order_relaxed);
   return star::migration_result::SUCCESS;
+        };
+        result = run();
+      });
+  return found ? result : star::migration_result::FAIL_OOM;
 }
 
 bool KVPartition::MoveOutForMigrationManager(const void *key) {
@@ -1076,12 +1105,37 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   EnterEbr();
   if (star::scc_manager == nullptr) return false;
   const FixedKey fixed_key = MakeKey(key);
-  Neighborhood neighborhood;
-  LockNeighborhood(fixed_key, &neighborhood);
-  if (!neighborhood.has_current) {
-    UnlockNeighborhood(&neighborhood);
-    return false;
-  }
+  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
+  if (table == nullptr) return false;
+  bool result = false;
+  const bool found = table->search_and_update_next_key_info(
+      &fixed_key,
+      [&](const void *prev_key, void *prev_meta, void *prev_data,
+          const void *cur_key, void *cur_meta, void *cur_data,
+          const void *next_key, void *next_meta, void *next_data) {
+        Neighborhood neighborhood;
+        const auto fill = [&](const void *row_key, void *row_meta,
+                              void *row_data, bool *present, RowRef *row) {
+          if (row_key == nullptr || row_meta == nullptr || row_data == nullptr)
+            return;
+          *present = true;
+          row->key = *static_cast<const FixedKey *>(row_key);
+          row->metadata = static_cast<PrivateMetadataLocal *>(row_meta);
+          row->value = reinterpret_cast<PrivateValueStruct *>(
+              static_cast<char *>(row_data) - sizeof(PrivateValueStruct));
+          row->offset = regions_.swcc().ToOffset(row->value);
+        };
+        fill(prev_key, prev_meta, prev_data, &neighborhood.has_prev,
+             &neighborhood.prev);
+        fill(cur_key, cur_meta, cur_data, &neighborhood.has_current,
+             &neighborhood.current);
+        fill(next_key, next_meta, next_data, &neighborhood.has_next,
+             &neighborhood.next);
+        if (!neighborhood.has_current) return;
+        if (neighborhood.has_prev) LockRow(neighborhood.prev.metadata);
+        LockRow(neighborhood.current.metadata);
+        if (neighborhood.has_next) LockRow(neighborhood.next.metadata);
+        auto run = [&]() -> bool {
   auto *private_value = neighborhood.current.value;
   auto *metadata = neighborhood.current.metadata;
   if (!metadata->is_migrated || metadata->migrated_smeta_off == kNullOffset) {
@@ -1162,6 +1216,10 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   star::num_data_move_out.fetch_add(1, std::memory_order_relaxed);
   KvMigrationRuntime::SyncHwCcUsage(*this);
   return true;
+        };
+        result = run();
+      });
+  return found && result;
 }
 
 std::string KVPartition::KeyString(const FixedKey &key) const {

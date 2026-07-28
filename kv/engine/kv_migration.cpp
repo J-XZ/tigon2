@@ -36,7 +36,10 @@ void KvPartitionTable::FillAdjacent(RegionOffset *offset, void **meta,
   *data = nullptr;
   if (offset == nullptr || *offset == kNullOffset) return;
   auto *value = partition_->ValueFromOffset(*offset);
-  *meta = &value->meta;
+  // Match TableBTreeOLC's adjacent callbacks: search() exposes the
+  // ValueStruct meta slot, while adjacent callbacks expose the resolved local
+  // metadata object stored in that slot.
+  *meta = partition_->MetadataFromValue(value);
   *data = value->data;
 }
 

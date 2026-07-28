@@ -147,6 +147,9 @@ int main() {
                       void *, void *) {
         assert(current_key != nullptr && current_meta != nullptr &&
                current_data != nullptr);
+        // TableBTreeOLC's adjacent callbacks expose the resolved local
+        // metadata, not the ValueStruct::meta slot returned by search().
+        assert(current_meta != alpha_meta);
         table_adjacent_called = true;
       }));
   assert(table_adjacent_called);
