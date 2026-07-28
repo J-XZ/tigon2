@@ -649,7 +649,7 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
                                 next_data = &next_value->row->data;
                         }
 
-                        return processor(prev_key, prev_meta, prev_data, cur_key, cur_meta, cur_value, next_key, next_meta, next_data);
+                        return processor(prev_key, prev_meta, prev_data, cur_key, cur_meta, cur_data, next_key, next_meta, next_data);
 		};
 
 
