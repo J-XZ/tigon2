@@ -1916,7 +1916,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
         fill(cur_key, cur_off, &neighborhood.has_current, &neighborhood.current);
         fill(next_key, next_off, &neighborhood.has_next, &neighborhood.next);
         // Preserve the original callback's row-lock order while the B+Tree
-        // holds the exact adjacent leaves; no lookupAdjacent revalidation.
+        // holds the exact adjacent leaves; no second tree lookup is needed.
         if (neighborhood.has_prev) LockRow(neighborhood.prev.metadata);
         if (neighborhood.has_current) LockRow(neighborhood.current.metadata);
         if (neighborhood.has_next) LockRow(neighborhood.next.metadata);
