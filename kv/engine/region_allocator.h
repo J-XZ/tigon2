@@ -41,9 +41,6 @@ struct alignas(64) RegionAllocatorHeader {
   uint64_t region_bytes = 0;
   uint64_t metadata_bytes = 0;
   uint64_t reserved_prefix_bytes = 0;
-  // Bumped on every Initialize so process-local TLS caches cannot reuse
-  // offsets after munmap+mmap recycles the same virtual address.
-  uint64_t init_id = 0;
   std::atomic<uint64_t> allocated_bytes{0};
   std::atomic<uint64_t> allocation_count{0};
   std::atomic<uint64_t> free_count{0};
@@ -68,8 +65,7 @@ class RegionAllocator {
       void *region, uint64_t region_bytes, RegionAllocatorHeader *header,
       bool metadata_is_hwcc = false);
 
-  // Hot path: per-thread size-class cache (see region_allocator.cpp) then
-  // shard freelist / bump under a short spin lock.
+  // Hot path: owner shard size-class freelist / bump under a short spin lock.
   // Every allocation is reclaimed by its owner. Cross-owner free is a protocol
   // error: remote nodes never access allocator control in owner-private SWCC.
   void *Allocate(uint64_t bytes, AllocationDomain domain, DomainCounter *counter,

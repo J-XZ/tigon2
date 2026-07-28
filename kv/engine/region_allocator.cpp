@@ -32,35 +32,6 @@ void FlushForRemoteVisibility(const void *address, size_t bytes,
 #endif
 }
 
-// PLAN §4.1 / §1.10: per-thread size-class cache (process-local DRAM).
-// Cached offsets are RegionFreeBlock bases; accounting already ran on Free.
-constexpr uint32_t kTlsCacheCapacity = 32;
-struct AllocatorTlsCache {
-  RegionAllocatorHeader *header = nullptr;
-  uint64_t init_id = 0;
-  struct Slot {
-    RegionOffset offsets[kTlsCacheCapacity]{};
-    uint32_t count = 0;
-  } slots[kAllocatorSizeClasses];
-};
-thread_local AllocatorTlsCache g_allocator_tls;
-std::atomic<uint64_t> g_allocator_init_seq{1};
-
-void TlsBind(RegionAllocatorHeader *header) {
-  if (g_allocator_tls.header == header &&
-      g_allocator_tls.init_id == header->init_id)
-    return;
-  for (auto &slot : g_allocator_tls.slots) slot.count = 0;
-  g_allocator_tls.header = header;
-  g_allocator_tls.init_id = header->init_id;
-}
-
-void TlsInvalidate() {
-  for (auto &slot : g_allocator_tls.slots) slot.count = 0;
-  g_allocator_tls.header = nullptr;
-  g_allocator_tls.init_id = 0;
-}
-
 }  // namespace
 
 uint64_t RegionAllocator::MetadataBytes() { return Align(sizeof(RegionAllocatorHeader)); }
@@ -102,8 +73,6 @@ RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
   header->region_bytes = region_bytes;
   header->metadata_bytes = MetadataBytes();
   header->reserved_prefix_bytes = reserved_prefix_bytes;
-  header->init_id = g_allocator_init_seq.fetch_add(1, std::memory_order_relaxed);
-  TlsInvalidate();
   const uint64_t payload_begin = header->metadata_bytes + reserved_prefix_bytes;
   const uint64_t payload = region_bytes - payload_begin;
   for (uint32_t shard = 0; shard < shard_count; ++shard) {
@@ -126,8 +95,7 @@ RegionAllocator RegionAllocator::Attach(void *region, uint64_t region_bytes,
   if (header->magic != 0x5449474f4e414c4cULL || header->version != 4 ||
       header->region_bytes != region_bytes || header->metadata_bytes != MetadataBytes() ||
       header->reserved_prefix_bytes > region_bytes - MetadataBytes() ||
-      header->shard_count == 0 || header->shard_count > kMaxAllocatorShards ||
-      header->init_id == 0)
+      header->shard_count == 0 || header->shard_count > kMaxAllocatorShards)
     throw std::runtime_error("allocator attachment validation failed");
   return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
 }
@@ -142,11 +110,12 @@ RegionAllocator RegionAllocator::InitializeWithExternalHeader(
   header->region_bytes = region_bytes;
   header->metadata_bytes = 0;
   header->reserved_prefix_bytes = 0;
-  header->init_id = g_allocator_init_seq.fetch_add(1, std::memory_order_relaxed);
-  header->shards[0].begin = 0;
+  // RegionOffset zero is the persistent null sentinel.  Dynamic arenas keep
+  // their allocator header in the owner-private control area, so reserve one
+  // cache line here rather than ever placing a reusable free block at offset 0.
+  header->shards[0].begin = kAlignment;
   header->shards[0].end = region_bytes;
-  header->shards[0].bump = 0;
-  TlsInvalidate();
+  header->shards[0].bump = kAlignment;
   return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
 }
 
@@ -157,7 +126,8 @@ RegionAllocator RegionAllocator::AttachWithExternalHeader(
       header->magic != 0x5449474f4e414c4cULL || header->version != 4 ||
       header->region_bytes != region_bytes || header->metadata_bytes != 0 ||
       header->reserved_prefix_bytes != 0 || header->shard_count != 1 ||
-      header->init_id == 0)
+      header->shards[0].begin != kAlignment ||
+      header->shards[0].bump < kAlignment)
     throw std::runtime_error("external allocator attachment validation failed");
   return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
 }
@@ -319,34 +289,6 @@ void *RegionAllocator::Allocate(uint64_t bytes, AllocationDomain, DomainCounter 
   const uint64_t requested = Align(bytes + Align(sizeof(RegionFreeBlock)));
   const uint32_t size_class = SizeClass(requested);
   const uint64_t header_bytes = Align(sizeof(RegionFreeBlock));
-  if (size_class < kAllocatorSizeClasses) {
-    RecordMetadataRead(&header_->init_id, sizeof(header_->init_id));
-    TlsBind(header_);
-    auto &slot = g_allocator_tls.slots[size_class];
-    if (slot.count == 0) {
-      // Refill a small batch under one shard lock (PLAN per-thread cache).
-      auto &shard = header_->shards[owner_shard];
-      Lock(shard);
-      while (slot.count < kTlsCacheCapacity / 2) {
-        RecordAtomicLoad(&shard.free_heads[size_class]);
-        const RegionOffset head =
-            shard.free_heads[size_class].load(std::memory_order_relaxed);
-        if (head == kNullOffset) break;
-        auto *block = static_cast<RegionFreeBlock *>(FromOffset(head));
-        RecordAtomicLoad(&block->next);
-        RecordAtomicStore(&shard.free_heads[size_class]);
-        shard.free_heads[size_class].store(
-            block->next.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        slot.offsets[slot.count++] = head;
-      }
-      Unlock(shard);
-    }
-    if (slot.count > 0) {
-      const RegionOffset offset = slot.offsets[--slot.count];
-      AccountAllocate(ClassBytes(size_class), counter);
-      return static_cast<std::byte *>(FromOffset(offset)) + header_bytes;
-    }
-  }
   void *result = AllocateFromShard(requested, size_class, owner_shard);
   if (size_class < kAllocatorSizeClasses) {
     auto *fresh_block = new (result) RegionFreeBlock;
@@ -394,14 +336,6 @@ void RegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain,
   const RegionOffset offset = ToOffset(block);
   if (owner_shard != current_shard)
     throw std::runtime_error("allocator free attempted by non-owner shard");
-  RecordMetadataRead(&header_->init_id, sizeof(header_->init_id));
-  TlsBind(header_);
-  auto &slot = g_allocator_tls.slots[size_class];
-  if (slot.count < kTlsCacheCapacity) {
-    slot.offsets[slot.count++] = offset;
-    AccountFree(ClassBytes(size_class), counter);
-    return;
-  }
   FreeLocal(offset, size_class, owner_shard);
   AccountFree(ClassBytes(size_class), counter);
 }
