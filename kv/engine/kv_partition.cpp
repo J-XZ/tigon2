@@ -1492,111 +1492,146 @@ bool KVPartition::DeletePrivateForMigrationManager(
   *need_untrack = false;
   *migration_policy_meta = nullptr;
   const FixedKey fixed_key = MakeKey(key);
+  if (IsInternalMaxSentinel(fixed_key))
+    throw std::invalid_argument("internal max sentinel is reserved");
   star::TwoPLPashaMetadataShared *retired_smeta = nullptr;
   star::TwoPLPashaSharedDataSCC *retired_payload = nullptr;
-  Neighborhood neighborhood;
-  LockNeighborhood(fixed_key, &neighborhood);
-  if (!neighborhood.has_current) {
-    UnlockNeighborhood(&neighborhood);
-    return false;
-  }
-  auto *private_value = neighborhood.current.value;
-  auto *metadata = neighborhood.current.metadata;
-  if (!metadata->is_valid) {
-    UnlockNeighborhood(&neighborhood);
-    return false;
-  }
-  BreakAdjacencyLocked(neighborhood);
-  metadata->is_valid = false;
-  RecordPrivateMetadataWrite(metadata);
+  PrivateValueStruct *retired_value = nullptr;
+  PrivateMetadataLocal *retired_metadata = nullptr;
+  enum class DeleteFailure { kNone, kBusy, kCorruption } failure =
+      DeleteFailure::kNone;
+  std::string failure_detail;
   const uint64_t value_bytes = sizeof(PrivateValueStruct) + fixed_value_size_;
   const uint64_t metadata_bytes = sizeof(PrivateMetadataLocal);
-  // `scc_data_off` persists after ordinary move-out so the next move-in can
-  // reuse it. A permanent delete is its sole owner and must retire it even
-  // when the row is currently private.
-  if (metadata->scc_data_off != kNullOffset) {
-    retired_payload = static_cast<star::TwoPLPashaSharedDataSCC *>(
-        regions_.swcc().FromOffset(metadata->scc_data_off));
-    if (!regions_.IsSwccAddress(retired_payload)) {
-      metadata->is_valid = true;
-      RecordPrivateMetadataWrite(metadata);
-      RefreshAdjacencyLocked(neighborhood);
-      UnlockNeighborhood(&neighborhood);
-      throw std::runtime_error("delete has cached SCC payload outside SWCC");
-    }
+  const bool removed = private_tree_->remove_and_process_adjacent_keys(
+      fixed_key,
+      [&](const FixedKey *prev_key, RegionOffset *prev_off,
+          const FixedKey *cur_key, RegionOffset *cur_off,
+          const FixedKey *next_key, RegionOffset *next_off) {
+        if (cur_key == nullptr || cur_off == nullptr) return false;
+        Neighborhood neighborhood;
+        const auto fill = [&](const FixedKey *row_key, RegionOffset *row_off,
+                              bool *present, RowRef *row) {
+          if (row_key == nullptr || row_off == nullptr) return;
+          *present = true;
+          row->key = *row_key;
+          row->offset = *row_off;
+          row->value = ValueFromOffset(*row_off);
+          row->metadata = MetadataFromValue(row->value);
+        };
+        fill(prev_key, prev_off, &neighborhood.has_prev, &neighborhood.prev);
+        fill(cur_key, cur_off, &neighborhood.has_current, &neighborhood.current);
+        fill(next_key, next_off, &neighborhood.has_next, &neighborhood.next);
+        // Preserve the original callback's row-lock order while the B+Tree
+        // holds the exact adjacent leaves; no lookupAdjacent revalidation.
+        if (neighborhood.has_prev) LockRow(neighborhood.prev.metadata);
+        if (neighborhood.has_current) LockRow(neighborhood.current.metadata);
+        if (neighborhood.has_next) LockRow(neighborhood.next.metadata);
+        const auto unlock = [&] { UnlockNeighborhood(&neighborhood); };
+        auto *private_value = neighborhood.current.value;
+        auto *metadata = neighborhood.current.metadata;
+        if (!metadata->is_valid) {
+          unlock();
+          return false;
+        }
+        BreakAdjacencyLocked(neighborhood);
+        metadata->is_valid = false;
+        RecordPrivateMetadataWrite(metadata);
+        if (metadata->scc_data_off != kNullOffset) {
+          retired_payload = static_cast<star::TwoPLPashaSharedDataSCC *>(
+              regions_.swcc().FromOffset(metadata->scc_data_off));
+          if (!regions_.IsSwccAddress(retired_payload)) {
+            metadata->is_valid = true;
+            RecordPrivateMetadataWrite(metadata);
+            RefreshAdjacencyLocked(neighborhood);
+            failure = DeleteFailure::kCorruption;
+            failure_detail = "delete has cached SCC payload outside SWCC";
+            unlock();
+            return false;
+          }
+        }
+        if (metadata->is_migrated) {
+          const RegionOffset smeta_offset = metadata->migrated_smeta_off;
+          if (smeta_offset == kNullOffset ||
+              !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
+            metadata->is_valid = true;
+            RecordPrivateMetadataWrite(metadata);
+            RefreshAdjacencyLocked(neighborhood);
+            failure = DeleteFailure::kCorruption;
+            failure_detail = "migrated delete has inconsistent shared offset";
+            unlock();
+            return false;
+          }
+          auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+              regions_.hwcc().FromOffset(smeta_offset));
+          smeta->lock();
+          auto *payload = smeta->get_scc_data();
+          if (retired_payload != payload) {
+            smeta->unlock();
+            metadata->is_valid = true;
+            RecordPrivateMetadataWrite(metadata);
+            RefreshAdjacencyLocked(neighborhood);
+            failure = DeleteFailure::kCorruption;
+            failure_detail = "migrated row payload disagrees with local cache";
+            unlock();
+            return false;
+          }
+          if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
+              smeta->is_write_locked()) {
+            smeta->unlock();
+            metadata->is_valid = true;
+            RecordPrivateMetadataWrite(metadata);
+            RefreshAdjacencyLocked(neighborhood);
+            failure = DeleteFailure::kBusy;
+            failure_detail = "delete shared-row busy";
+            unlock();
+            return false;
+          }
+          smeta->set_write_locked();
+          smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+          if (!shared_tree_->remove(fixed_key)) {
+            smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+            smeta->clear_write_locked();
+            smeta->unlock();
+            metadata->is_valid = true;
+            RecordPrivateMetadataWrite(metadata);
+            RefreshAdjacencyLocked(neighborhood);
+            failure = DeleteFailure::kCorruption;
+            failure_detail = "shared tree remove failed during delete";
+            unlock();
+            return false;
+          }
+          smeta->unlock();
+          metadata->is_migrated = false;
+          metadata->migrated_smeta_off = kNullOffset;
+          RecordPrivateMetadataWrite(metadata);
+          ClockLock();
+          ClockUntrackRowOffset(neighborhood.current.offset);
+          ClockUnlock();
+          *migration_policy_meta = &smeta->migration_policy_meta;
+          retired_smeta = smeta;
+        }
+        metadata->scc_data_off = kNullOffset;
+        RecordPrivateMetadataWrite(metadata);
+        Neighborhood remaining = neighborhood;
+        remaining.has_current = false;
+        RefreshAdjacencyLocked(remaining);
+        retired_value = private_value;
+        retired_metadata = metadata;
+        unlock();
+        return true;
+      });
+  if (!removed) {
+    if (failure == DeleteFailure::kBusy)
+      throw std::runtime_error(failure_detail);
+    if (failure == DeleteFailure::kCorruption)
+      throw std::runtime_error(failure_detail);
+    return false;
   }
-  if (metadata->is_migrated) {
-    const RegionOffset smeta_offset = metadata->migrated_smeta_off;
-    if (smeta_offset == kNullOffset ||
-        !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
-      metadata->is_valid = true;
-      RecordPrivateMetadataWrite(metadata);
-      RefreshAdjacencyLocked(neighborhood);
-      UnlockNeighborhood(&neighborhood);
-      throw std::runtime_error(
-          "migrated delete has inconsistent shared offset");
-    }
-    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-        regions_.hwcc().FromOffset(smeta_offset));
-    smeta->lock();
-    auto *payload = smeta->get_scc_data();
-    if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
-        smeta->is_write_locked()) {
-      smeta->unlock();
-      metadata->is_valid = true;
-      RecordPrivateMetadataWrite(metadata);
-      RefreshAdjacencyLocked(neighborhood);
-      UnlockNeighborhood(&neighborhood);
-      // Do not spin under Clock tracker lock (§10.2b); caller sees Busy.
-      throw std::runtime_error("delete shared-row busy");
-    }
-    smeta->set_write_locked();
-    smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
-    if (!shared_tree_->remove(fixed_key)) {
-      smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
-      smeta->clear_write_locked();
-      smeta->unlock();
-      metadata->is_valid = true;
-      RecordPrivateMetadataWrite(metadata);
-      RefreshAdjacencyLocked(neighborhood);
-      UnlockNeighborhood(&neighborhood);
-      throw std::runtime_error(
-          "shared tree remove failed during delete");
-    }
-    smeta->unlock();
-    metadata->is_migrated = false;
-    metadata->migrated_smeta_off = kNullOffset;
-    RecordPrivateMetadataWrite(metadata);
-    // Unlink before private metadata is EBR-retired.
-    ClockLock();
-    ClockUntrackRowOffset(neighborhood.current.offset);
-    ClockUnlock();
-    *need_untrack = false;  // already untracked by offset
-    *migration_policy_meta = &smeta->migration_policy_meta;
-    retired_smeta = smeta;
-    if (retired_payload != payload) {
-      UnlockNeighborhood(&neighborhood);
-      throw std::runtime_error("migrated row payload disagrees with local cache");
-    }
-  }
-  // Do not clear this cache locator until all fallible shared-row work has
-  // completed. A Busy delete retries the same migrated row and must retain its
-  // cached payload identity.
-  metadata->scc_data_off = kNullOffset;
-  RecordPrivateMetadataWrite(metadata);
-  if (!private_tree_->remove(fixed_key)) {
-    UnlockNeighborhood(&neighborhood);
-    throw std::runtime_error(
-        "private tree remove failed after shared delete");
-  }
-  Neighborhood remaining = neighborhood;
-  remaining.has_current = false;
-  RefreshAdjacencyLocked(remaining);
-  ebr_.add_retired_object(private_value, value_bytes, star::CXLMemory::MISC_FREE,
+  ebr_.add_retired_object(retired_value, value_bytes, star::CXLMemory::MISC_FREE,
                           owner_shard_, partition_id_);
-  ebr_.add_retired_object(metadata, metadata_bytes, star::CXLMemory::MISC_FREE,
-                          owner_shard_, partition_id_);
-  UnlockNeighborhood(&neighborhood);
+  ebr_.add_retired_object(retired_metadata, metadata_bytes,
+                          star::CXLMemory::MISC_FREE, owner_shard_, partition_id_);
   PersistPrivateRootIfChanged();
   if (retired_smeta != nullptr) {
     mem_access::DelayActiveScopeNow();
@@ -1606,6 +1641,8 @@ bool KVPartition::DeletePrivateForMigrationManager(
     ebr_.add_retired_object(
         retired_smeta, sizeof(star::TwoPLPashaMetadataShared),
         star::CXLMemory::METADATA_FREE, owner_shard_);
+  }
+  if (retired_payload != nullptr) {
     ebr_.add_retired_object(
         retired_payload, fixed_value_size_,
         star::CXLMemory::DATA_FREE, owner_shard_);

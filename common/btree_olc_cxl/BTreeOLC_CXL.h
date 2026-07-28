@@ -3830,7 +3830,9 @@ restart:
 				return saved_success;
 		}
 		assert(result_saved);
-		assert(saved_success);
+		// The adjacent callback is explicitly allowed to veto removal.  The
+		// original terminal assertion incorrectly turned that normal false
+		// result into an abort; preserve the callback's bool contract.
 		return saved_success;
 	}
 
