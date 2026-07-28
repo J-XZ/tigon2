@@ -813,7 +813,8 @@ SharedAccessState KVPartition::PutShared(std::string_view key, uint32_t host_id,
 
 SharedAccessState KVPartition::PrepareRemoteDelete(
     std::string_view key, uint32_t host_id,
-    star::TwoPLPashaMetadataShared **locked_row) {
+    star::TwoPLPashaMetadataShared **locked_row,
+    bool record_clock_access) {
   EnterEbr();
   if (locked_row == nullptr)
     throw std::invalid_argument("null remote delete lock output");
@@ -822,6 +823,7 @@ SharedAccessState KVPartition::PrepareRemoteDelete(
   RegionOffset smeta_offset = kNullOffset;
   const SharedAccessState pin = TryPinShared(MakeKey(key), &smeta, &smeta_offset);
   if (pin != SharedAccessState::kDone) return pin;
+  if (record_clock_access) NoteSharedAccess(smeta);
   smeta->lock();
   if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index)) {
     smeta->unlock();

@@ -122,7 +122,8 @@ class KVPartition {
   // ref while publishing invalid; owner deletion consumes both on success.
   SharedAccessState PrepareRemoteDelete(
       std::string_view key, uint32_t host_id,
-      star::TwoPLPashaMetadataShared **locked_row);
+      star::TwoPLPashaMetadataShared **locked_row,
+      bool record_clock_access = true);
   void AbortRemoteDelete(star::TwoPLPashaMetadataShared *locked_row);
   // Owner DATA_MIGRATION analogue: move_row_in(inc_ref=false). Returns Ok on
   // SUCCESS or FAIL_ALREADY_IN_CXL, NotFound if absent, OutOfMemory otherwise.

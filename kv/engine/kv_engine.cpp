@@ -656,12 +656,19 @@ Status KVEngine::Delete(std::string_view key) {
                          "internal max sentinel is reserved");
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
-    const Status migrated =
-        Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
-    if (!migrated.ok()) return migrated;
     star::TwoPLPashaMetadataShared *locked_row = nullptr;
-    const SharedAccessState prepared = route.partition->PrepareRemoteDelete(
-        key, config_.node_id, &locked_row);
+    const auto prepare_delete = [&](bool record_clock_access = true) {
+      return route.partition->PrepareRemoteDelete(key, config_.node_id,
+                                                  &locked_row,
+                                                  record_clock_access);
+    };
+    SharedAccessState prepared = prepare_delete();
+    if (prepared == SharedAccessState::kMissing) {
+      const Status migrated =
+          Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
+      if (!migrated.ok()) return migrated;
+      prepared = prepare_delete(/*record_clock_access=*/false);
+    }
     if (prepared == SharedAccessState::kMissing)
       return Status::Error(StatusCode::kNotFound, "key not found");
     if (prepared != SharedAccessState::kDone)
