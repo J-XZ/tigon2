@@ -70,7 +70,7 @@ void TestAttachReuseAndAccounting() {
   assert(index.peak_bytes.load() == 128 && payload.peak_bytes.load() == 192);
 }
 
-void TestCrossProcessRemoteFree() {
+void TestCrossProcessFreeRejected() {
   Mapping mapping(true);
   auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2, 0, true);
   void *counter_map = mmap(nullptr, sizeof(DomainCounter), PROT_READ | PROT_WRITE,
@@ -86,10 +86,15 @@ void TestCrossProcessRemoteFree() {
     if (child_base == MAP_FAILED) _exit(2);
     try {
       auto child_allocator = RegionAllocator::Attach(child_base, kBytes, true);
-      child_allocator.Free(child_allocator.FromOffset(offset), 100,
-                           AllocationDomain::kHwccMetadata, counter, 0, 1);
+      bool rejected = false;
+      try {
+        child_allocator.Free(child_allocator.FromOffset(offset), 100,
+                             AllocationDomain::kHwccMetadata, counter, 0, 1);
+      } catch (const std::runtime_error &) {
+        rejected = true;
+      }
       munmap(child_base, kBytes);
-      _exit(0);
+      _exit(rejected ? 0 : 3);
     } catch (...) {
       _exit(3);
     }
@@ -97,10 +102,7 @@ void TestCrossProcessRemoteFree() {
   int status = 0;
   assert(waitpid(child, &status, 0) == child);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-  // The owner harvests remote frees before its next allocation.
-  void *reused = allocator.Allocate(100, AllocationDomain::kHwccMetadata, counter, 0);
-  assert(reused == block);
-  allocator.Free(reused, 100, AllocationDomain::kHwccMetadata, counter, 0, 0);
+  allocator.Free(block, 100, AllocationDomain::kHwccMetadata, counter, 0, 0);
   assert(counter->used_bytes.load() == 0);
   munmap(counter_map, sizeof(DomainCounter));
 }
@@ -191,7 +193,7 @@ void TestDualPhysicalRegions() {
          dual.swcc().metadata_bytes() + arena_header_bytes);
   dual.PublishReady();
   assert(dual.layout().state.load(std::memory_order_acquire) ==
-         static_cast<uint32_t>(LayoutState::kDirty));
+         static_cast<uint32_t>(LayoutState::kReady));
   auto attached = DualRegionAllocator::Attach(mapping.base, config);
   assert(attached.IsHwccAddress(index) && attached.IsSwccAddress(payload));
   assert(attached.layout().domains[static_cast<size_t>(
@@ -208,15 +210,18 @@ void TestDualPhysicalRegions() {
     fixed_domain_rejected = true;
   }
   assert(fixed_domain_rejected);
-  attached.Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 1);
-  void *reused_remote =
-      dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 0);
-  assert(reused_remote == remote_payload);
+  bool remote_free_rejected = false;
+  try {
+    attached.Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 1);
+  } catch (const std::runtime_error &) {
+    remote_free_rejected = true;
+  }
+  assert(remote_free_rejected);
   dual.Free(index, 100, AllocationDomain::kHwccIndex, 0, 0);
   dual.Free(metadata, 64, AllocationDomain::kHwccMetadata, 1, 1);
   dual.Free(owner, 80, AllocationDomain::kOwnerPrivateSwcc, 0, 0);
   dual.Free(payload, 100, AllocationDomain::kSharedPayloadSwcc, 1, 1);
-  dual.Free(reused_remote, 100, AllocationDomain::kSharedPayloadSwcc, 0, 0);
+  dual.Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
              .used_bytes.load() == 0);
   assert(dual.layout().owner_migration_hwcc[0].used_bytes.load() == 0);
@@ -231,34 +236,16 @@ void TestDualPhysicalRegions() {
   checkpoint_latency.hwcc_atomic_store_ns = 1;
   auto &checkpoint_simulator = latency_sim::GlobalLatencySimulator();
   checkpoint_simulator.Configure(checkpoint_latency);
-  std::atomic<bool> checkpoint_settled{true};
-  std::thread checkpoint_zero([&] {
-    checkpoint_simulator.BeginScope(latency_sim::ScopeKind::kForeground);
-    dual.FlushCheckpointRanges(0, std::chrono::seconds(1));
-    if (checkpoint_simulator.PendingDelayNsForTest() != 0)
-      checkpoint_settled.store(false, std::memory_order_relaxed);
-    checkpoint_simulator.EndScopeAndDelay();
-  });
-  std::thread checkpoint_one([&] {
-    checkpoint_simulator.BeginScope(latency_sim::ScopeKind::kForeground);
-    attached.FlushCheckpointRanges(1, std::chrono::seconds(1));
-    if (checkpoint_simulator.PendingDelayNsForTest() != 0)
-      checkpoint_settled.store(false, std::memory_order_relaxed);
-    checkpoint_simulator.EndScopeAndDelay();
-  });
-  checkpoint_zero.join();
-  checkpoint_one.join();
-  assert(checkpoint_settled.load(std::memory_order_relaxed));
+  checkpoint_simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  dual.FlushOwnedRanges(0);
+  attached.FlushOwnedRanges(1);
+  checkpoint_simulator.EndScopeAndDelay();
   const auto checkpoint_stats = checkpoint_simulator.TakeStatsAndReset();
   assert(checkpoint_stats.swcc_raw_line_accesses > 0);
   assert(checkpoint_stats.hwcc_raw_line_accesses > 0);
   checkpoint_simulator.Configure(latency_sim::Config{});
-  assert(dual.layout().clean_epoch.load(std::memory_order_acquire) == 1);
   assert(dual.layout().state.load(std::memory_order_acquire) ==
-         static_cast<uint32_t>(LayoutState::kClean));
-  attached.MarkDirty();
-  assert(dual.layout().state.load(std::memory_order_acquire) ==
-         static_cast<uint32_t>(LayoutState::kDirty));
+         static_cast<uint32_t>(LayoutState::kReady));
 }
 
 DualRegionConfig TestDualConfig() {
@@ -372,7 +359,7 @@ void TestAllocatorLatencyAccounting() {
 
 int main() {
   TestAttachReuseAndAccounting();
-  TestCrossProcessRemoteFree();
+  TestCrossProcessFreeRejected();
   TestConcurrencyAndBounds();
   TestInvalidAttachment();
   TestDualPhysicalRegions();

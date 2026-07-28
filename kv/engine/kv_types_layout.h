@@ -28,7 +28,9 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // v17: shared metadata removes the KV-only writer-preference byte and restores
 //      the original single-attempt TwoPLPasha row-lock semantics.
 // v18: drops the unused Scan-certificate mutation generation from HWCC.
-constexpr uint32_t kSharedLayoutVersion = 18;
+// v19: startup has a single Initializing→Ready publication; clean-exit and
+//      checkpoint coordination are process-local, never shared layout state.
+constexpr uint32_t kSharedLayoutVersion = 19;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -57,7 +59,7 @@ enum class AllocationDomain : uint32_t {
 constexpr size_t kAllocationDomainCount =
     static_cast<size_t>(AllocationDomain::kCount);
 
-enum class LayoutState : uint32_t { kInitializing = 0, kClean = 1, kDirty = 2 };
+enum class LayoutState : uint32_t { kInitializing = 0, kReady = 1 };
 
 struct alignas(64) DomainCounter {
   std::atomic<uint64_t> used_bytes{0};
@@ -136,12 +138,11 @@ struct alignas(64) SharedLayoutHeader {
   uint32_t partition_count = 0;
   uint32_t fixed_key_size = 0;
   uint32_t fixed_value_size = 0;
-  std::atomic<uint64_t> clean_epoch{0};
+  // Each owner completes its own private arena/root initialization before VM0
+  // releases Ready. This bitmap is startup-only and never becomes a recovery
+  // generation or a checkpoint protocol.
+  std::atomic<uint64_t> owner_init_ready_bitmap{0};
   std::array<std::atomic<RegionOffset>, kRootSlotCount> roots{};
-  std::array<std::atomic<RegionOffset>, kMaxAllocatorShards>
-      swcc_remote_free_heads{};
-  std::array<std::atomic<uint64_t>, kMaxAllocatorShards>
-      checkpoint_ready_epoch{};
   std::array<DomainCounter, kMaxAllocatorShards>
       owner_migration_hwcc{};
   std::array<PartitionDirectoryEntry, kMaxPartitions> partitions{};
@@ -152,8 +153,8 @@ struct alignas(64) SharedLayoutHeader {
     return magic == kSharedLayoutMagic && layout_version == kSharedLayoutVersion &&
            config_hash == expected_hash && total_pool_bytes == expected_pool_bytes &&
            vm_count == expected_vms && partition_count == expected_partitions &&
-           state.load(std::memory_order_acquire) !=
-               static_cast<uint32_t>(LayoutState::kInitializing);
+           state.load(std::memory_order_acquire) ==
+               static_cast<uint32_t>(LayoutState::kReady);
   }
 };
 

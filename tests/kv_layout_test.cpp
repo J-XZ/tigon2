@@ -13,7 +13,7 @@ int main() {
   assert(kSingleTableId == 0);
   assert(kMaxFixedKeyBytes == 32);
   assert(kMaxPartitions >= 16);
-  assert(kSharedLayoutVersion == 18);
+  assert(kSharedLayoutVersion == 19);
   assert(sizeof(PartitionDirectoryEntry) == 64);
   assert(sizeof(PrivateRow) == 64);
   // §11.4 WireSize: header = offsetof(value); value bytes only on the wire.
@@ -73,7 +73,7 @@ int main() {
   header.vm_count = 2;
   header.partition_count = 16;
   assert(!header.IsCompatible(7, 4096, 2, 16));
-  header.state.store(static_cast<uint32_t>(LayoutState::kClean),
+  header.state.store(static_cast<uint32_t>(LayoutState::kReady),
                      std::memory_order_release);
   assert(header.IsCompatible(7, 4096, 2, 16));
   assert(!header.IsCompatible(8, 4096, 2, 16));

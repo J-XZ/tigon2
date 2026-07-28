@@ -954,8 +954,7 @@ Status KVEngine::Checkpoint() {
     // poll, so this only drains requests already visible to this VM.
     for (uint32_t i = 0; i < 1024; ++i) PollTransport();
     ebr_->drain_quiescent();
-    pool_->allocator().FlushCheckpointRanges(
-        config_.node_id, std::chrono::seconds(config_.sync_timeout_sec));
+    pool_->allocator().FlushOwnedRanges(config_.node_id);
     layout_dirty_.store(false, std::memory_order_release);
     return Status::Ok();
   } catch (const std::exception &e) {
@@ -964,8 +963,7 @@ Status KVEngine::Checkpoint() {
 }
 
 void KVEngine::MarkLayoutDirty() {
-  if (!layout_dirty_.exchange(true, std::memory_order_acq_rel))
-    pool_->allocator().MarkDirty();
+  layout_dirty_.store(true, std::memory_order_release);
 }
 
 void KVEngine::SendTransportMessage(const KvMessage &message) {

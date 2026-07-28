@@ -3,7 +3,6 @@
 #include "kv/engine/kv_types_layout.h"
 
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -24,7 +23,6 @@ struct alignas(64) RegionFreeBlock {
 
 struct alignas(64) RegionAllocatorShard {
   std::atomic<uint32_t> lock{0};
-  std::atomic<RegionOffset> remote_free_head{kNullOffset};
   uint64_t begin = 0;
   uint64_t end = 0;
   uint64_t bump = 0;  // only protected by lock
@@ -57,23 +55,19 @@ class RegionAllocator {
   static RegionAllocator Initialize(void *region, uint64_t region_bytes,
                                     uint32_t shard_count,
                                     uint64_t reserved_prefix_bytes = 0,
-                                    bool metadata_is_hwcc = false,
-                                    std::atomic<RegionOffset> *remote_free_heads = nullptr);
+                                    bool metadata_is_hwcc = false);
   static RegionAllocator Attach(void *region, uint64_t region_bytes,
-                                bool metadata_is_hwcc = false,
-                                std::atomic<RegionOffset> *remote_free_heads = nullptr);
+                                bool metadata_is_hwcc = false);
 
   // Hot path: per-thread size-class cache (see region_allocator.cpp) then
   // shard freelist / bump under a short spin lock.
-  // owner_shard identifies the VM which owns this allocation. current_shard
-  // identifies the freeing VM; a different value is placed on the persistent
-  // remote-free stack and reclaimed by the owner on its next allocation.
+  // Every allocation is reclaimed by its owner. Cross-owner free is a protocol
+  // error: remote nodes never access allocator control in owner-private SWCC.
   void *Allocate(uint64_t bytes, AllocationDomain domain, DomainCounter *counter,
                  uint32_t owner_shard = 0);
   void Free(void *pointer, uint64_t bytes, AllocationDomain domain,
             DomainCounter *counter, uint32_t owner_shard,
             uint32_t current_shard);
-  void ReapRemote(uint32_t owner_shard, DomainCounter *counter);
 
   RegionOffset ToOffset(const void *pointer) const;
   void *FromOffset(RegionOffset offset) const;
@@ -91,11 +85,9 @@ class RegionAllocator {
 
  private:
   RegionAllocator(void *base, uint64_t bytes, RegionAllocatorHeader *header,
-                  bool metadata_is_hwcc,
-                  std::atomic<RegionOffset> *remote_free_heads)
+                  bool metadata_is_hwcc)
       : base_(static_cast<std::byte *>(base)), bytes_(bytes), header_(header),
-        metadata_is_hwcc_(metadata_is_hwcc),
-        remote_free_heads_(remote_free_heads) {}
+        metadata_is_hwcc_(metadata_is_hwcc) {}
   static uint64_t Align(uint64_t bytes) {
     if (bytes > UINT64_MAX - (kAlignment - 1)) throw std::bad_alloc();
     return (bytes + kAlignment - 1) & ~(kAlignment - 1);
@@ -115,13 +107,11 @@ class RegionAllocator {
   void RecordAtomicLoad(const void *address) const;
   void RecordAtomicStore(const void *address) const;
   void RecordAtomicRmw(const void *address) const;
-  std::atomic<RegionOffset> &RemoteFreeHead(uint32_t owner_shard) const;
 
   std::byte *base_;
   uint64_t bytes_;
   RegionAllocatorHeader *header_;
   bool metadata_is_hwcc_;
-  std::atomic<RegionOffset> *remote_free_heads_;
 };
 
 // The pool is mapped once, but allocations are physically constrained to one
@@ -182,9 +172,8 @@ class DualRegionAllocator {
  public:
   static DualRegionAllocator Initialize(void *pool, const DualRegionConfig &config);
   static DualRegionAllocator Attach(void *pool, const DualRegionConfig &config);
-  // Publish only after transport, EBR, and every partition root are ready.
+  // Publish only after transport, EBR, and every owner has published its root.
   void PublishReady();
-  void MarkDirty();
 
   void *Allocate(uint64_t bytes, AllocationDomain domain, uint32_t owner_shard);
   void *AllocateOwnerPrivate(uint64_t bytes, uint32_t partition_id,
@@ -200,10 +189,9 @@ class DualRegionAllocator {
   bool IsInOwnerPrivateArena(const void *pointer, uint32_t partition_id) const;
   RegionOffset OwnerPrivateArenaOffset(uint32_t partition_id) const;
   uint64_t SharedPayloadCapacityBytes() const;
-  // Checkpoint persistence is cacheline writeback/fence only. It is not an
-  // SCC substitute and intentionally does not use page-level msync.
-  void FlushCheckpointRanges(uint32_t node_id,
-                             std::chrono::milliseconds timeout);
+  // Explicit test/teardown flush only. It is not a distributed checkpoint or
+  // a substitute for SCC publication.
+  void FlushOwnedRanges(uint32_t node_id);
   const SharedLayoutHeader &layout() const { return header_->layout; }
   SharedLayoutHeader &layout() { return header_->layout; }
   const RegionAllocator &hwcc() const { return hwcc_; }

@@ -91,8 +91,7 @@ uint64_t RegionAllocator::AccountedBytes(uint64_t bytes) {
 RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
                                             uint32_t shard_count,
                                             uint64_t reserved_prefix_bytes,
-                                            bool metadata_is_hwcc,
-                                            std::atomic<RegionOffset> *remote_free_heads) {
+                                            bool metadata_is_hwcc) {
   if (region == nullptr || shard_count == 0 || shard_count > kMaxAllocatorShards ||
       region_bytes <= MetadataBytes() ||
       reserved_prefix_bytes > region_bytes - MetadataBytes())
@@ -116,13 +115,11 @@ RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
     entry.bump = entry.begin;
   }
   FlushForRemoteVisibility(header, MetadataBytes(), !metadata_is_hwcc);
-  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc,
-                         remote_free_heads);
+  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
 }
 
 RegionAllocator RegionAllocator::Attach(void *region, uint64_t region_bytes,
-                                        bool metadata_is_hwcc,
-                                        std::atomic<RegionOffset> *remote_free_heads) {
+                                        bool metadata_is_hwcc) {
   if (region == nullptr || region_bytes <= MetadataBytes())
     throw std::invalid_argument("invalid allocator attachment");
   if (reinterpret_cast<uintptr_t>(region) % kAlignment != 0)
@@ -134,8 +131,7 @@ RegionAllocator RegionAllocator::Attach(void *region, uint64_t region_bytes,
       header->shard_count == 0 || header->shard_count > kMaxAllocatorShards ||
       header->init_id == 0)
     throw std::runtime_error("allocator attachment validation failed");
-  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc,
-                         remote_free_heads);
+  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
 }
 
 void RegionAllocator::RecordAtomicLoad(const void *address) const {
@@ -225,38 +221,6 @@ void RegionAllocator::AccountFree(uint64_t bytes, DomainCounter *counter) {
   }
 }
 
-std::atomic<RegionOffset> &RegionAllocator::RemoteFreeHead(
-    uint32_t owner_shard) const {
-  if (metadata_is_hwcc_) return header_->shards[owner_shard].remote_free_head;
-  if (remote_free_heads_ == nullptr)
-    throw std::logic_error(
-        "SWCC remote free requires an HWCC publication head");
-  return remote_free_heads_[owner_shard];
-}
-
-void RegionAllocator::ReapRemote(uint32_t owner_shard, DomainCounter *counter) {
-  RecordMetadataRead(&header_->shard_count, sizeof(header_->shard_count));
-  if (owner_shard >= header_->shard_count || counter == nullptr)
-    throw std::invalid_argument("invalid remote-free reap");
-  if (!metadata_is_hwcc_ && remote_free_heads_ == nullptr) return;
-  auto &head_source = RemoteFreeHead(owner_shard);
-  mem_access::HwccAtomicRmw(&head_source);
-  RegionOffset head = head_source.exchange(kNullOffset, std::memory_order_acq_rel);
-  while (head != kNullOffset) {
-    auto *block = static_cast<RegionFreeBlock *>(FromOffset(head));
-    RecordAtomicLoad(&block->next);
-    const RegionOffset next = block->next.load(std::memory_order_acquire);
-    RecordMetadataRead(&block->size_class,
-                       sizeof(block->size_class) + sizeof(block->owner_shard));
-    if (block->owner_shard != owner_shard || block->size_class >= kAllocatorSizeClasses)
-      throw std::runtime_error("invalid remote-free block");
-    FreeLocal(head, block->size_class, owner_shard);
-    // Remote frees were accounted on their issuing process; reaping must not
-    // change counters a second time.
-    head = next;
-  }
-}
-
 void RegionAllocator::FlushAllocatedRanges() const {
   FlushForRemoteVisibility(header_, MetadataBytes(), !metadata_is_hwcc_);
   RecordMetadataRead(&header_->shard_count, sizeof(header_->shard_count));
@@ -324,7 +288,6 @@ void *RegionAllocator::Allocate(uint64_t bytes, AllocationDomain, DomainCounter 
   RecordMetadataRead(&header_->shard_count, sizeof(header_->shard_count));
   if (bytes == 0 || counter == nullptr || owner_shard >= header_->shard_count)
     throw std::invalid_argument("invalid allocation");
-  ReapRemote(owner_shard, counter);
   const uint64_t requested = Align(bytes + Align(sizeof(RegionFreeBlock)));
   const uint32_t size_class = SizeClass(requested);
   const uint64_t header_bytes = Align(sizeof(RegionFreeBlock));
@@ -401,28 +364,17 @@ void RegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain,
   if (block->owner_shard != owner_shard || block->size_class != size_class)
     throw std::runtime_error("allocator owner or size-class mismatch");
   const RegionOffset offset = ToOffset(block);
-  if (owner_shard == current_shard) {
-    RecordMetadataRead(&header_->init_id, sizeof(header_->init_id));
-    TlsBind(header_);
-    auto &slot = g_allocator_tls.slots[size_class];
-    if (slot.count < kTlsCacheCapacity) {
-      slot.offsets[slot.count++] = offset;
-      AccountFree(ClassBytes(size_class), counter);
-      return;
-    }
-    FreeLocal(offset, size_class, owner_shard);
-  } else {
-    auto &head_source = RemoteFreeHead(owner_shard);
-    mem_access::HwccAtomicLoad(&head_source);
-    RegionOffset head = head_source.load(std::memory_order_relaxed);
-    do {
-      RecordAtomicStore(&block->next);
-      block->next.store(head, std::memory_order_relaxed);
-      FlushForRemoteVisibility(block, sizeof(*block), !metadata_is_hwcc_);
-      mem_access::HwccAtomicRmw(&head_source);
-    } while (!head_source.compare_exchange_weak(
-        head, offset, std::memory_order_release, std::memory_order_relaxed));
+  if (owner_shard != current_shard)
+    throw std::runtime_error("allocator free attempted by non-owner shard");
+  RecordMetadataRead(&header_->init_id, sizeof(header_->init_id));
+  TlsBind(header_);
+  auto &slot = g_allocator_tls.slots[size_class];
+  if (slot.count < kTlsCacheCapacity) {
+    slot.offsets[slot.count++] = offset;
+    AccountFree(ClassBytes(size_class), counter);
+    return;
   }
+  FreeLocal(offset, size_class, owner_shard);
   AccountFree(ClassBytes(size_class), counter);
 }
 
@@ -527,8 +479,7 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
                                           0, true);
   auto swcc = RegionAllocator::Initialize(base + header->swcc_allocator_offset,
                                           header->swcc_allocator_bytes, config.vm_count,
-                                          header->owner_private_arenas_bytes, false,
-                                          header->layout.swcc_remote_free_heads.data());
+                                          header->owner_private_arenas_bytes, false);
   auto *swcc_base = base + header->swcc_allocator_offset;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     auto *arena = new (swcc_base + header->owner_private_arenas_offset +
@@ -607,8 +558,7 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
   auto hwcc = RegionAllocator::Attach(base + header->hwcc_allocator_offset,
                                       header->hwcc_allocator_bytes, true);
   auto swcc = RegionAllocator::Attach(base + header->swcc_allocator_offset,
-                                      header->swcc_allocator_bytes, false,
-                                      header->layout.swcc_remote_free_heads.data());
+                                      header->swcc_allocator_bytes, false);
   return DualRegionAllocator(base, config, header, hwcc, swcc);
 }
 
@@ -617,8 +567,8 @@ void DualRegionAllocator::PublishReady() {
   const uint32_t state = header_->layout.state.load(std::memory_order_acquire);
   if (state != static_cast<uint32_t>(LayoutState::kInitializing))
     throw std::logic_error("dual-region layout ready published more than once");
-  // The reset coordinator created every initial private/shared tree. Publish
-  // those SWCC nodes before the HWCC Ready/Dirty release store.
+  // Publish initialized owner-private state before the single HWCC Ready
+  // release store. This is startup only, not a clean/dirty lifecycle.
   swcc_.FlushAllocatedRanges();
   mem_access::HwccRead(&header_->layout.partition_count,
                        sizeof(header_->layout.partition_count));
@@ -631,18 +581,10 @@ void DualRegionAllocator::PublishReady() {
       FlushForRemoteVisibility(arena, arena->bump - arena_offset);
   }
   mem_access::HwccAtomicStore(&header_->layout.state);
-  header_->layout.state.store(static_cast<uint32_t>(LayoutState::kDirty),
+  header_->layout.state.store(static_cast<uint32_t>(LayoutState::kReady),
                               std::memory_order_release);
   FlushForRemoteVisibility(&header_->layout.state, sizeof(header_->layout.state),
                            false);
-}
-
-void DualRegionAllocator::MarkDirty() {
-  uint32_t expected = static_cast<uint32_t>(LayoutState::kClean);
-  mem_access::HwccAtomicRmw(&header_->layout.state);
-  header_->layout.state.compare_exchange_strong(
-      expected, static_cast<uint32_t>(LayoutState::kDirty),
-      std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 void *DualRegionAllocator::Allocate(uint64_t bytes, AllocationDomain domain,
@@ -928,27 +870,13 @@ uint64_t DualRegionAllocator::SharedPayloadCapacityBytes() const {
   return header_->swcc_allocator_bytes - header_->owner_private_arenas_bytes;
 }
 
-void DualRegionAllocator::FlushCheckpointRanges(
-    uint32_t node_id, std::chrono::milliseconds timeout) {
+void DualRegionAllocator::FlushOwnedRanges(uint32_t node_id) {
   mem_access::HwccRead(&header_->layout.vm_count,
                        sizeof(header_->layout.vm_count) +
                            sizeof(header_->layout.partition_count));
   if (node_id >= header_->layout.vm_count) {
-    std::ostringstream detail;
-    detail << "checkpoint node outside layout node_id=" << node_id
-           << " layout.vm_count=" << header_->layout.vm_count
-           << " layout.partition_count=" << header_->layout.partition_count
-           << " layout_version=" << header_->layout.layout_version
-           << " magic=" << header_->layout.magic
-           << " state=" << header_->layout.state.load(std::memory_order_relaxed)
-           << " header=" << static_cast<const void *>(header_)
-           << " pool_base=" << static_cast<const void *>(pool_)
-           << " config.vm_count=" << config_.vm_count;
-    throw std::invalid_argument(detail.str());
+    throw std::invalid_argument("flush owner outside layout");
   }
-  mem_access::HwccAtomicLoad(&header_->layout.clean_epoch);
-  const uint64_t target =
-      header_->layout.clean_epoch.load(std::memory_order_acquire) + 1;
   swcc_.FlushOwnedRange(node_id);
   for (uint32_t partition = 0; partition < header_->layout.partition_count; ++partition) {
     auto *arena = Arena(partition);
@@ -958,50 +886,6 @@ void DualRegionAllocator::FlushCheckpointRanges(
     mem_access::PrivateRead(&arena->bump, sizeof(arena->bump));
     if (arena->bump > arena_offset)
       FlushForRemoteVisibility(arena, arena->bump - arena_offset);
-  }
-  auto &ready = header_->layout.checkpoint_ready_epoch[node_id];
-  // The range flush must finish in simulated time before readiness becomes
-  // visible to another VM.
-  mem_access::DelayActiveScopeNow();
-  mem_access::HwccAtomicStore(&ready);
-  mem_access::DelayActiveScopeNow();
-  ready.store(target, std::memory_order_release);
-
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  if (node_id == 0) {
-    for (;;) {
-      bool all_ready = true;
-      for (uint32_t node = 0; node < header_->layout.vm_count; ++node) {
-        auto &peer = header_->layout.checkpoint_ready_epoch[node];
-        mem_access::HwccAtomicLoad(&peer);
-        mem_access::DelayActiveScopeNow();
-        if (peer.load(std::memory_order_acquire) < target) {
-          all_ready = false;
-          break;
-        }
-      }
-      if (all_ready) break;
-      if (std::chrono::steady_clock::now() >= deadline)
-        throw std::runtime_error("collective checkpoint ready timeout");
-      std::this_thread::yield();
-    }
-    mem_access::HwccAtomicStore(&header_->layout.state);
-    mem_access::DelayActiveScopeNow();
-    header_->layout.state.store(static_cast<uint32_t>(LayoutState::kClean),
-                                std::memory_order_release);
-    mem_access::HwccAtomicStore(&header_->layout.clean_epoch);
-    mem_access::DelayActiveScopeNow();
-    header_->layout.clean_epoch.store(target, std::memory_order_release);
-  } else {
-    for (;;) {
-      mem_access::HwccAtomicLoad(&header_->layout.clean_epoch);
-      mem_access::DelayActiveScopeNow();
-      if (header_->layout.clean_epoch.load(std::memory_order_acquire) >= target)
-        break;
-      if (std::chrono::steady_clock::now() >= deadline)
-        throw std::runtime_error("collective checkpoint publish timeout");
-      std::this_thread::yield();
-    }
   }
 }
 
