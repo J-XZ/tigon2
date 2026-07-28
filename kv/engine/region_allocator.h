@@ -61,6 +61,12 @@ class RegionAllocator {
                                     bool metadata_is_hwcc = false);
   static RegionAllocator Attach(void *region, uint64_t region_bytes,
                                 bool metadata_is_hwcc = false);
+  static RegionAllocator InitializeWithExternalHeader(
+      void *region, uint64_t region_bytes, RegionAllocatorHeader *header,
+      bool metadata_is_hwcc = false);
+  static RegionAllocator AttachWithExternalHeader(
+      void *region, uint64_t region_bytes, RegionAllocatorHeader *header,
+      bool metadata_is_hwcc = false);
 
   // Hot path: per-thread size-class cache (see region_allocator.cpp) then
   // shard freelist / bump under a short spin lock.
@@ -154,6 +160,8 @@ struct alignas(64) OwnerPrivateArenaHeader {
   // words belong with this owner's non-coherent SWCC arena, never in the
   // globally coherent partition directory.
   RegionOffset private_root = kNullOffset;
+  RegionOffset dynamic_hwcc_allocator = kNullOffset;
+  RegionOffset dynamic_shared_swcc_allocator = kNullOffset;
   RegionOffset clock_head = kNullOffset;
   RegionOffset clock_tail = kNullOffset;
   RegionOffset clock_cursor = kNullOffset;
@@ -165,6 +173,8 @@ struct alignas(64) OwnerPrivateArenaHeader {
       retire_heads[kOwnerPrivateEbrWorkers][kOwnerPrivateEbrEpochs]{};
   std::atomic<uint64_t>
       retire_counts[kOwnerPrivateEbrWorkers][kOwnerPrivateEbrEpochs]{};
+  DomainCounter dynamic_hwcc{};
+  DomainCounter shared_payload{};
 };
 
 struct OwnerPrivateRetireRecord {
@@ -194,6 +204,10 @@ class DualRegionAllocator {
   // records offsets/bounds in HWCC, but no VM may construct another owner's
   // SWCC header.
   void InitializeOwnerPrivateArenas(uint32_t node_id);
+  // Rebuild only this process's non-owning dynamic allocator handles after
+  // its owner-private controls were already initialized and published.
+  void BindOwnerPrivateAllocators(uint32_t node_id);
+  void FinalizeStaticHwccLayout();
   // Startup has exactly one cross-VM state machine.  Each VM initializes only
   // its own SWCC arena and roots, publishes its bit, then VM0 releases Ready.
   // These are startup-only operations, never a checkpoint/recovery protocol.
@@ -224,7 +238,10 @@ class DualRegionAllocator {
   void *FromPoolOffset(uint64_t offset) const;
   bool IsInOwnerPrivateArena(const void *pointer, uint32_t partition_id) const;
   RegionOffset OwnerPrivateArenaOffset(uint32_t partition_id) const;
-  uint64_t SharedPayloadCapacityBytes() const;
+  uint64_t SharedPayloadCapacityBytes(uint32_t owner_shard) const;
+  uint64_t OwnerPrivateUsedBytes(uint32_t owner_shard) const;
+  uint64_t DynamicHwccUsedBytes(uint32_t owner_shard) const;
+  uint64_t SharedPayloadUsedBytes(uint32_t owner_shard) const;
   // Explicit test/teardown flush only. It is not a distributed checkpoint or
   // a substitute for SCC publication.
   void FlushOwnedRanges(uint32_t node_id);
@@ -245,6 +262,11 @@ class DualRegionAllocator {
   DualRegionPersistentHeader *header_;
   RegionAllocator hwcc_;
   RegionAllocator swcc_;
+  std::array<std::unique_ptr<RegionAllocator>, kMaxAllocatorShards>
+      dynamic_hwcc_{};
+  std::array<std::unique_ptr<RegionAllocator>, kMaxAllocatorShards>
+      dynamic_shared_swcc_{};
+  bool static_hwcc_finalized_ = false;
 };
 
 // Owns one MAP_SHARED backing-file mapping. Initialization is serialized with

@@ -134,6 +134,36 @@ RegionAllocator RegionAllocator::Attach(void *region, uint64_t region_bytes,
   return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
 }
 
+RegionAllocator RegionAllocator::InitializeWithExternalHeader(
+    void *region, uint64_t region_bytes, RegionAllocatorHeader *header,
+    bool metadata_is_hwcc) {
+  if (region == nullptr || header == nullptr || region_bytes == 0)
+    throw std::invalid_argument("invalid external allocator header");
+  new (header) RegionAllocatorHeader;
+  header->shard_count = 1;
+  header->region_bytes = region_bytes;
+  header->metadata_bytes = 0;
+  header->reserved_prefix_bytes = 0;
+  header->init_id = g_allocator_init_seq.fetch_add(1, std::memory_order_relaxed);
+  header->shards[0].begin = 0;
+  header->shards[0].end = region_bytes;
+  header->shards[0].bump = 0;
+  TlsInvalidate();
+  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
+}
+
+RegionAllocator RegionAllocator::AttachWithExternalHeader(
+    void *region, uint64_t region_bytes, RegionAllocatorHeader *header,
+    bool metadata_is_hwcc) {
+  if (region == nullptr || header == nullptr || region_bytes == 0 ||
+      header->magic != 0x5449474f4e414c4cULL || header->version != 4 ||
+      header->region_bytes != region_bytes || header->metadata_bytes != 0 ||
+      header->reserved_prefix_bytes != 0 || header->shard_count != 1 ||
+      header->init_id == 0)
+    throw std::runtime_error("external allocator attachment validation failed");
+  return RegionAllocator(region, region_bytes, header, metadata_is_hwcc);
+}
+
 void RegionAllocator::RecordAtomicLoad(const void *address) const {
   if (metadata_is_hwcc_)
     mem_access::HwccAtomicLoad(address);
@@ -194,12 +224,12 @@ void RegionAllocator::AccountAllocate(uint64_t bytes, DomainCounter *counter) {
     RecordAtomicRmw(&header_->allocation_count);
     header_->allocation_count.fetch_add(1, std::memory_order_relaxed);
   }
-  mem_access::HwccAtomicRmw(&counter->used_bytes);
+  RecordAtomicRmw(&counter->used_bytes);
   const uint64_t used = counter->used_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
-  mem_access::HwccAtomicLoad(&counter->peak_bytes);
+  RecordAtomicLoad(&counter->peak_bytes);
   uint64_t peak = counter->peak_bytes.load(std::memory_order_relaxed);
   while (peak < used) {
-    mem_access::HwccAtomicRmw(&counter->peak_bytes);
+    RecordAtomicRmw(&counter->peak_bytes);
     if (counter->peak_bytes.compare_exchange_weak(
             peak, used, std::memory_order_relaxed))
       break;
@@ -207,7 +237,7 @@ void RegionAllocator::AccountAllocate(uint64_t bytes, DomainCounter *counter) {
 }
 
 void RegionAllocator::AccountFree(uint64_t bytes, DomainCounter *counter) {
-  mem_access::HwccAtomicRmw(&counter->used_bytes);
+  RecordAtomicRmw(&counter->used_bytes);
   const uint64_t before = counter->used_bytes.fetch_sub(bytes, std::memory_order_relaxed);
   if (before < bytes) throw std::runtime_error("allocator domain accounting underflow");
   if (metadata_is_hwcc_) {
@@ -474,11 +504,13 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
     throw std::invalid_argument("owner-private arena is too small");
   header->owner_private_arenas_bytes =
       header->owner_private_arena_stride * config.partition_count;
+  // Static transport/EBR allocations are made by VM0 before owner startup;
+  // dynamic objects use owner-private control headers created in phase two.
   auto hwcc = RegionAllocator::Initialize(base + header->hwcc_allocator_offset,
-                                          header->hwcc_allocator_bytes, config.vm_count,
+                                          header->hwcc_allocator_bytes, 1,
                                           0, true);
   auto swcc = RegionAllocator::Initialize(base + header->swcc_allocator_offset,
-                                          header->swcc_allocator_bytes, config.vm_count,
+                                          header->swcc_allocator_bytes, 1,
                                           header->owner_private_arenas_bytes, false);
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     // This is only an immutable offset publication.  The actual arena header
@@ -495,13 +527,10 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
     counter.peak_bytes.store(bytes, std::memory_order_relaxed);
   };
   set_fixed_domain(AllocationDomain::kHwccLayout, dual_header_bytes);
-  const uint64_t arena_header_bytes =
-      ((sizeof(OwnerPrivateArenaHeader) + RegionAllocator::kAlignment - 1) &
-       ~(RegionAllocator::kAlignment - 1)) * config.partition_count;
   set_fixed_domain(AllocationDomain::kHwccAllocatorMetadata,
                    hwcc.metadata_bytes());
   set_fixed_domain(AllocationDomain::kSwccAllocatorMetadata,
-                   swcc.metadata_bytes() + arena_header_bytes);
+                   swcc.metadata_bytes());
   // Remain kInitializing until KVEngine publishes transport, EBR and all
   // partition roots.  Publishing here allowed peers to attach to half-built
   // state.
@@ -533,6 +562,94 @@ void DualRegionAllocator::InitializeOwnerPrivateArenas(uint32_t node_id) {
                               RegionAllocator::kAlignment - 1) &
                                  ~(RegionAllocator::kAlignment - 1));
   }
+  const uint32_t control_partition = node_id;
+  if (control_partition >= header_->layout.partition_count)
+    throw std::logic_error("owner has no private allocator control partition");
+  auto *control_arena = Arena(control_partition);
+  const auto &descriptor = header_->layout.owner_dynamic_arenas[node_id];
+  if (descriptor.hwcc_offset == kNullOffset ||
+      descriptor.shared_swcc_offset == kNullOffset)
+    return;  // VM0 has not yet published the static dynamic-range boundary.
+  auto *hwcc_header = static_cast<RegionAllocatorHeader *>(
+      AllocateOwnerPrivate(sizeof(RegionAllocatorHeader), control_partition, node_id));
+  auto *shared_header = static_cast<RegionAllocatorHeader *>(
+      AllocateOwnerPrivate(sizeof(RegionAllocatorHeader), control_partition, node_id));
+  mem_access::PrivateWrite(&control_arena->dynamic_hwcc_allocator,
+                           sizeof(control_arena->dynamic_hwcc_allocator) +
+                               sizeof(control_arena->dynamic_shared_swcc_allocator));
+  control_arena->dynamic_hwcc_allocator = swcc_.ToOffset(hwcc_header);
+  control_arena->dynamic_shared_swcc_allocator = swcc_.ToOffset(shared_header);
+  dynamic_hwcc_[node_id] = std::make_unique<RegionAllocator>(
+      RegionAllocator::InitializeWithExternalHeader(
+          hwcc_.FromOffset(descriptor.hwcc_offset), descriptor.hwcc_bytes,
+          hwcc_header, false));
+  dynamic_shared_swcc_[node_id] = std::make_unique<RegionAllocator>(
+      RegionAllocator::InitializeWithExternalHeader(
+          swcc_.FromOffset(descriptor.shared_swcc_offset),
+          descriptor.shared_swcc_bytes, shared_header, false));
+}
+
+void DualRegionAllocator::BindOwnerPrivateAllocators(uint32_t node_id) {
+  if (node_id >= header_->layout.vm_count)
+    throw std::invalid_argument("allocator owner outside layout");
+  const auto &descriptor = header_->layout.owner_dynamic_arenas[node_id];
+  auto *control = Arena(node_id);
+  if (descriptor.hwcc_offset == kNullOffset ||
+      descriptor.shared_swcc_offset == kNullOffset ||
+      control->dynamic_hwcc_allocator == kNullOffset ||
+      control->dynamic_shared_swcc_allocator == kNullOffset)
+    throw std::runtime_error("owner-private allocator controls are not initialized");
+  auto *hwcc_header = static_cast<RegionAllocatorHeader *>(
+      swcc_.FromOffset(control->dynamic_hwcc_allocator));
+  auto *shared_header = static_cast<RegionAllocatorHeader *>(
+      swcc_.FromOffset(control->dynamic_shared_swcc_allocator));
+  dynamic_hwcc_[node_id] = std::make_unique<RegionAllocator>(
+      RegionAllocator::AttachWithExternalHeader(
+          hwcc_.FromOffset(descriptor.hwcc_offset), descriptor.hwcc_bytes,
+          hwcc_header, false));
+  dynamic_shared_swcc_[node_id] = std::make_unique<RegionAllocator>(
+      RegionAllocator::AttachWithExternalHeader(
+          swcc_.FromOffset(descriptor.shared_swcc_offset),
+          descriptor.shared_swcc_bytes, shared_header, false));
+}
+
+void DualRegionAllocator::FinalizeStaticHwccLayout() {
+  if (static_hwcc_finalized_)
+    throw std::logic_error("dynamic allocator ranges finalized more than once");
+  const auto *static_header = reinterpret_cast<const RegionAllocatorHeader *>(
+      pool_ + header_->hwcc_allocator_offset);
+  mem_access::HwccRead(static_header, sizeof(*static_header));
+  const auto &static_shard = static_header->shards[0];
+  const uint64_t start = (static_shard.bump + RegionAllocator::kAlignment - 1) &
+                         ~(RegionAllocator::kAlignment - 1);
+  if (start >= hwcc_.capacity())
+    throw std::runtime_error("no dynamic HWCC space after static allocation");
+  const uint64_t hwcc_remaining = hwcc_.capacity() - start;
+  const uint64_t shared_start = header_->owner_private_arenas_offset +
+                                header_->owner_private_arenas_bytes;
+  if (shared_start >= swcc_.capacity())
+    throw std::runtime_error("no shared SWCC payload space after private arenas");
+  const uint64_t shared_remaining = swcc_.capacity() - shared_start;
+  for (uint32_t owner = 0; owner < header_->layout.vm_count; ++owner) {
+    auto &entry = header_->layout.owner_dynamic_arenas[owner];
+    mem_access::HwccWrite(&entry, sizeof(entry));
+    const uint64_t hwcc_begin = start + hwcc_remaining * owner / header_->layout.vm_count;
+    const uint64_t hwcc_end = start + hwcc_remaining * (owner + 1) /
+                                         header_->layout.vm_count;
+    const uint64_t shared_begin = shared_start +
+        shared_remaining * owner / header_->layout.vm_count;
+    const uint64_t shared_end = shared_start +
+        shared_remaining * (owner + 1) / header_->layout.vm_count;
+    entry.hwcc_offset = hwcc_begin;
+    entry.hwcc_bytes = hwcc_end - hwcc_begin;
+    entry.shared_swcc_offset = shared_begin;
+    entry.shared_swcc_bytes = shared_end - shared_begin;
+    if (entry.hwcc_bytes == 0 || entry.shared_swcc_bytes == 0)
+      throw std::runtime_error("dynamic owner arena has zero capacity");
+  }
+  FlushForRemoteVisibility(header_->layout.owner_dynamic_arenas.data(),
+                           sizeof(header_->layout.owner_dynamic_arenas), false);
+  static_hwcc_finalized_ = true;
 }
 
 DualRegionAllocator DualRegionAllocator::Attach(void *pool,
@@ -561,7 +678,9 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
                                       header->hwcc_allocator_bytes, true);
   auto swcc = RegionAllocator::Attach(base + header->swcc_allocator_offset,
                                       header->swcc_allocator_bytes, false);
-  return DualRegionAllocator(base, config, header, hwcc, swcc);
+  DualRegionAllocator attached(base, config, header, hwcc, swcc);
+  attached.static_hwcc_finalized_ = true;
+  return attached;
 }
 
 void DualRegionAllocator::PublishOwnerInitialized(uint32_t node_id) {
@@ -636,28 +755,29 @@ void *DualRegionAllocator::Allocate(uint64_t bytes, AllocationDomain domain,
   if (domain == AllocationDomain::kOwnerPrivateSwcc)
     throw std::invalid_argument(
         "owner-private allocation requires partition-specific arena");
-  DomainCounter &counter = header_->layout.domains[static_cast<size_t>(domain)];
-  void *result = IsHwccDomain(domain)
-                     ? hwcc_.Allocate(bytes, domain, &counter, owner_shard)
-                     : swcc_.Allocate(bytes, domain, &counter, owner_shard);
+  if (owner_shard >= header_->layout.vm_count)
+    throw std::invalid_argument("allocation owner outside layout");
   if (domain == AllocationDomain::kHwccIndex ||
       domain == AllocationDomain::kHwccMetadata) {
-    auto &owner = header_->layout.owner_migration_hwcc[owner_shard];
-    const uint64_t accounted = RegionAllocator::AccountedBytes(bytes);
-    mem_access::HwccAtomicRmw(&owner.used_bytes);
-    const uint64_t used =
-        owner.used_bytes.fetch_add(accounted, std::memory_order_relaxed) +
-        accounted;
-    mem_access::HwccAtomicLoad(&owner.peak_bytes);
-    uint64_t peak = owner.peak_bytes.load(std::memory_order_relaxed);
-    while (peak < used) {
-      mem_access::HwccAtomicRmw(&owner.peak_bytes);
-      if (owner.peak_bytes.compare_exchange_weak(
-              peak, used, std::memory_order_relaxed))
-        break;
-    }
+    auto *allocator = dynamic_hwcc_[owner_shard].get();
+    if (allocator == nullptr)
+      throw std::runtime_error("dynamic HWCC allocator is not initialized by owner");
+    auto *control = Arena(owner_shard);
+    return allocator->Allocate(bytes, domain, &control->dynamic_hwcc, 0);
   }
-  return result;
+  if (domain == AllocationDomain::kSharedPayloadSwcc) {
+    auto *allocator = dynamic_shared_swcc_[owner_shard].get();
+    if (allocator == nullptr)
+      throw std::runtime_error("shared SWCC allocator is not initialized by owner");
+    auto *control = Arena(owner_shard);
+    return allocator->Allocate(bytes, domain, &control->shared_payload, 0);
+  }
+  if (domain != AllocationDomain::kTransport && domain != AllocationDomain::kHwccEbr)
+    throw std::invalid_argument("invalid static allocation domain");
+  if (static_hwcc_finalized_)
+    throw std::logic_error("static HWCC allocation after dynamic ranges published");
+  DomainCounter &counter = header_->layout.domains[static_cast<size_t>(domain)];
+  return hwcc_.Allocate(bytes, domain, &counter, 0);
 }
 
 OwnerPrivateArenaHeader *DualRegionAllocator::Arena(uint32_t partition_id) const {
@@ -728,20 +848,6 @@ void *DualRegionAllocator::AllocateOwnerPrivate(uint64_t bytes, uint32_t partiti
       arena->lock.store(0, std::memory_order_release);
       mem_access::PrivateAtomicRmw(&arena->allocated_bytes);
       arena->allocated_bytes.fetch_add(block_bytes, std::memory_order_relaxed);
-      auto &counter = header_->layout.domains[
-          static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc)];
-      mem_access::HwccAtomicRmw(&counter.used_bytes);
-      const uint64_t used =
-          counter.used_bytes.fetch_add(block_bytes, std::memory_order_relaxed) +
-          block_bytes;
-      mem_access::HwccAtomicLoad(&counter.peak_bytes);
-      uint64_t peak = counter.peak_bytes.load(std::memory_order_relaxed);
-      while (peak < used) {
-        mem_access::HwccAtomicRmw(&counter.peak_bytes);
-        if (counter.peak_bytes.compare_exchange_weak(
-                peak, used, std::memory_order_relaxed))
-          break;
-      }
       return static_cast<std::byte *>(static_cast<void *>(block)) + RegionAllocator::kAlignment;
     }
     previous = current;
@@ -772,18 +878,6 @@ void *DualRegionAllocator::AllocateOwnerPrivate(uint64_t bytes, uint32_t partiti
   arena->allocated_bytes.fetch_add(requested, std::memory_order_relaxed);
   mem_access::PrivateAtomicStore(&arena->lock);
   arena->lock.store(0, std::memory_order_release);
-  auto &counter = header_->layout.domains[
-      static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc)];
-  mem_access::HwccAtomicRmw(&counter.used_bytes);
-  const uint64_t used = counter.used_bytes.fetch_add(requested, std::memory_order_relaxed) + requested;
-  mem_access::HwccAtomicLoad(&counter.peak_bytes);
-  uint64_t peak = counter.peak_bytes.load(std::memory_order_relaxed);
-  while (peak < used) {
-    mem_access::HwccAtomicRmw(&counter.peak_bytes);
-    if (counter.peak_bytes.compare_exchange_weak(
-            peak, used, std::memory_order_relaxed))
-      break;
-  }
   return static_cast<std::byte *>(swcc_.FromOffset(begin)) + RegionAllocator::kAlignment;
 }
 
@@ -822,35 +916,30 @@ void DualRegionAllocator::FreeOwnerPrivate(void *pointer, uint64_t bytes,
   arena->lock.store(0, std::memory_order_release);
   mem_access::PrivateAtomicRmw(&arena->allocated_bytes);
   arena->allocated_bytes.fetch_sub(block_bytes, std::memory_order_relaxed);
-  auto &counter = header_->layout.domains[
-      static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc)];
-  mem_access::HwccAtomicRmw(&counter.used_bytes);
-  const uint64_t before =
-      counter.used_bytes.fetch_sub(block_bytes, std::memory_order_relaxed);
-  if (before < block_bytes)
-    throw std::runtime_error("private arena accounting underflow");
 }
 
 void DualRegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain domain,
                                uint32_t owner_shard, uint32_t current_shard) {
-  DomainCounter &counter = header_->layout.domains[static_cast<size_t>(domain)];
-  if (IsHwccDomain(domain)) {
-    if (!hwcc_.Contains(pointer)) throw std::runtime_error("HWCC free outside HWCC region");
-    hwcc_.Free(pointer, bytes, domain, &counter, owner_shard, current_shard);
-    if (domain == AllocationDomain::kHwccIndex ||
-        domain == AllocationDomain::kHwccMetadata) {
-      auto &owner = header_->layout.owner_migration_hwcc[owner_shard];
-      const uint64_t accounted = RegionAllocator::AccountedBytes(bytes);
-      mem_access::HwccAtomicRmw(&owner.used_bytes);
-      const uint64_t before =
-          owner.used_bytes.fetch_sub(accounted, std::memory_order_relaxed);
-      if (before < accounted)
-        throw std::runtime_error("owner HWCC accounting underflow");
-    }
-  } else {
-    if (!swcc_.Contains(pointer)) throw std::runtime_error("SWCC free outside SWCC region");
-    swcc_.Free(pointer, bytes, domain, &counter, owner_shard, current_shard);
+  if (owner_shard != current_shard)
+    throw std::runtime_error("cross-owner free is forbidden");
+  if (domain == AllocationDomain::kHwccIndex ||
+      domain == AllocationDomain::kHwccMetadata) {
+    auto *allocator = dynamic_hwcc_[owner_shard].get();
+    if (allocator == nullptr || !allocator->Contains(pointer))
+      throw std::runtime_error("dynamic HWCC free outside owner arena");
+    allocator->Free(pointer, bytes, domain, &Arena(owner_shard)->dynamic_hwcc, 0, 0);
+    return;
   }
+  if (domain == AllocationDomain::kSharedPayloadSwcc) {
+    auto *allocator = dynamic_shared_swcc_[owner_shard].get();
+    if (allocator == nullptr || !allocator->Contains(pointer))
+      throw std::runtime_error("shared SWCC free outside owner arena");
+    allocator->Free(pointer, bytes, domain, &Arena(owner_shard)->shared_payload, 0, 0);
+    return;
+  }
+  if (!hwcc_.Contains(pointer)) throw std::runtime_error("static HWCC free outside HWCC region");
+  hwcc_.Free(pointer, bytes, domain,
+             &header_->layout.domains[static_cast<size_t>(domain)], 0, 0);
 }
 
 void DualRegionAllocator::Retire(uint32_t owner_shard, uint32_t queue_partition,
@@ -988,12 +1077,39 @@ RegionOffset DualRegionAllocator::OwnerPrivateArenaOffset(uint32_t partition_id)
       partition_id * header_->owner_private_arena_stride));
 }
 
-uint64_t DualRegionAllocator::SharedPayloadCapacityBytes() const {
-  mem_access::HwccRead(&header_->swcc_allocator_bytes,
-                       sizeof(header_->swcc_allocator_bytes));
-  mem_access::HwccRead(&header_->owner_private_arenas_bytes,
-                       sizeof(header_->owner_private_arenas_bytes));
-  return header_->swcc_allocator_bytes - header_->owner_private_arenas_bytes;
+uint64_t DualRegionAllocator::SharedPayloadCapacityBytes(
+    uint32_t owner_shard) const {
+  if (owner_shard >= header_->layout.vm_count)
+    throw std::invalid_argument("shared payload owner outside layout");
+  mem_access::HwccRead(&header_->layout.owner_dynamic_arenas[owner_shard],
+                       sizeof(OwnerDynamicArenaDescriptor));
+  return header_->layout.owner_dynamic_arenas[owner_shard].shared_swcc_bytes;
+}
+
+uint64_t DualRegionAllocator::OwnerPrivateUsedBytes(uint32_t owner_shard) const {
+  if (owner_shard >= header_->layout.vm_count)
+    throw std::invalid_argument("private usage owner outside layout");
+  uint64_t used = 0;
+  for (uint32_t partition = 0; partition < header_->layout.partition_count;
+       ++partition) {
+    if (partition % header_->layout.vm_count != owner_shard) continue;
+    auto *arena = Arena(partition);
+    mem_access::PrivateAtomicLoad(&arena->allocated_bytes);
+    used += arena->allocated_bytes.load(std::memory_order_relaxed);
+  }
+  return used;
+}
+
+uint64_t DualRegionAllocator::DynamicHwccUsedBytes(uint32_t owner_shard) const {
+  auto *arena = Arena(owner_shard);
+  mem_access::PrivateAtomicLoad(&arena->dynamic_hwcc.used_bytes);
+  return arena->dynamic_hwcc.used_bytes.load(std::memory_order_relaxed);
+}
+
+uint64_t DualRegionAllocator::SharedPayloadUsedBytes(uint32_t owner_shard) const {
+  auto *arena = Arena(owner_shard);
+  mem_access::PrivateAtomicLoad(&arena->shared_payload.used_bytes);
+  return arena->shared_payload.used_bytes.load(std::memory_order_relaxed);
 }
 
 void DualRegionAllocator::FlushOwnedRanges(uint32_t node_id) {
@@ -1003,7 +1119,6 @@ void DualRegionAllocator::FlushOwnedRanges(uint32_t node_id) {
   if (node_id >= header_->layout.vm_count) {
     throw std::invalid_argument("flush owner outside layout");
   }
-  swcc_.FlushOwnedRange(node_id);
   for (uint32_t partition = 0; partition < header_->layout.partition_count; ++partition) {
     if (partition % header_->layout.vm_count != node_id) continue;
     auto *arena = Arena(partition);

@@ -65,6 +65,7 @@ int main() {
   const std::string path(path_template);
   auto pool = tigonkv::engine::DualRegionMappedPool::Open(path, Config(), true);
   auto &regions = pool.allocator();
+  regions.FinalizeStaticHwccLayout();
   regions.InitializeOwnerPrivateArenas(0);
   regions.InitializeOwnerPrivateArenas(1);
   star::CXLMemory memory;
@@ -299,8 +300,7 @@ int main() {
          partition.shared_payload_capacity_bytes());
   simulator.EndScopeAndDelay();
   latency_stats = simulator.TakeStatsAndReset();
-  assert(latency_stats.hwcc_raw_line_accesses > 0);
-  assert(latency_stats.swcc_raw_line_accesses == 0);
+  assert(latency_stats.swcc_raw_line_accesses > 0);
   simulator.Configure(latency_sim::Config{});
 
   // FAIL_ALREADY_IN_CXL must pin ref_cnt so move-out quiescence waits; unpin

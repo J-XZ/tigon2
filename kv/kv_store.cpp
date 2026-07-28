@@ -803,7 +803,8 @@ void Config::Validate() {
       (hwcc_offset_mb < swcc_offset_mb + swcc_size_mb &&
        swcc_offset_mb < hwcc_offset_mb + hwcc_size_mb))
     throw std::invalid_argument("invalid shared-memory capacity or HWCC budget");
-  if (vm_count == 0 || partition_count == 0 || partition_count > engine::kMaxPartitions ||
+  if (vm_count == 0 || partition_count < vm_count ||
+      partition_count > engine::kMaxPartitions ||
       fixed_key_size == 0 || fixed_key_size > kMaxKey ||
       fixed_value_size > kMaxValue || shared_memory_numa_node < -1 || vm_numa_node < -1 ||
       network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0 ||

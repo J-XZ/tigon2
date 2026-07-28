@@ -54,6 +54,8 @@ int main() {
   void *pool = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   assert(pool != MAP_FAILED);
   auto regions = tigonkv::engine::DualRegionAllocator::Initialize(pool, Config(bytes));
+  regions.FinalizeStaticHwccLayout();
+  regions.InitializeOwnerPrivateArenas(0);
   star::CXLMemory::bind_dual_region_allocator(&regions, 0);
   latency_sim::Config latency;
   latency.enabled = true;

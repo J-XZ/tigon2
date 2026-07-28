@@ -66,6 +66,13 @@ struct alignas(64) DomainCounter {
   std::atomic<uint64_t> peak_bytes{0};
 };
 
+struct OwnerDynamicArenaDescriptor {
+  RegionOffset hwcc_offset = kNullOffset;
+  uint64_t hwcc_bytes = 0;
+  RegionOffset shared_swcc_offset = kNullOffset;
+  uint64_t shared_swcc_bytes = 0;
+};
+
 // This key format is deliberately bytewise and does not assume integral keys.
 struct FixedKey {
   char bytes[kMaxFixedKeyBytes];
@@ -143,8 +150,10 @@ struct alignas(64) SharedLayoutHeader {
   // generation or a checkpoint protocol.
   std::atomic<uint64_t> owner_init_ready_bitmap{0};
   std::array<std::atomic<RegionOffset>, kRootSlotCount> roots{};
-  std::array<DomainCounter, kMaxAllocatorShards>
-      owner_migration_hwcc{};
+  // Immutable dynamic data ranges. Their allocator headers/counters live in
+  // the owning VM's private SWCC arena, never in this HWCC layout.
+  std::array<OwnerDynamicArenaDescriptor, kMaxAllocatorShards>
+      owner_dynamic_arenas{};
   std::array<PartitionDirectoryEntry, kMaxPartitions> partitions{};
   std::array<DomainCounter, kAllocationDomainCount> domains{};
 

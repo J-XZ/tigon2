@@ -50,6 +50,7 @@ int main() {
   auto pool = tigonkv::engine::DualRegionMappedPool::Open(
       path, MakeConfig(kPoolBytes), true);
   auto &regions = pool.allocator();
+  regions.FinalizeStaticHwccLayout();
   regions.InitializeOwnerPrivateArenas(0);
   regions.InitializeOwnerPrivateArenas(1);
   star::CXL_EBR ebr(2, 1, &regions);
@@ -97,11 +98,8 @@ int main() {
     assert(private_scan[i].second == 250 + i);
     assert(shared_scan[i].second == 1250 + i);
   }
-  const auto &layout = regions.layout();
-  assert(layout.domains[static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc)]
-             .used_bytes.load() > 0);
-  assert(layout.domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
-             .used_bytes.load() > 0);
+  assert(regions.OwnerPrivateUsedBytes(0) > 0);
+  assert(regions.DynamicHwccUsedBytes(1) > 0);
   const auto root_offset = regions.swcc().ToOffset(
       private_tree->root_for_persistence());
   assert(root_offset != tigonkv::engine::kNullOffset);

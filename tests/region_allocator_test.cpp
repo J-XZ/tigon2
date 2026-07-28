@@ -162,6 +162,12 @@ void TestDualPhysicalRegions() {
   config.fixed_key_size = 32;
   config.fixed_value_size = 128;
   auto dual = DualRegionAllocator::Initialize(mapping.base, config);
+  dual.FinalizeStaticHwccLayout();
+  const auto &dynamic0 = dual.layout().owner_dynamic_arenas[0];
+  const auto &dynamic1 = dual.layout().owner_dynamic_arenas[1];
+  assert(dynamic0.hwcc_offset + dynamic0.hwcc_bytes <= dynamic1.hwcc_offset);
+  assert(dynamic0.shared_swcc_offset + dynamic0.shared_swcc_bytes <=
+         dynamic1.shared_swcc_offset);
   dual.InitializeOwnerPrivateArenas(0);
   dual.InitializeOwnerPrivateArenas(1);
   assert(dual.layout().state.load(std::memory_order_acquire) ==
@@ -175,10 +181,10 @@ void TestDualPhysicalRegions() {
   assert(dual.IsHwccAddress(index) && dual.IsHwccAddress(metadata));
   assert(dual.IsSwccAddress(owner) && dual.IsSwccAddress(payload));
   assert(!dual.IsHwccAddress(owner) && !dual.IsSwccAddress(index));
+  assert(dual.DynamicHwccUsedBytes(0) > 0);
+  assert(dual.DynamicHwccUsedBytes(1) > 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
-             .used_bytes.load() > 0);
-  assert(dual.layout().owner_migration_hwcc[0].used_bytes.load() > 0);
-  assert(dual.layout().owner_migration_hwcc[1].used_bytes.load() > 0);
+             .used_bytes.load() == 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccLayout)]
              .used_bytes.load() > 0);
   const uint64_t hwcc_allocator_metadata =
@@ -188,11 +194,7 @@ void TestDualPhysicalRegions() {
       dual.layout().domains[static_cast<size_t>(
           AllocationDomain::kSwccAllocatorMetadata)].used_bytes.load();
   assert(hwcc_allocator_metadata == dual.hwcc().metadata_bytes());
-  const uint64_t arena_header_bytes =
-      ((sizeof(OwnerPrivateArenaHeader) + RegionAllocator::kAlignment - 1) &
-       ~(RegionAllocator::kAlignment - 1)) * config.partition_count;
-  assert(swcc_allocator_metadata ==
-         dual.swcc().metadata_bytes() + arena_header_bytes);
+  assert(swcc_allocator_metadata == dual.swcc().metadata_bytes());
   dual.PublishOwnerInitialized(0);
   dual.PublishOwnerInitialized(1);
   dual.PublishReady();
@@ -226,10 +228,8 @@ void TestDualPhysicalRegions() {
   dual.FreeOwnerPrivate(owner, 80, 0, 0);
   dual.Free(payload, 100, AllocationDomain::kSharedPayloadSwcc, 1, 1);
   dual.Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 0);
-  assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
-             .used_bytes.load() == 0);
-  assert(dual.layout().owner_migration_hwcc[0].used_bytes.load() == 0);
-  assert(dual.layout().owner_migration_hwcc[1].used_bytes.load() == 0);
+  assert(dual.DynamicHwccUsedBytes(0) == 0);
+  assert(dual.DynamicHwccUsedBytes(1) == 0);
   latency_sim::Config checkpoint_latency;
   checkpoint_latency.enabled = true;
   checkpoint_latency.foreground_enabled = true;
@@ -274,6 +274,7 @@ void TestMappedPoolAttach() {
   close(seed_fd);
   const DualRegionConfig config = TestDualConfig();
   auto parent = DualRegionMappedPool::Open(path, config, true);
+  parent.allocator().FinalizeStaticHwccLayout();
   parent.allocator().InitializeOwnerPrivateArenas(0);
   parent.allocator().InitializeOwnerPrivateArenas(1);
   auto *payload = static_cast<char *>(parent.allocator().Allocate(
@@ -288,6 +289,7 @@ void TestMappedPoolAttach() {
   if (child == 0) {
     try {
       auto attached = DualRegionMappedPool::Open(path, config, false);
+      attached.allocator().BindOwnerPrivateAllocators(1);
       auto *child_payload = static_cast<char *>(
           attached.allocator().swcc().FromOffset(payload_offset));
       if (std::strcmp(child_payload, "mapped-payload") != 0) _exit(2);
@@ -315,6 +317,7 @@ void TestAllocatorLatencyAccounting() {
       RegionAllocator::Initialize(swcc_mapping.base, kBytes, 2, 0, false);
   const DualRegionConfig config = TestDualConfig();
   auto dual = DualRegionAllocator::Initialize(dual_mapping.base, config);
+  dual.FinalizeStaticHwccLayout();
   dual.InitializeOwnerPrivateArenas(0);
   dual.InitializeOwnerPrivateArenas(1);
 
@@ -346,21 +349,18 @@ void TestAllocatorLatencyAccounting() {
                       &swcc_counter, 0, 0);
   simulator.EndScopeAndDelay();
   stats = simulator.TakeStatsAndReset();
-  // SWCC allocator metadata remains private, while the domain counter is
-  // deliberately published in the HWCC layout.
+  // Shared-payload allocator controls and accounting are owner-private SWCC.
   assert(stats.swcc_raw_line_accesses > 0);
-  assert(stats.hwcc_raw_line_accesses > 0);
+  assert(stats.hwcc_raw_line_accesses == 0);
 
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   void *owner = dual.AllocateOwnerPrivate(80, 0, 0);
   dual.FreeOwnerPrivate(owner, 80, 0, 0);
-  assert(dual.SharedPayloadCapacityBytes() > 0);
+  assert(dual.SharedPayloadCapacityBytes(0) > 0);
   simulator.EndScopeAndDelay();
   stats = simulator.TakeStatsAndReset();
-  // Owner arena metadata/data is SWCC; its persistent directory and aggregate
-  // accounting live in HWCC.
+  // Owner arena metadata/data and its accounting are private SWCC.
   assert(stats.swcc_raw_line_accesses > 0);
-  assert(stats.hwcc_raw_line_accesses > 0);
 
   simulator.Configure(latency_sim::Config{});
 }
@@ -369,6 +369,7 @@ void TestOwnerPrivateRetireQueue() {
   Mapping mapping(true);
   DualRegionConfig config = TestDualConfig();
   auto dual = DualRegionAllocator::Initialize(mapping.base, config);
+  dual.FinalizeStaticHwccLayout();
   dual.InitializeOwnerPrivateArenas(0);
   dual.InitializeOwnerPrivateArenas(1);
   void *object = dual.Allocate(96, AllocationDomain::kHwccIndex, 0);

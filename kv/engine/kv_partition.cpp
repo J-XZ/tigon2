@@ -1732,20 +1732,15 @@ bool KVPartition::MoveOutClockVictim(uint32_t host_id) {
 }
 
 uint64_t KVPartition::shared_payload_used_bytes() const {
-  const auto &counter = regions_.layout().domains[static_cast<size_t>(
-      AllocationDomain::kSharedPayloadSwcc)];
-  mem_access::HwccAtomicLoad(&counter.used_bytes);
-  return counter.used_bytes.load(std::memory_order_relaxed);
+  return regions_.SharedPayloadUsedBytes(owner_shard_);
 }
 
 uint64_t KVPartition::shared_payload_capacity_bytes() const {
-  return regions_.SharedPayloadCapacityBytes();
+  return regions_.SharedPayloadCapacityBytes(owner_shard_);
 }
 
 uint64_t KVPartition::hwcc_used_bytes() const {
-  const auto &counter = regions_.layout().owner_migration_hwcc[owner_shard_];
-  mem_access::HwccAtomicLoad(&counter.used_bytes);
-  return counter.used_bytes.load(std::memory_order_relaxed);
+  return regions_.DynamicHwccUsedBytes(owner_shard_);
 }
 
 uint64_t KVPartition::migrated_key_count() const {

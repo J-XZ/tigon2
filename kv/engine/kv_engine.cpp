@@ -311,6 +311,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
                             config.foreground_worker_count_per_vm);
     star::CXLMemory::commit_shared_data_initialization(
         star::CXLMemory::cxl_global_ebr_meta_root_index, ebr);
+    pool->allocator().FinalizeStaticHwccLayout();
   } else {
     void *root = nullptr;
     star::CXLMemory::wait_and_retrieve_cxl_shared_data(
@@ -914,18 +915,41 @@ MemoryStats KVEngine::Memory() const {
   stats.total_pool_capacity_bytes = pool_->bytes();
   stats.logical_hwcc_capacity_bytes = config_.hwcc_size_mb * 1024ULL * 1024ULL;
   stats.logical_swcc_capacity_bytes = config_.swcc_size_mb * 1024ULL * 1024ULL;
-  for (size_t domain = 0; domain < static_cast<size_t>(AllocationDomain::kOwnerPrivateSwcc);
-       ++domain)
-    stats.logical_hwcc_used_bytes += layout.domains[domain].used_bytes.load(std::memory_order_relaxed);
+  // Dynamic allocator counters are owner-private SWCC.  A per-VM snapshot
+  // must never read another VM's control words; the runner aggregates these
+  // components and reports the globally static HWCC prefix once from VM0.
+  if (config_.node_id == 0) {
+    for (size_t domain :
+         {static_cast<size_t>(AllocationDomain::kHwccEbr),
+          static_cast<size_t>(AllocationDomain::kHwccLayout),
+          static_cast<size_t>(AllocationDomain::kTransport),
+          static_cast<size_t>(AllocationDomain::kHwccAllocatorMetadata)})
+      stats.logical_hwcc_used_bytes +=
+          layout.domains[domain].used_bytes.load(std::memory_order_relaxed);
+  }
+  stats.logical_hwcc_used_bytes +=
+      regions.DynamicHwccUsedBytes(config_.node_id);
   stats.physical_hwcc_used_bytes = stats.logical_hwcc_used_bytes;
-  stats.owner_private_swcc_used_bytes = layout.domains[static_cast<size_t>(
-      AllocationDomain::kOwnerPrivateSwcc)].used_bytes.load(std::memory_order_relaxed);
-  stats.shared_payload_swcc_used_bytes = layout.domains[static_cast<size_t>(
-      AllocationDomain::kSharedPayloadSwcc)].used_bytes.load(std::memory_order_relaxed);
-  stats.allocator_hwcc_metadata_bytes = layout.domains[static_cast<size_t>(
-      AllocationDomain::kHwccAllocatorMetadata)].used_bytes.load(std::memory_order_relaxed);
-  stats.allocator_swcc_metadata_bytes = layout.domains[static_cast<size_t>(
-      AllocationDomain::kSwccAllocatorMetadata)].used_bytes.load(std::memory_order_relaxed);
+  stats.owner_private_swcc_used_bytes =
+      regions.OwnerPrivateUsedBytes(config_.node_id);
+  stats.shared_payload_swcc_used_bytes =
+      regions.SharedPayloadUsedBytes(config_.node_id);
+  stats.allocator_hwcc_metadata_bytes = config_.node_id == 0
+      ? layout.domains[static_cast<size_t>(AllocationDomain::kHwccAllocatorMetadata)]
+            .used_bytes.load(std::memory_order_relaxed)
+      : 0;
+  const uint64_t arena_header_bytes =
+      (sizeof(OwnerPrivateArenaHeader) + RegionAllocator::kAlignment - 1) &
+      ~(RegionAllocator::kAlignment - 1);
+  uint64_t local_arena_headers = 0;
+  for (uint32_t partition = config_.node_id;
+       partition < config_.partition_count; partition += config_.vm_count)
+    local_arena_headers += arena_header_bytes;
+  stats.allocator_swcc_metadata_bytes = local_arena_headers;
+  if (config_.node_id == 0)
+    stats.allocator_swcc_metadata_bytes +=
+        layout.domains[static_cast<size_t>(AllocationDomain::kSwccAllocatorMetadata)]
+            .used_bytes.load(std::memory_order_relaxed);
   stats.allocator_shared_overhead_bytes =
       stats.allocator_hwcc_metadata_bytes +
       stats.allocator_swcc_metadata_bytes;
@@ -933,8 +957,10 @@ MemoryStats KVEngine::Memory() const {
       stats.owner_private_swcc_used_bytes +
       stats.shared_payload_swcc_used_bytes +
       stats.allocator_swcc_metadata_bytes;
-  for (const auto &partition : partitions_)
-    stats.active_shared_rows += partition->migrated_key_count();
+  for (const auto &partition : partitions_) {
+    if (partition->owner_shard() == config_.node_id)
+      stats.active_shared_rows += partition->migrated_key_count();
+  }
   // Physical capacity vs Clock dynamic limit (§11.10). Clock links live in
   // SWCC PrivateRow after §11.14, so process-heap tracker DRAM is zero.
   stats.physical_hwcc_capacity_bytes = config_.hwcc_size_mb * 1024ULL * 1024ULL;
