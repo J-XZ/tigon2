@@ -177,9 +177,9 @@ class KVPartition {
   void ClockUntrackRowOffset(RegionOffset row_off);
   // Returns the private ValueStruct offset under the Clock cursor (or null).
   RegionOffset ClockAdvanceCursor();
-  bool ClockMoveOutRow(RegionOffset row_off);
-  // Second-chance eviction loop used by the original PolicyClock gate.
-  bool ClockEvictUntilUnderBudget(uint64_t hw_cc_budget);
+  void ClockResetCursor();
+  bool ClockVictim(RegionOffset node_off, FixedKey *key,
+                   star::TwoPLPashaMetadataShared **smeta) const;
   bool MoveOutClockVictim(uint32_t host_id);
   uint64_t shared_payload_used_bytes() const;
   uint64_t shared_payload_capacity_bytes() const;
@@ -202,6 +202,7 @@ class KVPartition {
   // Matches core/Executor: enter before observing shared tree/row/move paths.
   void EnterEbr() const { ebr_.enter_critical_section(); }
   FixedKey MakeKey(std::string_view key) const;
+  bool MoveOutPrivateRaw(std::string_view key, uint32_t host_id);
   bool LookupPrivateOffset(const FixedKey &key, RegionOffset *offset) const;
   bool LookupSharedOffset(const FixedKey &key, RegionOffset *offset) const;
   PrivateValueStruct *ValueFromOffset(RegionOffset offset) const;

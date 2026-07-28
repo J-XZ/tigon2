@@ -793,7 +793,7 @@ OwnerPrivateArenaHeader *DualRegionAllocator::Arena(uint32_t partition_id) const
       header_->owner_private_arenas_offset +
       partition_id * header_->owner_private_arena_stride));
   mem_access::PrivateRead(arena, offsetof(OwnerPrivateArenaHeader, owner_shard));
-  if (arena->magic != 0x5449474f4e41524eULL || arena->version != 2 ||
+  if (arena->magic != 0x5449474f4e41524eULL || arena->version != 3 ||
       arena->partition_id != partition_id)
     throw std::runtime_error("owner-private arena attachment validation failed");
   return arena;

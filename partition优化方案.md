@@ -840,8 +840,9 @@ migration 开销，也不得用更差的新策略人为拖慢 Tigon。SWCC/HWCC 
    SWCC，指针使用`RegionOffset`；原实现没有count，不保留
    `migrated_key_count`或另一个热路径计数。每次成功move-in仍像原代码一样分配
    一个node，move-out/delete时释放，不能改成`PrivateRow`内嵌链表来省掉原分配。
-   node固定保存key字节、partition id、local ValueStruct offset、对应HWCC
-   smeta offset及prev/next offset；不得持久化`ITable *`或任何VA，callback时
+   node固定保存key字节、local ValueStruct offset、对应HWCC smeta offset及
+   prev/next offset；其所在的per-partition arena已唯一确定partition id，不能为
+   冗余id扩大每个node。不得持久化`ITable *`或任何VA，callback时
    由partition id、ValueStruct内的meta offset和smeta offset构造原式瞬时
    table/row tuple。这是必要内存适配。不得另存一个policy-meta offset，因为
    production Clock second chance直接使用该smeta的原预留bit 37。

@@ -23,7 +23,6 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // changes self-validating; the generation now certifies logical EOF only.
 // v13: PolicyClock tracker state lives in owner-private SWCC.
 // (owner-private SWCC), not process-heap ClockTrackerNode (§11.14).
-// v14: PartitionDirectoryEntry carries O(1) migrated_key_count (§11.16).
 // v15: layout identity includes the configured ordered range boundaries.
 // v16: private-tree root and Clock control state live in owner-private SWCC.
 // v17: shared metadata removes the KV-only writer-preference byte and restores
@@ -31,7 +30,9 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // v18: drops the unused Scan-certificate mutation generation from HWCC.
 // v19: startup has a single Initializing→Ready publication; clean-exit and
 //      checkpoint coordination are process-local, never shared layout state.
-constexpr uint32_t kSharedLayoutVersion = 20;
+// v21: removes the current-only Clock migrated-key hot counter and records
+//      the HWCC smeta offset in each owner-private Clock tracker node.
+constexpr uint32_t kSharedLayoutVersion = 21;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -137,6 +138,7 @@ static_assert(alignof(PrivateMetadataLocal) == 64);
 // separate avoids smuggling a key into the local-row header.
 struct PrivateClockTrackerNode {
   RegionOffset value_off{kNullOffset};
+  RegionOffset smeta_off{kNullOffset};
   RegionOffset prev_off{kNullOffset};
   RegionOffset next_off{kNullOffset};
   FixedKey key{};

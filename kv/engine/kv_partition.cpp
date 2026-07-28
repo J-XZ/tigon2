@@ -1415,12 +1415,26 @@ star::migration_result KVPartition::MoveInForMigrationManager(
 }
 
 bool KVPartition::MoveOutForMigrationManager(const void *key) {
-  return MoveOutPrivate(
+  return MoveOutPrivateRaw(
       std::string_view(static_cast<const char *>(key), fixed_key_size_),
       owner_shard_);
 }
 
 bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
+  const FixedKey fixed_key = MakeKey(key);
+  ClockLock();
+  try {
+    const bool moved = MoveOutPrivateRaw(key, host_id);
+    if (moved) ClockUntrackMigratedKey(fixed_key.bytes);
+    ClockUnlock();
+    return moved;
+  } catch (...) {
+    ClockUnlock();
+    throw;
+  }
+}
+
+bool KVPartition::MoveOutPrivateRaw(std::string_view key, uint32_t host_id) {
   EnterEbr();
   if (star::scc_manager == nullptr) return false;
   const FixedKey fixed_key = MakeKey(key);
@@ -1519,12 +1533,8 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
     UnlockAdjacentRows(&neighborhood);
     return false;
   }
-  const RegionOffset clock_row_off = neighborhood.current.offset;
   ApplySharedAdjacency(neighborhood);
   UnlockAdjacentRows(&neighborhood);
-  ClockLock();
-  ClockUntrackRowOffset(clock_row_off);
-  ClockUnlock();
   mem_access::DelayActiveScopeNow();
   smeta->lock();
   smeta->clear_write_locked();
@@ -2009,9 +2019,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
           metadata->is_migrated = false;
           metadata->migrated_smeta_off = kNullOffset;
           RecordPrivateMetadataWrite(metadata);
-          ClockLock();
-          ClockUntrackRowOffset(neighborhood.current.offset);
-          ClockUnlock();
+          *need_untrack = true;
           *migration_policy_meta = &smeta->migration_policy_meta;
           retired_smeta = smeta;
         }
@@ -2143,6 +2151,7 @@ void KVPartition::ClockTrackMigratedKey(const void *key_bytes) {
                                                    partition_id_, owner_shard_))
       PrivateClockTrackerNode;
   node->value_off = row_off;
+  node->smeta_off = metadata->migrated_smeta_off;
   node->key = fixed_key;
   const RegionOffset node_off = regions_.swcc().ToOffset(node);
   mem_access::PrivateWrite(&private_arena_.clock_head, sizeof(private_arena_.clock_head));
@@ -2160,8 +2169,6 @@ void KVPartition::ClockTrackMigratedKey(const void *key_bytes) {
   }
   metadata->clock_node_off = node_off;
   RecordPrivateMetadataWrite(metadata);
-  mem_access::PrivateAtomicRmw(&private_arena_.migrated_key_count);
-  private_arena_.migrated_key_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void KVPartition::ClockUntrackMigratedKey(const void *key_bytes) {
@@ -2170,9 +2177,22 @@ void KVPartition::ClockUntrackMigratedKey(const void *key_bytes) {
                                       fixed_key_size_),
                      fixed_key_size_);
   RegionOffset row_off = kNullOffset;
-  if (!LookupPrivateOffset(fixed_key, &row_off) || row_off == kNullOffset)
+  if (LookupPrivateOffset(fixed_key, &row_off) && row_off != kNullOffset) {
+    ClockUntrackRowOffset(row_off);
     return;
-  ClockUntrackRowOffset(row_off);
+  }
+  // Delete removes the private-tree entry before PolicyClock untracks. Match
+  // the original policy's linear tracker search rather than adding a map.
+  for (RegionOffset node_off = private_arena_.clock_head; node_off != kNullOffset;) {
+    auto *node = ClockNodeFromOffset(node_off);
+    if (node == nullptr) return;
+    const RegionOffset next = node->next_off;
+    if (node->key.Compare(fixed_key) == 0) {
+      ClockUntrackRowOffset(node->value_off);
+      return;
+    }
+    node_off = next;
+  }
 }
 
 void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
@@ -2214,8 +2234,6 @@ void KVPartition::ClockUntrackRowOffset(RegionOffset row_off) {
   }
   metadata->clock_node_off = kNullOffset;
   RecordPrivateMetadataWrite(metadata);
-  mem_access::PrivateAtomicRmw(&private_arena_.migrated_key_count);
-  private_arena_.migrated_key_count.fetch_sub(1, std::memory_order_relaxed);
   regions_.FreeOwnerPrivate(node, sizeof(PrivateClockTrackerNode), partition_id_,
                             owner_shard_);
 }
@@ -2230,66 +2248,29 @@ RegionOffset KVPartition::ClockAdvanceCursor() {
     auto *cur = ClockNodeFromOffset(private_arena_.clock_cursor);
     mem_access::PrivateRead(cur, sizeof(*cur));
     const RegionOffset next = cur->next_off;
-    // Linear intrusive list: wrap to head so a lone node with a fresh
-    // second_chance can be reconsidered in the same eviction pass.
-    private_arena_.clock_cursor =
-        (next == kNullOffset) ? private_arena_.clock_head : next;
+    private_arena_.clock_cursor = next;
   }
   return private_arena_.clock_cursor;
 }
 
-bool KVPartition::ClockMoveOutRow(RegionOffset row_off) {
-  if (row_off == kNullOffset) return false;
-  auto *node = ClockNodeFromOffset(row_off);
-  return node != nullptr && MoveOutForMigrationManager(node->key.bytes);
+void KVPartition::ClockResetCursor() {
+  mem_access::PrivateWrite(&private_arena_.clock_cursor,
+                           sizeof(private_arena_.clock_cursor));
+  private_arena_.clock_cursor = kNullOffset;
 }
 
-bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget) {
-  bool ret = false;
-  ClockLock();
-  if (star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
-      hw_cc_budget) {
-    ClockUnlock();
-    return false;
-  }
-  // Bound the scan so an empty/corrupt list cannot spin forever.
-  for (uint32_t steps = 0; steps < 1024; ++steps) {
-    const RegionOffset victim_off = ClockAdvanceCursor();
-    if (victim_off == kNullOffset) break;
-    auto *node = ClockNodeFromOffset(victim_off);
-    if (node == nullptr) continue;
-    auto *private_value = ValueFromOffset(node->value_off);
-    auto *metadata = MetadataFromValue(private_value);
-    if (!metadata->is_migrated || metadata->migrated_smeta_off == kNullOffset) {
-      // Stale list node after concurrent move-out raced past track: drop it
-      // so migrated_key_count and the intrusive list stay honest.
-      ClockUntrackRowOffset(node->value_off);
-      continue;
-    }
-    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-        regions_.hwcc().FromOffset(metadata->migrated_smeta_off));
-    smeta->lock();
-    const bool second_chance = smeta->get_second_chance_bit();
-    if (second_chance) smeta->clear_second_chance_bit();
-    smeta->unlock();
-    if (second_chance)
-      continue;
-    const FixedKey victim_key = node->key;
-    // Do not hold the Clock spinlock across move-out (§11.15).
-    ClockUnlock();
-    // MoveOutForMigrationManager untracks under its own brief ClockLock.
-    const bool moved = MoveOutForMigrationManager(victim_key.bytes);
-    ClockLock();
-    if (moved) {
-      if (star::cxl_memory.get_stats(star::CXLMemory::TOTAL_HW_CC_USAGE) <
-          hw_cc_budget) {
-        ret = true;
-        break;
-      }
-    }
-  }
-  ClockUnlock();
-  return ret;
+bool KVPartition::ClockVictim(
+    RegionOffset node_off, FixedKey *key,
+    star::TwoPLPashaMetadataShared **smeta) const {
+  if (key == nullptr || smeta == nullptr || node_off == kNullOffset) return false;
+  auto *node = ClockNodeFromOffset(node_off);
+  if (node == nullptr || node->smeta_off == kNullOffset) return false;
+  auto *candidate = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(node->smeta_off));
+  if (!regions_.IsHwccAddress(candidate)) return false;
+  *key = node->key;
+  *smeta = candidate;
+  return true;
 }
 
 bool KVPartition::MoveOutClockVictim(uint32_t host_id) {
@@ -2313,8 +2294,17 @@ uint64_t KVPartition::hwcc_used_bytes() const {
 }
 
 uint64_t KVPartition::migrated_key_count() const {
-  mem_access::PrivateAtomicLoad(&private_arena_.migrated_key_count);
-  return private_arena_.migrated_key_count.load(std::memory_order_relaxed);
+  auto *self = const_cast<KVPartition *>(this);
+  self->ClockLock();
+  uint64_t count = 0;
+  for (RegionOffset node_off = private_arena_.clock_head; node_off != kNullOffset;) {
+    auto *node = ClockNodeFromOffset(node_off);
+    if (node == nullptr) break;
+    ++count;
+    node_off = node->next_off;
+  }
+  self->ClockUnlock();
+  return count;
 }
 
 

@@ -1625,18 +1625,13 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
   if (hw_used < hw_budget) return;
   // PolicyClock's original policy is governed solely by its HWCC accounting.
   KvMigrationRuntime::SyncHwCcUsage(partition);
-  for (uint32_t pass = 0; pass < 2; ++pass) {
-    for (auto &candidate : partitions_) {
-      if (OwnerForPartition(candidate->partition_id()) != config_.node_id)
-        continue;
-      if (candidate->MoveOutClockVictim(config_.node_id)) {
-        migration_out_.fetch_add(1, std::memory_order_relaxed);
-        return;
-      }
-    }
+  if (partition.MoveOutClockVictim(config_.node_id)) {
+    migration_out_.fetch_add(1, std::memory_order_relaxed);
   }
-  throw std::runtime_error(
-      "migration budget exceeded without an eligible owner Clock victim");
+  // An original Clock pass may consume only second chances, or find pinned
+  // rows.  The migration already acknowledged above remains valid; leave the
+  // next OnDemand pass to resume from the original cursor instead of turning
+  // this normal policy result into a synthetic OOM.
 }
 
 Status KVEngine::MoveOut(std::string_view key) {

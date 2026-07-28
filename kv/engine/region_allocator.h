@@ -146,7 +146,7 @@ struct DualRegionConfig {
 // a lock-protected bump path; reclamation is added through EBR in M4.
 struct alignas(64) OwnerPrivateArenaHeader {
   uint64_t magic = 0x5449474f4e41524eULL;  // TIGONARN
-  uint32_t version = 2;
+  uint32_t version = 3;
   uint32_t partition_id = 0;
   uint32_t owner_shard = 0;
   uint32_t reserved = 0;
@@ -165,7 +165,6 @@ struct alignas(64) OwnerPrivateArenaHeader {
   RegionOffset clock_head = kNullOffset;
   RegionOffset clock_tail = kNullOffset;
   RegionOffset clock_cursor = kNullOffset;
-  std::atomic<uint64_t> migrated_key_count{0};
   // Original EBR keeps one retire list per worker/epoch.  The lists are
   // owner-private SWCC offsets so their allocator metadata never becomes a
   // cross-VM synchronization object.

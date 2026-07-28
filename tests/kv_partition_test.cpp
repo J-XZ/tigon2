@@ -37,8 +37,8 @@ class PassthroughScc final : public star::SCCManager {
 
 tigonkv::engine::DualRegionConfig Config() {
   tigonkv::engine::DualRegionConfig config;
-  config.total_pool_bytes = 8 * 1024 * 1024;
-  config.hwcc_size_bytes = 2 * 1024 * 1024;
+  config.total_pool_bytes = 16 * 1024 * 1024;
+  config.hwcc_size_bytes = 4 * 1024 * 1024;
   config.swcc_offset_bytes = config.hwcc_size_bytes;
   config.swcc_size_bytes = config.total_pool_bytes - config.swcc_offset_bytes;
   config.config_hash = 0x9911;
@@ -48,7 +48,9 @@ tigonkv::engine::DualRegionConfig Config() {
   config.fixed_value_size = 128;
   // The original ValueStruct/local-metadata split and owner-private Clock
   // tracker node use separate owner-private allocations.
-  config.owner_private_swcc_fraction = 0.5;
+  // This focused Clock test materializes more than 1024 owner rows while
+  // retaining the original eight-partition layout.
+  config.owner_private_swcc_fraction = 0.9;
   return config;
 }
 
@@ -360,7 +362,8 @@ int main() {
   // Fresh move-in starts without a second chance; the first over-budget Clock
   // pass may therefore move it out immediately.  Only a real shared access
   // grants a chance.
-  // Other keys (e.g. gamma) may still be migrated; counter is O(1) track/untrack.
+  // Other keys (e.g. gamma) may still be migrated; this is an explicit
+  // tracker-list statistics snapshot, never a migration hot-path counter.
   assert(partition.PutPrivate("clock", "victim"));
   assert(partition.PromotePrivate("clock", 1));
   const uint64_t migrated_before_clock = partition.migrated_key_count();
@@ -559,6 +562,41 @@ int main() {
   } while (!migration_done.load(std::memory_order_acquire) ||
            scan_rounds < 32);
   migrator.join();
+
+  // The original Clock loop has no fixed candidate limit.  Drain earlier
+  // tracker entries, then give 1025 rows a real shared access (one chance)
+  // and leave the 1026th cold: the next pass must reach and evict that tail.
+  const uint64_t clock_budget =
+      (1024ULL * 1024ULL * 1024ULL - star::CXL_EBR::max_ebr_retiring_memory) / 2;
+  while (partition.migrated_key_count() != 0) {
+    star::cxl_memory.set_total_hw_cc_usage(clock_budget);
+    // A first original Clock pass may only clear second-chance bits.
+    if (!partition.MoveOutClockVictim(1)) {
+      star::cxl_memory.set_total_hw_cc_usage(clock_budget);
+      assert(partition.MoveOutClockVictim(1));
+    }
+  }
+  for (uint32_t i = 0; i < 1025; ++i) {
+    char key[32];
+    std::snprintf(key, sizeof(key), "clock-pass-%04u", i);
+    assert(partition.PutPrivate(key, "candidate"));
+    assert(partition.PromotePrivate(key, 1));
+    std::string shared_value;
+    assert(partition.GetShared(key, 1, &shared_value) ==
+           tigonkv::engine::SharedAccessState::kDone);
+  }
+  assert(partition.PutPrivate("clock-pass-tail", "victim"));
+  assert(partition.PromotePrivate("clock-pass-tail", 1));
+  const uint64_t before_long_clock_pass = partition.migrated_key_count();
+  assert(before_long_clock_pass == 1026);
+  partition.ClockLock();
+  partition.ClockResetCursor();
+  partition.ClockUnlock();
+  star::cxl_memory.set_total_hw_cc_usage(clock_budget);
+  assert(partition.MoveOutClockVictim(1));
+  assert(partition.migrated_key_count() == before_long_clock_pass - 1);
+  assert(partition.GetPrivate("clock-pass-tail", &value) &&
+         value == FixedValue("victim"));
 
   // The owner create path keeps the original next-row write lock across
   // placeholder insertion and publication.  Make that successor migrated so
