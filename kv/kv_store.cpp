@@ -1091,8 +1091,6 @@ ScanResult KVStore::Scan(std::string_view start_key, std::string_view end_key,
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
-  if (!config_.enable_scan)
-    return {Status::Error(StatusCode::kInvalidArgument, "SCAN disabled"), {}};
   if (start_key.size() != config_.fixed_key_size || IsInternalMaxKey(start_key) ||
       (!end_key.empty() && end_key.size() != config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument, "invalid scan range"), {}};

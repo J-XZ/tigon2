@@ -150,7 +150,6 @@ struct Config {
   std::string when_to_move_out = "OnDemand";
   std::string scc_mechanism = "WriteThrough";
   uint64_t transport_ring_total_mb = 16;
-  bool enable_scan = true;
   bool strict_swcc_access = false;
   bool checkpoint_on_clean_exit = true;
   bool verbose = false;
