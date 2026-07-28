@@ -157,7 +157,9 @@ static_assert(sizeof(PartitionDirectoryEntry) == 64,
 // The first object in the HWCC region. Fields are fixed-width so an attach in a
 // separately mapped process can validate the complete layout before dereference.
 struct alignas(64) SharedLayoutHeader {
-  uint64_t magic = kSharedLayoutMagic;
+  // The reset VM publishes this only after every immutable layout field is
+  // initialized.  Joining VMs use it as the acquire/release attachment gate.
+  std::atomic<uint64_t> magic{0};
   uint32_t layout_version = kSharedLayoutVersion;
   std::atomic<uint32_t> state{static_cast<uint32_t>(LayoutState::kInitializing)};
   uint64_t config_hash = 0;
@@ -184,7 +186,8 @@ struct alignas(64) SharedLayoutHeader {
 
   bool IsCompatible(uint64_t expected_hash, uint64_t expected_pool_bytes,
                     uint32_t expected_vms, uint32_t expected_partitions) const {
-    return magic == kSharedLayoutMagic && layout_version == kSharedLayoutVersion &&
+    return magic.load(std::memory_order_acquire) == kSharedLayoutMagic &&
+           layout_version == kSharedLayoutVersion &&
            config_hash == expected_hash && total_pool_bytes == expected_pool_bytes &&
            vm_count == expected_vms && partition_count == expected_partitions &&
            state.load(std::memory_order_acquire) ==

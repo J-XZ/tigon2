@@ -75,6 +75,7 @@ int main() {
   assert(kNullOffset == 0);
 
   SharedLayoutHeader header;
+  header.magic.store(kSharedLayoutMagic, std::memory_order_release);
   header.config_hash = 7;
   header.total_pool_bytes = 4096;
   header.vm_count = 2;

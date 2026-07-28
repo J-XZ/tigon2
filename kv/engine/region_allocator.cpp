@@ -2,7 +2,6 @@
 #include "kv/engine/mem_access.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -13,7 +12,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sstream>
-#include <thread>
 
 namespace tigonkv::engine {
 namespace {
@@ -471,6 +469,9 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   if (reinterpret_cast<uintptr_t>(base) % RegionAllocator::kAlignment != 0)
     throw std::invalid_argument("dual-region pool is not cacheline aligned");
   auto *header = new (base + config.hwcc_offset_bytes) DualRegionPersistentHeader;
+  // magic is the immutable-layout publication flag.  Keep it clear while
+  // this VM fills the remaining fixed fields, so joining VMs cannot validate
+  // a half-constructed default header.
   header->layout.config_hash = config.config_hash;
   header->layout.total_pool_bytes = config.total_pool_bytes;
   header->layout.hwcc_offset_bytes = config.hwcc_offset_bytes;
@@ -534,6 +535,8 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   // Remain kInitializing until KVEngine publishes transport, EBR and all
   // partition roots.  Publishing here allowed peers to attach to half-built
   // state.
+  mem_access::HwccAtomicStore(&header->layout.magic);
+  header->layout.magic.store(kSharedLayoutMagic, std::memory_order_release);
   FlushForRemoteVisibility(header, sizeof(*header), false);
   return DualRegionAllocator(base, config, header, hwcc, swcc);
 }
@@ -657,23 +660,47 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
   if (pool == nullptr) throw std::invalid_argument("null dual-region pool");
   auto *base = static_cast<std::byte *>(pool);
   auto *header = reinterpret_cast<DualRegionPersistentHeader *>(base + config.hwcc_offset_bytes);
+  // A joining VM can map the backing before VM0 has published the immutable
+  // layout.  Wait for that HWCC publication once, then validate it below.
+  // Retrying Attach from the KV facade races the same phase and can expire
+  // while VM0 is still constructing the static transport/EBR prefix.
+  for (;;) {
+    mem_access::HwccAtomicLoad(&header->layout.magic);
+    if (header->layout.magic.load(std::memory_order_acquire) ==
+        kSharedLayoutMagic)
+      break;
+    _mm_pause();
+  }
   // A joining VM must attach while the layout is still Initializing so it can
   // construct its own private arena/root.  Ready is intentionally checked by
   // KVEngine only after all owner bits are published.
-  if (header->layout.magic != kSharedLayoutMagic ||
-      header->layout.layout_version != kSharedLayoutVersion ||
-      header->layout.config_hash != config.config_hash ||
-      header->layout.total_pool_bytes != config.total_pool_bytes ||
-      header->layout.vm_count != config.vm_count ||
-      header->layout.partition_count != config.partition_count ||
-      header->layout.hwcc_offset_bytes != config.hwcc_offset_bytes ||
-      header->layout.hwcc_size_bytes != config.hwcc_size_bytes ||
-      header->layout.swcc_offset_bytes != config.swcc_offset_bytes ||
-      header->layout.swcc_size_bytes != config.swcc_size_bytes ||
-      header->layout.fixed_key_size != config.fixed_key_size ||
-      header->layout.fixed_value_size != config.fixed_value_size ||
-      header->owner_private_arena_stride == 0)
-    throw std::runtime_error("dual-region layout attachment validation failed");
+  const bool compatible =
+      header->layout.magic.load(std::memory_order_acquire) ==
+          kSharedLayoutMagic &&
+      header->layout.layout_version == kSharedLayoutVersion &&
+      header->layout.config_hash == config.config_hash &&
+      header->layout.total_pool_bytes == config.total_pool_bytes &&
+      header->layout.vm_count == config.vm_count &&
+      header->layout.partition_count == config.partition_count &&
+      header->layout.hwcc_offset_bytes == config.hwcc_offset_bytes &&
+      header->layout.hwcc_size_bytes == config.hwcc_size_bytes &&
+      header->layout.swcc_offset_bytes == config.swcc_offset_bytes &&
+      header->layout.swcc_size_bytes == config.swcc_size_bytes &&
+      header->layout.fixed_key_size == config.fixed_key_size &&
+      header->layout.fixed_value_size == config.fixed_value_size &&
+      header->owner_private_arena_stride != 0;
+  if (!compatible) {
+    std::ostringstream detail;
+    detail << "dual-region layout attachment validation failed"
+           << " version=" << header->layout.layout_version
+           << " hash=" << header->layout.config_hash
+           << " expected_hash=" << config.config_hash
+           << " vm_count=" << header->layout.vm_count
+           << " expected_vm_count=" << config.vm_count
+           << " partition_count=" << header->layout.partition_count
+           << " expected_partition_count=" << config.partition_count;
+    throw std::runtime_error(detail.str());
+  }
   auto hwcc = RegionAllocator::Attach(base + header->hwcc_allocator_offset,
                                       header->hwcc_allocator_bytes, true);
   auto swcc = RegionAllocator::Attach(base + header->swcc_allocator_offset,
@@ -732,8 +759,11 @@ void DualRegionAllocator::WaitUntilReady() const {
 void DualRegionAllocator::PublishReady() {
   mem_access::HwccAtomicLoad(&header_->layout.state);
   const uint32_t state = header_->layout.state.load(std::memory_order_acquire);
-  if (state != static_cast<uint32_t>(LayoutState::kInitializing))
-    throw std::logic_error("dual-region layout ready published more than once");
+  if (state != static_cast<uint32_t>(LayoutState::kInitializing)) {
+    throw std::logic_error(
+        "dual-region layout ready published with state=" +
+        std::to_string(state));
+  }
   const uint64_t expected = header_->layout.vm_count == 64
                                 ? ~uint64_t{0}
                                 : ((uint64_t{1} << header_->layout.vm_count) - 1);

@@ -982,19 +982,7 @@ KVStore::~KVStore() {
 }
 
 void KVStore::Open(bool reset) {
-  constexpr uint32_t kAttachAttempts = 100;
-  for (uint32_t attempt = 0;; ++attempt) {
-    try {
-      impl_->engine = engine::KVEngine::Open(config_, reset);
-      return;
-    } catch (const std::runtime_error &error) {
-      const std::string_view message(error.what());
-      if (reset || attempt + 1 == kAttachAttempts ||
-          message.find("layout attachment validation failed") == std::string_view::npos)
-        throw;
-      std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-  }
+  impl_->engine = engine::KVEngine::Open(config_, reset);
 }
 
 void KVStore::Close() {
