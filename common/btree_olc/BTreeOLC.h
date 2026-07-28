@@ -8,8 +8,10 @@
 #include <cassert>
 #include <cstring>
 #include <functional>
+#include <iostream>
 #include <utility>
 #include <vector>
+#include <queue>
 #include <thread>
 #include <random>
 #include <type_traits> // std::{enable_if,is_trivial}
@@ -221,21 +223,21 @@ class BPlusTree {
 
 		void iteratorEnter(bool &needRestart)
 		{
-			// Shared-pessimistic acquire (OLC): bump reader count only while
-			// unlocked. Plain fetch_add raced with writeLock and could leave the
-			// lock word with both the lock bit and a reader count set; a later
-			// mismatched iteratorLeave then permanently corrupted the version.
-			uint64_t version = word.load(std::memory_order_relaxed);
-			for (;;) {
-				if (isLocked(version) || (version & kReaderMask) == kReaderMask) {
-					needRestart = true;
-					_mm_pause();
-					return;
-				}
-				if (word.compare_exchange_weak(version, version + 1, std::memory_order_acquire,
-							       std::memory_order_relaxed))
-					return;
+			// if (isRWLock) {
+			//     assert(getReaderCount(word.load()) < 20);
+			//     acquireRead();
+			//     assert(getReaderCount(word.load()) < 20);
+			// } else {
+			uint64_t version;
+			version = word.load(std::memory_order_relaxed);
+			if (isLocked(version)) {
+				// acquire read lock fail
+				needRestart = true;
+				_mm_pause();
+				return;
 			}
+			word.fetch_add(1);
+			//}
 		}
 
 		void iteratorLeave()
@@ -521,6 +523,7 @@ class BPlusTree {
 		{
 			meta_.count_ = count;
 		}
+		// virtual int display(std::queue<NodeBase *> &nodeQueue) {}
 	};
 
 	/**
@@ -571,6 +574,25 @@ class BPlusTree {
 			, pre_(nullptr)
 			, next_(nullptr)
 		{
+		}
+
+		/**
+		 * NOTE: used by tests
+		 */
+		int display(std::queue<NodeBase *> &nodeQueue)
+		{
+			assert(false);
+			std::cout << "(";
+			for (int i = 0; i < this->getCount(); i++) {
+				// assert(data_[i].second != nullptr);
+				// auto itr = data_[i].second->begin();
+				// std::cout << data_[i].first.getValue();
+				if (i != this->getCount() - 1) {
+					std::cout << ",";
+				}
+			}
+			std::cout << ") ";
+			return 0;
 		}
 
 		/**
@@ -1128,6 +1150,29 @@ class BPlusTree {
 			this->setCount(this->getCount() + 1);
 		}
 
+		/**
+		 * NOTE: used by tests
+		 */
+		int display(std::queue<NodeBase *> &nodeQueue)
+		{
+			std::cout << "[";
+			for (int i = 0; i < this->getCount(); i++) {
+				std::cout << keyAt(i).getValue();
+				if (i != this->getCount() - 1) {
+					std::cout << '|';
+				}
+			}
+			std::cout << "] ";
+
+			if (this->getCount()) {
+				for (int i = 0; i <= this->getCount(); i++) {
+					nodeQueue.push(childAt(i));
+				}
+				return this->getCount() + 1;
+			} else {
+				return 0;
+			}
+		}
 	};
 	static_assert(InnerPageSize > sizeof(BTreeInner), "InnerPageSize too small");
 
@@ -1329,6 +1374,43 @@ class BPlusTree {
 		}
 	};
 
+	/**
+	 * NOTE: used by tests
+	 */
+	void display()
+	{
+		NodeBase *node = root_;
+		// std::cout << node->getCount() << std::endl;
+		std::queue<NodeBase *> nodeQueue;
+
+		std::cout << "++++++\n";
+		int p_sum;
+		if (node->getType() == NodeType::BTreeLeaf) {
+			p_sum = reinterpret_cast<BTreeLeaf *>(node)->display(nodeQueue);
+		} else {
+			p_sum = reinterpret_cast<BTreeInner *>(node)->display(nodeQueue);
+		}
+
+		std::cout << std::endl;
+		int sum = 0;
+		while (nodeQueue.empty() == false) {
+			for (int i = 0; i < p_sum; i++) {
+				node = nodeQueue.front();
+				nodeQueue.pop();
+
+				if (node->getType() == NodeType::BTreeLeaf) {
+					sum += reinterpret_cast<BTreeLeaf *>(node)->display(nodeQueue);
+				} else {
+					sum += reinterpret_cast<BTreeInner *>(node)->display(nodeQueue);
+				}
+			}
+			std::cout << std::endl;
+			p_sum = sum;
+			sum = 0;
+		}
+		std::cout << "------\n";
+	}
+
 	BPlusTree(bool isUnique = false, const KeyComparator &keyComp = KeyComparator{}, const ValueComparator &valueComp = ValueComparator{})
 		: keyComp_(keyComp)
 		, valueComp_(valueComp)
@@ -1337,6 +1419,8 @@ class BPlusTree {
 		char *base = new char[LeafPageSize];
 		root_ = new (base) BTreeLeaf(); // Placement new
 		stats_.leaf_nodes++;
+		// std::cout << "BTreeLeaf::maxEntries = " << BTreeLeaf::maxEntries << ", "
+		//           << "BTreeInner::maxEntries = " << BTreeInner::maxEntries << ".\n";
 	}
 
 	void makeRoot(const KeyType &k, NodeBase *leftChild, NodeBase *rightChild)
@@ -2595,12 +2679,7 @@ restart:
 		// according to the `leftExist`
 		if (!leftExist && keyComp_(lowKey, leaf->keys_[pos]) == 0) {
 			if ((int)pos == leaf->getCount() - 1) {
-				auto *nextLeaf = leaf->next_;
-				// Validate before following next_ (OLC pointer-then-check).
-				leaf->checkOrRestart(versionNode, needRestart);
-				if (needRestart)
-					goto restart;
-				leaf = nextLeaf;
+				leaf = leaf->next_;
 				pos = 0;
 			} else {
 				pos++;
@@ -2610,11 +2689,6 @@ restart:
 			return;
 
 		leaf->iteratorEnter(needRestart);
-		// Must restart if enter failed: constructing an iterator without a
-		// successful enter makes ~BPlusTreeIterator call iteratorLeave and
-		// corrupt the optimistic lock word (livelock under YCSB-E writers).
-		if (needRestart)
-			goto restart;
 		{
 			BPlusTreeIterator itr(leaf, pos);
 			if (itr == retryItr())
