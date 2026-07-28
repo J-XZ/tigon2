@@ -13,7 +13,7 @@ int main() {
   assert(kSingleTableId == 0);
   assert(kMaxFixedKeyBytes == 32);
   assert(kMaxPartitions >= 16);
-  assert(kSharedLayoutVersion == 19);
+  assert(kSharedLayoutVersion == 21);
   assert(sizeof(PartitionDirectoryEntry) == 64);
   assert(sizeof(PrivateValueStruct) == sizeof(RegionOffset));
   assert(alignof(PrivateMetadataLocal) == 64);
@@ -43,15 +43,21 @@ int main() {
   }
   // §5.1 ScanMigrate codec round-trip and reject unknown flags / wrong size.
   {
-    const auto req = EncodeScanMigrateRequest(7, kScanMigrateFlagCursorDuplicate, 17);
+    const std::string max_key(32, static_cast<char>(0xff));
+    const auto req = EncodeScanMigrateRequest(
+        7, kScanMigrateFlagCursorDuplicate, 17, max_key);
     assert(req.size() == kScanMigrateRequestBytes);
     uint32_t pid = 0, flags = 0;
     uint64_t limit = 0;
-    assert(DecodeScanMigrateRequest(req, &pid, &flags, &limit));
+    std::string decoded_max;
+    assert(DecodeScanMigrateRequest(req, &pid, &flags, &limit, &decoded_max));
     assert(pid == 7 && flags == kScanMigrateFlagCursorDuplicate && limit == 17);
-    assert(!DecodeScanMigrateRequest(req + "x", &pid, &flags, &limit));
-    const auto bad_flags = EncodeScanMigrateRequest(0, 2u, 1);
-    assert(!DecodeScanMigrateRequest(bad_flags, &pid, &flags, &limit));
+    assert(decoded_max == max_key);
+    assert(!DecodeScanMigrateRequest(req + "x", &pid, &flags, &limit,
+                                     &decoded_max));
+    const auto bad_flags = EncodeScanMigrateRequest(0, 2u, 1, max_key);
+    assert(!DecodeScanMigrateRequest(bad_flags, &pid, &flags, &limit,
+                                     &decoded_max));
     const auto resp = EncodeScanMigrateResponse(7, true, true);
     assert(resp.size() == kScanMigrateResponseBytes);
     bool exhausted = false;

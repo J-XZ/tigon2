@@ -629,30 +629,32 @@ int main() {
     }
     assert(!owned.empty());
     std::sort(owned.begin(), owned.end());
+    const std::string scan_max(pscan_config.fixed_key_size,
+                               static_cast<char>(0xff));
     bool exhausted = false;
     assert(engine
-               ->PreparePartitionSharedScan(part, owned.front(), false, 2,
+               ->PreparePartitionSharedScan(part, owned.front(), scan_max, false, 2,
                                             pscan_config.node_id, &exhausted)
                .ok());
     bool exhausted2 = true;
     assert(engine
-               ->PreparePartitionSharedScan(part, owned.front(), false, 2,
+               ->PreparePartitionSharedScan(part, owned.front(), scan_max, false, 2,
                                             pscan_config.node_id, &exhausted2)
                .ok());
     bool exhausted3 = false;
     assert(engine
-               ->PreparePartitionSharedScan(part, owned.front(), false, 64,
+               ->PreparePartitionSharedScan(part, owned.front(), scan_max, false, 64,
                                             pscan_config.node_id, &exhausted3)
                .ok());
     assert(exhausted3);
     assert(engine
-               ->PreparePartitionSharedScan(999, "x", false, 2,
+               ->PreparePartitionSharedScan(999, "x", scan_max, false, 2,
                                             pscan_config.node_id, &exhausted)
                .code == tigonkv::StatusCode::kInvalidArgument);
     assert(engine
-               ->PreparePartitionSharedScan(part, "x", false, 0,
+               ->PreparePartitionSharedScan(part, "x", scan_max, false, 0,
                                             pscan_config.node_id, &exhausted)
-               .code == tigonkv::StatusCode::kInvalidArgument);
+               .ok());
     unlink(pscan_template);
   }
 

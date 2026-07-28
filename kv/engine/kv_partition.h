@@ -136,13 +136,16 @@ class KVPartition {
   // for non-owned partitions.
   bool ScanOwned(std::string_view start_key, uint64_t limit,
                  std::vector<std::pair<std::string, std::string>> *items,
-                 const std::function<void()> *progress = nullptr) const;
+                 const std::function<void()> *progress = nullptr,
+                 std::string_view inclusive_max = {}) const;
   // Key-only owner locator walk used by TwoPLPasha-style range move-in. It
   // deliberately avoids reading values that the requester will read via CXL.
   bool ScanOwnedKeys(
       std::string_view start_key, uint64_t limit,
       std::vector<std::string> *keys,
-      const std::function<void()> *progress = nullptr) const;
+      const std::function<void()> *progress = nullptr,
+      bool include_internal_sentinel = false,
+      std::string_view inclusive_max = {}) const;
   // Test/legacy helper; formal Scan uses ProbeSharedScanPage. host_id is the
   // SCC reader identity (requester), not owner_shard_.
   bool ScanShared(
@@ -168,7 +171,8 @@ class KVPartition {
   SharedScanProbeResult ProbeSharedScanPage(
       uint32_t host_id, std::string_view start_key, uint64_t output_limit,
       bool owner_exhausted_for_cursor, bool cursor_is_duplicate,
-      bool owner_no_predecessor_for_cursor = false) const;
+      bool owner_no_predecessor_for_cursor = false,
+      std::string_view inclusive_max = {}) const;
   bool PrivatePredecessorKey(std::string_view key, std::string *predecessor) const;
   void ClockLock();
   void ClockUnlock();
@@ -221,11 +225,6 @@ class KVPartition {
                                  RegionOffset *smeta_offset) const;
   bool TryPinSharedEntry(
       const FixedKey &key, RegionOffset expected_offset,
-      star::TwoPLPashaMetadataShared **smeta) const;
-  // Pin without shared-tree re-lookup; only safe while scanForUpdate holds the
-  // leaf write lock (lookup would self-deadlock on that leaf).
-  bool TryPinSharedEntryUnderScan(
-      RegionOffset expected_offset,
       star::TwoPLPashaMetadataShared **smeta) const;
   struct RowRef {
     FixedKey key{};

@@ -67,6 +67,29 @@ bool IsInternalMaxSentinel(std::string_view key) {
   });
 }
 
+// TwoPLPasha's scan callback uses an inclusive max key while the KV facade
+// deliberately exposes the usual exclusive upper bound.  Keys are fixed-size
+// unsigned byte strings, so this conversion is exact and needs no protocol
+// mode bit.
+bool ExclusiveToInclusive(std::string_view exclusive, uint32_t key_size,
+                          FixedKey *inclusive) {
+  if (inclusive == nullptr || exclusive.size() != key_size) return false;
+  *inclusive = FixedKey::From(exclusive, key_size);
+  for (size_t i = key_size; i != 0; --i) {
+    auto &byte = reinterpret_cast<unsigned char *>(inclusive->bytes)[i - 1];
+    if (byte != 0) {
+      --byte;
+      return true;
+    }
+    byte = 0xff;
+  }
+  return false;
+}
+
+bool LessFixed(std::string_view left, std::string_view right, uint32_t key_size) {
+  return FixedKey::From(left, key_size).Compare(FixedKey::From(right, key_size)) < 0;
+}
+
 uint64_t SharedLayoutConfigDigest(const Config &config) {
   LayoutDigest digest;
   const auto u64 = [&](std::string_view name, uint64_t value) {
@@ -648,82 +671,46 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
   if (IsInternalMaxSentinel(start_key))
     return {Status::Error(StatusCode::kInvalidArgument,
                           "internal max sentinel is reserved"), {}};
-  constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
-  if (limit > kScanSafetyLimit)
-    return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
   TlsScanDiag = {};
   ScanTlsFlushGuard flush_guard{&scan_partition_probes_, &scan_migrate_rpcs_};
-  const uint64_t target = limit == 0 ? kScanSafetyLimit : limit;
+  if (!end_key.empty() && !LessFixed(start_key, end_key, config_.fixed_key_size))
+    return {Status::Ok(), {}};
 
-  struct PartitionCursor {
-    uint32_t partition_id = 0;
-    uint32_t owner = 0;
-    bool local = false;
-    std::string cursor;
-    bool has_cursor = false;
-    bool owner_exhausted_for_cursor = false;
-    bool owner_no_predecessor_for_cursor = false;
-    bool more = false;
-    bool reached_end = false;
-  };
-
-  auto append_items = [&](PartitionCursor *cursor,
-                          std::vector<std::pair<std::string, std::string>> raw,
-                          bool more, ScanResult *result) {
-    for (auto &item : raw) {
-      if (cursor->has_cursor && item.first <= cursor->cursor) continue;
-      if (!end_key.empty() && item.first >= end_key) {
-        cursor->reached_end = true;
-        break;
-      }
-      cursor->cursor = item.first;
-      cursor->has_cursor = true;
-      result->items.push_back({std::move(item.first), std::move(item.second)});
-      if (result->items.size() == target) break;
-    }
-    cursor->more = more && !cursor->reached_end && result->items.size() < target;
-  };
-
-  auto probe_remote = [&](PartitionCursor *source, uint64_t page_limit,
-                          ScanResult *result) -> Status {
-    auto *partition = partitions_[source->partition_id].get();
+  auto scan_remote = [&](uint32_t partition_id, std::string_view min_key,
+                         std::string_view inclusive_max, uint64_t scan_limit,
+                         ScanResult *result) -> Status {
+    auto *partition = partitions_[partition_id].get();
     bool migrated_once = false;
+    bool owner_exhausted = false;
+    bool owner_no_predecessor = false;
     for (;;) {
-      const std::string_view cursor =
-          source->has_cursor ? std::string_view(source->cursor) : start_key;
       KVPartition::SharedScanProbeResult probe;
       {
         RequestServeDepthGuard depth_guard;
         probe = partition->ProbeSharedScanPage(
-            config_.node_id, cursor, page_limit,
-            source->owner_exhausted_for_cursor, source->has_cursor,
-            source->owner_no_predecessor_for_cursor);
+            config_.node_id, min_key, scan_limit,
+            owner_exhausted,
+            /*cursor_is_duplicate=*/false,
+            owner_no_predecessor, inclusive_max);
       }
       ++TlsScanDiag.partition_probes;
       PollTransport();
-      source->owner_exhausted_for_cursor = false;
-      source->owner_no_predecessor_for_cursor = false;
       if (!probe.status.ok()) return probe.status;
       if (probe.migration_required) {
-        // One remote partition primitive is probe → optional move-in →
-        // reprobe.  A second incomplete reprobe is contention/incompleteness
-        // for the facade to retry, not a hidden Scan deadline or busy loop.
         if (migrated_once)
           return Status::Error(StatusCode::kBusy,
                                "CXL scan remains incomplete after move-in");
         migrated_once = true;
-        bool exhausted = false;
-        bool no_predecessor = false;
-        const uint32_t flags =
-            source->has_cursor ? kScanMigrateFlagCursorDuplicate : 0;
+        bool unused_exhausted = false;
+        bool unused_no_predecessor = false;
         const auto payload =
-            EncodeScanMigrateRequest(source->partition_id, flags, page_limit);
+            EncodeScanMigrateRequest(partition_id, 0, scan_limit, inclusive_max);
         const uint64_t request_id = NextRequestId(config_.node_id);
         auto pending = RegisterPendingResponse(request_id);
         try {
           SendTransportMessage(MakeRequest(
-              KvMessageType::kScanMigrate, config_.node_id, source->owner,
-              request_id, cursor, payload));
+              KvMessageType::kScanMigrate, config_.node_id,
+              OwnerForPartition(partition_id), request_id, min_key, payload));
           ++TlsScanDiag.migrate_rpcs;
         } catch (...) {
           RemovePendingResponse(request_id);
@@ -734,81 +721,78 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
             AwaitResponse(request_id, pending, &response_value);
         if (!migrated.ok()) return migrated;
         uint32_t resp_part = 0;
-        if (!DecodeScanMigrateResponse(response_value, &resp_part, &exhausted,
-                                       &no_predecessor) ||
-            resp_part != source->partition_id)
+        if (!DecodeScanMigrateResponse(response_value, &resp_part,
+                                       &unused_exhausted,
+                                       &unused_no_predecessor) ||
+            resp_part != partition_id)
           return Status::Error(StatusCode::kCorruption,
                                "malformed scan migrate response");
-        source->owner_exhausted_for_cursor = exhausted;
-        source->owner_no_predecessor_for_cursor = no_predecessor;
+        owner_exhausted = unused_exhausted;
+        owner_no_predecessor = unused_no_predecessor;
         continue;
       }
       if (!probe.scan_success)
         return Status::Error(StatusCode::kCorruption, "CXL probe incomplete");
-      append_items(source, std::move(probe.items), probe.more, result);
+      for (auto &item : probe.items)
+        result->items.push_back({std::move(item.first), std::move(item.second)});
       return Status::Ok();
     }
   };
 
-  auto probe_local = [&](PartitionCursor *source, uint64_t page_limit,
-                         ScanResult *result) -> Status {
-    auto *partition = partitions_[source->partition_id].get();
-    const uint64_t fetch = page_limit + 1;
-    const std::string_view cursor =
-        source->has_cursor ? std::string_view(source->cursor) : start_key;
-    std::vector<std::pair<std::string, std::string>> items;
-    const std::function<void()> progress = [this] { PollTransport(); };
-    bool ok = false;
-    {
-      RequestServeDepthGuard depth_guard;
-      ok = partition->ScanOwned(cursor, fetch, &items, &progress);
-    }
-    ++TlsScanDiag.partition_probes;
-    PollTransport();
-    if (!ok)
-      return Status::Error(StatusCode::kBusy,
-                           "owner scan contention/retry budget");
-    const bool more = items.size() == fetch;
-    if (more && !items.empty()) items.pop_back();
-    append_items(source, std::move(items), more, result);
-    return Status::Ok();
-  };
-
   ScanResult result{Status::Ok(), {}};
-  // Range partitioning preserves global key order.  Follow the original
-  // per-partition TwoPLPasha CXL-first/move-in path, then advance only to the
-  // next range once the current range is exhausted; no k-way merge treats CXL
-  // and owner results as independent authorities.
   uint32_t partition_id = config_.PartitionForKey(start_key);
-  for (; partition_id < config_.partition_count && result.items.size() < target;
-       ++partition_id) {
-    PartitionCursor cursor;
-    cursor.partition_id = partition_id;
-    cursor.owner = OwnerForPartition(partition_id);
-    cursor.local = cursor.owner == config_.node_id;
-    cursor.cursor = partition_id == config_.PartitionForKey(start_key)
-                        ? std::string(start_key)
-                        : config_.partition_ranges[partition_id].lower_key;
-    for (;;) {
-      const uint64_t remaining = target - result.items.size();
-      if (remaining == 0) break;
-      const Status status = cursor.local
-          ? probe_local(&cursor, remaining, &result)
-          : probe_remote(&cursor, remaining, &result);
-      if (!status.ok()) return {status, {}};
-      if (!cursor.more) break;
+  for (; partition_id < config_.partition_count; ++partition_id) {
+    const auto &range = config_.partition_ranges[partition_id];
+    const std::string_view min_key =
+        partition_id == config_.PartitionForKey(start_key)
+            ? start_key : std::string_view(range.lower_key);
+    if (!end_key.empty() && !LessFixed(min_key, end_key, config_.fixed_key_size))
+      break;
+    std::string_view exclusive_max = end_key;
+    if (!range.upper_key.empty() &&
+        (exclusive_max.empty() ||
+         LessFixed(range.upper_key, exclusive_max, config_.fixed_key_size)))
+      exclusive_max = range.upper_key;
+    FixedKey inclusive{};
+    if (!exclusive_max.empty() &&
+        !ExclusiveToInclusive(exclusive_max, config_.fixed_key_size, &inclusive))
+      break;
+    if (exclusive_max.empty())
+      std::memset(inclusive.bytes, 0xff, config_.fixed_key_size);
+    if (limit != 0 && result.items.size() >= limit) break;
+    const uint64_t remaining =
+        limit == 0 ? 0 : static_cast<uint64_t>(limit - result.items.size());
+    const std::string inclusive_max(inclusive.bytes, config_.fixed_key_size);
+    Status status;
+    if (OwnerForPartition(partition_id) == config_.node_id) {
+      std::vector<std::pair<std::string, std::string>> items;
+      const std::function<void()> progress = [this] { PollTransport(); };
+      bool ok = false;
+      {
+        RequestServeDepthGuard depth_guard;
+        ok = partitions_[partition_id]->ScanOwned(min_key, remaining, &items,
+                                                  &progress, inclusive_max);
+      }
+      ++TlsScanDiag.partition_probes;
+      PollTransport();
+      status = ok ? Status::Ok()
+                  : Status::Error(StatusCode::kBusy,
+                                  "owner scan contention/retry budget");
+      for (auto &item : items)
+        result.items.push_back({std::move(item.first), std::move(item.second)});
+    } else {
+      status = scan_remote(partition_id, min_key, inclusive_max, remaining,
+                           &result);
     }
-    if (cursor.reached_end) break;
+    if (!status.ok()) return {status, {}};
+    if (!end_key.empty() && exclusive_max == end_key) break;
   }
-  if (limit == 0 && result.items.size() == kScanSafetyLimit)
-    return {Status::Error(StatusCode::kInvalidArgument,
-                          "scan result exceeds safety cap"),
-            {}};
   return result;
 }
 
 Status KVEngine::PreparePartitionSharedScan(
-    uint32_t partition_id, std::string_view start_key, bool cursor_is_duplicate,
+    uint32_t partition_id, std::string_view start_key,
+    std::string_view inclusive_max, bool cursor_is_duplicate,
     uint64_t output_limit, uint32_t requester, bool *exhausted_out,
     bool *no_predecessor_out) {
   if (exhausted_out == nullptr)
@@ -822,17 +806,34 @@ Status KVEngine::PreparePartitionSharedScan(
   if (OwnerForPartition(partition_id) != config_.node_id)
     return Status::Error(StatusCode::kOwnerViolation,
                          "scan migrate routed to non-owner");
-  if (output_limit == 0 || output_limit > 1024 * 1024)
-    return Status::Error(StatusCode::kInvalidArgument,
-                         "scan migrate output_limit out of range");
   auto *partition = partitions_[partition_id].get();
-  const uint64_t fetch =
-      output_limit + (cursor_is_duplicate ? 1 : 0) + 1;  // +1 right boundary
+  const uint64_t fetch = output_limit == 0 ||
+      output_limit == std::numeric_limits<uint64_t>::max()
+      ? 0
+      : output_limit + (cursor_is_duplicate ? 1 : 0) + 1;  // +1 right boundary
   std::vector<std::string> keys;
-  if (!partition->ScanOwnedKeys(start_key, fetch, &keys))
+  if (!partition->ScanOwnedKeys(start_key, fetch, &keys, nullptr,
+                                /*include_internal_sentinel=*/true,
+                                inclusive_max))
     return Status::Error(StatusCode::kCorruption,
                          "owner key-only range scan failed");
-  *exhausted_out = keys.size() < fetch;
+  // A lower-bound start may fall between two owner keys.  CXLTable's original
+  // next-key check then needs that predecessor present so the first returned
+  // row has a real previous neighbour; it remains below min and is never a
+  // result on the requester.
+  if (!keys.empty() &&
+      FixedKey::From(keys.front(), config_.fixed_key_size)
+              .Compare(FixedKey::From(start_key, config_.fixed_key_size)) > 0) {
+    std::string predecessor;
+    if (partition->PrivatePredecessorKey(keys.front(), &predecessor))
+      keys.insert(keys.begin(), std::move(predecessor));
+  }
+  FixedKey internal_max{};
+  std::memset(internal_max.bytes, 0xff, config_.fixed_key_size);
+  const bool includes_right_sentinel =
+      !keys.empty() && FixedKey::From(keys.back(), config_.fixed_key_size)
+                           .Compare(internal_max) == 0;
+  *exhausted_out = includes_right_sentinel || keys.size() < fetch;
   // Open left edge: first key > start and its private predecessor is absent or
   // strictly below start (outside this page's move-in set) (§4.4/§4.5).
   if (!keys.empty() &&
@@ -1517,15 +1518,17 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     uint32_t partition_id = 0;
     uint32_t flags = 0;
     uint64_t output_limit = 0;
+    std::string inclusive_max;
     KVPartition *prepared_partition = nullptr;
-    if (!DecodeScanMigrateRequest(value, &partition_id, &flags, &output_limit)) {
+    if (!DecodeScanMigrateRequest(value, &partition_id, &flags, &output_limit,
+                                  &inclusive_max)) {
       response.status = static_cast<uint32_t>(StatusCode::kInvalidArgument);
     } else {
       try {
         bool exhausted = false;
         bool no_predecessor = false;
         const Status status = PreparePartitionSharedScan(
-            partition_id, key,
+            partition_id, key, inclusive_max,
             (flags & kScanMigrateFlagCursorDuplicate) != 0, output_limit,
             message.source_node, &exhausted, &no_predecessor);
         response.status = static_cast<uint32_t>(status.code);

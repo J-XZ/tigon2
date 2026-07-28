@@ -67,6 +67,7 @@ class KVEngine {
   // Single-partition owner range move-in (§5.2). Does not return values.
   Status PreparePartitionSharedScan(uint32_t partition_id,
                                     std::string_view start_key,
+                                    std::string_view inclusive_max,
                                     bool cursor_is_duplicate,
                                     uint64_t output_limit, uint32_t requester,
                                     bool *exhausted_out,

@@ -93,10 +93,11 @@ inline KvMessage MakeResponse(uint32_t source, uint32_t destination, uint64_t re
   return message;
 }
 
-// Single-partition ScanMigrate value payloads (§5.1). Key carries start/cursor.
+// Single-partition ScanMigrate value payloads. Key carries min_key; payload
+// keeps the original min/max/limit scan contract by carrying inclusive max.
 constexpr uint32_t kScanMigrateFlagCursorDuplicate = 1u;
 constexpr uint32_t kScanMigrateKnownFlags = kScanMigrateFlagCursorDuplicate;
-constexpr size_t kScanMigrateRequestBytes = 16;  // partition_id + flags + limit
+constexpr size_t kScanMigrateRequestBytes = 48;  // partition_id + flags + limit + max
 constexpr size_t kScanMigrateResponseBytes = 6;  // partition_id + exhausted + no_pred
 
 inline void AppendLe32(std::string *out, uint32_t value) {
@@ -132,23 +133,30 @@ inline bool ConsumeLe64(std::string_view *in, uint64_t *value) {
 }
 
 inline std::string EncodeScanMigrateRequest(uint32_t partition_id, uint32_t flags,
-                                            uint64_t output_limit) {
+                                            uint64_t output_limit,
+                                            std::string_view inclusive_max) {
+  if (inclusive_max.size() != KvMessage{}.key.size())
+    throw std::invalid_argument("scan migrate max key must be fixed size");
   std::string out;
   out.reserve(kScanMigrateRequestBytes);
   AppendLe32(&out, partition_id);
   AppendLe32(&out, flags);
   AppendLe64(&out, output_limit);
+  out.append(inclusive_max.data(), inclusive_max.size());
   return out;
 }
 
 inline bool DecodeScanMigrateRequest(std::string_view value, uint32_t *partition_id,
-                                     uint32_t *flags, uint64_t *output_limit) {
-  if (partition_id == nullptr || flags == nullptr || output_limit == nullptr)
+                                     uint32_t *flags, uint64_t *output_limit,
+                                     std::string *inclusive_max) {
+  if (partition_id == nullptr || flags == nullptr || output_limit == nullptr ||
+      inclusive_max == nullptr)
     return false;
   if (value.size() != kScanMigrateRequestBytes) return false;
   if (!ConsumeLe32(&value, partition_id) || !ConsumeLe32(&value, flags) ||
-      !ConsumeLe64(&value, output_limit) || !value.empty())
+      !ConsumeLe64(&value, output_limit) || value.size() != KvMessage{}.key.size())
     return false;
+  inclusive_max->assign(value.data(), value.size());
   if ((*flags & ~kScanMigrateKnownFlags) != 0) return false;
   return true;
 }

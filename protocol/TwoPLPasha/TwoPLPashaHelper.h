@@ -601,6 +601,47 @@ class TwoPLPashaHelper {
                 return true;
         }
 
+        // Scan keeps the original remote_read_lock_and_inc_ref_cnt lifetime:
+        // acquire reader/ref and prepare SCC while walking the CXL tree, copy
+        // the payload only after the fragment's right boundary is locked, then
+        // release every row together.  Point reads use kv_shared_read_value.
+        static bool kv_shared_scan_read_lock(
+                TwoPLPashaMetadataShared *smeta, std::size_t host_id,
+                std::size_t size, TwoPLPashaSharedDataSCC **scc_data_out)
+        {
+                if (smeta == nullptr || scc_manager == nullptr ||
+                    scc_data_out == nullptr || size == 0)
+                        return false;
+                *scc_data_out = nullptr;
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                if (!smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) ||
+                    smeta->is_write_locked() ||
+                    smeta->get_reader_count() == smeta->get_reader_count_max() ||
+                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
+                        smeta->unlock();
+                        return false;
+                }
+                smeta->increase_reader_count();
+                smeta->increment_ref_cnt();
+                scc_manager->prepare_read(smeta, host_id, scc_data, size);
+                smeta->unlock();
+                *scc_data_out = scc_data;
+                return true;
+        }
+
+        static void kv_shared_scan_read_unlock(TwoPLPashaMetadataShared *smeta)
+        {
+                DCHECK(smeta != nullptr);
+                tigonkv::engine::mem_access::DelayActiveScopeNow();
+                smeta->lock();
+                DCHECK(smeta->get_ref_cnt() > 0);
+                DCHECK(smeta->get_reader_count() > 0);
+                smeta->decrement_ref_cnt();
+                smeta->decrease_reader_count();
+                smeta->unlock();
+        }
+
         static bool kv_shared_write(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
                                     const void *src, std::size_t size,
                                     KvSharedResult *result = nullptr)
