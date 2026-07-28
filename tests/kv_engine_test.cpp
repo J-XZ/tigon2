@@ -1028,7 +1028,13 @@ int main() {
           engine->ReleaseWorker();
         });
       }
-      assert(engine->Put(key, "v1").ok());
+      tigonkv::Status put_status;
+      for (uint32_t attempt = 0; attempt != 64; ++attempt) {
+        put_status = engine->Put(key, "v1");
+        if (put_status.code != tigonkv::StatusCode::kBusy) break;
+        std::this_thread::yield();
+      }
+      assert(put_status.ok());
       put_done.store(true, std::memory_order_release);
       for (auto &t : readers) t.join();
       assert(!get_illegal.load());

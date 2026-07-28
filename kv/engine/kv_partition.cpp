@@ -515,7 +515,19 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
     *value = std::move(local);
     return true;
   }
-  if (!migrated) return false;
+  if (!migrated) {
+    // kv_take_private_read_lock_and_read deliberately has one failure return
+    // for an invalid row and for ordinary reader/writer contention.  Recheck
+    // under the owner-private latch before mapping it to the KV API: a live
+    // non-migrated row can only be Busy, never NotFound.
+    LockRow(metadata);
+    const bool valid = metadata->is_valid;
+    const bool now_migrated = metadata->is_migrated;
+    UnlockRow(metadata);
+    if (!valid) return false;
+    if (!now_migrated)
+      throw std::runtime_error("private row read busy");
+  }
   LockRow(metadata);
   // REMOTE_INSERT initially leaves the owner placeholder invalid.  Once the
   // requester publishes its pinned shared row, the owner observes that shared
