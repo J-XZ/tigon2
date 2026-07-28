@@ -164,7 +164,6 @@ class KVPartition {
   PrivateValueStruct *AllocateValue(std::string_view value);
   PrivateMetadataLocal *AllocateMetadata();
   static void LockRow(PrivateMetadataLocal *metadata);
-  static bool TryLockRow(PrivateMetadataLocal *metadata);
   static void UnlockRow(PrivateMetadataLocal *metadata);
   std::string KeyString(const FixedKey &key) const;
   void NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const;
@@ -195,10 +194,7 @@ class KVPartition {
     RowRef current;
     RowRef next;
   };
-  void LockNeighborhood(const FixedKey &key, Neighborhood *neighborhood) const;
   static void UnlockNeighborhood(Neighborhood *neighborhood);
-  bool SameNeighborhood(const Neighborhood &left,
-                        const Neighborhood &right) const;
   void SetNextReal(const RowRef &row, bool real);
   void SetPrevReal(const RowRef &row, bool real);
   void RefreshAdjacencyLocked(const Neighborhood &neighborhood);

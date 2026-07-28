@@ -160,67 +160,8 @@ void KVPartition::LockRow(PrivateMetadataLocal *metadata) {
   RecordPrivateMetadataRead(metadata);
 }
 
-bool KVPartition::TryLockRow(PrivateMetadataLocal *metadata) {
-  if (pthread_spin_trylock(&metadata->latch) != 0) return false;
-  RecordPrivateMetadataRead(metadata);
-  return true;
-}
-
 void KVPartition::UnlockRow(PrivateMetadataLocal *metadata) {
   metadata->unlock();
-}
-
-void KVPartition::LockNeighborhood(
-    const FixedKey &key, Neighborhood *neighborhood) const {
-  if (neighborhood == nullptr)
-    throw std::invalid_argument("null private-tree neighborhood");
-  auto load = [&](Neighborhood *result) {
-    PrivateTree::AdjacentResult adjacent;
-    private_tree_->lookupAdjacent(key, adjacent);
-    *result = {};
-    auto assign = [&](const auto &entry, bool *present, RowRef *row) {
-      if (!entry.has_value()) return;
-      *present = true;
-      row->key = entry->first;
-      row->offset = entry->second;
-      row->value = ValueFromOffset(entry->second);
-      row->metadata = MetadataFromValue(row->value);
-      if (row->value == nullptr || row->metadata == nullptr)
-        throw std::runtime_error("private-tree adjacency has null value/metadata");
-    };
-    assign(adjacent.prev, &result->has_prev, &result->prev);
-    assign(adjacent.equal, &result->has_current, &result->current);
-    assign(adjacent.next, &result->has_next, &result->next);
-  };
-  for (;;) {
-    Neighborhood candidate;
-    load(&candidate);
-    std::array<RowRef *, 3> rows{{
-        candidate.has_prev ? &candidate.prev : nullptr,
-        candidate.has_current ? &candidate.current : nullptr,
-        candidate.has_next ? &candidate.next : nullptr}};
-    size_t locked = 0;
-    for (; locked < rows.size(); ++locked) {
-      if (rows[locked] == nullptr) continue;
-      if (!TryLockRow(rows[locked]->metadata)) break;
-    }
-    if (locked != rows.size()) {
-      while (locked != 0) {
-        --locked;
-        if (rows[locked] != nullptr) UnlockRow(rows[locked]->metadata);
-      }
-      std::this_thread::yield();
-      continue;
-    }
-    Neighborhood confirmed;
-    load(&confirmed);
-    if (SameNeighborhood(candidate, confirmed)) {
-      *neighborhood = candidate;
-      return;
-    }
-    UnlockNeighborhood(&candidate);
-    std::this_thread::yield();
-  }
 }
 
 void KVPartition::UnlockNeighborhood(Neighborhood *neighborhood) {
@@ -229,21 +170,6 @@ void KVPartition::UnlockNeighborhood(Neighborhood *neighborhood) {
   if (neighborhood->has_current) UnlockRow(neighborhood->current.metadata);
   if (neighborhood->has_prev) UnlockRow(neighborhood->prev.metadata);
   *neighborhood = {};
-}
-
-bool KVPartition::SameNeighborhood(
-    const Neighborhood &left, const Neighborhood &right) const {
-  auto same = [](bool left_present, const RowRef &left_row,
-                 bool right_present, const RowRef &right_row) {
-    return left_present == right_present &&
-           (!left_present ||
-            (left_row.offset == right_row.offset &&
-             left_row.key.Compare(right_row.key) == 0));
-  };
-  return same(left.has_prev, left.prev, right.has_prev, right.prev) &&
-         same(left.has_current, left.current,
-              right.has_current, right.current) &&
-         same(left.has_next, left.next, right.has_next, right.next);
 }
 
 void KVPartition::SetNextReal(const RowRef &row, bool real) {
