@@ -2025,6 +2025,167 @@ restart:
 		}
 	}
 
+	// Mechanical offset-safe counterpart of BTreeOLC::
+	// insert_and_process_adjacent_tuples.  The callback runs while the target
+	// leaf and any leaf containing its immediate predecessor/successor remain
+	// write-locked, exactly as in the original Tigon tree.
+	bool insert_and_process_adjacent_tuples(
+		const KeyType &k, const ValueType &v,
+		std::function<bool(const KeyType *prev_key, ValueType *prev_value,
+		                   const KeyType *next_key, ValueType *next_value)>
+			adjacent_tuples_processor)
+	{
+		TreeAccessScope access_scope(allocation_);
+		int restartCount = 0;
+	restart:
+		if (restartCount++)
+			yield(restartCount, true);
+		bool needRestart = false;
+
+		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, false);
+		uint64_t versionNode = node->readLockOrRestart(needRestart);
+		if (needRestart || node != load_root()) {
+			node->readUnlockOrRestart(versionNode, needRestart);
+			goto restart;
+		}
+
+		BTreeInner *parent = nullptr;
+		uint64_t versionParent = 0;
+		while (node->getType() == NodeType::BTreeInner) {
+			auto *inner = static_cast<BTreeInner *>(node);
+			if (inner->isFull()) {
+				if (parent) {
+					parent->upgradeToWriteLockOrRestart(versionParent, needRestart);
+					if (needRestart) goto restart;
+				}
+				node->upgradeToWriteLockOrRestart(versionNode, needRestart);
+				if (needRestart) {
+					if (parent) parent->writeUnlock();
+					goto restart;
+				}
+				if (!parent && node != load_root()) {
+					node->writeUnlock();
+					goto restart;
+				}
+				KeyType sep;
+				BTreeInner *newInner = inner->split(sep, allocation_);
+				stats_.inner_nodes++;
+				if (parent) parent->insert(sep, newInner, keyComp_);
+				else makeRoot(sep, inner, newInner);
+				node->writeUnlock();
+				if (parent) parent->writeUnlock();
+				goto restart;
+			}
+
+			if (parent) {
+				parent->readUnlockOrRestart(versionParent, needRestart);
+				if (needRestart) goto restart;
+			}
+			parent = inner;
+			versionParent = versionNode;
+			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, false);
+			inner->checkOrRestart(versionNode, needRestart);
+			if (needRestart) goto restart;
+			versionNode = node->readLockOrRestart(needRestart);
+			if (needRestart) goto restart;
+		}
+
+		if (parent) {
+			parent->checkOrRestart(versionParent, needRestart);
+			if (needRestart) {
+				node->readUnlockOrRestart(versionNode, needRestart);
+				goto restart;
+			}
+		}
+		auto *leaf = static_cast<BTreeLeaf *>(node);
+		if (leaf->getCount() == leaf->maxEntries) {
+			if (parent) {
+				parent->upgradeToWriteLockOrRestart(versionParent, needRestart);
+				if (needRestart) goto restart;
+			}
+			node->upgradeToWriteLockOrRestart(versionNode, needRestart);
+			if (needRestart) {
+				if (parent) parent->writeUnlock();
+				goto restart;
+			}
+			if (!parent && node != load_root()) {
+				node->writeUnlock();
+				goto restart;
+			}
+			KeyType sep;
+			BTreeLeaf *newLeaf = leaf->split(sep, allocation_);
+			stats_.leaf_nodes++;
+			if (parent) parent->insert(sep, newLeaf, keyComp_);
+			else makeRoot(sep, leaf, newLeaf);
+			node->writeUnlock();
+			if (parent) parent->writeUnlock();
+			goto restart;
+		}
+
+		node->upgradeToWriteLockOrRestart(versionNode, needRestart);
+		if (needRestart) goto restart;
+		if (parent) {
+			parent->readUnlockOrRestart(versionParent, needRestart);
+			if (needRestart) {
+				node->writeUnlock();
+				goto restart;
+			}
+		}
+
+		BTreeLeaf *prevLeaf = nullptr;
+		BTreeLeaf *nextLeaf = nullptr;
+		KeyType *prev_key = nullptr;
+		KeyType *next_key = nullptr;
+		ValueType *prev_value = nullptr;
+		ValueType *next_value = nullptr;
+		const unsigned pos = leaf->lowerBound(k, keyComp_);
+		bool success = false;
+		if (pos >= leaf->getCount() || keyComp_(leaf->keys_[pos], k) != 0) {
+			if (pos > 0) {
+				prev_key = &leaf->keys_[pos - 1];
+				prev_value = &leaf->values_[pos - 1];
+			} else if ((prevLeaf = leaf->pre_.get()) != nullptr) {
+				RecordTreeAccess(allocation_, prevLeaf, true);
+				prevLeaf->writeLockOrRestart(needRestart);
+				if (needRestart) {
+					leaf->writeUnlock();
+					goto restart;
+				}
+				if (prevLeaf->getCount() > 0) {
+					prev_key = &prevLeaf->keys_[prevLeaf->getCount() - 1];
+					prev_value = &prevLeaf->values_[prevLeaf->getCount() - 1];
+				}
+			}
+			if (pos == leaf->getCount()) {
+				nextLeaf = leaf->next_.get();
+				CHECK(nextLeaf != nullptr);
+				RecordTreeAccess(allocation_, nextLeaf, true);
+				nextLeaf->writeLockOrRestart(needRestart);
+				if (needRestart) {
+					leaf->writeUnlock();
+					if (prevLeaf) prevLeaf->writeUnlock();
+					goto restart;
+				}
+				next_key = &nextLeaf->keys_[0];
+				next_value = &nextLeaf->values_[0];
+			} else {
+				next_key = &leaf->keys_[pos];
+				next_value = &leaf->values_[pos];
+			}
+			if (adjacent_tuples_processor(prev_key, prev_value, next_key, next_value)) {
+				success = leaf->insert(k, v, keyComp_);
+				CHECK(success == true);
+			}
+		}
+		if (prevLeaf) prevLeaf->writeUnlock();
+		if (nextLeaf) nextLeaf->writeUnlock();
+		node->writeUnlock();
+		if (success) stats_.num_items++;
+		return success;
+	}
+
 	/**
 	 * return v if insert successful
 	 * otherwise return an existing value
@@ -2393,6 +2554,22 @@ restart:
 	{
 		TreeAccessScope access_scope(allocation_);
 		return _remove(key);
+	}
+
+	/**
+	 * Delete key and process its adjacent keys atomically.
+	 * The callback contract and leaf-latch timing are the original BTreeOLC
+	 * contract; this CXL variant only records the HWCC node accesses.
+	 */
+	bool remove_and_process_adjacent_keys(
+		const KeyType &key,
+		std::function<bool(const KeyType *prev_key, ValueType *prev_value,
+					   const KeyType *cur_key, ValueType *cur_value,
+					   const KeyType *next_key, ValueType *next_value)>
+			adjacent_tuples_processor)
+	{
+		TreeAccessScope access_scope(allocation_);
+		return _remove_and_process_adjacent_tuples(key, adjacent_tuples_processor);
 	}
 
 	/**
@@ -3039,6 +3216,17 @@ restart:
 		return _lookupForUpdate(key, update_processor);
 	}
 
+	// Original lookupForNextKeyUpdate primitive, retained for the table
+	// adapter's next-key metadata update path.
+	bool lookupForNextKeyUpdate(
+		const KeyType &key,
+		std::function<void(const KeyType *, ValueType *, const KeyType *,
+					   ValueType *, const KeyType *, ValueType *)> processor)
+	{
+		TreeAccessScope access_scope(allocation_);
+		return _lookupForNextKeyUpdate(key, processor);
+	}
+
 	/**
 	 * find <key, value>
 	 * return true if <key, value> exists and delete successfully
@@ -3494,6 +3682,158 @@ restart:
 		return saved_success;
 	}
 
+	bool _remove_and_process_adjacent_tuples(
+		const KeyType &deleteKey,
+		std::function<bool(const KeyType *prev_key, ValueType *prev_value,
+					   const KeyType *cur_key, ValueType *cur_value,
+					   const KeyType *next_key, ValueType *next_value)>
+			adjacent_tuples_processor)
+	{
+		// This is the original BTreeOLC adjacent-delete algorithm, with only
+		// RegionOffset dereferences and CXL access accounting adapted.
+		int restartCount = 0;
+		bool saved_success = false;
+		bool result_saved = false;
+	restart:
+		if (restartCount++)
+			yield(restartCount, true);
+		bool needRestart = false;
+		std::vector<StackNodeElement> stack;
+		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, false);
+		uint64_t versionNode = node->readLockOrRestart(needRestart);
+		if (needRestart || node != load_root()) {
+			node->readUnlockOrRestart(versionNode, needRestart);
+			goto restart;
+		}
+		stack.push_back(StackNodeElement{ node, -1, versionNode });
+		BTreeInner *parent = nullptr;
+		uint64_t versionParent = 0;
+		while (node->getType() == NodeType::BTreeInner) {
+			BTreeInner *inner = static_cast<BTreeInner *>(node);
+			if (parent) {
+				parent->checkOrRestart(versionParent, needRestart);
+				if (needRestart)
+					goto restart;
+			}
+			parent = inner;
+			versionParent = versionNode;
+			unsigned child_pos = inner->lowerBound(deleteKey, keyComp_);
+			node = inner->childAt(child_pos).get();
+			RecordTreeAccess(allocation_, node, false);
+			inner->checkOrRestart(versionNode, needRestart);
+			if (needRestart)
+				goto restart;
+			versionNode = node->readLockOrRestart(needRestart);
+			if (needRestart)
+				goto restart;
+			stack.push_back(StackNodeElement{ node, int(child_pos), versionNode });
+		}
+
+		BTreeLeaf *leafNode = static_cast<BTreeLeaf *>(node);
+		BTreeLeaf *leaf = leafNode;
+		leafNode->upgradeToWriteLockOrRestart(versionNode, needRestart);
+		if (needRestart)
+			goto restart;
+		if (parent) {
+			parent->checkOrRestart(versionParent, needRestart);
+			if (needRestart) {
+				leafNode->writeUnlock();
+				goto restart;
+			}
+		}
+
+		BTreeLeaf *prevLeaf = nullptr, *nextLeaf = nullptr;
+		KeyType *prev_key = nullptr, *cur_key = nullptr, *next_key = nullptr;
+		ValueType *prev_value = nullptr, *cur_value = nullptr, *next_value = nullptr;
+		unsigned pos = leafNode->lowerBound(deleteKey, keyComp_);
+		bool success = false, leafNeedMerge = false;
+		if (pos < leafNode->getCount() && !saved_success) {
+			const KeyType &key = leafNode->keys_[pos];
+			if (keyComp_(key, deleteKey) == 0) {
+				cur_key = &leaf->keys_[pos];
+				cur_value = &leaf->values_[pos];
+				if (pos > 0) {
+					prev_key = &leaf->keys_[pos - 1];
+					prev_value = &leaf->values_[pos - 1];
+				} else {
+					prevLeaf = leaf->pre_.get();
+					if (prevLeaf) {
+						RecordTreeAccess(allocation_, prevLeaf, true);
+						prevLeaf->writeLockOrRestart(needRestart);
+						if (needRestart) {
+							leaf->writeUnlock();
+							goto restart;
+						}
+						if (prevLeaf->getCount() > 0) {
+							prev_key = &prevLeaf->keys_[prevLeaf->getCount() - 1];
+							prev_value = &prevLeaf->values_[prevLeaf->getCount() - 1];
+						}
+					}
+				}
+				if (pos < leaf->getCount() - 1) {
+					next_key = &leaf->keys_[pos + 1];
+					next_value = &leaf->values_[pos + 1];
+				} else {
+					nextLeaf = leaf->next_.get();
+					if (nextLeaf) {
+						RecordTreeAccess(allocation_, nextLeaf, true);
+						nextLeaf->writeLockOrRestart(needRestart);
+						if (needRestart) {
+							leaf->writeUnlock();
+							if (prevLeaf)
+								prevLeaf->writeUnlock();
+							goto restart;
+						}
+						if (nextLeaf->getCount() > 0) {
+							next_key = &nextLeaf->keys_[0];
+							next_value = &nextLeaf->values_[0];
+						}
+					}
+				}
+				bool should_remove = adjacent_tuples_processor(
+					prev_key, prev_value, cur_key, cur_value, next_key, next_value);
+				if (should_remove) {
+					assert(keyComp_(leafNode->keys_[pos], deleteKey) == 0);
+					success = leafNode->erase(pos, keyComp_, valueComp_, false);
+					assert(success);
+					if (success)
+						stats_.num_items--;
+					leafNeedMerge = leafNode->needMerge();
+					saved_success = success;
+					result_saved = true;
+				}
+				if (prevLeaf)
+					prevLeaf->writeUnlock();
+				if (nextLeaf)
+					nextLeaf->writeUnlock();
+			}
+			result_saved = true;
+			saved_success = success;
+		}
+		if (!result_saved) {
+			result_saved = true;
+			saved_success = success;
+		}
+		leafNeedMerge = leafNode->needMerge();
+		leafNode->writeUnlock();
+		if (stack.size() > 1 && leafNeedMerge) {
+			versionNode = leafNode->readLockOrRestart(needRestart);
+			if (needRestart) {
+				assert(result_saved);
+				assert(saved_success);
+				return saved_success;
+			}
+			stack.back().version = versionNode;
+			auto stack_copy = stack;
+			if (!EraseMerge(stack_copy))
+				return saved_success;
+		}
+		assert(result_saved);
+		assert(saved_success);
+		return saved_success;
+	}
+
 	bool _lookupForUpdate(const KeyType &key, std::function<void(const KeyType &key, ValueType &value)> update_processor)
 	{
 		int restartCount = 0;
@@ -3565,6 +3905,95 @@ restart:
 		}
 
 		leaf->writeUnlock();
+		return success;
+	}
+
+	bool _lookupForNextKeyUpdate(
+		const KeyType &key,
+		std::function<void(const KeyType *, ValueType *, const KeyType *,
+					   ValueType *, const KeyType *, ValueType *)> processor)
+	{
+		int restartCount = 0;
+	restart:
+		if (restartCount++) yield(restartCount);
+		bool needRestart = false;
+		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, false);
+		uint64_t versionNode = node->readLockOrRestart(needRestart);
+		if (needRestart || node != load_root()) {
+			node->readUnlockOrRestart(versionNode, needRestart);
+			goto restart;
+		}
+		BTreeInner *parent = nullptr;
+		uint64_t versionParent = 0;
+		while (node->getType() == NodeType::BTreeInner) {
+			auto *inner = static_cast<BTreeInner *>(node);
+			if (parent) {
+				parent->readUnlockOrRestart(versionParent, needRestart);
+				if (needRestart) goto restart;
+			}
+			parent = inner;
+			versionParent = versionNode;
+			node = inner->childAt(inner->lowerBound(key, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, false);
+			prefetch((char *)node, sizeof(NodeMetaData));
+			inner->checkOrRestart(versionNode, needRestart);
+			if (needRestart) goto restart;
+			versionNode = node->readLockOrRestart(needRestart);
+			if (needRestart) goto restart;
+		}
+		node->checkOrRestart(versionNode, needRestart);
+		if (needRestart) goto restart;
+		auto *leaf = static_cast<BTreeLeaf *>(node);
+		leaf->upgradeToWriteLockOrRestart(versionNode, needRestart);
+		if (needRestart) goto restart;
+		if (parent) {
+			parent->checkOrRestart(versionParent, needRestart);
+			if (needRestart) { leaf->writeUnlock(); goto restart; }
+		}
+
+		bool success = false;
+		BTreeLeaf *prevLeaf = nullptr, *nextLeaf = nullptr;
+		KeyType *prev_key = nullptr, *cur_key = nullptr, *next_key = nullptr;
+		ValueType *prev_value = nullptr, *cur_value = nullptr, *next_value = nullptr;
+		unsigned pos = leaf->lowerBound(key, keyComp_);
+		if (pos < leaf->getCount() && keyComp_(leaf->keys_[pos], key) == 0) {
+			success = true;
+			cur_key = &leaf->keys_[pos];
+			cur_value = &leaf->values_[pos];
+			if (pos > 0) {
+				prev_key = &leaf->keys_[pos - 1];
+				prev_value = &leaf->values_[pos - 1];
+			} else if ((prevLeaf = leaf->pre_.get()) != nullptr) {
+				RecordTreeAccess(allocation_, prevLeaf, true);
+				prevLeaf->writeLockOrRestart(needRestart);
+				if (needRestart) { leaf->writeUnlock(); goto restart; }
+				if (prevLeaf->getCount() > 0) {
+					prev_key = &prevLeaf->keys_[prevLeaf->getCount() - 1];
+					prev_value = &prevLeaf->values_[prevLeaf->getCount() - 1];
+				}
+			}
+			if (pos < leaf->getCount() - 1) {
+				next_key = &leaf->keys_[pos + 1];
+				next_value = &leaf->values_[pos + 1];
+			} else if ((nextLeaf = leaf->next_.get()) != nullptr) {
+				RecordTreeAccess(allocation_, nextLeaf, true);
+				nextLeaf->writeLockOrRestart(needRestart);
+				if (needRestart) {
+					leaf->writeUnlock();
+					if (prevLeaf) prevLeaf->writeUnlock();
+					goto restart;
+				}
+				if (nextLeaf->getCount() > 0) {
+					next_key = &nextLeaf->keys_[0];
+					next_value = &nextLeaf->values_[0];
+				}
+			}
+			processor(prev_key, prev_value, cur_key, cur_value, next_key, next_value);
+		}
+		leaf->writeUnlock();
+		if (prevLeaf) prevLeaf->writeUnlock();
+		if (nextLeaf) nextLeaf->writeUnlock();
 		return success;
 	}
 

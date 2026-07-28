@@ -88,6 +88,89 @@ int main() {
     assert(private_tree->lookup(Key(i), value) && value == i);
     assert(shared_tree->lookup(Key(i), value) && value == i + 1000);
   }
+  // Original adjacent callback must observe the immediate leaf-chain
+  // neighbours while their leaf latches remain held.  The rightmost existing
+  // tuple supplies the normal Tigon next-key sentinel contract for this test.
+  bool private_adjacent = false;
+  assert(private_tree->insert_and_process_adjacent_tuples(
+      Key(100), 100,
+      [&](const FixedKey *prev_key, uint64_t *prev_value,
+          const FixedKey *next_key, uint64_t *next_value) {
+        assert(prev_key == nullptr && prev_value == nullptr);
+        assert(next_key != nullptr && next_value != nullptr);
+        assert(next_key->Compare(Key(200)) == 0 && *next_value == 200);
+        private_adjacent = true;
+        return true;
+      }));
+  assert(private_adjacent);
+  bool shared_adjacent = false;
+  assert(shared_tree->insert_and_process_adjacent_tuples(
+      Key(100), 1100,
+      [&](const FixedKey *prev_key, uint64_t *prev_value,
+          const FixedKey *next_key, uint64_t *next_value) {
+        assert(prev_key == nullptr && prev_value == nullptr);
+        assert(next_key != nullptr && next_value != nullptr);
+        assert(next_key->Compare(Key(200)) == 0 && *next_value == 1200);
+        shared_adjacent = true;
+        return true;
+      }));
+  assert(shared_adjacent);
+  bool private_removed = false;
+  assert(private_tree->remove_and_process_adjacent_keys(
+      Key(100),
+      [&](const FixedKey *prev_key, uint64_t *prev_value,
+          const FixedKey *cur_key, uint64_t *cur_value,
+          const FixedKey *next_key, uint64_t *next_value) {
+        assert(prev_key == nullptr && prev_value == nullptr);
+        assert(cur_key != nullptr && cur_value != nullptr &&
+               cur_key->Compare(Key(100)) == 0 && *cur_value == 100);
+        assert(next_key != nullptr && next_value != nullptr &&
+               next_key->Compare(Key(200)) == 0 && *next_value == 200);
+        private_removed = true;
+        return true;
+      }));
+  bool shared_removed = false;
+  assert(shared_tree->remove_and_process_adjacent_keys(
+      Key(100),
+      [&](const FixedKey *prev_key, uint64_t *prev_value,
+          const FixedKey *cur_key, uint64_t *cur_value,
+          const FixedKey *next_key, uint64_t *next_value) {
+        assert(prev_key == nullptr && prev_value == nullptr);
+        assert(cur_key != nullptr && cur_value != nullptr &&
+               cur_key->Compare(Key(100)) == 0 && *cur_value == 1100);
+        assert(next_key != nullptr && next_value != nullptr &&
+               next_key->Compare(Key(200)) == 0 && *next_value == 1200);
+        shared_removed = true;
+        return true;
+      }));
+  assert(private_removed && shared_removed);
+  bool private_next_key_update = false;
+  assert(private_tree->lookupForNextKeyUpdate(
+      Key(200),
+      [&](const FixedKey *prev_key, uint64_t *prev_value,
+          const FixedKey *cur_key, uint64_t *cur_value,
+          const FixedKey *next_key, uint64_t *next_value) {
+        assert(prev_key == nullptr && prev_value == nullptr);
+        assert(cur_key != nullptr && cur_value != nullptr &&
+               cur_key->Compare(Key(200)) == 0 && *cur_value == 200);
+        assert(next_key != nullptr && next_value != nullptr &&
+               next_key->Compare(Key(201)) == 0 && *next_value == 201);
+        private_next_key_update = true;
+      }));
+  bool shared_next_key_update = false;
+  assert(shared_tree->lookupForNextKeyUpdate(
+      Key(200),
+      [&](const FixedKey *prev_key, uint64_t *prev_value,
+          const FixedKey *cur_key, uint64_t *cur_value,
+          const FixedKey *next_key, uint64_t *next_value) {
+        assert(prev_key == nullptr && prev_value == nullptr);
+        assert(cur_key != nullptr && cur_value != nullptr &&
+               cur_key->Compare(Key(200)) == 0 && *cur_value == 1200);
+        assert(next_key != nullptr && next_value != nullptr &&
+               next_key->Compare(Key(201)) == 0 && *next_value == 1201);
+        shared_next_key_update = true;
+      }));
+  assert(private_next_key_update && shared_next_key_update);
   std::vector<Tree::KeyValuePair> private_scan;
   std::vector<Tree::KeyValuePair> shared_scan;
   private_tree->scan(Key(250), Key(260), true, true, 0, private_scan);
