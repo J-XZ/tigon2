@@ -953,7 +953,6 @@ Status KVEngine::Checkpoint() {
     // Poll a bounded batch before reclamation. Synchronous forwarders also
     // poll, so this only drains requests already visible to this VM.
     for (uint32_t i = 0; i < 1024; ++i) PollTransport();
-    ebr_->drain_quiescent();
     pool_->allocator().FlushOwnedRanges(config_.node_id);
     layout_dirty_.store(false, std::memory_order_release);
     return Status::Ok();
@@ -1345,7 +1344,6 @@ void KVEngine::ReleaseWorker() {
                          current);
   if (owner == worker_owners_.end())
     throw std::runtime_error("ReleaseWorker called by an unbound thread");
-  ebr_->handoff_retired_objects();
   *owner = std::thread::id{};
 }
 

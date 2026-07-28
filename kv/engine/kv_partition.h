@@ -152,8 +152,6 @@ class KVPartition {
  private:
   // Matches core/Executor: enter before observing shared tree/row/move paths.
   void EnterEbr() const { ebr_.enter_critical_section(); }
-  // Upstream Tigon leave is unused (CHECK(0)); keep as empty no-op for pairing.
-  void LeaveEbr() const { ebr_.leave_critical_section(); }
   FixedKey MakeKey(std::string_view key) const;
   PrivateRow *RowFromOffset(RegionOffset offset) const;
   PrivateRow *AllocateRow(const FixedKey &key, std::string_view value);

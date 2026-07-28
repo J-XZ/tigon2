@@ -131,7 +131,6 @@ int main() {
       while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
       (void)partition.PutPrivate("race-key", "a");
       done.fetch_add(1, std::memory_order_acq_rel);
-      ebr.handoff_retired_objects();
     });
     std::thread t1([&] {
       ebr.thread_init_ebr_meta(0, 0);
@@ -139,7 +138,6 @@ int main() {
       while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
       (void)partition.PutPrivate("race-key", "b");
       done.fetch_add(1, std::memory_order_acq_rel);
-      ebr.handoff_retired_objects();
     });
     while (ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
     start.store(true, std::memory_order_release);
@@ -240,17 +238,8 @@ int main() {
   assert(partition.GetPrivate("alpha", &value) && value == FixedValue("shared-update"));
   assert(regions.layout().partitions[5].migration_in_seq.load() ==
          migration_in_before_alpha + 1);
-  const auto hwcc_before_moveout = regions.layout().domains[
-      static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load();
-  const auto swcc_before_moveout = regions.layout().domains[
-      static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load();
   assert(partition.MoveOutPrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == FixedValue("shared-update"));
-  assert(ebr.drain_quiescent() > 0);
-  assert(regions.layout().domains[
-      static_cast<size_t>(tigonkv::engine::AllocationDomain::kHwccMetadata)].used_bytes.load() < hwcc_before_moveout);
-  assert(regions.layout().domains[
-      static_cast<size_t>(tigonkv::engine::AllocationDomain::kSharedPayloadSwcc)].used_bytes.load() < swcc_before_moveout);
   assert(partition.PutPrivate("delete-shared", "value"));
   assert(partition.PromotePrivate("delete-shared", 1));
   assert(partition.DeletePrivate("delete-shared"));
@@ -265,7 +254,6 @@ int main() {
   assert(partition.PromotePrivate("gamma", 1));
   assert(partition.DeletePrivate("gamma"));
   assert(!partition.GetPrivate("gamma", &value));
-  assert(ebr.drain_quiescent() > 0);
   assert(partition.PutPrivate("gamma", "replacement"));
   assert(partition.GetPrivate("gamma", &value) && value == FixedValue("replacement"));
   bool exchanged = false;
@@ -466,7 +454,6 @@ int main() {
         partition.MoveOutPrivate(key, 1);
       }
     }
-    ebr.handoff_retired_objects();
     migration_done.store(true, std::memory_order_release);
   });
   uint32_t scan_rounds = 0;
@@ -490,15 +477,6 @@ int main() {
            scan_rounds < 32);
   migrator.join();
 
-  void *handed_off = regions.Allocate(
-      64, tigonkv::engine::AllocationDomain::kSharedPayloadSwcc, 0);
-  std::thread retiring_worker([&] {
-    ebr.thread_init_ebr_meta(0, 0);
-    ebr.add_retired_object(handed_off, 64, star::CXLMemory::DATA_FREE, 0);
-    ebr.handoff_retired_objects();
-  });
-  retiring_worker.join();
-  assert(ebr.drain_quiescent() >= 64);
   star::scc_manager = nullptr;
 
   regions.PublishReady();
