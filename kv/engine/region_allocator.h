@@ -172,6 +172,10 @@ class DualRegionAllocator {
  public:
   static DualRegionAllocator Initialize(void *pool, const DualRegionConfig &config);
   static DualRegionAllocator Attach(void *pool, const DualRegionConfig &config);
+  // Construct only this VM's owner-private arena controls.  Static layout
+  // records offsets/bounds in HWCC, but no VM may construct another owner's
+  // SWCC header.
+  void InitializeOwnerPrivateArenas(uint32_t node_id);
   // Startup has exactly one cross-VM state machine.  Each VM initializes only
   // its own SWCC arena and roots, publishes its bit, then VM0 releases Ready.
   // These are startup-only operations, never a checkpoint/recovery protocol.

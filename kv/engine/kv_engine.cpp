@@ -337,6 +337,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   // Phase one: a VM constructs only the roots that it owns.  In particular,
   // reset VM0 never writes another VM's owner-private arena merely because it
   // happens to publish the static HWCC layout.
+  engine->pool_->allocator().InitializeOwnerPrivateArenas(config.node_id);
   std::vector<std::unique_ptr<KVPartition>> initializer_partitions;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     if (engine->OwnerForPartition(partition) != config.node_id) continue;

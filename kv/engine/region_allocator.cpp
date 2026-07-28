@@ -480,23 +480,12 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   auto swcc = RegionAllocator::Initialize(base + header->swcc_allocator_offset,
                                           header->swcc_allocator_bytes, config.vm_count,
                                           header->owner_private_arenas_bytes, false);
-  auto *swcc_base = base + header->swcc_allocator_offset;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
-    auto *arena = new (swcc_base + header->owner_private_arenas_offset +
-                       partition * header->owner_private_arena_stride)
-        OwnerPrivateArenaHeader;
-    arena->partition_id = partition;
-    // The persistent layout follows the public routing contract: partitions
-    // are striped across owners, rather than stored in contiguous owner runs.
-    arena->owner_shard = partition % config.vm_count;
-    arena->begin = header->owner_private_arenas_offset +
-                   partition * header->owner_private_arena_stride +
-                   ((sizeof(OwnerPrivateArenaHeader) + RegionAllocator::kAlignment - 1) &
-                    ~(RegionAllocator::kAlignment - 1));
-    arena->end = header->owner_private_arenas_offset +
-                 (partition + 1) * header->owner_private_arena_stride;
-    arena->bump = arena->begin;
-    header->layout.partitions[partition].private_arena = swcc.ToOffset(arena);
+    // This is only an immutable offset publication.  The actual arena header
+    // and allocator controls are constructed by its owner during phase two.
+    header->layout.partitions[partition].private_arena =
+        header->owner_private_arenas_offset +
+        partition * header->owner_private_arena_stride;
   }
   auto set_fixed_domain = [&](AllocationDomain domain, uint64_t bytes) {
     auto &counter = header->layout.domains[static_cast<size_t>(domain)];
@@ -518,6 +507,32 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   // state.
   FlushForRemoteVisibility(header, sizeof(*header), false);
   return DualRegionAllocator(base, config, header, hwcc, swcc);
+}
+
+void DualRegionAllocator::InitializeOwnerPrivateArenas(uint32_t node_id) {
+  if (node_id >= header_->layout.vm_count)
+    throw std::invalid_argument("owner-private initialization outside layout");
+  for (uint32_t partition = 0; partition < header_->layout.partition_count;
+       ++partition) {
+    if (partition % header_->layout.vm_count != node_id) continue;
+    auto *arena = static_cast<OwnerPrivateArenaHeader *>(swcc_.FromOffset(
+        header_->owner_private_arenas_offset +
+        partition * header_->owner_private_arena_stride));
+    new (arena) OwnerPrivateArenaHeader;
+    arena->partition_id = partition;
+    arena->owner_shard = node_id;
+    arena->begin = header_->owner_private_arenas_offset +
+                   partition * header_->owner_private_arena_stride +
+                   ((sizeof(OwnerPrivateArenaHeader) + RegionAllocator::kAlignment - 1) &
+                    ~(RegionAllocator::kAlignment - 1));
+    arena->end = header_->owner_private_arenas_offset +
+                 (partition + 1) * header_->owner_private_arena_stride;
+    arena->bump = arena->begin;
+    FlushForRemoteVisibility(arena,
+                             (sizeof(OwnerPrivateArenaHeader) +
+                              RegionAllocator::kAlignment - 1) &
+                                 ~(RegionAllocator::kAlignment - 1));
+  }
 }
 
 DualRegionAllocator DualRegionAllocator::Attach(void *pool,
@@ -618,6 +633,9 @@ void DualRegionAllocator::PublishReady() {
 
 void *DualRegionAllocator::Allocate(uint64_t bytes, AllocationDomain domain,
                                     uint32_t owner_shard) {
+  if (domain == AllocationDomain::kOwnerPrivateSwcc)
+    throw std::invalid_argument(
+        "owner-private allocation requires partition-specific arena");
   DomainCounter &counter = header_->layout.domains[static_cast<size_t>(domain)];
   void *result = IsHwccDomain(domain)
                      ? hwcc_.Allocate(bytes, domain, &counter, owner_shard)
@@ -908,9 +926,8 @@ void DualRegionAllocator::FlushOwnedRanges(uint32_t node_id) {
   }
   swcc_.FlushOwnedRange(node_id);
   for (uint32_t partition = 0; partition < header_->layout.partition_count; ++partition) {
+    if (partition % header_->layout.vm_count != node_id) continue;
     auto *arena = Arena(partition);
-    mem_access::PrivateRead(&arena->owner_shard, sizeof(arena->owner_shard));
-    if (arena->owner_shard != node_id) continue;
     const RegionOffset arena_offset = swcc_.ToOffset(arena);
     mem_access::PrivateRead(&arena->bump, sizeof(arena->bump));
     if (arena->bump > arena_offset)

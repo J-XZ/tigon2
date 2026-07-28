@@ -162,11 +162,13 @@ void TestDualPhysicalRegions() {
   config.fixed_key_size = 32;
   config.fixed_value_size = 128;
   auto dual = DualRegionAllocator::Initialize(mapping.base, config);
+  dual.InitializeOwnerPrivateArenas(0);
+  dual.InitializeOwnerPrivateArenas(1);
   assert(dual.layout().state.load(std::memory_order_acquire) ==
          static_cast<uint32_t>(LayoutState::kInitializing));
   void *index = dual.Allocate(100, AllocationDomain::kHwccIndex, 0);
   void *metadata = dual.Allocate(64, AllocationDomain::kHwccMetadata, 1);
-  void *owner = dual.Allocate(80, AllocationDomain::kOwnerPrivateSwcc, 0);
+  void *owner = dual.AllocateOwnerPrivate(80, 0, 0);
   void *payload = dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 1);
   void *remote_payload =
       dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 0);
@@ -221,7 +223,7 @@ void TestDualPhysicalRegions() {
   assert(remote_free_rejected);
   dual.Free(index, 100, AllocationDomain::kHwccIndex, 0, 0);
   dual.Free(metadata, 64, AllocationDomain::kHwccMetadata, 1, 1);
-  dual.Free(owner, 80, AllocationDomain::kOwnerPrivateSwcc, 0, 0);
+  dual.FreeOwnerPrivate(owner, 80, 0, 0);
   dual.Free(payload, 100, AllocationDomain::kSharedPayloadSwcc, 1, 1);
   dual.Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 0);
   assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
@@ -272,6 +274,8 @@ void TestMappedPoolAttach() {
   close(seed_fd);
   const DualRegionConfig config = TestDualConfig();
   auto parent = DualRegionMappedPool::Open(path, config, true);
+  parent.allocator().InitializeOwnerPrivateArenas(0);
+  parent.allocator().InitializeOwnerPrivateArenas(1);
   auto *payload = static_cast<char *>(parent.allocator().Allocate(
       64, AllocationDomain::kSharedPayloadSwcc, 0));
   std::memcpy(payload, "mapped-payload", 15);
@@ -311,6 +315,8 @@ void TestAllocatorLatencyAccounting() {
       RegionAllocator::Initialize(swcc_mapping.base, kBytes, 2, 0, false);
   const DualRegionConfig config = TestDualConfig();
   auto dual = DualRegionAllocator::Initialize(dual_mapping.base, config);
+  dual.InitializeOwnerPrivateArenas(0);
+  dual.InitializeOwnerPrivateArenas(1);
 
   latency_sim::Config latency;
   latency.enabled = true;

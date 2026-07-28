@@ -65,6 +65,8 @@ int main() {
   const std::string path(path_template);
   auto pool = tigonkv::engine::DualRegionMappedPool::Open(path, Config(), true);
   auto &regions = pool.allocator();
+  regions.InitializeOwnerPrivateArenas(0);
+  regions.InitializeOwnerPrivateArenas(1);
   star::CXLMemory memory;
   star::CXLMemory::bind_dual_region_allocator(&regions, 1);
   // Fixture binds the process owner once for this VM before any partition

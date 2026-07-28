@@ -50,12 +50,14 @@ int main() {
   auto pool = tigonkv::engine::DualRegionMappedPool::Open(
       path, MakeConfig(kPoolBytes), true);
   auto &regions = pool.allocator();
+  regions.InitializeOwnerPrivateArenas(0);
+  regions.InitializeOwnerPrivateArenas(1);
   star::CXL_EBR ebr(2, 1, &regions);
   ebr.thread_init_ebr_meta(0, 0);
   using Tree = btreeolc_cxl::BPlusTree<FixedKey, uint64_t, FixedKeyComparator,
                                        std::equal_to<uint64_t>>;
   btreeolc_cxl::TreeNodeAllocation private_binding{
-      &regions, AllocationDomain::kOwnerPrivateSwcc, 0, &ebr};
+      &regions, AllocationDomain::kOwnerPrivateSwcc, 0, &ebr, 0};
   btreeolc_cxl::TreeNodeAllocation shared_binding{
       &regions, AllocationDomain::kHwccIndex, 1, &ebr};
   // The original tree intentionally has no safe destructor; this test keeps
@@ -135,7 +137,7 @@ int main() {
     star::CXL_EBR attached_ebr(2, 1, &attached_regions);
     attached_ebr.thread_init_ebr_meta(0, 0);
     btreeolc_cxl::TreeNodeAllocation attached_binding{
-        &attached_regions, AllocationDomain::kOwnerPrivateSwcc, 0, &attached_ebr};
+        &attached_regions, AllocationDomain::kOwnerPrivateSwcc, 0, &attached_ebr, 0};
     Tree attached_tree(attached_binding,
                        attached_regions.swcc().FromOffset(root_offset));
     for (uint32_t i = 200; i < 400; ++i) {
