@@ -66,6 +66,12 @@ std::string ScanEndKey(uint32_t fixed_key_size = 32) {
   return std::string(fixed_key_size, static_cast<char>(0xff));
 }
 
+std::string FixedDecimal(std::string_view decimal, uint32_t fixed_value_size = 128) {
+  std::string value(fixed_value_size, '\0');
+  std::memcpy(value.data(), decimal.data(), decimal.size());
+  return value;
+}
+
 }  // namespace
 
 int main() {
@@ -460,13 +466,14 @@ int main() {
     assert(cas.status.ok() && cas.exchanged);
     const auto cas_failed = engine->CompareExchange("alpha", "updated", "ignored");
     assert(cas_failed.status.code == tigonkv::StatusCode::kCompareFailed && !cas_failed.exchanged);
-    assert(engine->Put("counter", "1").ok());
+    assert(engine->Put("counter", FixedDecimal("1")).ok());
     const auto incremented = engine->Increment("counter", 2);
     assert(incremented.status.ok() && incremented.value == 3);
     const auto scan = engine->Scan("alpha", ScanEndKey(), 0);
     assert(scan.status.ok() && scan.items.size() == 2);
     assert(scan.items[0].key == "alpha" && scan.items[0].value == "cas-value");
-    assert(scan.items[1].key == "counter" && scan.items[1].value == "3");
+    assert(scan.items[1].key == "counter" &&
+           scan.items[1].value == FixedDecimal("3"));
     {
       const auto rt = engine->EngineRuntime();
       assert(rt.scan_partition_probes >= 1);
@@ -777,12 +784,14 @@ int main() {
       // non-owner shared fast path rather than send another fixed transport frame.
       if (node_one->NetworkTxBytes() != tx_after_promotion) _exit(11);
       const std::string counter_key = "H-counter";
-      if (counter_key.empty() || !node_one->Put(counter_key, "1").ok()) _exit(7);
+      if (counter_key.empty() ||
+          !node_one->Put(counter_key, FixedDecimal("1")).ok()) _exit(7);
       const auto increment = node_one->Increment(counter_key, 2);
       if (!increment.status.ok() || increment.value != 3) _exit(8);
       const uint64_t tx_after_remote_increment = node_one->NetworkTxBytes();
       const auto promoted_counter = node_one->Get(counter_key);
-      if (!promoted_counter.status.ok() || promoted_counter.value != "3") _exit(22);
+      if (!promoted_counter.status.ok() ||
+          promoted_counter.value != FixedDecimal("3")) _exit(22);
       if (node_one->NetworkTxBytes() != tx_after_remote_increment) _exit(23);
       const std::string cas_create_key = "H-cas-create";
       const auto cas_create =
@@ -929,7 +938,7 @@ int main() {
 
       // Increment: N concurrent +1 from "0" → final == N.
       const std::string inc_key = "hist-inc-private";
-      assert(engine->Put(inc_key, "0").ok());
+      assert(engine->Put(inc_key, FixedDecimal("0")).ok());
       constexpr uint32_t kIncWorkers = 4;
       constexpr uint32_t kIncPerWorker = 25;
       std::atomic<bool> inc_bad{false};
@@ -956,7 +965,7 @@ int main() {
       const auto final_inc = engine->Get(inc_key);
       assert(final_inc.status.ok());
       assert(final_inc.value ==
-             std::to_string(kIncWorkers * kIncPerWorker));
+             FixedDecimal(std::to_string(kIncWorkers * kIncPerWorker)));
 
       // Delete then Put: Get after delete is NotFound; after put sees new value.
       assert(engine->Delete(key).ok());
@@ -1116,7 +1125,7 @@ int main() {
         }
       }
       const auto inc_get = engine0->Get(owned1);
-      assert(inc_get.status.ok() && inc_get.value == "10");
+      assert(inc_get.status.ok() && inc_get.value == FixedDecimal("10"));
 
       close(parent_to_child[1]);  // wake child EOF
       int status = 0;

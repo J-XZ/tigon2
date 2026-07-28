@@ -1,4 +1,5 @@
 #include "kv/engine/kv_partition.h"
+#include "kv/engine/fixed_value.h"
 #include "kv/engine/kv_migration.h"
 #include "kv/engine/mem_access.h"
 #include "protocol/Pasha/PolicyClock.h"
@@ -517,17 +518,17 @@ SharedAccessState KVPartition::IncrementShared(std::string_view key,
       smeta, host_id, fixed_value_size_,
       [&](const std::string &current, std::string *replacement) {
         int64_t previous = 0;
-        const auto parsed =
-            std::from_chars(current.data(), current.data() + current.size(), previous);
-        if (parsed.ec != std::errc{} ||
-            parsed.ptr != current.data() + current.size() ||
+        if (!DecodeCanonicalFixedDecimal(current, &previous) ||
             (delta > 0 && previous > std::numeric_limits<int64_t>::max() - delta) ||
             (delta < 0 && previous < std::numeric_limits<int64_t>::min() - delta)) {
           invalid = true;
           return false;
         }
         next = previous + delta;
-        *replacement = std::to_string(next);
+        if (!EncodeCanonicalFixedDecimal(next, fixed_value_size_, replacement)) {
+          invalid = true;
+          return false;
+        }
         return true;
       },
       &changed);
@@ -635,7 +636,9 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
   RegionOffset row_offset = kNullOffset;
   const FixedKey fixed_key = MakeKey(key);
   if (!private_tree_->lookup(fixed_key, row_offset)) {
-    const std::string encoded = std::to_string(delta);
+    std::string encoded;
+    if (!EncodeCanonicalFixedDecimal(delta, fixed_value_size_, &encoded))
+      throw std::invalid_argument("increment value exceeds fixed value size");
     {
           auto *row = AllocateRow(fixed_key, encoded);
       if (InsertPrivateRow(fixed_key, row)) {
@@ -678,11 +681,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
             smeta, owner_shard_, fixed_value_size_,
             [&](const std::string &value_before, std::string *replacement) {
               int64_t previous = 0;
-              const auto parsed = std::from_chars(
-                  value_before.data(), value_before.data() + value_before.size(),
-                  previous);
-              if (parsed.ec != std::errc{} ||
-                  parsed.ptr != value_before.data() + value_before.size() ||
+              if (!DecodeCanonicalFixedDecimal(value_before, &previous) ||
                   (delta > 0 &&
                    previous > std::numeric_limits<int64_t>::max() - delta) ||
                   (delta < 0 &&
@@ -690,7 +689,9 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
                 throw std::invalid_argument(
                     "increment requires a non-overflowing int64 value");
               next = previous + delta;
-              *replacement = std::to_string(next);
+              if (!EncodeCanonicalFixedDecimal(next, fixed_value_size_, replacement))
+                throw std::invalid_argument(
+                    "increment value exceeds fixed value size");
               return true;
             },
             &changed)) {
@@ -698,7 +699,11 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
       throw std::runtime_error("migrated increment shared write rejected");
     }
     DCHECK(changed);
-    const std::string encoded = std::to_string(next);
+    std::string encoded;
+    if (!EncodeCanonicalFixedDecimal(next, fixed_value_size_, &encoded)) {
+      UnlockRow(row);
+      throw std::invalid_argument("increment value exceeds fixed value size");
+    }
     RecordPrivateRowStateWrite(row);
     row->value_len = static_cast<uint32_t>(encoded.size());
     NoteSharedAccess(smeta);
@@ -708,10 +713,7 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
     return true;
   } else {
     int64_t previous = 0;
-    const auto parsed =
-        std::from_chars(current.data(), current.data() + current.size(), previous);
-    if (parsed.ec != std::errc{} ||
-        parsed.ptr != current.data() + current.size() ||
+    if (!DecodeCanonicalFixedDecimal(current, &previous) ||
         (delta > 0 && previous > std::numeric_limits<int64_t>::max() - delta) ||
         (delta < 0 && previous < std::numeric_limits<int64_t>::min() - delta)) {
       UnlockRow(row);
@@ -719,7 +721,11 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
           "increment requires a non-overflowing int64 value");
     }
     const int64_t next = previous + delta;
-    const std::string encoded = std::to_string(next);
+    std::string encoded;
+    if (!EncodeCanonicalFixedDecimal(next, fixed_value_size_, &encoded)) {
+      UnlockRow(row);
+      throw std::invalid_argument("increment value exceeds fixed value size");
+    }
     RecordPrivateRowStateWrite(row);
     std::memcpy(row->kv + row->key_len, encoded.data(), encoded.size());
     mem_access::PrivateWrite(row->kv + row->key_len, encoded.size());
