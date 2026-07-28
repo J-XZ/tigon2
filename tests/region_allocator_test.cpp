@@ -191,6 +191,8 @@ void TestDualPhysicalRegions() {
        ~(RegionAllocator::kAlignment - 1)) * config.partition_count;
   assert(swcc_allocator_metadata ==
          dual.swcc().metadata_bytes() + arena_header_bytes);
+  dual.PublishOwnerInitialized(0);
+  dual.PublishOwnerInitialized(1);
   dual.PublishReady();
   assert(dual.layout().state.load(std::memory_order_acquire) ==
          static_cast<uint32_t>(LayoutState::kReady));
@@ -274,6 +276,8 @@ void TestMappedPoolAttach() {
       64, AllocationDomain::kSharedPayloadSwcc, 0));
   std::memcpy(payload, "mapped-payload", 15);
   const RegionOffset payload_offset = parent.allocator().swcc().ToOffset(payload);
+  parent.allocator().PublishOwnerInitialized(0);
+  parent.allocator().PublishOwnerInitialized(1);
   parent.allocator().PublishReady();
   const pid_t child = fork();
   assert(child >= 0);

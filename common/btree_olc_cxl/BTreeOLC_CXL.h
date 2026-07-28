@@ -1647,15 +1647,10 @@ class BPlusTree {
 		store_root(inner);
 	}
 
-	void destroy(NodeBase *node)
-	{
-		CHECK(0);
-	}
-
-	~BPlusTree()
-	{
-		CHECK(0);
-	}
+	// This is a process-local, non-owning view of nodes allocated in a mapped
+	// region.  EBR owns persistent reclamation; destroying the view must never
+	// recurse through a shared tree.
+	~BPlusTree() = default;
 
 	int intRand(const int &min, const int &max)
 	{

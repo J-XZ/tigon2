@@ -44,6 +44,7 @@ class KVPartition {
   KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
               uint32_t partition_id, uint32_t owner_shard, bool attach,
               bool materialize_private);
+  ~KVPartition();
 
   uint32_t partition_id() const { return partition_id_; }
   uint32_t owner_shard() const { return owner_shard_; }

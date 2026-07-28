@@ -333,20 +333,41 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
                                                         std::move(scc)));
   engine->affinity_cpus_ = std::move(affinity_cpus);
   engine->rings_ = rings;
+
+  // Phase one: a VM constructs only the roots that it owns.  In particular,
+  // reset VM0 never writes another VM's owner-private arena merely because it
+  // happens to publish the static HWCC layout.
+  std::vector<std::unique_ptr<KVPartition>> initializer_partitions;
+  for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
+    if (engine->OwnerForPartition(partition) != config.node_id) continue;
+    const auto &directory = engine->pool_->allocator().layout().partitions[partition];
+    mem_access::HwccAtomicLoad(&directory.shared_root);
+    if (directory.shared_root.load(std::memory_order_acquire) != kNullOffset)
+      throw std::runtime_error(
+          "tigonkv: owner initialization found an already-published shared root");
+    initializer_partitions.emplace_back(std::make_unique<KVPartition>(
+        engine->pool_->allocator(), *engine->ebr_, partition,
+        engine->OwnerForPartition(partition), false, true));
+  }
+  engine->pool_->allocator().PublishOwnerInitialized(config.node_id);
+  if (config.node_id == 0)
+    engine->pool_->allocator().WaitForOwnersAndPublishReady();
+  else
+    engine->pool_->allocator().WaitUntilReady();
+
+  // Initializer handles never serve requests.  Reconstruct the regular
+  // non-owning tree handles only after Ready made every root visible.
+  initializer_partitions.clear();
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     const auto &directory = engine->pool_->allocator().layout().partitions[partition];
-    // Non-owners reconstruct only the shared CXL tree.  The private root and
-    // Clock state are deliberately owner-private SWCC; reset materializes all
-    // roots once before Ready, later attach materializes a private tree only
-    // for the partition's owner.
     mem_access::HwccAtomicLoad(&directory.shared_root);
-    const bool attach = directory.shared_root.load(std::memory_order_acquire) !=
-                        kNullOffset;
+    if (directory.shared_root.load(std::memory_order_acquire) == kNullOffset)
+      throw std::runtime_error("tigonkv: layout ready with missing shared root");
     const bool materialize_private =
-        reset || engine->OwnerForPartition(partition) == config.node_id;
+        engine->OwnerForPartition(partition) == config.node_id;
     engine->partitions_.emplace_back(std::make_unique<KVPartition>(
         engine->pool_->allocator(), *engine->ebr_, partition,
-        engine->OwnerForPartition(partition), attach, materialize_private));
+        engine->OwnerForPartition(partition), true, materialize_private));
   }
   if (star::CXLMemory::bound_owner_shard() != config.node_id)
     throw std::runtime_error(
@@ -407,7 +428,6 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   // Clock list head/tail/cursor and PrivateRow links persist in SWCC; attach
   // does not rebuild a process-heap tracker (§11.14).
   engine->StartInboundDemuxer();
-  if (reset) engine->pool_->allocator().PublishReady();
   return engine;
 }
 

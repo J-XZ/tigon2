@@ -102,6 +102,12 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
   // process-local PolicyClock exists (PLAN §4.5 attach rebuild).
 }
 
+KVPartition::~KVPartition() {
+  delete private_tree_;
+  delete shared_tree_;
+  if (clock_lock_inited_) pthread_spin_destroy(&clock_lock_);
+}
+
 FixedKey KVPartition::MakeKey(std::string_view key) const {
   return FixedKey::From(key, fixed_key_size_);
 }

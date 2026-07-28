@@ -479,6 +479,8 @@ int main() {
 
   star::scc_manager = nullptr;
 
+  regions.PublishOwnerInitialized(0);
+  regions.PublishOwnerInitialized(1);
   regions.PublishReady();
   const pid_t child = fork();
   assert(child >= 0);

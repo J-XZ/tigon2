@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <immintrin.h>
 #include <stdexcept>
 
 #include "core/Context.h"
@@ -233,12 +234,18 @@ class CXLMemory {
                 if (shared_data == nullptr || dual_regions_ == nullptr ||
                     root_index >= tigonkv::engine::kRootSlotCount)
                         throw std::runtime_error("tigonkv: dual-region root table is unavailable");
-                tigonkv::engine::mem_access::HwccAtomicLoad(
-                        &dual_regions_->layout().roots[root_index]);
-                const auto offset = dual_regions_->layout().roots[root_index].load(
-                        std::memory_order_acquire);
-                if (offset == tigonkv::engine::kNullOffset)
-                        throw std::runtime_error("tigonkv: shared root is not initialized");
+                // Preserve Tigon's startup wait: an attaching coordinator may
+                // observe the static layout before VM0 has published every
+                // root.  This waits only for that original root publication;
+                // the higher-level Ready barrier still gates request service.
+                tigonkv::engine::RegionOffset offset = tigonkv::engine::kNullOffset;
+                do {
+                        tigonkv::engine::mem_access::HwccAtomicLoad(
+                                &dual_regions_->layout().roots[root_index]);
+                        offset = dual_regions_->layout().roots[root_index].load(
+                                std::memory_order_acquire);
+                        if (offset == tigonkv::engine::kNullOffset) _mm_pause();
+                } while (offset == tigonkv::engine::kNullOffset);
                 *shared_data = dual_regions_->hwcc().FromOffset(offset);
         }
 

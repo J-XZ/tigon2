@@ -172,7 +172,13 @@ class DualRegionAllocator {
  public:
   static DualRegionAllocator Initialize(void *pool, const DualRegionConfig &config);
   static DualRegionAllocator Attach(void *pool, const DualRegionConfig &config);
-  // Publish only after transport, EBR, and every owner has published its root.
+  // Startup has exactly one cross-VM state machine.  Each VM initializes only
+  // its own SWCC arena and roots, publishes its bit, then VM0 releases Ready.
+  // These are startup-only operations, never a checkpoint/recovery protocol.
+  void PublishOwnerInitialized(uint32_t node_id);
+  void WaitForOwnersAndPublishReady();
+  void WaitUntilReady() const;
+  // Internal final release after every owner bit is visible.
   void PublishReady();
 
   void *Allocate(uint64_t bytes, AllocationDomain domain, uint32_t owner_shard);

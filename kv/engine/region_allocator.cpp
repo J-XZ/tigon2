@@ -525,28 +525,15 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
   if (pool == nullptr) throw std::invalid_argument("null dual-region pool");
   auto *base = static_cast<std::byte *>(pool);
   auto *header = reinterpret_cast<DualRegionPersistentHeader *>(base + config.hwcc_offset_bytes);
-  const bool matching_identity =
-      header->layout.magic == kSharedLayoutMagic &&
-      header->layout.layout_version == kSharedLayoutVersion &&
-      header->layout.config_hash == config.config_hash &&
-      header->layout.total_pool_bytes == config.total_pool_bytes &&
-      header->layout.vm_count == config.vm_count &&
-      header->layout.partition_count == config.partition_count;
-  if (matching_identity) {
-    constexpr auto kReadyTimeout = std::chrono::seconds(60);
-    const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
-    for (;;) {
-      mem_access::HwccAtomicLoad(&header->layout.state);
-      if (header->layout.state.load(std::memory_order_acquire) !=
-          static_cast<uint32_t>(LayoutState::kInitializing))
-        break;
-      if (std::chrono::steady_clock::now() >= deadline)
-        throw std::runtime_error("dual-region layout ready barrier timed out");
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
-  if (!header->layout.IsCompatible(config.config_hash, config.total_pool_bytes,
-                                   config.vm_count, config.partition_count) ||
+  // A joining VM must attach while the layout is still Initializing so it can
+  // construct its own private arena/root.  Ready is intentionally checked by
+  // KVEngine only after all owner bits are published.
+  if (header->layout.magic != kSharedLayoutMagic ||
+      header->layout.layout_version != kSharedLayoutVersion ||
+      header->layout.config_hash != config.config_hash ||
+      header->layout.total_pool_bytes != config.total_pool_bytes ||
+      header->layout.vm_count != config.vm_count ||
+      header->layout.partition_count != config.partition_count ||
       header->layout.hwcc_offset_bytes != config.hwcc_offset_bytes ||
       header->layout.hwcc_size_bytes != config.hwcc_size_bytes ||
       header->layout.swcc_offset_bytes != config.swcc_offset_bytes ||
@@ -562,24 +549,66 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
   return DualRegionAllocator(base, config, header, hwcc, swcc);
 }
 
+void DualRegionAllocator::PublishOwnerInitialized(uint32_t node_id) {
+  if (node_id >= header_->layout.vm_count || node_id >= 64)
+    throw std::invalid_argument("owner-ready node outside layout");
+  mem_access::HwccAtomicLoad(&header_->layout.state);
+  if (header_->layout.state.load(std::memory_order_acquire) !=
+      static_cast<uint32_t>(LayoutState::kInitializing))
+    throw std::logic_error("owner initialized after layout became ready");
+  // The owner, and only the owner, makes its private SWCC initialization
+  // visible before advertising the corresponding startup bit.
+  FlushOwnedRanges(node_id);
+  const uint64_t bit = 1ULL << node_id;
+  mem_access::HwccAtomicRmw(&header_->layout.owner_init_ready_bitmap);
+  const uint64_t previous = header_->layout.owner_init_ready_bitmap.fetch_or(
+      bit, std::memory_order_release);
+  if ((previous & bit) != 0)
+    throw std::logic_error("owner initialization published more than once");
+  FlushForRemoteVisibility(&header_->layout.owner_init_ready_bitmap,
+                           sizeof(header_->layout.owner_init_ready_bitmap), false);
+}
+
+void DualRegionAllocator::WaitForOwnersAndPublishReady() {
+  if (header_->layout.vm_count == 0 || header_->layout.vm_count > 64)
+    throw std::logic_error("invalid owner-ready bitmap width");
+  const uint64_t expected = header_->layout.vm_count == 64
+                                ? ~uint64_t{0}
+                                : ((uint64_t{1} << header_->layout.vm_count) - 1);
+  for (;;) {
+    mem_access::HwccAtomicLoad(&header_->layout.owner_init_ready_bitmap);
+    if (header_->layout.owner_init_ready_bitmap.load(std::memory_order_acquire) ==
+        expected)
+      break;
+    _mm_pause();
+  }
+  PublishReady();
+}
+
+void DualRegionAllocator::WaitUntilReady() const {
+  for (;;) {
+    mem_access::HwccAtomicLoad(&header_->layout.state);
+    if (header_->layout.state.load(std::memory_order_acquire) ==
+        static_cast<uint32_t>(LayoutState::kReady))
+      return;
+    _mm_pause();
+  }
+}
+
 void DualRegionAllocator::PublishReady() {
   mem_access::HwccAtomicLoad(&header_->layout.state);
   const uint32_t state = header_->layout.state.load(std::memory_order_acquire);
   if (state != static_cast<uint32_t>(LayoutState::kInitializing))
     throw std::logic_error("dual-region layout ready published more than once");
-  // Publish initialized owner-private state before the single HWCC Ready
-  // release store. This is startup only, not a clean/dirty lifecycle.
-  swcc_.FlushAllocatedRanges();
-  mem_access::HwccRead(&header_->layout.partition_count,
-                       sizeof(header_->layout.partition_count));
-  for (uint32_t partition = 0;
-       partition < header_->layout.partition_count; ++partition) {
-    auto *arena = Arena(partition);
-    const RegionOffset arena_offset = swcc_.ToOffset(arena);
-    mem_access::PrivateRead(&arena->bump, sizeof(arena->bump));
-    if (arena->bump > arena_offset)
-      FlushForRemoteVisibility(arena, arena->bump - arena_offset);
-  }
+  const uint64_t expected = header_->layout.vm_count == 64
+                                ? ~uint64_t{0}
+                                : ((uint64_t{1} << header_->layout.vm_count) - 1);
+  mem_access::HwccAtomicLoad(&header_->layout.owner_init_ready_bitmap);
+  if (header_->layout.owner_init_ready_bitmap.load(std::memory_order_acquire) !=
+      expected)
+    throw std::logic_error("layout ready before every owner initialized");
+  // Each owner flushed its own private arena before setting its bit. VM0 only
+  // performs the HWCC release; it must not walk another VM's private SWCC.
   mem_access::HwccAtomicStore(&header_->layout.state);
   header_->layout.state.store(static_cast<uint32_t>(LayoutState::kReady),
                               std::memory_order_release);

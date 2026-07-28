@@ -123,6 +123,8 @@ int main() {
   assert(shared_stats.hwcc_raw_line_accesses > 1);
   simulator.Configure(latency_sim::Config{});
 
+  regions.PublishOwnerInitialized(0);
+  regions.PublishOwnerInitialized(1);
   regions.PublishReady();
   const pid_t child = fork();
   assert(child >= 0);
