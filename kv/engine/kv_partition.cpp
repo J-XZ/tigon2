@@ -46,6 +46,13 @@ uint32_t ReadHwccConfigField(const uint32_t *field) {
   return *field;
 }
 
+bool IsInternalMaxSentinel(const FixedKey &key) {
+  return std::all_of(key.bytes, key.bytes + sizeof(key.bytes),
+                     [](char byte) {
+                       return static_cast<unsigned char>(byte) == 0xff;
+                     });
+}
+
 }  // namespace
 
 KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
@@ -92,6 +99,20 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
     if (!materialize_private)
       throw std::logic_error("reset must materialize every private partition root");
     private_tree_ = new PrivateTree(private_binding_);
+    // Preserve the original per-partition maximum-key tuple. It is a normal
+    // private ValueStruct/local-metadata row and supplies the mandatory right
+    // neighbour for TableBTreeOLC adjacent callbacks.
+    FixedKey sentinel{};
+    std::memset(sentinel.bytes, 0xff, fixed_key_size_);
+    const std::string zero_value(fixed_value_size_, '\0');
+    auto *sentinel_value = AllocateValue(zero_value);
+    // This is the one bootstrap insertion before a right neighbour exists.
+    // Every later logical insert uses the original adjacent callback and sees
+    // this tuple as its mandatory next key.
+    if (!private_tree_->insert(sentinel, regions_.swcc().ToOffset(sentinel_value))) {
+      FreeUnpublishedPrivateValue(sentinel_value);
+      throw std::runtime_error("private tree internal max sentinel duplicate");
+    }
     shared_tree_ = new SharedTree(shared_binding_);
     shared_tree_->bind_published_root(&directory_.shared_root);
     PersistPrivateRootIfChanged();
@@ -292,29 +313,33 @@ void KVPartition::BreakAdjacencyLocked(
 }
 
 bool KVPartition::InsertPrivateValue(const FixedKey &key, PrivateValueStruct *value) {
-  Neighborhood neighborhood;
-  LockNeighborhood(key, &neighborhood);
-  if (neighborhood.has_current) {
-    UnlockNeighborhood(&neighborhood);
-    return false;
-  }
   auto *metadata = MetadataFromValue(value);
-  if (!TryLockRow(metadata)) {
-    UnlockNeighborhood(&neighborhood);
-    throw std::runtime_error("new private row unexpectedly locked");
-  }
-  BreakAdjacencyLocked(neighborhood);
   const RegionOffset offset = regions_.swcc().ToOffset(value);
-  if (!private_tree_->insert(key, offset)) {
-    UnlockRow(metadata);
-    UnlockNeighborhood(&neighborhood);
-    throw std::runtime_error("private-tree insert failed with locked gap");
-  }
-  neighborhood.has_current = true;
-  neighborhood.current = RowRef{key, offset, value, metadata};
-  RefreshAdjacencyLocked(neighborhood);
-  UnlockNeighborhood(&neighborhood);
-  return true;
+  // Direct mechanical use of the original B+Tree adjacent-insert callback.
+  // The permanent maximum-key tuple supplies a right neighbour at tree EOF.
+  return private_tree_->insert_and_process_adjacent_tuples(
+      key, offset,
+      [&](const FixedKey *prev_key, RegionOffset *prev_off,
+          const FixedKey *next_key, RegionOffset *next_off) {
+        (void)metadata;  // fully initialized before publication in the leaf.
+        RowRef prev;
+        RowRef next;
+        if (prev_key != nullptr && prev_off != nullptr) {
+          prev = {*prev_key, *prev_off, ValueFromOffset(*prev_off), nullptr};
+          prev.metadata = MetadataFromValue(prev.value);
+        }
+        if (next_key != nullptr && next_off != nullptr) {
+          next = {*next_key, *next_off, ValueFromOffset(*next_off), nullptr};
+          next.metadata = MetadataFromValue(next.value);
+        }
+        if (prev.metadata != nullptr) LockRow(prev.metadata);
+        if (next.metadata != nullptr) LockRow(next.metadata);
+        if (prev.metadata != nullptr) SetNextReal(prev, false);
+        if (next.metadata != nullptr) SetPrevReal(next, false);
+        if (next.metadata != nullptr) UnlockRow(next.metadata);
+        if (prev.metadata != nullptr) UnlockRow(prev.metadata);
+        return true;
+      });
 }
 
 void KVPartition::FreeUnpublishedPrivateValue(PrivateValueStruct *value) {
@@ -1173,6 +1198,7 @@ bool KVPartition::ScanOwned(
     private_tree_->scan(low, high, left_inclusive, true, fetch, rows);
     if (rows.empty()) break;
     for (const auto &entry : rows) {
+      if (IsInternalMaxSentinel(entry.first)) break;
       auto *private_value = ValueFromOffset(entry.second);
       auto *metadata = MetadataFromValue(private_value);
       {
@@ -1239,6 +1265,7 @@ bool KVPartition::ScanOwnedKeys(
     private_tree_->scan(low, high, left_inclusive, true, fetch, rows);
     if (rows.empty()) break;
     for (const auto &entry : rows) {
+      if (IsInternalMaxSentinel(entry.first)) break;
       auto *private_value = ValueFromOffset(entry.second);
       auto *metadata = MetadataFromValue(private_value);
       LockRow(metadata);

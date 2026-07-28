@@ -100,6 +100,11 @@ int main() {
   assert(star::CXLMemory::bound_owner_shard() == 1);
   assert(regions.OwnerPrivateArenaOffset(5) ==
          regions.layout().partitions[5].private_arena);
+  // The original max-key tuple is physically present but never leaks through
+  // an empty logical scan.
+  std::vector<std::pair<std::string, std::string>> empty_scan;
+  assert(partition.ScanOwned("", 0, &empty_scan));
+  assert(empty_scan.empty());
   {
     std::vector<tigonkv::engine::KVPartition *> parts(8, nullptr);
     parts[5] = &partition;
