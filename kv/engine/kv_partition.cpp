@@ -286,6 +286,190 @@ bool KVPartition::InsertPrivateValue(const FixedKey &key, PrivateValueStruct *va
       });
 }
 
+bool KVPartition::AcquireOwnerNextRowWriteLock(
+    PrivateValueStruct *value, OwnerNextRowLock *locked_row) {
+  if (value == nullptr || locked_row == nullptr)
+    throw std::invalid_argument("null owner insert next-row lock");
+  auto *metadata = MetadataFromValue(value);
+  LockRow(metadata);
+  if (!metadata->is_valid) {
+    UnlockRow(metadata);
+    return false;
+  }
+
+  locked_row->value = value;
+  locked_row->metadata = metadata;
+  locked_row->shared = false;
+  if (!metadata->is_migrated) {
+    const uint64_t old_tid = metadata->tid;
+    if (star::TwoPLPashaHelper::is_read_locked(old_tid) ||
+        star::TwoPLPashaHelper::is_write_locked(old_tid)) {
+      UnlockRow(metadata);
+      return false;
+    }
+    metadata->tid = old_tid |
+        (star::TwoPLPashaHelper::WRITE_LOCK_BIT_MASK
+         << star::TwoPLPashaHelper::WRITE_LOCK_BIT_OFFSET);
+    locked_row->observed_tid =
+        star::TwoPLPashaHelper::remove_lock_bit(old_tid);
+    RecordPrivateMetadataWrite(metadata);
+    UnlockRow(metadata);
+    return true;
+  }
+
+  const RegionOffset smeta_offset = metadata->migrated_smeta_off;
+  if (smeta_offset == kNullOffset ||
+      !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
+    UnlockRow(metadata);
+    return false;
+  }
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  auto *scc_data = smeta->get_scc_data();
+  smeta->lock();
+  star::scc_manager->prepare_read(smeta, owner_shard_, scc_data,
+                                  fixed_value_size_);
+  if (smeta->is_data_modified_since_moved_in()) {
+    if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index)) {
+      smeta->unlock();
+      UnlockRow(metadata);
+      return false;
+    }
+    metadata->is_valid = true;
+    metadata->tid = smeta->tid;
+    star::scc_manager->do_read(nullptr, owner_shard_, value->data,
+                               scc_data->data, fixed_value_size_);
+    smeta->clear_is_data_modified_since_moved_in();
+    mem_access::PrivateWrite(value->data, fixed_value_size_);
+    RecordPrivateMetadataWrite(metadata);
+  } else if (!metadata->is_valid) {
+    smeta->unlock();
+    UnlockRow(metadata);
+    return false;
+  }
+  const uint64_t old_tid = smeta->tid;
+  if (smeta->get_reader_count() != 0 || smeta->is_write_locked()) {
+    smeta->unlock();
+    UnlockRow(metadata);
+    return false;
+  }
+  smeta->set_write_locked();
+  locked_row->observed_tid =
+      star::TwoPLPashaHelper::remove_lock_bit(old_tid);
+  locked_row->shared = true;
+  smeta->unlock();
+  UnlockRow(metadata);
+  return true;
+}
+
+void KVPartition::ReleaseOwnerNextRowWriteLock(
+    const OwnerNextRowLock &locked_row, uint64_t new_tid, bool commit) {
+  if (locked_row.metadata == nullptr) return;
+  auto *metadata = locked_row.metadata;
+  if (!locked_row.shared) {
+    LockRow(metadata);
+    DCHECK(star::TwoPLPashaHelper::is_write_locked(metadata->tid));
+    metadata->tid = commit ? new_tid : locked_row.observed_tid;
+    RecordPrivateMetadataWrite(metadata);
+    UnlockRow(metadata);
+    return;
+  }
+
+  LockRow(metadata);
+  const RegionOffset smeta_offset = metadata->migrated_smeta_off;
+  if (smeta_offset == kNullOffset ||
+      !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
+    UnlockRow(metadata);
+    throw std::runtime_error("owner insert next-row shared locator vanished");
+  }
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  auto *scc_data = smeta->get_scc_data();
+  smeta->lock();
+  DCHECK(smeta->get_reader_count() == 0);
+  DCHECK(smeta->is_write_locked());
+  smeta->clear_write_locked();
+  if (commit) {
+    smeta->tid = new_tid;
+    star::scc_manager->finish_write(
+        smeta, owner_shard_, scc_data,
+        sizeof(star::TwoPLPashaMetadataShared) + fixed_value_size_);
+  }
+  smeta->unlock();
+  UnlockRow(metadata);
+}
+
+bool KVPartition::InsertOwnerPlaceholderWithNextLock(
+    const FixedKey &key, std::string_view value, OwnerNextRowLock *locked_row) {
+  if (locked_row == nullptr)
+    throw std::invalid_argument("null owner insert next-row output");
+  *locked_row = {};
+  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
+  if (table == nullptr) throw std::runtime_error("owner table is unavailable");
+  return table->insert_lock_next_key(
+      &key, value.data(),
+      [&](const void *, std::atomic<uint64_t> *next_meta, void *) {
+        // The table's persistent meta slot is the first field of
+        // PrivateValueStruct.  Resolve its RegionOffset before applying the
+        // original next-row write-lock semantics.
+        if (next_meta == nullptr) return false;
+        auto *next_value = reinterpret_cast<PrivateValueStruct *>(next_meta);
+        return AcquireOwnerNextRowWriteLock(next_value, locked_row);
+      },
+      true);
+}
+
+bool KVPartition::PublishOwnerPlaceholder(const FixedKey &key,
+                                          uint64_t commit_tid) {
+  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
+  if (table == nullptr) throw std::runtime_error("owner table is unavailable");
+  const auto clear_adjacent = [&](void *meta, bool clear_next) {
+    if (meta == nullptr) return true;
+    auto *adjacent = static_cast<PrivateMetadataLocal *>(meta);
+    LockRow(adjacent);
+    if (adjacent->is_migrated) {
+      const RegionOffset smeta_offset = adjacent->migrated_smeta_off;
+      if (smeta_offset == kNullOffset ||
+          !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
+        UnlockRow(adjacent);
+        return false;
+      }
+      auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+          regions_.hwcc().FromOffset(smeta_offset));
+      smeta->lock();
+      if (clear_next)
+        smeta->clear_next_key_real_bit();
+      else
+        smeta->clear_prev_key_real_bit();
+      smeta->unlock();
+    }
+    UnlockRow(adjacent);
+    return true;
+  };
+  const bool found = table->search_and_update_next_key_info(
+      &key, [&](const void *, void *prev_meta, void *, const void *,
+                void *cur_meta, void *, const void *, void *next_meta, void *) {
+        return cur_meta != nullptr && clear_adjacent(prev_meta, true) &&
+               clear_adjacent(next_meta, false);
+      });
+  if (!found) return false;
+
+  RegionOffset row_offset = kNullOffset;
+  if (!LookupPrivateOffset(key, &row_offset)) return false;
+  auto *metadata = MetadataFromValue(ValueFromOffset(row_offset));
+  LockRow(metadata);
+  if (metadata->is_migrated || metadata->is_valid) {
+    UnlockRow(metadata);
+    return false;
+  }
+  metadata->tid = commit_tid;
+  metadata->is_valid = true;
+  metadata->is_data_modified_since_moved_out = true;
+  RecordPrivateMetadataWrite(metadata);
+  UnlockRow(metadata);
+  return true;
+}
+
 void KVPartition::FreeUnpublishedPrivateValue(PrivateValueStruct *value) {
   if (value == nullptr) return;
   auto *metadata = MetadataFromValue(value);
@@ -392,13 +576,21 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       RecordPrivateMetadataWrite(metadata);
       return false;
     }
-    auto *private_value = AllocateValue(value);
-    if (!InsertPrivateValue(fixed_key, private_value)) {
-      // Concurrent create race: another owner worker published first. Free the
-      // unpublished loser and retry as an upsert (§10.9).
-      FreeUnpublishedPrivateValue(private_value);
+    OwnerNextRowLock next_row;
+    if (!InsertOwnerPlaceholderWithNextLock(fixed_key, value, &next_row)) {
+      // The original insert helper leaves no placeholder when it cannot lock
+      // the successor or loses the tree create race.  The KV facade owns the
+      // bounded Busy retry, so re-resolve the key here without a second
+      // create protocol.
       continue;
     }
+    const uint64_t commit_tid = star::TwoPLPashaHelper::kv_next_commit_tid(
+        next_row.observed_tid);
+    if (!PublishOwnerPlaceholder(fixed_key, commit_tid)) {
+      ReleaseOwnerNextRowWriteLock(next_row, 0, false);
+      throw std::runtime_error("owner insert placeholder publication failed");
+    }
+    ReleaseOwnerNextRowWriteLock(next_row, commit_tid, true);
     PersistPrivateRootIfChanged();
     return true;
   }

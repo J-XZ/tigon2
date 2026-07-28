@@ -242,6 +242,23 @@ class KVPartition {
   void ApplySharedAdjacency(const AdjacentRows &rows);
   void ClearSharedAdjacency(const AdjacentRows &rows);
   bool InsertPrivateValue(const FixedKey &key, PrivateValueStruct *value);
+  struct OwnerNextRowLock {
+    PrivateValueStruct *value = nullptr;
+    PrivateMetadataLocal *metadata = nullptr;
+    uint64_t observed_tid = 0;
+    bool shared = false;
+  };
+  // Offset-safe adapter for the original insert_and_update_next_key_info
+  // next-row write lock.  It keeps the original placeholder → adjacency →
+  // valid → release sequence without storing a process VA in ValueStruct.
+  bool AcquireOwnerNextRowWriteLock(PrivateValueStruct *value,
+                                    OwnerNextRowLock *locked_row);
+  void ReleaseOwnerNextRowWriteLock(const OwnerNextRowLock &locked_row,
+                                    uint64_t new_tid, bool commit);
+  bool InsertOwnerPlaceholderWithNextLock(const FixedKey &key,
+                                          std::string_view value,
+                                          OwnerNextRowLock *locked_row);
+  bool PublishOwnerPlaceholder(const FixedKey &key, uint64_t commit_tid);
   void FreeUnpublishedPrivateValue(PrivateValueStruct *value);
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;

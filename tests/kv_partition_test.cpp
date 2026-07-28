@@ -181,18 +181,31 @@ int main() {
     std::atomic<uint32_t> ready{0};
     std::atomic<uint32_t> done{0};
     std::atomic<bool> start{false};
+    const auto put_with_facade_retry = [&](std::string_view key,
+                                           std::string_view value) {
+      for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
+        try {
+          (void)partition.PutPrivate(key, value);
+          return;
+        } catch (const std::runtime_error &error) {
+          assert(std::string(error.what()).find("busy") != std::string::npos);
+          std::this_thread::yield();
+        }
+      }
+      assert(false && "KVPartition Busy did not clear at facade boundary");
+    };
     std::thread t0([&] {
       ebr.thread_init_ebr_meta(0, 0);
       ready.fetch_add(1, std::memory_order_acq_rel);
       while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-      (void)partition.PutPrivate("race-key", "a");
+      put_with_facade_retry("race-key", "a");
       done.fetch_add(1, std::memory_order_acq_rel);
     });
     std::thread t1([&] {
       ebr.thread_init_ebr_meta(0, 0);
       ready.fetch_add(1, std::memory_order_acq_rel);
       while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-      (void)partition.PutPrivate("race-key", "b");
+      put_with_facade_retry("race-key", "b");
       done.fetch_add(1, std::memory_order_acq_rel);
     });
     while (ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
@@ -546,6 +559,17 @@ int main() {
   } while (!migration_done.load(std::memory_order_acquire) ||
            scan_rounds < 32);
   migrator.join();
+
+  // The owner create path keeps the original next-row write lock across
+  // placeholder insertion and publication.  Make that successor migrated so
+  // this covers the offset adapter's shared-row acquire/release branch.
+  assert(partition.PutPrivate("owner-next-middle", "middle"));
+  assert(partition.PromotePrivate("owner-next-middle", 1));
+  assert(partition.PutPrivate("owner-next-before", "before"));
+  assert(partition.GetPrivate("owner-next-before", &value) &&
+         value == FixedValue("before"));
+  assert(partition.GetPrivate("owner-next-middle", &value) &&
+         value == FixedValue("middle"));
 
   star::scc_manager = nullptr;
 
