@@ -2250,8 +2250,7 @@ uint64_t KVPartition::hwcc_used_bytes() const {
 void KVPartition::PersistPrivateRootIfChanged() {
   // Shared live root is published only by BPlusTree::store_root through
   // bind_published_root; do not rewrite directory_.shared_root here (§11.6).
-  const RegionOffset private_root =
-      regions_.swcc().ToOffset(private_tree_->root_for_persistence());
+  const RegionOffset private_root = private_tree_->root_offset_for_persistence();
   if (private_root == persisted_private_root_offset_) return;
   mem_access::PrivateWrite(&private_arena_.private_root,
                            sizeof(private_arena_.private_root));

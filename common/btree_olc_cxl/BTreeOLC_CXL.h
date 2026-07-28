@@ -1624,7 +1624,10 @@ class BPlusTree {
 		}
 	}
 
-	void *root_for_persistence() const { return load_root(); }
+	tigonkv::engine::RegionOffset root_offset_for_persistence() const
+	{
+		return allocation_.ToOffset(load_root());
+	}
 
 	void makeRoot(const KeyType &k, NodeBase *leftChild, NodeBase *rightChild)
 	{

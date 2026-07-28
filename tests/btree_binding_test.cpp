@@ -183,8 +183,7 @@ int main() {
   }
   assert(regions.OwnerPrivateUsedBytes(0) > 0);
   assert(regions.DynamicHwccUsedBytes(1) > 0);
-  const auto root_offset = regions.swcc().ToOffset(
-      private_tree->root_for_persistence());
+  const auto root_offset = private_tree->root_offset_for_persistence();
   assert(root_offset != tigonkv::engine::kNullOffset);
 
   latency_sim::Config latency;
