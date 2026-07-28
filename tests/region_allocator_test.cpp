@@ -169,6 +169,11 @@ void TestDualPhysicalRegions() {
   assert(dynamic0.shared_swcc_offset + dynamic0.shared_swcc_bytes <=
          dynamic1.shared_swcc_offset);
   dual.InitializeOwnerPrivateArenas(0);
+  auto *foreign_arena = static_cast<OwnerPrivateArenaHeader *>(
+      dual.swcc().FromOffset(dual.layout().partitions[1].private_arena));
+  // Phase two is owner-only: VM0 may publish immutable HWCC geometry, but it
+  // must not construct VM1's private allocator control/header.
+  assert(foreign_arena->magic == 0);
   dual.InitializeOwnerPrivateArenas(1);
   assert(dual.layout().state.load(std::memory_order_acquire) ==
          static_cast<uint32_t>(LayoutState::kInitializing));
@@ -224,6 +229,11 @@ void TestDualPhysicalRegions() {
   }
   assert(remote_free_rejected);
   dual.Free(index, 100, AllocationDomain::kHwccIndex, 0, 0);
+  // RegionOffset zero is null.  The dynamic arena therefore reserves its
+  // first cache line and can immediately reuse the first freed block.
+  void *reused_index = dual.Allocate(100, AllocationDomain::kHwccIndex, 0);
+  assert(reused_index == index);
+  dual.Free(reused_index, 100, AllocationDomain::kHwccIndex, 0, 0);
   dual.Free(metadata, 64, AllocationDomain::kHwccMetadata, 1, 1);
   dual.FreeOwnerPrivate(owner, 80, 0, 0);
   dual.Free(payload, 100, AllocationDomain::kSharedPayloadSwcc, 1, 1);
