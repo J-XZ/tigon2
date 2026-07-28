@@ -81,11 +81,6 @@ void AddRuntimeStats(RuntimeStats *total, const RuntimeStats &part) {
   total->scan_ops += part.scan_ops;
   total->scan_partition_probes += part.scan_partition_probes;
   total->scan_migrate_rpcs += part.scan_migrate_rpcs;
-  total->scan_owner_rows_movein_attempted +=
-      part.scan_owner_rows_movein_attempted;
-  total->deferred_queue_peak =
-      std::max(total->deferred_queue_peak, part.deferred_queue_peak);
-  total->abandoned_responses += part.abandoned_responses;
 }
 
 std::string StripComments(std::string text) {
@@ -1178,13 +1173,8 @@ RuntimeStats KVStore::Runtime() const {
     stats.shared_swcc_flushes += engine.shared_swcc_flushes;
     stats.migration_in += engine.migration_in;
     stats.migration_out += engine.migration_out;
-    stats.abandoned_responses += engine.abandoned_responses;
     stats.scan_partition_probes += engine.scan_partition_probes;
     stats.scan_migrate_rpcs += engine.scan_migrate_rpcs;
-    stats.scan_owner_rows_movein_attempted +=
-        engine.scan_owner_rows_movein_attempted;
-    stats.deferred_queue_peak =
-        std::max(stats.deferred_queue_peak, engine.deferred_queue_peak);
     stats.network_tx_bytes = engine.network_tx_bytes;
     stats.network_rx_bytes = engine.network_rx_bytes;
   }
@@ -1246,11 +1236,6 @@ std::string KVStore::DumpStats() const {
   out += "scan_partition_probes=" +
          std::to_string(runtime.scan_partition_probes) + "\n";
   out += "scan_migrate_rpcs=" + std::to_string(runtime.scan_migrate_rpcs) + "\n";
-  out += "scan_owner_rows_movein_attempted=" +
-         std::to_string(runtime.scan_owner_rows_movein_attempted) + "\n";
-  out += "deferred_queue_peak=" +
-         std::to_string(runtime.deferred_queue_peak) + "\n";
-  out += "abandoned_responses=" + std::to_string(runtime.abandoned_responses) + "\n";
   const latency_sim::Stats latency = latency_sim::GlobalLatencySimulator().SnapshotStats();
   const auto ratio = [](uint64_t hits, uint64_t misses) {
     const uint64_t total = hits + misses;

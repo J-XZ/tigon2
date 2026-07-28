@@ -154,7 +154,6 @@ class KVEngine {
   // §13 Scan diagnostics: flushed from TLS at Scan boundaries / once per RPC.
   std::atomic<uint64_t> scan_partition_probes_{0};
   std::atomic<uint64_t> scan_migrate_rpcs_{0};
-  std::atomic<uint64_t> scan_owner_rows_movein_attempted_{0};
 };
 
 }  // namespace tigonkv::engine

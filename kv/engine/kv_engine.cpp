@@ -710,31 +710,28 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
                          std::string_view inclusive_max, uint64_t scan_limit,
                          ScanResult *result) -> Status {
     auto *partition = partitions_[partition_id].get();
-    bool migrated_once = false;
-    for (;;) {
-      KVPartition::SharedScanResult probe = partition->ScanSharedPartition(
-          config_.node_id, min_key, scan_limit, inclusive_max);
-      ++TlsScanDiag.partition_probes;
-      PollTransport();
-      if (!probe.status.ok()) return probe.status;
-      if (probe.migration_required) {
-        if (migrated_once)
-          return Status::Error(StatusCode::kBusy,
-                               "CXL scan remains incomplete after move-in");
-        migrated_once = true;
-        const Status migrated = Forward(
-            RpcKind::kScanMigrate, min_key, {}, partition_id,
-            OwnerForPartition(partition_id), inclusive_max, scan_limit);
-        ++TlsScanDiag.migrate_rpcs;
-        if (!migrated.ok()) return migrated;
-        continue;
-      }
-      if (!probe.scan_success)
-        return Status::Error(StatusCode::kCorruption, "CXL probe incomplete");
-      for (auto &item : probe.items)
-        result->items.push_back({std::move(item.first), std::move(item.second)});
-      return Status::Ok();
+    KVPartition::SharedScanResult probe = partition->ScanSharedPartition(
+        config_.node_id, min_key, scan_limit, inclusive_max);
+    ++TlsScanDiag.partition_probes;
+    PollTransport();
+    if (!probe.status.ok()) return probe.status;
+    if (probe.migration_required) {
+      const Status migrated = Forward(
+          RpcKind::kScanMigrate, min_key, {}, partition_id,
+          OwnerForPartition(partition_id), inclusive_max, scan_limit);
+      ++TlsScanDiag.migrate_rpcs;
+      if (!migrated.ok()) return migrated;
+      // The original handler has now moved the range in.  Do not add a
+      // second operation retry policy here: the single KVStore facade retry
+      // restarts this scan from its public operation boundary.
+      return Status::Error(StatusCode::kBusy,
+                           "CXL scan range moved in; retry at facade");
     }
+    if (!probe.scan_success)
+      return Status::Error(StatusCode::kCorruption, "CXL probe incomplete");
+    for (auto &item : probe.items)
+      result->items.push_back({std::move(item.first), std::move(item.second)});
+    return Status::Ok();
   };
 
   ScanResult result{Status::Ok(), {}};
@@ -1041,14 +1038,10 @@ RuntimeStats KVEngine::EngineRuntime() const {
   stats.shared_swcc_flushes = shared_swcc_flushes_.load(std::memory_order_relaxed);
   stats.migration_in = migration_in_.load(std::memory_order_relaxed);
   stats.migration_out = migration_out_.load(std::memory_order_relaxed);
-  stats.abandoned_responses = 0;
   stats.scan_partition_probes =
       scan_partition_probes_.load(std::memory_order_relaxed);
   stats.scan_migrate_rpcs =
       scan_migrate_rpcs_.load(std::memory_order_relaxed);
-  stats.scan_owner_rows_movein_attempted =
-      scan_owner_rows_movein_attempted_.load(std::memory_order_relaxed);
-  stats.deferred_queue_peak = 0;
   stats.network_tx_bytes = NetworkTxBytes();
   stats.network_rx_bytes = NetworkRxBytes();
   return stats;

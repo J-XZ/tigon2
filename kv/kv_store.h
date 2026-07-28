@@ -78,10 +78,6 @@ struct RuntimeStats {
   uint64_t scan_ops = 0;
   uint64_t scan_partition_probes = 0;
   uint64_t scan_migrate_rpcs = 0;
-  uint64_t scan_owner_rows_movein_attempted = 0;
-  uint64_t deferred_queue_peak = 0;
-  // Late responses dropped after Await timeout tombstones (§10.11).
-  uint64_t abandoned_responses = 0;
 };
 
 struct MemoryStats {

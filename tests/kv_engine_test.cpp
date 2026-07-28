@@ -209,326 +209,6 @@ int main() {
          WTERMSIG(misroute_status) == SIGABRT);
   unlink(misroute_template);
 
-#if 0  // Removed current-only wire timeout/tombstone tests; §3.14 uses Message inboxes.
-  char full_template[] = "/tmp/tigonkv-engine-full-XXXXXX";
-  const int full_fd = mkstemp(full_template);
-  assert(full_fd >= 0);
-  close(full_fd);
-  const pid_t full_child = fork();
-  assert(full_child >= 0);
-  if (full_child == 0) {
-    const rlimit no_core{0, 0};
-    (void)setrlimit(RLIMIT_CORE, &no_core);
-    auto full_config = ConfigFor(full_template, 2, 0);
-    full_config.sync_timeout_sec = 1;
-    std::unique_ptr<tigonkv::engine::KVEngine> engine;
-    {
-      // Join the owner-startup barrier, then stop its demuxer before filling
-      // its inbound ring.  A live owner demuxer would consume the exact ring
-      // this test intentionally keeps full.
-      auto peer = JoiningPeer(ConfigFor(full_template, 2, 1));
-      engine = tigonkv::engine::KVEngine::Open(full_config, true);
-    }
-    void *root = nullptr;
-    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
-        star::CXLMemory::cxl_transport_root_index, &root);
-    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
-    tigonkv::engine::KvMessage frame{};
-    while (rings[1].enqueue(
-        reinterpret_cast<char *>(&frame), sizeof(frame))) {
-    }
-    std::string remote_key;
-    for (uint32_t i = 0; i < 1000; ++i) {
-      remote_key = "full-ring-" + std::to_string(i);
-      if (engine->OwnerForKey(remote_key) == 1) break;
-    }
-    (void)engine->Put(remote_key, "value");
-    _exit(91);
-  }
-  int full_status = 0;
-  assert(waitpid(full_child, &full_status, 0) == full_child);
-  assert(WIFSIGNALED(full_status) && WTERMSIG(full_status) == SIGABRT);
-  unlink(full_template);
-
-  // §10.11: Await timeout abandons request_id; late response must not abort.
-  {
-    char late_template[] = "/tmp/tigonkv-engine-late-resp-XXXXXX";
-    const int late_fd = mkstemp(late_template);
-    assert(late_fd >= 0);
-    close(late_fd);
-    auto late_config = ConfigFor(late_template, 2, 0);
-    late_config.sync_timeout_sec = 1;
-    std::unique_ptr<tigonkv::engine::KVEngine> engine;
-    {
-      // This case injects the response itself.  Join owner startup first, then
-      // stop the peer so no real response races the synthetic late response.
-      auto peer = JoiningPeer(ConfigFor(late_template, 2, 1));
-      engine = tigonkv::engine::KVEngine::Open(late_config, true);
-    }
-    std::string remote_key;
-    for (uint32_t i = 0; i < 1000; ++i) {
-      remote_key = "late-resp-" + std::to_string(i);
-      if (engine->OwnerForKey(remote_key) == 1) break;
-    }
-    assert(!remote_key.empty() && engine->OwnerForKey(remote_key) == 1);
-    void *root = nullptr;
-    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
-        star::CXLMemory::cxl_transport_root_index, &root);
-    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
-    std::atomic<bool> get_done{false};
-    tigonkv::StatusCode get_code = tigonkv::StatusCode::kOk;
-    std::thread getter([&] {
-      engine->BindWorker(0);
-      get_code = engine->Get(remote_key).status.code;
-      engine->ReleaseWorker();
-      get_done.store(true, std::memory_order_release);
-    });
-    tigonkv::engine::KvMessage outbound{};
-    const auto drain_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    for (;;) {
-      alignas(64) char bytes[sizeof(tigonkv::engine::KvMessage)];
-      const uint64_t got = rings[1].recv(bytes, sizeof(bytes));
-      if (got >= tigonkv::engine::WireHeaderBytes()) {
-        std::memcpy(&outbound, bytes, got);
-        assert(tigonkv::engine::ValidWireFrame(got, outbound));
-        break;
-      }
-      assert(std::chrono::steady_clock::now() < drain_deadline);
-      std::this_thread::yield();
-    }
-    assert(outbound.request_id != 0);
-    while (!get_done.load(std::memory_order_acquire))
-      std::this_thread::yield();
-    getter.join();
-    assert(get_code == tigonkv::StatusCode::kBusy);
-    auto response = tigonkv::engine::MakeResponse(
-        1, 0, outbound.request_id, tigonkv::StatusCode::kOk);
-    while (!rings[0].enqueue(reinterpret_cast<char *>(&response),
-                             tigonkv::engine::WireSize(response)))
-      std::this_thread::yield();
-    const auto settle = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(200);
-    while (std::chrono::steady_clock::now() < settle)
-      std::this_thread::yield();
-    assert(engine->EngineRuntime().abandoned_responses >= 1);
-    unlink(late_template);
-  }
-
-  // Unknown response after tombstone miss/eviction: demuxer drops and counts,
-  // never aborts the process (§10.11 post-audit).
-  {
-    char unknown_template[] = "/tmp/tigonkv-engine-unknown-resp-XXXXXX";
-    const int unknown_fd = mkstemp(unknown_template);
-    assert(unknown_fd >= 0);
-    close(unknown_fd);
-    auto config = ConfigFor(unknown_template, 1, 0);
-    auto engine = tigonkv::engine::KVEngine::Open(config, true);
-    const uint64_t before = engine->EngineRuntime().abandoned_responses;
-    void *root = nullptr;
-    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
-        star::CXLMemory::cxl_transport_root_index, &root);
-    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
-    auto response = tigonkv::engine::MakeResponse(
-        0, 0, /*request_id=*/0xdeadbeefULL);
-    // Inject via the local inbound path: enqueue to this node's ring and let
-    // the demuxer apply it (same fate as a late peer response).
-    assert(rings[0].enqueue(reinterpret_cast<char *>(&response),
-                            tigonkv::engine::WireSize(response)));
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (engine->EngineRuntime().abandoned_responses <= before &&
-           std::chrono::steady_clock::now() < deadline) {
-      engine->PollTransport();
-      std::this_thread::yield();
-    }
-    assert(engine->EngineRuntime().abandoned_responses > before);
-    unlink(unknown_template);
-  }
-
-  // §11.4: forged value_size / trailing bytes abort demux; mixed sizes round-trip.
-  {
-    char wire_bad_template[] = "/tmp/tigonkv-engine-wire-bad-XXXXXX";
-    const int wire_bad_fd = mkstemp(wire_bad_template);
-    assert(wire_bad_fd >= 0);
-    close(wire_bad_fd);
-    const pid_t wire_bad_child = fork();
-    assert(wire_bad_child >= 0);
-    if (wire_bad_child == 0) {
-      const rlimit no_core{0, 0};
-      (void)setrlimit(RLIMIT_CORE, &no_core);
-      auto config = ConfigFor(wire_bad_template, 2, 0);
-      auto peer = JoiningPeer(ConfigFor(wire_bad_template, 2, 1));
-      auto engine = tigonkv::engine::KVEngine::Open(config, true);
-      void *root = nullptr;
-      star::CXLMemory::wait_and_retrieve_cxl_shared_data(
-          star::CXLMemory::cxl_transport_root_index, &root);
-      auto *rings = static_cast<star::MPSCRingBuffer *>(root);
-      // Claim value_size=32 but only send the header (truncated value).
-      auto forged = tigonkv::engine::MakeRequest(
-          tigonkv::engine::KvMessageType::kPut, 1, 0, 99, "wire-bad",
-          std::string(32, 'z'));
-      while (!rings[0].enqueue(reinterpret_cast<char *>(&forged),
-                               tigonkv::engine::WireHeaderBytes()))
-        std::this_thread::yield();
-      for (;;) engine->PollTransport();
-    }
-    int wire_bad_status = 0;
-    assert(waitpid(wire_bad_child, &wire_bad_status, 0) == wire_bad_child);
-    assert(WIFSIGNALED(wire_bad_status) &&
-           WTERMSIG(wire_bad_status) == SIGABRT);
-    unlink(wire_bad_template);
-  }
-  {
-    char wire_tail_template[] = "/tmp/tigonkv-engine-wire-tail-XXXXXX";
-    const int wire_tail_fd = mkstemp(wire_tail_template);
-    assert(wire_tail_fd >= 0);
-    close(wire_tail_fd);
-    const pid_t wire_tail_child = fork();
-    assert(wire_tail_child >= 0);
-    if (wire_tail_child == 0) {
-      const rlimit no_core{0, 0};
-      (void)setrlimit(RLIMIT_CORE, &no_core);
-      auto config = ConfigFor(wire_tail_template, 2, 0);
-      auto peer = JoiningPeer(ConfigFor(wire_tail_template, 2, 1));
-      auto engine = tigonkv::engine::KVEngine::Open(config, true);
-      void *root = nullptr;
-      star::CXLMemory::wait_and_retrieve_cxl_shared_data(
-          star::CXLMemory::cxl_transport_root_index, &root);
-      auto *rings = static_cast<star::MPSCRingBuffer *>(root);
-      // value_size=0 but enqueue full POD (extra trailing bytes).
-      auto empty = tigonkv::engine::MakeResponse(1, 0, 42);
-      while (!rings[0].enqueue(reinterpret_cast<char *>(&empty),
-                               sizeof(empty)))
-        std::this_thread::yield();
-      for (;;) engine->PollTransport();
-    }
-    int wire_tail_status = 0;
-    assert(waitpid(wire_tail_child, &wire_tail_status, 0) == wire_tail_child);
-    assert(WIFSIGNALED(wire_tail_status) &&
-           WTERMSIG(wire_tail_status) == SIGABRT);
-    unlink(wire_tail_template);
-  }
-  {
-    // Mixed 0/8/32B values: node0 Forward Put tx bytes == WireSize(req)+WireSize(rsp).
-    char wire_ok_template[] = "/tmp/tigonkv-engine-wire-ok-XXXXXX";
-    const int wire_ok_fd = mkstemp(wire_ok_template);
-    assert(wire_ok_fd >= 0);
-    close(wire_ok_fd);
-    auto node0_cfg = ConfigFor(wire_ok_template, 2, 0);
-    auto node1_cfg = ConfigFor(wire_ok_template, 2, 1);
-    std::vector<std::pair<std::string, size_t>> remote_puts;
-    {
-      JoiningPeer bootstrap(node1_cfg);
-      auto probe = tigonkv::engine::KVEngine::Open(node0_cfg, true);
-      for (size_t n : {size_t{0}, size_t{8}, size_t{32}}) {
-        for (uint32_t i = 0; i < 4000; ++i) {
-          const std::string key =
-              "wire-mix-" + std::to_string(n) + "-" + std::to_string(i);
-          if (probe->OwnerForKey(key) == 1) {
-            remote_puts.emplace_back(key, n);
-            break;
-          }
-        }
-      }
-      assert(remote_puts.size() == 3);
-    }
-    const pid_t peer = fork();
-    assert(peer >= 0);
-    if (peer == 0) {
-      auto node1 = tigonkv::engine::KVEngine::Open(node1_cfg, false);
-      node1->BindWorker(0);
-      const auto deadline =
-          std::chrono::steady_clock::now() + std::chrono::seconds(15);
-      size_t seen = 0;
-      while (seen < remote_puts.size()) {
-        node1->PollTransport();
-        seen = 0;
-        for (const auto &entry : remote_puts) {
-          if (node1->Get(entry.first).status.ok()) ++seen;
-        }
-        assert(std::chrono::steady_clock::now() < deadline);
-        std::this_thread::yield();
-      }
-      for (const auto &entry : remote_puts) {
-        const auto got = node1->Get(entry.first);
-        assert(got.status.ok());
-        assert(got.value.size() == node1_cfg.fixed_value_size);
-        assert(got.value.substr(0, entry.second) == std::string(entry.second, 'v'));
-        assert(std::all_of(got.value.begin() + entry.second, got.value.end(),
-                           [](char byte) { return byte == '\0'; }));
-      }
-      node1->ReleaseWorker();
-      _exit(0);
-    }
-    auto node0 = tigonkv::engine::KVEngine::Open(node0_cfg, false);
-    node0->BindWorker(0);
-    const uint64_t tx_before = node0->NetworkTxBytes();
-    uint64_t expected_tx = 0;
-    for (const auto &entry : remote_puts) {
-      const std::string value(entry.second, 'v');
-      assert(node0->Put(entry.first, value).ok());
-      expected_tx += tigonkv::engine::WireSize(tigonkv::engine::MakeRequest(
-          tigonkv::engine::KvMessageType::kMigrate, 0, 1, 1, entry.first, {}));
-      expected_tx += tigonkv::engine::WireSize(tigonkv::engine::MakeRequest(
-          tigonkv::engine::KvMessageType::kPut, 0, 1, 1, entry.first, value));
-    }
-    node0->ReleaseWorker();
-    assert(node0->NetworkTxBytes() - tx_before == expected_tx);
-    // A create first checks/migrates the row, then performs owner insert; both
-    // replies are header-only.
-    assert(node0->NetworkRxBytes() ==
-           remote_puts.size() * 2 * tigonkv::engine::WireHeaderBytes());
-    int peer_status = 0;
-    assert(waitpid(peer, &peer_status, 0) == peer);
-    assert(WIFEXITED(peer_status) && WEXITSTATUS(peer_status) == 0);
-    unlink(wire_ok_template);
-  }
-
-  char ring_latency_template[] = "/tmp/tigonkv-ring-latency-XXXXXX";
-  const int ring_latency_fd = mkstemp(ring_latency_template);
-  assert(ring_latency_fd >= 0);
-  close(ring_latency_fd);
-  {
-    std::unique_ptr<tigonkv::engine::KVEngine> engine;
-    {
-      // This direct ring test needs both owner-private arenas initialized,
-      // but no live peer is allowed to consume ring 1.
-      auto peer = JoiningPeer(ConfigFor(ring_latency_template, 2, 1));
-      engine = tigonkv::engine::KVEngine::Open(
-          ConfigFor(ring_latency_template, 2, 0), true);
-    }
-    void *root = nullptr;
-    star::CXLMemory::wait_and_retrieve_cxl_shared_data(
-        star::CXLMemory::cxl_transport_root_index, &root);
-    auto *rings = static_cast<star::MPSCRingBuffer *>(root);
-    latency_sim::Config latency;
-    latency.enabled = true;
-    latency.foreground_enabled = true;
-    latency.stats_enabled = true;
-    latency.hwcc_read_ns_per_line = 1;
-    latency.hwcc_write_ns_per_line = 1;
-    latency.hwcc_atomic_load_ns = 1;
-    latency.hwcc_atomic_store_ns = 1;
-    latency.hwcc_atomic_rmw_ns = 1;
-    auto &simulator = latency_sim::GlobalLatencySimulator();
-    simulator.Configure(latency);
-    simulator.BeginScope(latency_sim::ScopeKind::kForeground);
-    tigonkv::engine::KvMessage frame{};
-    assert(rings[1].enqueue(reinterpret_cast<char *>(&frame), sizeof(frame)));
-    assert(simulator.PendingDelayNsForTest() == 0);
-    tigonkv::engine::KvMessage received{};
-    assert(rings[1].dequeue(reinterpret_cast<char *>(&received),
-                            sizeof(received)) == sizeof(received));
-    assert(simulator.PendingDelayNsForTest() == 0);
-    simulator.EndScopeAndDelay();
-    const auto stats = simulator.TakeStatsAndReset();
-    assert(stats.hwcc_raw_line_accesses > 0);
-    assert(stats.swcc_raw_line_accesses == 0);
-    simulator.Configure(latency_sim::Config{});
-  }
-  unlink(ring_latency_template);
-#endif
 
   char path_template[] = "/tmp/tigonkv-engine-XXXXXX";
   const int fd = mkstemp(path_template);
@@ -787,9 +467,22 @@ int main() {
             promoted.value != FixedValue("owner-authority"))
           _exit(14);
       }
+      // KVEngine exposes one-shot primitives.  Mirror the production
+      // KVStore boundary here rather than restoring an Engine-local Scan
+      // retry after a successful range move-in.
+      auto scan_with_facade_retry = [&](std::string_view start,
+                                        uint64_t limit) {
+        tigonkv::ScanResult result;
+        for (uint32_t attempt = 0; attempt != 64; ++attempt) {
+          result = node_one->Scan(start, ScanEndKey(), limit);
+          if (result.status.code != tigonkv::StatusCode::kBusy) return result;
+          std::this_thread::yield();
+        }
+        return result;
+      };
       const uint64_t tx_before_authoritative_scan = node_one->NetworkTxBytes();
-      const auto authoritative_scan = node_one->Scan(
-          promoted_scan_keys.front(), ScanEndKey(), 100);
+      const auto authoritative_scan = scan_with_facade_retry(
+          promoted_scan_keys.front(), 100);
       const uint64_t authoritative_scan_tx =
           node_one->NetworkTxBytes() - tx_before_authoritative_scan;
       if (!authoritative_scan.status.ok() || authoritative_scan.items.size() != 100)
@@ -803,14 +496,14 @@ int main() {
       // A complete CXL range does not send an owner-value RPC.  If migration
       // was needed, the only frame remains the original scan-migration one.
       (void)authoritative_scan_tx;
-      const auto boundary_scan = node_one->Scan(promoted_scan_keys[63], ScanEndKey(), 3);
+      const auto boundary_scan = scan_with_facade_retry(promoted_scan_keys[63], 3);
       if (!boundary_scan.status.ok() || boundary_scan.items.size() != 3)
         _exit(29);
       for (size_t i = 0; i < boundary_scan.items.size(); ++i)
         if (boundary_scan.items[i].key != promoted_scan_keys[63 + i])
           _exit(30);
-      const auto complete_hybrid_scan = node_one->Scan(
-          promoted_scan_keys.front(), ScanEndKey(), 130);
+      const auto complete_hybrid_scan = scan_with_facade_retry(
+          promoted_scan_keys.front(), 130);
       if (!complete_hybrid_scan.status.ok() ||
           complete_hybrid_scan.items.size() != promoted_scan_keys.size())
         _exit(31);
@@ -827,8 +520,8 @@ int main() {
           node_one->BindWorker(worker);
           while (!start_concurrent_scans.load(std::memory_order_acquire))
             std::this_thread::yield();
-          const auto scan = node_one->Scan(
-              promoted_scan_keys.front(), ScanEndKey(), 100);
+          const auto scan = scan_with_facade_retry(
+              promoted_scan_keys.front(), 100);
           if (!scan.status.ok() || scan.items.size() != 100) {
             concurrent_scan_failed.store(true, std::memory_order_release);
           } else {
@@ -844,21 +537,8 @@ int main() {
       for (auto &thread : scan_threads) thread.join();
       if (concurrent_scan_failed.load(std::memory_order_acquire)) _exit(18);
 
-      // The parent deliberately races move-out/insert with the preceding
-      // scans.  Busy is the documented operation-boundary retry result, not
-      // a partial Scan result; retry here so the remainder of this child also
-      // exercises the independent remote point-operation paths.
-      auto scan_after_contention = [&](std::string_view start, uint64_t limit) {
-        tigonkv::ScanResult result;
-        for (uint32_t attempt = 0; attempt != 128; ++attempt) {
-          result = node_one->Scan(start, ScanEndKey(), limit);
-          if (result.status.code != tigonkv::StatusCode::kBusy) return result;
-          std::this_thread::yield();
-        }
-        return result;
-      };
-      const auto distributed_scan = scan_after_contention("", 0);
-      const auto limited_scan = scan_after_contention("", 17);
+      const auto distributed_scan = scan_with_facade_retry("", 0);
+      const auto limited_scan = scan_with_facade_retry("", 17);
       bool saw_owner_zero = false;
       bool saw_owner_one = false;
       for (const auto &item : distributed_scan.items) {
