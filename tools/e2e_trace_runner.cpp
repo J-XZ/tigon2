@@ -46,10 +46,6 @@ Status RunWithBusyRetry(KVStore &store, Op &&op) {
   return status;
 }
 
-std::string ScanEndKey(uint32_t fixed_key_size) {
-  return std::string(static_cast<size_t>(fixed_key_size), static_cast<char>(0xff));
-}
-
 // Align with cxlkv FixedTraceValue: printable '!'..'~', length=fixed_value_size
 // (trace PUT LEN is ignored for the payload, as in cxlkv).
 std::string FixedTraceValue(std::mt19937_64 *rng, uint32_t fixed_value_size) {
@@ -226,7 +222,7 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_
     } else if (op == "SCAN") {
       ScanResult scan;
       status = RunWithBusyRetry(store, [&] {
-        scan = store.Scan(key, ScanEndKey(fixed_key_size), len);
+        scan = store.Scan(key, {}, len);
         return scan.status;
       });
       if (status.ok()) {
@@ -519,7 +515,7 @@ int main(int argc, char **argv) {
       } else if (op == "SCAN") {
         ScanResult result;
         status = RunWithBusyRetry(*store, [&] {
-          result = store->Scan(key, ScanEndKey(config.fixed_key_size), len);
+          result = store->Scan(key, {}, len);
           return result.status;
         });
         if (status.ok()) {
