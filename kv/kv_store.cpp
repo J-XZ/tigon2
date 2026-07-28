@@ -1075,17 +1075,6 @@ Status KVStore::Delete(std::string_view key) {
   return status;
 }
 
-Status KVStore::MoveOut(std::string_view key) {
-  engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kForeground);
-  impl_->engine->PollTransport();
-  RuntimeStats &runtime = ThreadRuntime();
-  ++runtime.logical_ops;
-  Status status = impl_->engine->MoveOut(key);
-  if (status.ok()) { ++runtime.commits; ++runtime.migration_out; }
-  return status;
-}
-
 ScanResult KVStore::Scan(std::string_view start_key, std::string_view end_key,
                          uint64_t limit) {
   engine::mem_access::LatencyScope latency_scope(
