@@ -137,11 +137,10 @@ class KVPartition {
   bool PromotePrivate(std::string_view key, uint32_t host_id,
                       star::TwoPLPashaMetadataShared **pinned_existing);
   bool MoveOutPrivate(std::string_view key, uint32_t host_id);
-  // Owner-only dual-tree merge (private + shared). Engine must not call this
-  // for non-owned partitions.
-  bool ScanOwned(std::string_view start_key, uint64_t limit,
-                 std::vector<std::pair<std::string, std::string>> *items,
-                 std::string_view inclusive_max = {}) const;
+  // Original ITable local scan fragment. Engine calls it only for the owner.
+  bool ScanLocalPartition(std::string_view start_key, uint64_t limit,
+                          std::vector<std::pair<std::string, std::string>> *items,
+                          std::string_view inclusive_max = {}) const;
   // Thin CXLTable::scan-style entry: shared_tree_->scanForUpdate only.
   // Processor returns true to stop (BTreeOLC_CXL end semantics). Adapter does
   // ValueType→RegionOffset passthrough; no adjacency/migration logic (§4.3).
@@ -149,8 +148,9 @@ class KVPartition {
       const FixedKey &min_key,
       const std::function<bool(const FixedKey &key, RegionOffset smeta_off,
                                bool is_last_tuple)> &processor) const;
-  // CXL-first page probe (§4.3–§4.5): adjacency under leaf latch; values after.
-  struct SharedScanProbeResult {
+  // Original CXLTable scan fragment: adjacency under leaf latch, values while
+  // the fragment's reader/ref pins remain held.
+  struct SharedScanResult {
     Status status = Status::Ok();
     bool scan_success = false;
     bool migration_required = false;
@@ -158,7 +158,7 @@ class KVPartition {
   };
   // host_id is the requester (SCC cache bit / clflush identity), not the
   // partition owner. Matches original TwoPLPasha coordinator_id on remote scan.
-  SharedScanProbeResult ProbeSharedScanPage(
+  SharedScanResult ScanSharedPartition(
       uint32_t host_id, std::string_view start_key, uint64_t output_limit,
       std::string_view inclusive_max = {}) const;
   void ClockLock();

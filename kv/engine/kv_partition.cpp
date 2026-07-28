@@ -1593,7 +1593,7 @@ std::string KVPartition::KeyString(const FixedKey &key) const {
   return std::string(key.bytes, length);
 }
 
-bool KVPartition::ScanOwned(
+bool KVPartition::ScanLocalPartition(
     std::string_view start_key, uint64_t limit,
     std::vector<std::pair<std::string, std::string>> *items,
     std::string_view inclusive_max) const {
@@ -1723,11 +1723,11 @@ void KVPartition::ScanSharedForUpdate(
       });
 }
 
-KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
+KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
     uint32_t host_id, std::string_view start_key, uint64_t output_limit,
     std::string_view inclusive_max) const {
   EnterEbr();
-  SharedScanProbeResult result;
+  SharedScanResult result;
   const FixedKey min_key = MakeKey(start_key);
   FixedKey max_key{};
   if (inclusive_max.empty())

@@ -712,7 +712,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
     auto *partition = partitions_[partition_id].get();
     bool migrated_once = false;
     for (;;) {
-      KVPartition::SharedScanProbeResult probe = partition->ProbeSharedScanPage(
+      KVPartition::SharedScanResult probe = partition->ScanSharedPartition(
           config_.node_id, min_key, scan_limit, inclusive_max);
       ++TlsScanDiag.partition_probes;
       PollTransport();
@@ -764,7 +764,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
     Status status;
     if (OwnerForPartition(partition_id) == config_.node_id) {
       std::vector<std::pair<std::string, std::string>> items;
-      const bool ok = partitions_[partition_id]->ScanOwned(
+      const bool ok = partitions_[partition_id]->ScanLocalPartition(
           min_key, remaining, &items, inclusive_max);
       ++TlsScanDiag.partition_probes;
       PollTransport();

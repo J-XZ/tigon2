@@ -113,7 +113,7 @@ int main() {
   // The original max-key tuple is physically present but never leaks through
   // an empty logical scan.
   std::vector<std::pair<std::string, std::string>> empty_scan;
-  assert(partition.ScanOwned("", 0, &empty_scan));
+  assert(partition.ScanLocalPartition("", 0, &empty_scan));
   assert(empty_scan.empty());
   bool wrong_owner_rejected = false;
   try {
@@ -281,7 +281,7 @@ int main() {
   assert(partition.PutPrivate("latency-only", "payload"));
   assert(partition.GetPrivate("latency-only", &value) && value == FixedValue("payload"));
   std::vector<std::pair<std::string, std::string>> latency_scan;
-  assert(partition.ScanOwned("latency-only", 1, &latency_scan));
+  assert(partition.ScanLocalPartition("latency-only", 1, &latency_scan));
   assert(latency_scan.size() == 1 && latency_scan[0].second == FixedValue("payload"));
   simulator.EndScopeAndDelay();
   auto latency_stats = simulator.TakeStatsAndReset();
@@ -442,7 +442,7 @@ int main() {
   // A partition scan merges the private and shared authorities in key order,
   // without resurrecting tombstones or duplicate migrated locator rows.
   std::vector<std::pair<std::string, std::string>> scan;
-  assert(partition.ScanOwned("alpha", 0, &scan));
+  assert(partition.ScanLocalPartition("alpha", 0, &scan));
   assert(scan.size() == 8);
   assert(scan[0] == std::make_pair(std::string("alpha"), FixedValue("shared-update")));
   assert(scan[1] == std::make_pair(std::string("clock"), FixedValue("victim")));
@@ -452,7 +452,7 @@ int main() {
   assert(scan[5] == std::make_pair(std::string("new-counter"), FixedValue("-2")));
   assert(scan[6] == std::make_pair(std::string("pinfail"), FixedValue("x")));
   assert(scan[7] == std::make_pair(std::string("pinned"), FixedValue("hold")));
-  assert(partition.ScanOwned("alpha", 2, &scan));
+  assert(partition.ScanLocalPartition("alpha", 2, &scan));
   assert(scan.size() == 2);
   assert(scan[0].first == "alpha" && scan[1].first == "clock");
 
@@ -463,7 +463,7 @@ int main() {
     assert(partition.EnsureInShared(key, 1) == tigonkv::StatusCode::kOk);
   const std::string scan_max(regions.layout().fixed_key_size,
                              static_cast<char>(0xff));
-  const auto shared_scan = partition.ProbeSharedScanPage(
+  const auto shared_scan = partition.ScanSharedPartition(
       /*host_id=*/1, "alpha", 2, scan_max);
   assert(shared_scan.status.ok() && shared_scan.scan_success);
   assert(shared_scan.items.size() == 2);
@@ -514,7 +514,7 @@ int main() {
     std::snprintf(key, sizeof(key), "m9%03d", i);
     assert(partition.PutPrivate(key, "tail"));
   }
-  assert(partition.ScanOwned("m1", 3, &scan));
+  assert(partition.ScanLocalPartition("m1", 3, &scan));
   assert(scan.size() == 3);
   assert(scan[0] == std::make_pair(std::string("m1"), FixedValue("shared-m1")));
   assert(scan[1] == std::make_pair(std::string("m2"), FixedValue("priv-m2")));
@@ -546,7 +546,7 @@ int main() {
     // Busy retry here instead of restoring an internal Scan retry budget.
     bool scanned = false;
     for (uint32_t attempt = 0; attempt < 1024 && !scanned; ++attempt) {
-      scanned = partition.ScanOwned("scan-race-", 32, &scan);
+      scanned = partition.ScanLocalPartition("scan-race-", 32, &scan);
       if (!scanned) std::this_thread::yield();
     }
     assert(scanned);
