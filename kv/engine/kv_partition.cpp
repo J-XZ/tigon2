@@ -1827,12 +1827,32 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
 
 bool KVPartition::DeletePrivate(std::string_view key) {
   const FixedKey fixed_key = MakeKey(key);
-  RegionOffset row_offset = kNullOffset;
-  if (!LookupPrivateOffset(fixed_key, &row_offset)) return false;
-  auto *value = ValueFromOffset(row_offset);
+  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
+  if (table == nullptr || star::migration_manager == nullptr)
+    throw std::runtime_error("owner delete has no installed migration callback");
+  // Keep the original owner read-and-delete entry: lookup through ITable,
+  // take the row write lock while reading it, then let the Clock callback
+  // consume that lock with the retired row.
+  auto [meta_slot, data] = table->search(&fixed_key);
+  if (meta_slot == nullptr || data == nullptr) return false;
+  auto *value = reinterpret_cast<PrivateValueStruct *>(meta_slot);
+  auto *metadata = MetadataFromValue(value);
   OwnerNextRowLock row_lock;
-  if (!AcquireOwnerNextRowWriteLock(value, &row_lock)) {
-    auto *metadata = MetadataFromValue(value);
+  bool write_locked = false;
+  bool migrated = false;
+  std::string prior_value(fixed_value_size_, '\0');
+  const uint64_t observed_tid =
+      star::TwoPLPashaHelper::take_write_lock_and_read(
+          *metadata, data, prior_value.data(), prior_value.size(),
+          write_locked, &migrated);
+  if (write_locked) {
+    row_lock = {value, metadata, false, observed_tid};
+  } else if (migrated) {
+    // The offset-backed local helper intentionally leaves migrated rows to
+    // the existing SCC acquisition path.
+    if (!AcquireOwnerNextRowWriteLock(value, &row_lock))
+      throw std::runtime_error("private delete busy");
+  } else {
     LockRow(metadata);
     const bool valid = metadata->is_valid;
     UnlockRow(metadata);
@@ -1844,9 +1864,6 @@ bool KVPartition::DeletePrivate(std::string_view key) {
   // then let the PolicyClock callback consume it with the deleted row.  The
   // successful callback retires the row, so it must not be released again.
   try {
-    auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
-    if (table == nullptr || star::migration_manager == nullptr)
-      throw std::runtime_error("owner delete has no installed migration callback");
     const bool deleted = star::migration_manager->delete_specific_row_and_move_out(
         table, &fixed_key, /*is_delete_local=*/true);
     if (!deleted)
