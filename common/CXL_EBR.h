@@ -26,10 +26,7 @@ class CXL_EBR {
         static constexpr uint64_t max_epoch = 3;
 
         static constexpr uint64_t max_coordinator_num = 8;
-        // The old benchmark-only limit of five workers was smaller than the
-        // configured foreground-worker contract.  Per-host local_epoch slots
-        // live in the CXL-resident object; keep the grid sized for KV experiments.
-        static constexpr uint64_t max_thread_num = 64;
+        static constexpr uint64_t max_thread_num = 5;
 
         // try to advance global epoch when we have more than this number of garbage
         static constexpr uint64_t epoch_advance_threshold = 100;
