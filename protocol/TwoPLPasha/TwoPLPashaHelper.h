@@ -417,6 +417,163 @@ class TwoPLPashaHelper {
                 return max_tid;
         }
 
+        // The remote-row lock transition is shared by the original executor
+        // and the single-operation KV facade.  The facade differs only in
+        // how it obtains the row (offset lookup rather than Transaction), so
+        // keep the SCC/read-lock/write-lock state machine here instead of
+        // maintaining a second `kv_shared_*` implementation.
+        static uint64_t remote_take_read_lock_and_read(
+            TwoPLPashaMetadataShared *smeta, std::size_t host_id, void *dest,
+            std::size_t size, bool inc_ref_cnt, bool &success,
+            KvSharedResult *result = nullptr)
+        {
+                if (result != nullptr) *result = KvSharedResult::kBusy;
+                success = false;
+                if (smeta == nullptr || scc_manager == nullptr) return 0;
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                scc_manager->prepare_read(smeta, host_id, scc_data, size);
+                if (!smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index)) {
+                        smeta->unlock();
+                        if (result != nullptr) *result = KvSharedResult::kMissing;
+                        return 0;
+                }
+                const uint64_t tid = remove_lock_bit(smeta->tid);
+                if (smeta->is_write_locked() ||
+                    smeta->get_reader_count() == smeta->get_reader_count_max() ||
+                    (inc_ref_cnt && smeta->get_ref_cnt() ==
+                        std::numeric_limits<uint8_t>::max())) {
+                        smeta->unlock();
+                        return tid;
+                }
+                smeta->increase_reader_count();
+                if (inc_ref_cnt) smeta->increment_ref_cnt();
+                if (dest != nullptr && size != 0) {
+                        tigonkv::engine::mem_access::SharedPayloadRead(
+                            scc_data->data, size);
+                        scc_manager->do_read(nullptr, host_id, dest,
+                                             scc_data->data, size);
+                }
+                success = true;
+                smeta->unlock();
+                if (result != nullptr) *result = KvSharedResult::kDone;
+                return tid;
+        }
+
+        static uint64_t remote_take_write_lock_and_read(
+            TwoPLPashaMetadataShared *smeta, std::size_t host_id, void *dest,
+            std::size_t size, bool inc_ref_cnt, bool &success,
+            KvSharedResult *result = nullptr, bool allow_invalid = false)
+        {
+                if (result != nullptr) *result = KvSharedResult::kBusy;
+                success = false;
+                if (smeta == nullptr || scc_manager == nullptr) return 0;
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                scc_manager->prepare_read(smeta, host_id, scc_data, size);
+                if (!allow_invalid &&
+                    !smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index)) {
+                        smeta->unlock();
+                        if (result != nullptr) *result = KvSharedResult::kMissing;
+                        return 0;
+                }
+                const uint64_t tid = remove_lock_bit(smeta->tid);
+                if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
+                    (inc_ref_cnt && smeta->get_ref_cnt() ==
+                        std::numeric_limits<uint8_t>::max())) {
+                        smeta->unlock();
+                        return tid;
+                }
+                smeta->set_write_locked();
+                if (inc_ref_cnt) smeta->increment_ref_cnt();
+                if (dest != nullptr && size != 0) {
+                        tigonkv::engine::mem_access::SharedPayloadRead(
+                            scc_data->data, size);
+                        scc_manager->do_read(nullptr, host_id, dest,
+                                             scc_data->data, size);
+                }
+                success = true;
+                smeta->unlock();
+                if (result != nullptr) *result = KvSharedResult::kDone;
+                return tid;
+        }
+
+        static void remote_read_lock_release(TwoPLPashaMetadataShared *smeta,
+                                             bool dec_ref_cnt = false)
+        {
+                DCHECK(smeta != nullptr);
+                tigonkv::engine::mem_access::DelayActiveScopeNow();
+                smeta->lock();
+                DCHECK(smeta->get_reader_count() > 0);
+                DCHECK(!smeta->is_write_locked());
+                if (dec_ref_cnt) {
+                        DCHECK(smeta->get_ref_cnt() > 0);
+                        smeta->decrement_ref_cnt();
+                }
+                smeta->decrease_reader_count();
+                smeta->unlock();
+        }
+
+        static void remote_write_lock_abort(TwoPLPashaMetadataShared *smeta,
+                                            bool dec_ref_cnt = false)
+        {
+                DCHECK(smeta != nullptr);
+                tigonkv::engine::mem_access::DelayActiveScopeNow();
+                smeta->lock();
+                DCHECK(smeta->get_reader_count() == 0);
+                DCHECK(smeta->is_write_locked());
+                if (dec_ref_cnt) {
+                        DCHECK(smeta->get_ref_cnt() > 0);
+                        smeta->decrement_ref_cnt();
+                }
+                smeta->clear_write_locked();
+                smeta->unlock();
+        }
+
+        static void remote_write_lock_release(
+            TwoPLPashaMetadataShared *smeta, std::size_t host_id,
+            std::size_t scc_bytes, uint64_t new_tid, bool dec_ref_cnt = false)
+        {
+                DCHECK(smeta != nullptr);
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                DCHECK(smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index));
+                DCHECK(smeta->get_reader_count() == 0);
+                DCHECK(smeta->is_write_locked());
+                if (dec_ref_cnt) {
+                        DCHECK(smeta->get_ref_cnt() > 0);
+                        smeta->decrement_ref_cnt();
+                }
+                smeta->clear_write_locked();
+                tigonkv::engine::mem_access::HwccWrite(&smeta->tid,
+                                                        sizeof(smeta->tid));
+                smeta->tid = new_tid;
+                scc_manager->finish_write(smeta, host_id, scc_data, scc_bytes);
+                smeta->unlock();
+        }
+
+        static bool remote_write_locked_update(
+            TwoPLPashaMetadataShared *smeta, std::size_t host_id,
+            const void *src, std::size_t size, bool allow_invalid = false)
+        {
+                DCHECK(smeta != nullptr);
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                if ((!allow_invalid &&
+                     !smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index)) ||
+                    !smeta->is_write_locked()) {
+                        smeta->unlock();
+                        return false;
+                }
+                tigonkv::engine::mem_access::SharedPayloadWrite(scc_data->data,
+                                                                  size);
+                scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
+                smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
+                smeta->set_is_data_modified_since_moved_in();
+                smeta->unlock();
+                return true;
+        }
+
         // Offset-adapted overloads of the original non-migrated local-row
         // branches below. `LocalMetadata` deliberately has the same
         // latch/tid/valid fields as TwoPLPashaMetadataLocal; the KV layout
@@ -527,39 +684,8 @@ class TwoPLPashaHelper {
                                    void *dest, std::size_t size,
                                    KvSharedResult *result = nullptr)
         {
-                if (result != nullptr) *result = KvSharedResult::kBusy;
-                if (smeta == nullptr || scc_manager == nullptr) return false;
-                smeta->lock();
-                auto *scc_data = smeta->get_scc_data();
-                // ref_cnt is uint8_t; refuse saturation instead of wrapping.
-                if (smeta->is_write_locked() ||
-                    smeta->get_reader_count() == smeta->get_reader_count_max() ||
-                    smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
-                        smeta->unlock();
-                        return false;
-                }
-                smeta->increase_reader_count();
-                smeta->increment_ref_cnt();
-                scc_manager->prepare_read(smeta, host_id, scc_data, size);
-                const bool valid =
-                    smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                smeta->unlock();
-                if (valid) {
-                        tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
-                        scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
-                }
-                // Pay the shared read while the protocol reader/ref pins still
-                // prevent move-out, but without holding the HWCC metadata latch.
-                tigonkv::engine::mem_access::DelayActiveScopeNow();
-                smeta->lock();
-                DCHECK(smeta->get_ref_cnt() > 0);
-                smeta->decrement_ref_cnt();
-                smeta->decrease_reader_count();
-                smeta->unlock();
-                if (result != nullptr)
-                        *result = valid ? KvSharedResult::kDone
-                                        : KvSharedResult::kMissing;
-                return valid;
+                return kv_shared_read_value(smeta, host_id, dest, size,
+                                            KvSharedRefMode::kAcquire, result);
         }
 
         static bool kv_shared_read_value(TwoPLPashaMetadataShared *smeta,
@@ -569,48 +695,13 @@ class TwoPLPashaHelper {
                                              KvSharedRefMode::kAcquire,
                                          KvSharedResult *result = nullptr)
         {
-                if (result != nullptr) *result = KvSharedResult::kBusy;
-                if (smeta == nullptr || scc_manager == nullptr || capacity == 0)
-                        return false;
-                smeta->lock();
-                auto *scc_data = smeta->get_scc_data();
-                const uint64_t size = capacity;
-                if (smeta->is_write_locked() ||
-                    smeta->get_reader_count() == smeta->get_reader_count_max() ||
-                    (ref_mode == KvSharedRefMode::kAcquire &&
-                     smeta->get_ref_cnt() ==
-                         std::numeric_limits<uint8_t>::max())) {
-                        smeta->unlock();
-                        return false;
-                }
-                smeta->increase_reader_count();
-                if (ref_mode == KvSharedRefMode::kAcquire)
-                        smeta->increment_ref_cnt();
-                scc_manager->prepare_read(smeta, host_id, scc_data, size);
-                const bool valid =
-                    smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                if (!valid) {
-                        if (ref_mode == KvSharedRefMode::kAcquire) {
-                                DCHECK(smeta->get_ref_cnt() > 0);
-                                smeta->decrement_ref_cnt();
-                        }
-                        smeta->decrease_reader_count();
-                        smeta->unlock();
-                        if (result != nullptr) *result = KvSharedResult::kMissing;
-                        return false;
-                }
-                smeta->unlock();
-                tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
-                scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
-                tigonkv::engine::mem_access::DelayActiveScopeNow();
-                smeta->lock();
-                if (ref_mode == KvSharedRefMode::kAcquire) {
-                        DCHECK(smeta->get_ref_cnt() > 0);
-                        smeta->decrement_ref_cnt();
-                }
-                smeta->decrease_reader_count();
-                smeta->unlock();
-                if (result != nullptr) *result = KvSharedResult::kDone;
+                bool success = false;
+                remote_take_read_lock_and_read(
+                    smeta, host_id, dest, capacity,
+                    ref_mode == KvSharedRefMode::kAcquire, success, result);
+                if (!success) return false;
+                remote_read_lock_release(
+                    smeta, ref_mode == KvSharedRefMode::kAcquire);
                 return true;
         }
 
@@ -661,43 +752,21 @@ class TwoPLPashaHelper {
                                         KvSharedRefMode::kAcquire,
                                     KvSharedResult *result = nullptr)
         {
-                if (result != nullptr) *result = KvSharedResult::kBusy;
-                if (smeta == nullptr || scc_manager == nullptr) return false;
-                smeta->lock();
-                auto *scc_data = smeta->get_scc_data();
-                // Match remote_take_write_lock_and_read: a reader or writer is
-                // ordinary contention for this logical operation, not an
-                // internal reader-drain loop.
-                if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
-                    (ref_mode == KvSharedRefMode::kAcquire &&
-                     smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max())) {
-                    smeta->unlock();
-                    return false;
+                bool success = false;
+                const uint64_t observed_tid = remote_take_write_lock_and_read(
+                    smeta, host_id, nullptr, size,
+                    ref_mode == KvSharedRefMode::kAcquire, success, result,
+                    /*allow_invalid=*/true);
+                if (!success) return false;
+                if (!remote_write_locked_update(smeta, host_id, src, size,
+                                                /*allow_invalid=*/true)) {
+                        remote_write_lock_abort(
+                            smeta, ref_mode == KvSharedRefMode::kAcquire);
+                        return false;
                 }
-                smeta->set_write_locked();
-                if (ref_mode == KvSharedRefMode::kAcquire)
-                        smeta->increment_ref_cnt();
-                scc_manager->prepare_read(smeta, host_id, scc_data, size);
-                tigonkv::engine::mem_access::SharedPayloadWrite(
-                        scc_data->data, size);
-                scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
-                smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                smeta->set_is_data_modified_since_moved_in();
-                tigonkv::engine::mem_access::HwccWrite(&smeta->tid,
-                                                        sizeof(smeta->tid));
-                smeta->tid = kv_next_commit_tid(smeta->tid);
-                scc_manager->finish_write(smeta, host_id, scc_data, size);
-                smeta->unlock();
-                // Keep write_locked/ref_cnt published until the
-                // synthetic payload/writeback latency has elapsed.
-                tigonkv::engine::mem_access::DelayActiveScopeNow();
-                smeta->lock();
-                if (ref_mode == KvSharedRefMode::kAcquire) {
-                        DCHECK(smeta->get_ref_cnt() > 0);
-                        smeta->decrement_ref_cnt();
-                }
-                smeta->clear_write_locked();
-                smeta->unlock();
+                remote_write_lock_release(
+                    smeta, host_id, size, kv_next_commit_tid(observed_tid),
+                    ref_mode == KvSharedRefMode::kAcquire);
                 if (result != nullptr) *result = KvSharedResult::kDone;
                 return true;
         }
@@ -710,32 +779,13 @@ class TwoPLPashaHelper {
                                          KvSharedRefMode::kAcquire,
                                      KvSharedResult *result = nullptr)
         {
-                if (result != nullptr) *result = KvSharedResult::kBusy;
-                if (smeta == nullptr || scc_manager == nullptr || changed == nullptr)
-                        return false;
-                smeta->lock();
-                auto *scc_data = smeta->get_scc_data();
-                const uint64_t size = capacity;
-                if (!smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index)) {
-                        smeta->unlock();
-                        if (result != nullptr) *result = KvSharedResult::kMissing;
-                        return false;
-                }
-                if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
-                    (ref_mode == KvSharedRefMode::kAcquire &&
-                     smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max())) {
-                        smeta->unlock();
-                        return false;
-                }
-                smeta->set_write_locked();
-                if (ref_mode == KvSharedRefMode::kAcquire)
-                        smeta->increment_ref_cnt();
-                scc_manager->prepare_read(smeta, host_id, scc_data, size);
-                smeta->unlock();
-
-                std::string current(size, '\0');
-                tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
-                scc_manager->do_read(smeta, host_id, current.data(), scc_data->data, size);
+                if (changed == nullptr) return false;
+                std::string current(capacity, '\0');
+                bool success = false;
+                const uint64_t observed_tid = remote_take_write_lock_and_read(
+                    smeta, host_id, current.data(), capacity,
+                    ref_mode == KvSharedRefMode::kAcquire, success, result);
+                if (!success) return false;
                 std::string replacement;
                 bool write = false;
                 try {
@@ -743,39 +793,26 @@ class TwoPLPashaHelper {
                         if (write && replacement.size() != capacity)
                                 throw std::length_error("shared update requires fixed value size");
                 } catch (...) {
-                        tigonkv::engine::mem_access::DelayActiveScopeNow();
-                        smeta->lock();
-                        if (ref_mode == KvSharedRefMode::kAcquire) {
-                                DCHECK(smeta->get_ref_cnt() > 0);
-                                smeta->decrement_ref_cnt();
-                        }
-                        smeta->clear_write_locked();
-                        smeta->unlock();
+                        remote_write_lock_abort(
+                            smeta, ref_mode == KvSharedRefMode::kAcquire);
                         throw;
                 }
                 if (write) {
-                        tigonkv::engine::mem_access::SharedPayloadWrite(
-                                scc_data->data, replacement.size());
-                        scc_manager->do_write(smeta, host_id, scc_data->data,
-                                              replacement.data(), replacement.size());
-                        smeta->lock();
-                        smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                        smeta->set_is_data_modified_since_moved_in();
-                        tigonkv::engine::mem_access::HwccWrite(&smeta->tid,
-                                                                sizeof(smeta->tid));
-                        smeta->tid = kv_next_commit_tid(smeta->tid);
-                        scc_manager->finish_write(smeta, host_id, scc_data,
-                                                  replacement.size());
-                        smeta->unlock();
+                        if (!remote_write_locked_update(smeta, host_id,
+                                                        replacement.data(),
+                                                        replacement.size())) {
+                                remote_write_lock_abort(
+                                    smeta, ref_mode == KvSharedRefMode::kAcquire);
+                                return false;
+                        }
+                        remote_write_lock_release(
+                            smeta, host_id, replacement.size(),
+                            kv_next_commit_tid(observed_tid),
+                            ref_mode == KvSharedRefMode::kAcquire);
+                } else {
+                        remote_write_lock_abort(
+                            smeta, ref_mode == KvSharedRefMode::kAcquire);
                 }
-                tigonkv::engine::mem_access::DelayActiveScopeNow();
-                smeta->lock();
-                if (ref_mode == KvSharedRefMode::kAcquire) {
-                        DCHECK(smeta->get_ref_cnt() > 0);
-                        smeta->decrement_ref_cnt();
-                }
-                smeta->clear_write_locked();
-                smeta->unlock();
                 *changed = write;
                 if (result != nullptr) *result = KvSharedResult::kDone;
                 return true;
@@ -1140,88 +1177,16 @@ out_unlock_lmeta:
 
         uint64_t remote_take_read_lock_and_read(char *row, void *dest, std::size_t size, bool inc_ref_cnt, bool &success)
 	{
-		TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(row);
-                TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
-                void *src = scc_data->data;
-                uint64_t old_value = 0, new_value = 0;
-                uint64_t tid = 0;
-
-		smeta->lock();
-
-                // SCC prepare read
-                scc_manager->prepare_read(smeta, coordinator_id, scc_data, size);
-
-                if (smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) == false) {
-                        success = false;
-                        smeta->unlock();
-                        return remove_lock_bit(old_value);
-                }
-
-                old_value = smeta->tid;
-                tid = remove_lock_bit(old_value);
-
-                // can we get the lock?
-                if (smeta->is_write_locked() || smeta->get_reader_count() == smeta->get_reader_count_max()) {
-                        success = false;
-                        smeta->unlock();
-                        return tid;
-                }
-
-                // OK, we can get the lock
-                smeta->increase_reader_count();
-                success = true;
-
-                // read the data
-                scc_manager->do_read(nullptr, coordinator_id, dest, src, size);
-
-                // increase reference counting only if we get the lock
-                if (inc_ref_cnt == true) {
-                        smeta->increment_ref_cnt();
-                }
-
-                smeta->unlock();
-
-		return tid;
+		return remote_take_read_lock_and_read(
+                        reinterpret_cast<TwoPLPashaMetadataShared *>(row),
+                        coordinator_id, dest, size, inc_ref_cnt, success);
 	}
 
         uint64_t remote_read_lock_and_inc_ref_cnt(char *row, uint64_t size, bool &success)
 	{
-		TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(row);
-                TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
-                uint64_t old_value = 0, new_value = 0;
-                uint64_t tid = 0;
-
-		smeta->lock();
-
-                // SCC prepare read
-                scc_manager->prepare_read(smeta, coordinator_id, scc_data, size);
-
-                if (smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) == false) {
-                        success = false;
-                        smeta->unlock();
-                        return remove_lock_bit(old_value);
-                }
-
-                old_value = smeta->tid;
-                tid = remove_lock_bit(old_value);
-
-                // can we get the lock?
-                if (smeta->is_write_locked() || smeta->get_reader_count() == smeta->get_reader_count_max()) {
-                        success = false;
-                        smeta->unlock();
-                        return tid;
-                }
-
-                // OK, we can get the lock
-                smeta->increase_reader_count();
-                success = true;
-
-                // increase reference counting only if we get the lock
-                smeta->increment_ref_cnt();
-
-                smeta->unlock();
-
-		return tid;
+		return remote_take_read_lock_and_read(
+                        reinterpret_cast<TwoPLPashaMetadataShared *>(row),
+                        coordinator_id, nullptr, size, true, success);
 	}
 
 	uint64_t write_lock(std::atomic<uint64_t> &meta, void* data_ptr, uint64_t size, bool &success)
@@ -1407,88 +1372,16 @@ out_unlock_lmeta:
 
         uint64_t remote_take_write_lock_and_read(char *row, void *dest, std::size_t size, bool inc_ref_cnt, bool &success)
 	{
-		TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(row);
-                TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
-                void *src = scc_data->data;
-                uint64_t old_value = 0, new_value = 0;
-                uint64_t tid = 0;
-
-		smeta->lock();
-
-                // SCC prepare read
-                scc_manager->prepare_read(smeta, coordinator_id, scc_data, size);
-
-                if (smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) == false) {
-                        success = false;
-                        smeta->unlock();
-                        return remove_lock_bit(old_value);
-                }
-
-                old_value = smeta->tid;
-                tid = remove_lock_bit(old_value);
-
-                // can we get the lock?
-                if (smeta->get_reader_count() > 0 || smeta->is_write_locked()) {
-                        success = false;
-                        smeta->unlock();
-                        return tid;
-                }
-
-                // OK, we can get the lock
-                smeta->set_write_locked();
-                success = true;
-
-                // read the data
-                scc_manager->do_read(nullptr, coordinator_id, dest, src, size);
-
-                // increase reference counting only if we get the lock
-                if (inc_ref_cnt == true) {
-                        smeta->increment_ref_cnt();
-                }
-
-                smeta->unlock();
-
-		return tid;
+		return remote_take_write_lock_and_read(
+                        reinterpret_cast<TwoPLPashaMetadataShared *>(row),
+                        coordinator_id, dest, size, inc_ref_cnt, success);
 	}
 
         uint64_t remote_write_lock_and_inc_ref_cnt(char *row, uint64_t size, bool &success)
 	{
-		TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(row);
-                TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
-                uint64_t old_value = 0, new_value = 0;
-                uint64_t tid = 0;
-
-		smeta->lock();
-
-                // SCC prepare read
-                scc_manager->prepare_read(smeta, coordinator_id, scc_data, size);
-
-                if (smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) == false) {
-                        success = false;
-                        smeta->unlock();
-                        return tid;
-                }
-
-                old_value = smeta->tid;
-                tid = remove_lock_bit(old_value);
-
-                // can we get the lock?
-                if (smeta->get_reader_count() > 0 || smeta->is_write_locked()) {
-                        success = false;
-                        smeta->unlock();
-                        return tid;
-                }
-
-                // OK, we can get the lock
-                smeta->set_write_locked();
-                success = true;
-
-                // increase reference counting only if we get the lock
-                smeta->increment_ref_cnt();
-
-                smeta->unlock();
-
-		return tid;
+		return remote_take_write_lock_and_read(
+                        reinterpret_cast<TwoPLPashaMetadataShared *>(row),
+                        coordinator_id, nullptr, size, true, success);
 	}
 
 	static void read_lock_release(std::atomic<uint64_t> &meta)
@@ -1518,16 +1411,8 @@ out_unlock_lmeta:
 
         static void remote_read_lock_release(char *row)
 	{
-		TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(row);
-                TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
-                uint64_t old_value = 0, new_value = 0;
-
-		smeta->lock();
-                DCHECK(smeta->get_reader_count() > 0);
-                DCHECK(smeta->is_write_locked() == false);
-                smeta->decrease_reader_count();
-
-                smeta->unlock();
+		remote_read_lock_release(
+                        reinterpret_cast<TwoPLPashaMetadataShared *>(row));
 	}
 
 	static void write_lock_release(std::atomic<uint64_t> &meta)
@@ -1557,15 +1442,8 @@ out_unlock_lmeta:
 
         static void remote_write_lock_release(char *row)
 	{
-		TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(row);
-                TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
-                uint64_t old_value = 0, new_value = 0;
-
-		smeta->lock();
-                DCHECK(smeta->get_reader_count() == 0);
-                DCHECK(smeta->is_write_locked() == true);
-                smeta->clear_write_locked();
-                smeta->unlock();
+		remote_write_lock_abort(
+                        reinterpret_cast<TwoPLPashaMetadataShared *>(row));
 	}
 
 	void write_lock_release(std::atomic<uint64_t> &meta, uint64_t size, uint64_t new_value)
@@ -1601,22 +1479,10 @@ out_unlock_lmeta:
 
         void remote_write_lock_release(char *row, uint64_t size, uint64_t new_value)
 	{
-		TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(row);
-                TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
-                uint64_t old_value = 0;
-
-		smeta->lock();
-                DCHECK(smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) == true);
-
-                old_value = smeta->tid;
-                DCHECK(smeta->get_reader_count() == 0);
-                DCHECK(smeta->is_write_locked() == true);
-                smeta->clear_write_locked();
-
-                smeta->tid = new_value;
-
-                scc_manager->finish_write(smeta, coordinator_id, scc_data, sizeof(TwoPLPashaMetadataShared) + size);
-                smeta->unlock();
+		remote_write_lock_release(
+                        reinterpret_cast<TwoPLPashaMetadataShared *>(row),
+                        coordinator_id, sizeof(TwoPLPashaMetadataShared) + size,
+                        new_value);
 	}
 
         void modify_tuple_valid_bit(std::atomic<uint64_t> &meta, bool is_valid, bool is_insert = false)
