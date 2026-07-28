@@ -1427,8 +1427,6 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   smeta->clear_write_locked();
   smeta->unlock();
   PersistPrivateRootIfChanged();
-  mem_access::HwccAtomicRmw(&directory_.migration_in_seq);
-  directory_.migration_in_seq.fetch_add(1, std::memory_order_relaxed);
   star::num_data_move_in.fetch_add(1, std::memory_order_relaxed);
   return star::migration_result::SUCCESS;
         };

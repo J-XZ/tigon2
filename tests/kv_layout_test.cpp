@@ -63,10 +63,8 @@ int main() {
   assert(arena.private_root == kNullOffset);
   arena.private_root = 64;
   header.partitions[3].shared_root.store(128, std::memory_order_release);
-  header.partitions[3].migration_in_seq.store(1, std::memory_order_release);
   assert(arena.private_root == 64);
   assert(header.partitions[3].shared_root.load(std::memory_order_acquire) == 128);
-  assert(header.partitions[3].migration_in_seq.load(std::memory_order_acquire) == 1);
 
   alignas(PrivateValueStruct) std::byte value_storage[
       sizeof(PrivateValueStruct) + 16]{};

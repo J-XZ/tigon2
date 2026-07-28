@@ -149,7 +149,6 @@ struct alignas(64) PartitionDirectoryEntry {
   // tree op loads this atomically so already-attached peers see splits.
   std::atomic<RegionOffset> shared_root{kNullOffset};
   RegionOffset private_arena = kNullOffset;
-  std::atomic<uint64_t> migration_in_seq{0};
 };
 static_assert(sizeof(PartitionDirectoryEntry) == 64,
               "directory contains only globally coherent shared-tree state");

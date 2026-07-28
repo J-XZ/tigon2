@@ -302,16 +302,12 @@ int main() {
   assert(latency_stats.hwcc_raw_line_accesses > 0);
   simulator.Configure(latency_sim::Config{});
   assert(partition.DeletePrivate("latency-only"));
-  const uint64_t migration_in_before_alpha =
-      regions.layout().partitions[5].migration_in_seq.load();
   assert(partition.PromotePrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == FixedValue("updated"));
   // Once migrated, PUT must update the shared SCC authority rather than the
   // retained private locator row.
   assert(!partition.PutPrivate("alpha", "shared-update"));
   assert(partition.GetPrivate("alpha", &value) && value == FixedValue("shared-update"));
-  assert(regions.layout().partitions[5].migration_in_seq.load() ==
-         migration_in_before_alpha + 1);
   assert(partition.MoveOutPrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == FixedValue("shared-update"));
   // A shared write marks the cached payload dirty.  Move-in must copy that
