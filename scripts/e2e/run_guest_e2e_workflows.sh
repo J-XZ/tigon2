@@ -40,10 +40,34 @@ remote() {
   ssh "${ssh_opts[@]}" -p "$((base_port + vm))" root@127.0.0.1 "$@"
 }
 
+kill_guest_suite() {
+  local suite=$1 vm=$2 runner quoted_runner
+  runner="$remote_root/build/e2e_${suite}"
+  printf -v quoted_runner '%q' "$runner"
+  # Guest images need not provide killall.  Match /proc/exe rather than COMM:
+  # an interrupted run can otherwise keep the shared transport rings live
+  # while the next fresh-pool round starts.
+  remote "$vm" "runner=$quoted_runner; \
+for proc in /proc/[0-9]*; do \
+  exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); \
+  case \"\$exe\" in \
+    \"\$runner\"|\"\$runner (deleted)\") kill -9 \"\${proc##*/}\" 2>/dev/null || true ;; \
+  esac; \
+done; \
+for proc in /proc/[0-9]*; do \
+  exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); \
+  case \"\$exe\" in \
+    \"\$runner\"|\"\$runner (deleted)\") \
+      echo \"failed to stop stale guest runner pid=\${proc##*/} exe=\$exe\" >&2; exit 1 ;; \
+  esac; \
+done"
+}
+
 sync_guest_binary() {
   local suite=$1 vm
   for ((vm = 0; vm < vm_count; vm++)); do
-    remote "$vm" "killall -9 e2e_${suite} 2>/dev/null; sleep 0.2; rm -f '$remote_root/build/e2e_${suite}'; true"
+    kill_guest_suite "$suite" "$vm"
+    remote "$vm" "rm -f '$remote_root/build/e2e_${suite}'"
     remote "$vm" "mkdir -p '$remote_root/build'"
     scp "${ssh_opts[@]}" -P "$((base_port + vm))" \
       "$binary_dir/e2e_${suite}" "root@127.0.0.1:$remote_root/build/e2e_${suite}.new" >/dev/null

@@ -176,6 +176,70 @@ PhaseResult RunWorkers(KVStore &store, const Config &base, uint64_t total, Opera
   return {phase_end - phase_start, node_count};
 }
 
+// The original Executor keeps every worker alive to process its own inbound
+// Message queue after it has exhausted local work.  A guest phase is
+// intentionally asymmetric across range owners, so returning a finished
+// worker before peers reach the host-release barrier would strand a later
+// request addressed to that worker id.  Keep the original per-worker queue
+// ownership: no worker steals or polls another worker's inbox.
+template <typename Operation, typename OnReplayDone>
+PhaseResult RunWorkersWithPeerService(KVStore &store, const Config &base,
+                                      uint64_t total, Operation operation,
+                                      OnReplayDone on_replay_done) {
+  const uint64_t threads = PositiveEnv("TIGONKV_E2E_THREADS",
+                                       base.foreground_worker_count_per_vm);
+  const uint64_t node_count = CountForPart(total, base.vm_count, base.node_id);
+  const uint64_t node_start = StartForPart(total, base.vm_count, base.node_id);
+  std::atomic<bool> start{false};
+  std::atomic<bool> release{false};
+  std::atomic<uint64_t> replayed{0};
+  std::atomic<bool> failed{false};
+  std::mutex error_mutex;
+  std::exception_ptr error;
+  std::vector<std::thread> workers;
+  workers.reserve(static_cast<size_t>(threads));
+  const uint64_t phase_start = NowUs();
+  for (uint64_t worker = 0; worker < threads; ++worker) {
+    workers.emplace_back([&, worker] {
+      try {
+        store.BindWorker(static_cast<uint32_t>(worker));
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        const uint64_t worker_start = StartForPart(node_count, threads, worker);
+        const uint64_t worker_count = CountForPart(node_count, threads, worker);
+        for (uint64_t i = 0; i < worker_count; ++i)
+          operation(store, worker, node_start + worker_start + i, i);
+        replayed.fetch_add(1, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+          const Status status = store.PollTransport();
+          if (!status.ok())
+            throw std::runtime_error("phase transport poll failed: " + status.message);
+          std::this_thread::yield();
+        }
+        store.ReleaseWorker();
+      } catch (...) {
+        try {
+          store.ReleaseWorker();
+        } catch (...) {
+        }
+        {
+          std::lock_guard<std::mutex> guard(error_mutex);
+          if (!error) error = std::current_exception();
+        }
+        failed.store(true, std::memory_order_release);
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  while (replayed.load(std::memory_order_acquire) != threads &&
+         !failed.load(std::memory_order_acquire))
+    std::this_thread::yield();
+  if (!failed.load(std::memory_order_acquire)) on_replay_done();
+  release.store(true, std::memory_order_release);
+  for (auto &worker : workers) worker.join();
+  if (error) std::rethrow_exception(error);
+  return {NowUs() - phase_start, node_count};
+}
+
 inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
   const uint64_t threads = PositiveEnv("TIGONKV_E2E_THREADS",
                                        base.foreground_worker_count_per_vm);
@@ -256,7 +320,8 @@ inline void DrainTransport(KVStore &store) {
 // suites. Guests do not share a filesystem; the host creates the same marker
 // locally on every VM only after every replay has completed. Until then this
 // VM must keep serving peers that issue a late remote request.
-inline void WaitForHostRelease(const std::string &phase, KVStore &store) {
+inline void WaitForHostRelease(const std::string &phase, KVStore &store,
+                               bool service_transport = true) {
   const std::string release_file = Env("TIGONKV_E2E_RELEASE_FILE");
   if (release_file.empty()) return;
   {
@@ -269,10 +334,12 @@ inline void WaitForHostRelease(const std::string &phase, KVStore &store) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::seconds(timeout);
   while (!std::filesystem::exists(release_file)) {
-    const Status status = store.PollTransport();
-    if (!status.ok())
-      throw std::runtime_error(
-          "transport poll failed while waiting for host release: " + status.message);
+    if (service_transport) {
+      const Status status = store.PollTransport();
+      if (!status.ok())
+        throw std::runtime_error(
+            "transport poll failed while waiting for host release: " + status.message);
+    }
     if (std::chrono::steady_clock::now() >= deadline)
       throw std::runtime_error("host release timeout for phase " + phase);
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -292,13 +359,17 @@ inline int RunE2E08MultiVm() {
   const uint64_t total = PositiveEnv("TIGONKV_E2E08_TOTAL_KEYS", 100000);
   PhaseResult result;
   if (phase == "fill") {
-    result = RunWorkers(*main_store, config, total, [](KVStore &store, uint64_t, uint64_t index, uint64_t) {
+    result = RunWorkersWithPeerService(*main_store, config, total, [&](KVStore &store, uint64_t, uint64_t index, uint64_t) {
       const std::string key = Key08(index);
       const Status status = store.Put(key, Value08(key));
       if (!status.ok()) throw std::runtime_error("e2e08 fill PUT failed: " + status.message);
+    }, [&] {
+      std::cerr << "E2E_08_STAGE node=" << config.node_id << " phase=" << phase
+                << " stage=replay_done\n" << std::flush;
+      WaitForHostRelease(phase, *main_store, /*service_transport=*/false);
     });
   } else if (phase == "read") {
-    result = RunWorkers(*main_store, config, total, [&](KVStore &store, uint64_t worker, uint64_t, uint64_t i) {
+    result = RunWorkersWithPeerService(*main_store, config, total, [&](KVStore &store, uint64_t worker, uint64_t, uint64_t i) {
       const uint64_t index = SplitMix64(0xe2080000ULL ^
           (static_cast<uint64_t>(config.node_id) << 32U) ^
           ((worker + 1) << 16U) ^ i) % total;
@@ -309,13 +380,14 @@ inline int RunE2E08MultiVm() {
                                  " status=" + std::to_string(static_cast<uint32_t>(got.status.code)) +
                                  " message=" + got.status.message +
                                  " value_size=" + std::to_string(got.value.size()));
+    }, [&] {
+      std::cerr << "E2E_08_STAGE node=" << config.node_id << " phase=" << phase
+                << " stage=replay_done\n" << std::flush;
+      WaitForHostRelease(phase, *main_store, /*service_transport=*/false);
     });
   } else {
     throw std::invalid_argument("e2e08 phase must be fill or read");
   }
-  std::cerr << "E2E_08_STAGE node=" << config.node_id << " phase=" << phase
-            << " stage=replay_done\n" << std::flush;
-  WaitForHostRelease(phase, *main_store);
   DrainTransport(*main_store);
   std::cout << "E2E_08_PHASE_TIME_US node=" << config.node_id << " phase=" << phase
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";
@@ -346,27 +418,32 @@ inline int RunE2E09MultiVm() {
   PhaseResult result;
   if (phase == "fill" || phase == "update") {
     const uint64_t generation = phase == "update" ? 1 : 0;
-    result = RunWorkers(*main_store, config, total, [generation](KVStore &store, uint64_t, uint64_t index, uint64_t) {
+    result = RunWorkersWithPeerService(*main_store, config, total, [generation](KVStore &store, uint64_t, uint64_t index, uint64_t) {
       const Status status = store.Put(Key09(index), Value09(index, generation));
       if (!status.ok()) throw std::runtime_error("e2e09 PUT failed: " + status.message);
+    }, [&] {
+      std::cerr << "E2E_09_STAGE node=" << config.node_id << " phase=" << phase
+                << " stage=replay_done\n" << std::flush;
+      WaitForHostRelease(phase, *main_store, /*service_transport=*/false);
     });
   } else if (phase == "read") {
-    result = RunWorkers(*main_store, config, total, [&](KVStore &store, uint64_t worker, uint64_t, uint64_t i) {
+    result = RunWorkersWithPeerService(*main_store, config, total, [&](KVStore &store, uint64_t worker, uint64_t, uint64_t i) {
       const uint64_t index = SplitMix64(0xe2090000ULL ^
           (static_cast<uint64_t>(config.node_id) << 32U) ^
           ((worker + 1) << 16U) ^ i) % total;
       const GetResult got = store.Get(Key09(index));
       if (!got.status.ok() || got.value != Value09(index, 1))
         throw std::runtime_error("e2e09 read verification failed for index " + std::to_string(index));
+    }, [&] {
+      std::cerr << "E2E_09_STAGE node=" << config.node_id << " phase=" << phase
+                << " stage=replay_done\n" << std::flush;
+      WaitForHostRelease(phase, *main_store, /*service_transport=*/false);
     });
   } else if (phase == "mixed") {
     result = RunMixedWorkers(*main_store, config);
   } else {
     throw std::invalid_argument("e2e09 phase must be fill, update, read, or mixed");
   }
-  std::cerr << "E2E_09_STAGE node=" << config.node_id << " phase=" << phase
-            << " stage=replay_done\n" << std::flush;
-  WaitForHostRelease(phase, *main_store);
   DrainTransport(*main_store);
   std::cout << "E2E_09_PHASE_TIME_US node=" << config.node_id << " phase=" << phase
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";

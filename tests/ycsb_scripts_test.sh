@@ -38,6 +38,11 @@ guest_workflow="$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh"
 rg -q 'kill_guest_runners' "$guest_workflow"
 rg -Fq 'for proc in /proc/[0-9]*' "$guest_workflow"
 rg -Fq 'readlink \"\$proc/exe\"' "$guest_workflow"
+e2e_workflow="$root/scripts/e2e/run_guest_e2e_workflows.sh"
+! rg -q 'killall .*e2e_' "$e2e_workflow"
+rg -q 'kill_guest_suite' "$e2e_workflow"
+rg -Fq 'for proc in /proc/[0-9]*' "$e2e_workflow"
+rg -Fq 'readlink \"\$proc/exe\"' "$e2e_workflow"
 # A guest that finishes replay first must keep servicing peer transport until
 # every VM reaches replay_done.
 rg -q 'TIGONKV_E2E_RELEASE_FILE=' "$guest_workflow"
