@@ -61,7 +61,8 @@ class KVPartition {
                               bool *inserted = nullptr);
   bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value,
                         bool *inserted = nullptr);
-  // Non-owner APIs never touch PrivateRow. Point ops use TryPinShared + SCC.
+  // Non-owner APIs never touch owner-private ValueStruct/local metadata. Point
+  // ops use TryPinShared + SCC.
   // SharedAccessState distinguishes miss vs contention (§10.1); HasShared gone.
   SharedAccessState GetShared(std::string_view key, uint32_t host_id,
                               std::string *value) const;
@@ -128,7 +129,7 @@ class KVPartition {
   void ClockTrackMigratedKey(const void *key_bytes);
   void ClockUntrackMigratedKey(const void *key_bytes);
   void ClockUntrackRowOffset(RegionOffset row_off);
-  // Returns the PrivateRow offset under the Clock cursor (or kNullOffset).
+  // Returns the private ValueStruct offset under the Clock cursor (or null).
   RegionOffset ClockAdvanceCursor();
   bool ClockMoveOutRow(RegionOffset row_off);
   // Second-chance eviction loop used by the original PolicyClock gate.
@@ -154,15 +155,18 @@ class KVPartition {
   // Matches core/Executor: enter before observing shared tree/row/move paths.
   void EnterEbr() const { ebr_.enter_critical_section(); }
   FixedKey MakeKey(std::string_view key) const;
-  PrivateRow *RowFromOffset(RegionOffset offset) const;
-  PrivateRow *AllocateRow(const FixedKey &key, std::string_view value);
-  static void LockRow(PrivateRow *row);
-  static bool TryLockRow(PrivateRow *row);
-  static void UnlockRow(PrivateRow *row);
+  PrivateValueStruct *ValueFromOffset(RegionOffset offset) const;
+  PrivateMetadataLocal *MetadataFromValue(PrivateValueStruct *value) const;
+  PrivateClockTrackerNode *ClockNodeFromOffset(RegionOffset offset) const;
+  PrivateValueStruct *AllocateValue(std::string_view value);
+  PrivateMetadataLocal *AllocateMetadata();
+  static void LockRow(PrivateMetadataLocal *metadata);
+  static bool TryLockRow(PrivateMetadataLocal *metadata);
+  static void UnlockRow(PrivateMetadataLocal *metadata);
   std::string KeyString(const FixedKey &key) const;
   void NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const;
   // Pin shared smeta so MoveOut cannot retire it between tree lookup and SCC
-  // access (replaces the old non-owner PrivateRow LockRow quiescence window).
+  // access.
   SharedAccessState TryPinShared(const FixedKey &key,
                                  star::TwoPLPashaMetadataShared **smeta,
                                  RegionOffset *smeta_offset) const;
@@ -177,7 +181,8 @@ class KVPartition {
   struct RowRef {
     FixedKey key{};
     RegionOffset offset = kNullOffset;
-    PrivateRow *row = nullptr;
+    PrivateValueStruct *value = nullptr;
+    PrivateMetadataLocal *metadata = nullptr;
   };
   struct Neighborhood {
     bool has_prev = false;
@@ -195,8 +200,8 @@ class KVPartition {
   void SetPrevReal(const RowRef &row, bool real);
   void RefreshAdjacencyLocked(const Neighborhood &neighborhood);
   void BreakAdjacencyLocked(const Neighborhood &neighborhood);
-  bool InsertPrivateRow(const FixedKey &key, PrivateRow *row);
-  void FreeUnpublishedPrivateRow(PrivateRow *row);
+  bool InsertPrivateValue(const FixedKey &key, PrivateValueStruct *value);
+  void FreeUnpublishedPrivateValue(PrivateValueStruct *value);
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;
   uint32_t partition_id_;
@@ -212,7 +217,7 @@ class KVPartition {
   // Process-local cache of the last published private root offset (§11.6).
   RegionOffset persisted_private_root_offset_ = kNullOffset;
   uint64_t private_root_publishes_ = 0;
-  // Process-local Clock list lock; list nodes live in SWCC PrivateRow (§11.14).
+  // Process-local Clock list lock; list nodes live in owner-private metadata.
   pthread_spinlock_t clock_lock_{};
   bool clock_lock_inited_ = false;
 };

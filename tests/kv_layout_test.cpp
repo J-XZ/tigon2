@@ -15,7 +15,8 @@ int main() {
   assert(kMaxPartitions >= 16);
   assert(kSharedLayoutVersion == 19);
   assert(sizeof(PartitionDirectoryEntry) == 64);
-  assert(sizeof(PrivateRow) == 64);
+  assert(sizeof(PrivateValueStruct) == sizeof(RegionOffset));
+  assert(alignof(PrivateMetadataLocal) == 64);
   // §11.4 WireSize: header = offsetof(value); value bytes only on the wire.
   assert(WireHeaderBytes() == offsetof(KvMessage, value));
   {
@@ -86,12 +87,15 @@ int main() {
   assert(header.partitions[3].shared_root.load(std::memory_order_acquire) == 128);
   assert(header.partitions[3].migration_in_seq.load(std::memory_order_acquire) == 1);
 
-  alignas(PrivateRow) std::byte storage[sizeof(PrivateRow) + 16]{};
-  auto *row = new (storage) PrivateRow;
-  row->key_len = 3;
-  row->version = 9;
-  std::memcpy(row->kv, "keyvalue", 8);
-  assert(std::memcmp(row->kv, "keyvalue", 8) == 0);
-  assert(row->migrated_smeta_off == kNullOffset && row->is_migrated == 0);
+  alignas(PrivateValueStruct) std::byte value_storage[
+      sizeof(PrivateValueStruct) + 16]{};
+  auto *private_value = new (value_storage) PrivateValueStruct;
+  std::memcpy(private_value->data, "value", 6);
+  assert(std::memcmp(private_value->data, "value", 6) == 0);
+  alignas(PrivateMetadataLocal) std::byte metadata_storage[
+      sizeof(PrivateMetadataLocal)]{};
+  auto *metadata = new (metadata_storage) PrivateMetadataLocal;
+  assert(metadata->migrated_smeta_off == kNullOffset && !metadata->is_migrated);
+  pthread_spin_destroy(&metadata->latch);
   return 0;
 }

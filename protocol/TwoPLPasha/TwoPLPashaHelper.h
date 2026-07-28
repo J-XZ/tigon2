@@ -9,6 +9,7 @@
 #include <list>
 #include <tuple>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "common/CCSet.h"
@@ -373,6 +374,98 @@ class TwoPLPashaHelper {
 
         enum class KvSharedResult : uint8_t { kDone, kMissing, kBusy };
 
+        // The transaction layer normally owns a per-worker max_tid.  The KV
+        // facade has one-operation transactions, so retain only that bounded
+        // thread-local state and reuse the original TID bit layout.
+        static uint64_t kv_next_commit_tid(uint64_t observed_tid)
+        {
+                static thread_local uint64_t max_tid = 0;
+                const uint64_t observed = remove_lock_bit(observed_tid);
+                if (observed >= max_tid) max_tid = observed + 1;
+                else ++max_tid;
+                if (max_tid >= (uint64_t{1} << READ_LOCK_BIT_OFFSET))
+                        throw std::overflow_error("TwoPLPasha KV TID overflow");
+                return max_tid;
+        }
+
+        // Offset-adapted overloads of the original non-migrated local-row
+        // branches below. `LocalMetadata` deliberately has the same
+        // latch/tid/valid fields as TwoPLPashaMetadataLocal; the KV layout
+        // supplies it through ValueStruct::meta rather than a persisted VA.
+        template <typename LocalMetadata>
+        static uint64_t kv_take_private_read_lock_and_read(
+            LocalMetadata &lmeta, const void *src, void *dest, std::size_t size,
+            bool &success, bool *migrated = nullptr)
+        {
+                uint64_t old_value = 0;
+                lmeta.lock();
+                if (migrated != nullptr) *migrated = lmeta.is_migrated;
+                if (!lmeta.is_valid || lmeta.is_migrated) {
+                        success = false;
+                } else {
+                        old_value = lmeta.tid;
+                        if (is_write_locked(old_value) ||
+                            read_lock_num(old_value) == read_lock_max()) {
+                                success = false;
+                        } else {
+                                lmeta.tid = old_value +
+                                    (uint64_t{1} << READ_LOCK_BIT_OFFSET);
+                                std::memcpy(dest, src, size);
+                                success = true;
+                        }
+                }
+                lmeta.unlock();
+                return remove_lock_bit(old_value);
+        }
+
+        template <typename LocalMetadata>
+        static uint64_t kv_take_private_write_lock(LocalMetadata &lmeta,
+                                                   bool &success,
+                                                   bool *migrated = nullptr)
+        {
+                uint64_t old_value = 0;
+                lmeta.lock();
+                if (migrated != nullptr) *migrated = lmeta.is_migrated;
+                if (!lmeta.is_valid || lmeta.is_migrated) {
+                        success = false;
+                } else {
+                        old_value = lmeta.tid;
+                        if (is_read_locked(old_value) || is_write_locked(old_value)) {
+                                success = false;
+                        } else {
+                                lmeta.tid = old_value |
+                                    (WRITE_LOCK_BIT_MASK << WRITE_LOCK_BIT_OFFSET);
+                                success = true;
+                        }
+                }
+                lmeta.unlock();
+                return remove_lock_bit(old_value);
+        }
+
+        template <typename LocalMetadata>
+        static void kv_private_read_lock_release(LocalMetadata &lmeta)
+        {
+                lmeta.lock();
+                const uint64_t old_value = lmeta.tid;
+                DCHECK(is_read_locked(old_value));
+                DCHECK(!is_write_locked(old_value));
+                lmeta.tid = old_value - (uint64_t{1} << READ_LOCK_BIT_OFFSET);
+                lmeta.unlock();
+        }
+
+        template <typename LocalMetadata>
+        static void kv_private_write_lock_release(LocalMetadata &lmeta,
+                                                  uint64_t new_tid)
+        {
+                lmeta.lock();
+                DCHECK(is_write_locked(lmeta.tid));
+                DCHECK(!is_read_locked(lmeta.tid));
+                DCHECK(!is_write_locked(new_tid));
+                DCHECK(!is_read_locked(new_tid));
+                lmeta.tid = new_tid;
+                lmeta.unlock();
+        }
+
         TwoPLPashaHelper(std::size_t coordinator_id, Context context, std::vector<std::vector<CXLTableBase *> > &cxl_tbl_vecs)
                 : coordinator_id(coordinator_id)
                 , context(context)
@@ -513,6 +606,10 @@ class TwoPLPashaHelper {
                         scc_data->data, size);
                 scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
                 smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
+                smeta->set_is_data_modified_since_moved_in();
+                tigonkv::engine::mem_access::HwccWrite(&smeta->tid,
+                                                        sizeof(smeta->tid));
+                smeta->tid = kv_next_commit_tid(smeta->tid);
                 scc_manager->finish_write(smeta, host_id, scc_data, size);
                 smeta->unlock();
                 // Keep write_locked/ref_cnt published until the
@@ -579,6 +676,10 @@ class TwoPLPashaHelper {
                                               replacement.data(), replacement.size());
                         smeta->lock();
                         smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
+                        smeta->set_is_data_modified_since_moved_in();
+                        tigonkv::engine::mem_access::HwccWrite(&smeta->tid,
+                                                                sizeof(smeta->tid));
+                        smeta->tid = kv_next_commit_tid(smeta->tid);
                         scc_manager->finish_write(smeta, host_id, scc_data,
                                                   replacement.size());
                         smeta->unlock();

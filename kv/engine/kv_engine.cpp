@@ -442,7 +442,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   KvMigrationRuntime::Instance().Install(
       partition_ptrs, config.fixed_key_size, config.fixed_value_size,
       config.node_id, config.partition_count, hw_budget);
-  // Clock list head/tail/cursor and PrivateRow links persist in SWCC; attach
+  // Clock tracker nodes persist in owner-private SWCC; attach
   // does not rebuild a process-heap tracker (§11.14).
   engine->StartInboundDemuxer();
   return engine;
@@ -977,7 +977,7 @@ MemoryStats KVEngine::Memory() const {
       stats.active_shared_rows += partition->migrated_key_count();
   }
   // Physical capacity vs Clock dynamic limit (§11.10). Clock links live in
-  // SWCC PrivateRow after §11.14, so process-heap tracker DRAM is zero.
+  // owner-private SWCC after §11.14, so process-heap tracker DRAM is zero.
   stats.physical_hwcc_capacity_bytes = config_.hwcc_size_mb * 1024ULL * 1024ULL;
   // Open-time clamp (§11.10); do not recompute from raw config alone.
   stats.owner_migration_dynamic_budget_bytes =

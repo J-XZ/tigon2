@@ -46,6 +46,9 @@ tigonkv::engine::DualRegionConfig Config() {
   config.partition_count = 8;
   config.fixed_key_size = 32;
   config.fixed_value_size = 128;
+  // The original ValueStruct/local-metadata split and owner-private Clock
+  // tracker node use separate owner-private allocations.
+  config.owner_private_swcc_fraction = 0.5;
   return config;
 }
 
@@ -224,6 +227,13 @@ int main() {
   assert(latency_stats.swcc_raw_line_accesses > 0);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   assert(partition.PromotePrivate("latency-only", 1));
+  const uint64_t cached_payload_used = partition.shared_payload_used_bytes();
+  assert(partition.MoveOutPrivate("latency-only", 1));
+  // Original TwoPLPasha retains the SCC allocation across ordinary move-out;
+  // the next move-in must reuse it rather than allocate a second payload.
+  assert(partition.shared_payload_used_bytes() == cached_payload_used);
+  assert(partition.PromotePrivate("latency-only", 1));
+  assert(partition.shared_payload_used_bytes() == cached_payload_used);
   assert(partition.MoveOutPrivate("latency-only", 1));
   simulator.EndScopeAndDelay();
   latency_stats = simulator.TakeStatsAndReset();
@@ -241,6 +251,13 @@ int main() {
   assert(partition.GetPrivate("alpha", &value) && value == FixedValue("shared-update"));
   assert(regions.layout().partitions[5].migration_in_seq.load() ==
          migration_in_before_alpha + 1);
+  assert(partition.MoveOutPrivate("alpha", 1));
+  assert(partition.GetPrivate("alpha", &value) && value == FixedValue("shared-update"));
+  // A shared write marks the cached payload dirty.  Move-in must copy that
+  // authoritative value once, while still reusing the same allocation.
+  const uint64_t alpha_payload_used = partition.shared_payload_used_bytes();
+  assert(partition.PromotePrivate("alpha", 1));
+  assert(partition.shared_payload_used_bytes() == alpha_payload_used);
   assert(partition.MoveOutPrivate("alpha", 1));
   assert(partition.GetPrivate("alpha", &value) && value == FixedValue("shared-update"));
   assert(partition.PutPrivate("delete-shared", "value"));

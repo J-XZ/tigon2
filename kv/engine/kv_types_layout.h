@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <pthread.h>
 #include <stdexcept>
 #include <string_view>
 
@@ -20,7 +21,7 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // v11: the Scan generation also covers logical-key insertion/deletion.
 // v12: original TwoPLPasha next/prev adjacency bits make shared visibility
 // changes self-validating; the generation now certifies logical EOF only.
-// v13: PolicyClock tracker links live in PrivateRow / PartitionDirectoryEntry
+// v13: PolicyClock tracker state lives in owner-private SWCC.
 // (owner-private SWCC), not process-heap ClockTrackerNode (§11.14).
 // v14: PartitionDirectoryEntry carries O(1) migrated_key_count (§11.16).
 // v15: layout identity includes the configured ordered range boundaries.
@@ -102,22 +103,44 @@ struct FixedKeyComparator {
   }
 };
 
-// Owner-private SWCC row header. The key bytes are followed by value bytes in
-// kv[]; no raw process pointer is persisted here.
-struct alignas(64) PrivateRow {
-  std::atomic<uint32_t> latch{0};
-  uint8_t is_migrated = 0;
-  uint8_t is_tombstone = 0;
-  uint16_t key_len = 0;
-  uint64_t version = 0;
-  RegionOffset migrated_smeta_off = kNullOffset;
-  // Intrusive PolicyClock list links in owner-private SWCC (§11.14).
-  RegionOffset clock_prev_off = kNullOffset;
-  RegionOffset clock_next_off = kNullOffset;
-  char kv[];
+// Offset-adapted forms of the original TableBTreeOLC::ValueStruct and
+// TwoPLPashaMetadataLocal.  They are separate owner-private allocations: the
+// leaf carries the ValueStruct offset, its atomic meta carries this metadata
+// offset, and no process virtual address survives an attach.
+struct PrivateValueStruct {
+  std::atomic<RegionOffset> meta{kNullOffset};
+  char data[];
 };
-static_assert(sizeof(PrivateRow) == 64,
-              "PrivateRow clock links must stay inside the existing 64B header");
+
+struct alignas(64) PrivateMetadataLocal {
+  PrivateMetadataLocal() {
+    pthread_spin_init(&latch, PTHREAD_PROCESS_PRIVATE);
+  }
+
+  void lock() { pthread_spin_lock(&latch); }
+  void unlock() { pthread_spin_unlock(&latch); }
+
+  pthread_spinlock_t latch;
+  uint64_t tid{0};
+  bool is_valid{false};
+  bool is_migrated{false};
+  bool is_data_modified_since_moved_out{true};
+  uint8_t reserved{0};
+  RegionOffset migrated_smeta_off{kNullOffset};
+  RegionOffset scc_data_off{kNullOffset};
+  RegionOffset clock_node_off{kNullOffset};
+};
+static_assert(alignof(PrivateMetadataLocal) == 64);
+
+// Mechanical owner-private adaptation of PolicyClock::ClockTrackerNode.  The
+// original node owns a key copy independently of ValueStruct; keeping it
+// separate avoids smuggling a key into the local-row header.
+struct PrivateClockTrackerNode {
+  RegionOffset value_off{kNullOffset};
+  RegionOffset prev_off{kNullOffset};
+  RegionOffset next_off{kNullOffset};
+  FixedKey key{};
+};
 
 struct alignas(64) PartitionDirectoryEntry {
   // Shared-tree live root (HWCC). Updated on makeRoot/merge; every shared
@@ -169,7 +192,6 @@ struct alignas(64) SharedLayoutHeader {
 
 static_assert(alignof(SharedLayoutHeader) == 64);
 static_assert(sizeof(FixedKey) == kMaxFixedKeyBytes);
-static_assert(alignof(PrivateRow) == 64);
 static_assert(alignof(PartitionDirectoryEntry) == 64);
 
 }  // namespace tigonkv::engine
