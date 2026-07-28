@@ -2025,6 +2025,138 @@ restart:
 		}
 	}
 
+	// Mechanical offset-safe counterpart of BTreeOLC::insert_lock_next_key.
+	// Keep the original narrower lock scope: unlike the adjacent-tuple variant,
+	// this callback locks only the immediate successor leaf.
+	bool insert_lock_next_key(
+		const KeyType &k, const ValueType &v,
+		std::function<bool(const KeyType *next_key, ValueType *next_value)>
+			next_key_processor)
+	{
+		TreeAccessScope access_scope(allocation_);
+		int restartCount = 0;
+	restart:
+		if (restartCount++) yield(restartCount, true);
+		bool needRestart = false;
+		NodeBase *node = load_root();
+		RecordTreeAccess(allocation_, node, false);
+		uint64_t versionNode = node->readLockOrRestart(needRestart);
+		if (needRestart || node != load_root()) {
+			node->readUnlockOrRestart(versionNode, needRestart);
+			goto restart;
+		}
+		BTreeInner *parent = nullptr;
+		uint64_t versionParent = 0;
+		while (node->getType() == NodeType::BTreeInner) {
+			auto *inner = static_cast<BTreeInner *>(node);
+			if (inner->isFull()) {
+				if (parent) {
+					parent->upgradeToWriteLockOrRestart(versionParent, needRestart);
+					if (needRestart) goto restart;
+				}
+				node->upgradeToWriteLockOrRestart(versionNode, needRestart);
+				if (needRestart) {
+					if (parent) parent->writeUnlock();
+					goto restart;
+				}
+				if (!parent && node != load_root()) {
+					node->writeUnlock();
+					goto restart;
+				}
+				KeyType sep;
+				BTreeInner *newInner = inner->split(sep, allocation_);
+				stats_.inner_nodes++;
+				if (parent) parent->insert(sep, newInner, keyComp_);
+				else makeRoot(sep, inner, newInner);
+				node->writeUnlock();
+				if (parent) parent->writeUnlock();
+				goto restart;
+			}
+			if (parent) {
+				parent->readUnlockOrRestart(versionParent, needRestart);
+				if (needRestart) goto restart;
+			}
+			parent = inner;
+			versionParent = versionNode;
+			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
+			RecordTreeAccess(allocation_, node, false);
+			inner->checkOrRestart(versionNode, needRestart);
+			if (needRestart) goto restart;
+			versionNode = node->readLockOrRestart(needRestart);
+			if (needRestart) goto restart;
+		}
+		if (parent) {
+			parent->checkOrRestart(versionParent, needRestart);
+			if (needRestart) {
+				node->readUnlockOrRestart(versionNode, needRestart);
+				goto restart;
+			}
+		}
+		auto *leaf = static_cast<BTreeLeaf *>(node);
+		if (leaf->getCount() == leaf->maxEntries) {
+			if (parent) {
+				parent->upgradeToWriteLockOrRestart(versionParent, needRestart);
+				if (needRestart) goto restart;
+			}
+			node->upgradeToWriteLockOrRestart(versionNode, needRestart);
+			if (needRestart) {
+				if (parent) parent->writeUnlock();
+				goto restart;
+			}
+			if (!parent && node != load_root()) {
+				node->writeUnlock();
+				goto restart;
+			}
+			KeyType sep;
+			BTreeLeaf *newLeaf = leaf->split(sep, allocation_);
+			stats_.leaf_nodes++;
+			if (parent) parent->insert(sep, newLeaf, keyComp_);
+			else makeRoot(sep, leaf, newLeaf);
+			node->writeUnlock();
+			if (parent) parent->writeUnlock();
+			goto restart;
+		}
+		node->upgradeToWriteLockOrRestart(versionNode, needRestart);
+		if (needRestart) goto restart;
+		if (parent) {
+			parent->readUnlockOrRestart(versionParent, needRestart);
+			if (needRestart) {
+				node->writeUnlock();
+				goto restart;
+			}
+		}
+		const unsigned pos = leaf->lowerBound(k, keyComp_);
+		bool success = false;
+		BTreeLeaf *nextLeaf = nullptr;
+		if (pos >= leaf->getCount() || keyComp_(leaf->keys_[pos], k) != 0) {
+			const KeyType *next_key = nullptr;
+			ValueType *next_value = nullptr;
+			if (pos == leaf->getCount()) {
+				nextLeaf = leaf->next_.get();
+				CHECK(nextLeaf != nullptr);
+				RecordTreeAccess(allocation_, nextLeaf, true);
+				nextLeaf->writeLockOrRestart(needRestart);
+				if (needRestart) {
+					leaf->writeUnlock();
+					goto restart;
+				}
+				next_key = &nextLeaf->keys_[0];
+				next_value = &nextLeaf->values_[0];
+			} else {
+				next_key = &leaf->keys_[pos];
+				next_value = &leaf->values_[pos];
+			}
+			if (next_key_processor(next_key, next_value)) {
+				success = leaf->insert(k, v, keyComp_);
+				CHECK(success == true);
+			}
+		}
+		if (nextLeaf) nextLeaf->writeUnlock();
+		node->writeUnlock();
+		if (success) stats_.num_items++;
+		return success;
+	}
+
 	// Mechanical offset-safe counterpart of BTreeOLC::
 	// insert_and_process_adjacent_tuples.  The callback runs while the target
 	// leaf and any leaf containing its immediate predecessor/successor remain

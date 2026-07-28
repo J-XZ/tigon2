@@ -150,6 +150,19 @@ int main() {
         table_adjacent_called = true;
       }));
   assert(table_adjacent_called);
+  const auto table_insert_key = tigonkv::engine::FixedKey::From("table-next", 32);
+  const std::string table_insert_value = FixedValue("table-value");
+  bool next_key_locked = false;
+  assert(table->insert_lock_next_key(
+      &table_insert_key, table_insert_value.data(),
+      [&](const void *next_key, star::ITable::MetaDataType *next_meta,
+          void *next_data) {
+        assert(next_key != nullptr && next_meta != nullptr && next_data != nullptr);
+        next_key_locked = true;
+        return true;
+      }, true));
+  assert(next_key_locked);
+  assert(table->remove(&table_insert_key));
   const uint64_t root_pubs_after_create = partition.PrivateRootPublishCount();
   assert(root_pubs_after_create >= 1);
   // §11.6: value updates that do not change private root must not republish.

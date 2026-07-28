@@ -108,10 +108,9 @@ bool KvPartitionTable::insert_lock_next_key(
   auto *row = partition_->AllocateValue(TableValue(value, value_size_));
   partition_->MetadataFromValue(row)->is_valid = !is_placeholder;
   const RegionOffset row_offset = partition_->regions_.swcc().ToOffset(row);
-  const bool inserted = partition_->private_tree_->insert_and_process_adjacent_tuples(
+  const bool inserted = partition_->private_tree_->insert_lock_next_key(
       TableKey(key), row_offset,
-      [&](const FixedKey *, RegionOffset *, const FixedKey *next_key,
-          RegionOffset *next_offset) {
+      [&](const FixedKey *next_key, RegionOffset *next_offset) {
         auto [meta, data] = next_offset == nullptr ? std::make_tuple(nullptr, nullptr)
                                                     : Row(*next_offset);
         return processor(next_key, meta, data);
