@@ -344,8 +344,9 @@ int main() {
   assert(partition.CompareExchangePrivate("new-cas", "", "created", &exchanged));
   assert(exchanged && partition.GetPrivate("new-cas", &value) && value == FixedValue("created"));
 
-  // Fresh move-in starts with second_chance=1; ClockAdvanceCursor wraps so the
-  // same eviction pass can clear the chance then move the victim out.
+  // Fresh move-in starts without a second chance; the first over-budget Clock
+  // pass may therefore move it out immediately.  Only a real shared access
+  // grants a chance.
   // Other keys (e.g. gamma) may still be migrated; counter is O(1) track/untrack.
   assert(partition.PutPrivate("clock", "victim"));
   assert(partition.PromotePrivate("clock", 1));
