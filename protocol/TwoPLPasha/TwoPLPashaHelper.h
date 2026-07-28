@@ -392,6 +392,17 @@ class TwoPLPashaHelper {
 
         enum class KvSharedResult : uint8_t { kDone, kMissing, kBusy };
 
+        // The original paths have three distinct shared-row lifetimes.  A
+        // remote lookup acquires its own ref, a get_migrated_row hit already
+        // owns one, and an owner-side migrated-row operation is protected by
+        // the local metadata latch instead.  Keep that distinction explicit
+        // rather than charging every path an extra ref-count transition.
+        enum class KvSharedRefMode : uint8_t {
+                kAcquire,
+                kAlreadyPinned,
+                kOwnerLocalLatch,
+        };
+
         // The transaction layer normally owns a per-worker max_tid.  The KV
         // facade has one-operation transactions, so retain only that bounded
         // thread-local state and reuse the original TID bit layout.
@@ -554,7 +565,8 @@ class TwoPLPashaHelper {
         static bool kv_shared_read_value(TwoPLPashaMetadataShared *smeta,
                                          std::size_t host_id, void *dest,
                                          std::size_t capacity,
-                                         bool ref_already_pinned = false,
+                                         KvSharedRefMode ref_mode =
+                                             KvSharedRefMode::kAcquire,
                                          KvSharedResult *result = nullptr)
         {
                 if (result != nullptr) *result = KvSharedResult::kBusy;
@@ -565,19 +577,20 @@ class TwoPLPashaHelper {
                 const uint64_t size = capacity;
                 if (smeta->is_write_locked() ||
                     smeta->get_reader_count() == smeta->get_reader_count_max() ||
-                    (!ref_already_pinned &&
+                    (ref_mode == KvSharedRefMode::kAcquire &&
                      smeta->get_ref_cnt() ==
                          std::numeric_limits<uint8_t>::max())) {
                         smeta->unlock();
                         return false;
                 }
                 smeta->increase_reader_count();
-                if (!ref_already_pinned) smeta->increment_ref_cnt();
+                if (ref_mode == KvSharedRefMode::kAcquire)
+                        smeta->increment_ref_cnt();
                 scc_manager->prepare_read(smeta, host_id, scc_data, size);
                 const bool valid =
                     smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
                 if (!valid) {
-                        if (!ref_already_pinned) {
+                        if (ref_mode == KvSharedRefMode::kAcquire) {
                                 DCHECK(smeta->get_ref_cnt() > 0);
                                 smeta->decrement_ref_cnt();
                         }
@@ -591,7 +604,7 @@ class TwoPLPashaHelper {
                 scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
                 tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
-                if (!ref_already_pinned) {
+                if (ref_mode == KvSharedRefMode::kAcquire) {
                         DCHECK(smeta->get_ref_cnt() > 0);
                         smeta->decrement_ref_cnt();
                 }
@@ -644,7 +657,8 @@ class TwoPLPashaHelper {
 
         static bool kv_shared_write(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
                                     const void *src, std::size_t size,
-                                    bool ref_already_pinned = false,
+                                    KvSharedRefMode ref_mode =
+                                        KvSharedRefMode::kAcquire,
                                     KvSharedResult *result = nullptr)
         {
                 if (result != nullptr) *result = KvSharedResult::kBusy;
@@ -655,13 +669,14 @@ class TwoPLPashaHelper {
                 // ordinary contention for this logical operation, not an
                 // internal reader-drain loop.
                 if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
-                    (!ref_already_pinned &&
+                    (ref_mode == KvSharedRefMode::kAcquire &&
                      smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max())) {
                     smeta->unlock();
                     return false;
                 }
                 smeta->set_write_locked();
-                if (!ref_already_pinned) smeta->increment_ref_cnt();
+                if (ref_mode == KvSharedRefMode::kAcquire)
+                        smeta->increment_ref_cnt();
                 scc_manager->prepare_read(smeta, host_id, scc_data, size);
                 tigonkv::engine::mem_access::SharedPayloadWrite(
                         scc_data->data, size);
@@ -677,7 +692,7 @@ class TwoPLPashaHelper {
                 // synthetic payload/writeback latency has elapsed.
                 tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
-                if (!ref_already_pinned) {
+                if (ref_mode == KvSharedRefMode::kAcquire) {
                         DCHECK(smeta->get_ref_cnt() > 0);
                         smeta->decrement_ref_cnt();
                 }
@@ -691,7 +706,8 @@ class TwoPLPashaHelper {
         static bool kv_shared_update(TwoPLPashaMetadataShared *smeta,
                                      std::size_t host_id, std::size_t capacity,
                                      Mutator &&mutator, bool *changed,
-                                     bool ref_already_pinned = false,
+                                     KvSharedRefMode ref_mode =
+                                         KvSharedRefMode::kAcquire,
                                      KvSharedResult *result = nullptr)
         {
                 if (result != nullptr) *result = KvSharedResult::kBusy;
@@ -706,13 +722,14 @@ class TwoPLPashaHelper {
                         return false;
                 }
                 if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
-                    (!ref_already_pinned &&
+                    (ref_mode == KvSharedRefMode::kAcquire &&
                      smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max())) {
                         smeta->unlock();
                         return false;
                 }
                 smeta->set_write_locked();
-                if (!ref_already_pinned) smeta->increment_ref_cnt();
+                if (ref_mode == KvSharedRefMode::kAcquire)
+                        smeta->increment_ref_cnt();
                 scc_manager->prepare_read(smeta, host_id, scc_data, size);
                 smeta->unlock();
 
@@ -728,7 +745,7 @@ class TwoPLPashaHelper {
                 } catch (...) {
                         tigonkv::engine::mem_access::DelayActiveScopeNow();
                         smeta->lock();
-                        if (!ref_already_pinned) {
+                        if (ref_mode == KvSharedRefMode::kAcquire) {
                                 DCHECK(smeta->get_ref_cnt() > 0);
                                 smeta->decrement_ref_cnt();
                         }
@@ -753,7 +770,7 @@ class TwoPLPashaHelper {
                 }
                 tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
-                if (!ref_already_pinned) {
+                if (ref_mode == KvSharedRefMode::kAcquire) {
                         DCHECK(smeta->get_ref_cnt() > 0);
                         smeta->decrement_ref_cnt();
                 }

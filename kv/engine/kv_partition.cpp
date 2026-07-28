@@ -569,7 +569,8 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
         // Follow the owner-private metadata offset under latch; one helper
         // attempt (§10.2).
         const bool written = star::TwoPLPashaHelper::kv_shared_write(
-            smeta, owner_shard_, value.data(), fixed_value_size_);
+            smeta, owner_shard_, value.data(), fixed_value_size_,
+            star::TwoPLPashaHelper::KvSharedRefMode::kOwnerLocalLatch);
         if (written) {
           metadata->is_data_modified_since_moved_out = true;
           RecordPrivateMetadataWrite(metadata);
@@ -742,7 +743,8 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
       regions_.hwcc().FromOffset(smeta_offset));
   std::string shared(fixed_value_size_, '\0');
   const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
-      smeta, owner_shard_, shared.data(), shared.size());
+      smeta, owner_shard_, shared.data(), shared.size(),
+      star::TwoPLPashaHelper::KvSharedRefMode::kOwnerLocalLatch);
   if (read) {
     if (!metadata->is_valid) {
       metadata->is_valid = true;
@@ -776,7 +778,9 @@ SharedAccessState KVPartition::GetShared(std::string_view key, uint32_t host_id,
   star::TwoPLPashaHelper::KvSharedResult read_result =
       star::TwoPLPashaHelper::KvSharedResult::kBusy;
   const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
-      smeta, host_id, shared.data(), shared.size(), true, &read_result);
+      smeta, host_id, shared.data(), shared.size(),
+      star::TwoPLPashaHelper::KvSharedRefMode::kAlreadyPinned,
+      &read_result);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   if (!read) {
     if (read_result == star::TwoPLPashaHelper::KvSharedResult::kMissing)
@@ -806,7 +810,7 @@ SharedAccessState KVPartition::PutShared(std::string_view key, uint32_t host_id,
   if (record_clock_access) NoteSharedAccess(smeta);
   const bool written = star::TwoPLPashaHelper::kv_shared_write(
       smeta, host_id, value.data(), fixed_value_size_,
-      /*ref_already_pinned=*/true);
+      star::TwoPLPashaHelper::KvSharedRefMode::kAlreadyPinned);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   return written ? SharedAccessState::kDone : SharedAccessState::kRetry;
 }
@@ -887,7 +891,7 @@ SharedAccessState KVPartition::CompareExchangeShared(
         replacement->assign(desired);
         return true;
       },
-      &changed, /*ref_already_pinned=*/true);
+      &changed, star::TwoPLPashaHelper::KvSharedRefMode::kAlreadyPinned);
   if (!updated) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     return SharedAccessState::kRetry;
@@ -929,7 +933,7 @@ SharedAccessState KVPartition::IncrementShared(std::string_view key,
         }
         return true;
       },
-      &changed, /*ref_already_pinned=*/true);
+      &changed, star::TwoPLPashaHelper::KvSharedRefMode::kAlreadyPinned);
   if (invalid) {
     star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
     throw std::invalid_argument(
@@ -1033,7 +1037,7 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
         replacement->assign(desired);
         return true;
       },
-      &changed);
+      &changed, star::TwoPLPashaHelper::KvSharedRefMode::kOwnerLocalLatch);
   if (!read) {
     UnlockRow(metadata);
     throw std::runtime_error("migrated row shared CAS busy");
@@ -1123,7 +1127,8 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
                     "increment value exceeds fixed value size");
               return true;
             },
-            &changed)) {
+            &changed,
+            star::TwoPLPashaHelper::KvSharedRefMode::kOwnerLocalLatch)) {
       UnlockRow(metadata);
       throw std::runtime_error("migrated increment shared write rejected");
     }
@@ -1638,7 +1643,8 @@ bool KVPartition::ScanOwned(
               regions_.hwcc().FromOffset(metadata->migrated_smeta_off));
           value.resize(fixed_value_size_);
           read = star::TwoPLPashaHelper::kv_shared_read_value(
-              smeta, owner_shard_, value.data(), value.size());
+              smeta, owner_shard_, value.data(), value.size(),
+              star::TwoPLPashaHelper::KvSharedRefMode::kOwnerLocalLatch);
         }
         UnlockRow(metadata);
         if (read) {

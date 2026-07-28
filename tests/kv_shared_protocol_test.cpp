@@ -206,7 +206,9 @@ int main() {
     star::TwoPLPashaHelper::KvSharedResult missing_result =
         star::TwoPLPashaHelper::KvSharedResult::kDone;
     assert(!star::TwoPLPashaHelper::kv_shared_read_value(
-        meta, 0, readable, sizeof(readable), false, &missing_result));
+        meta, 0, readable, sizeof(readable),
+        star::TwoPLPashaHelper::KvSharedRefMode::kAcquire,
+        &missing_result));
     assert(missing_result == star::TwoPLPashaHelper::KvSharedResult::kMissing);
     meta->lock();
     meta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
