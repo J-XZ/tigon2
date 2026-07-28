@@ -880,6 +880,13 @@ class TwoPLPashaHelper {
                         return false;
                 }
                 smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
+                // The owner keeps the original local metadata as the locator
+                // for this migrated row.  Its next write-lock acquisition
+                // refreshes local validity only when this existing shared
+                // dirty bit is set; publishing a remote-created placeholder
+                // must therefore use the same notification as a shared
+                // write, even though its payload was copied by move-in.
+                smeta->set_is_data_modified_since_moved_in();
                 // This is the original value-only insertion publication.  It
                 // deliberately does not copy payload: owner move_row_in did
                 // the one private-to-shared copy before the response.
