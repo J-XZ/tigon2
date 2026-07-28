@@ -744,11 +744,18 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
           OwnerForPartition(partition_id), inclusive_max, scan_limit);
       ++TlsScanDiag.migrate_rpcs;
       if (!migrated.ok()) return migrated;
-      // The original handler has now moved the range in.  Do not add a
-      // second operation retry policy here: the single KVStore facade retry
-      // restarts this scan from its public operation boundary.
-      return Status::Error(StatusCode::kBusy,
-                           "CXL scan range moved in; retry at facade");
+      // The original scan path immediately re-enters the same CXL scan after
+      // the owner has moved its incomplete range in.  This is one prescribed
+      // continuation, not an operation-level retry loop; a second incomplete
+      // probe remains Busy for the facade boundary to handle.
+      probe = partition->ScanSharedPartition(config_.node_id, min_key,
+                                             scan_limit, inclusive_max);
+      ++TlsScanDiag.partition_probes;
+      PollTransport();
+      if (!probe.status.ok()) return probe.status;
+      if (probe.migration_required)
+        return Status::Error(StatusCode::kBusy,
+                             "CXL scan range remains incomplete");
     }
     if (!probe.scan_success)
       return Status::Error(StatusCode::kCorruption, "CXL probe incomplete");
