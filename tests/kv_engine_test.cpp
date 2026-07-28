@@ -73,6 +73,60 @@ std::string FixedValue(std::string_view value_text,
   return value;
 }
 
+// A reset VM must wait for every owner to publish its private arena.  Keep the
+// unit fixture faithful to that protocol by starting a real joining owner,
+// rather than weakening KVEngine::Open for single-process tests.
+class JoiningPeer {
+ public:
+  explicit JoiningPeer(tigonkv::Config config) : config_(std::move(config)) {
+    assert(pipe2(stop_pipe_, O_CLOEXEC) == 0);
+    child_ = fork();
+    assert(child_ >= 0);
+    if (child_ == 0) {
+      close(stop_pipe_[1]);
+      assert(fcntl(stop_pipe_[0], F_SETFL,
+                   fcntl(stop_pipe_[0], F_GETFL) | O_NONBLOCK) == 0);
+      std::unique_ptr<tigonkv::engine::KVEngine> engine;
+      for (;;) {
+        try {
+          engine = tigonkv::engine::KVEngine::Open(config_, false);
+          break;
+        } catch (const std::exception &) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+      engine->BindWorker(0);
+      char ignored;
+      for (;;) {
+        const ssize_t stopped = read(stop_pipe_[0], &ignored, 1);
+        if (stopped == 0) break;
+        assert(stopped < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        engine->PollTransport();
+        std::this_thread::yield();
+      }
+      engine->ReleaseWorker();
+      _exit(0);
+    }
+    close(stop_pipe_[0]);
+  }
+
+  ~JoiningPeer() {
+    if (child_ <= 0) return;
+    close(stop_pipe_[1]);
+    int status = 0;
+    assert(waitpid(child_, &status, 0) == child_);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+
+  JoiningPeer(const JoiningPeer &) = delete;
+  JoiningPeer &operator=(const JoiningPeer &) = delete;
+
+ private:
+  tigonkv::Config config_;
+  int stop_pipe_[2]{-1, -1};
+  pid_t child_{-1};
+};
+
 }  // namespace
 
 int main() {
@@ -113,6 +167,7 @@ int main() {
     const rlimit no_core{0, 0};
     (void)setrlimit(RLIMIT_CORE, &no_core);
     const auto config = ConfigFor(misroute_template, 2, 0);
+    auto peer = JoiningPeer(ConfigFor(misroute_template, 2, 1));
     auto engine = tigonkv::engine::KVEngine::Open(config, true);
     std::string wrong_owner_key;
     for (uint32_t i = 0; i < 1000; ++i) {
@@ -150,6 +205,7 @@ int main() {
     (void)setrlimit(RLIMIT_CORE, &no_core);
     auto full_config = ConfigFor(full_template, 2, 0);
     full_config.sync_timeout_sec = 1;
+    auto peer = JoiningPeer(ConfigFor(full_template, 2, 1));
     auto engine = tigonkv::engine::KVEngine::Open(full_config, true);
     void *root = nullptr;
     star::CXLMemory::wait_and_retrieve_cxl_shared_data(
@@ -180,6 +236,7 @@ int main() {
     close(late_fd);
     auto late_config = ConfigFor(late_template, 2, 0);
     late_config.sync_timeout_sec = 1;
+    auto peer = JoiningPeer(ConfigFor(late_template, 2, 1));
     auto engine = tigonkv::engine::KVEngine::Open(late_config, true);
     std::string remote_key;
     for (uint32_t i = 0; i < 1000; ++i) {
@@ -274,6 +331,7 @@ int main() {
       const rlimit no_core{0, 0};
       (void)setrlimit(RLIMIT_CORE, &no_core);
       auto config = ConfigFor(wire_bad_template, 2, 0);
+      auto peer = JoiningPeer(ConfigFor(wire_bad_template, 2, 1));
       auto engine = tigonkv::engine::KVEngine::Open(config, true);
       void *root = nullptr;
       star::CXLMemory::wait_and_retrieve_cxl_shared_data(
@@ -305,6 +363,7 @@ int main() {
       const rlimit no_core{0, 0};
       (void)setrlimit(RLIMIT_CORE, &no_core);
       auto config = ConfigFor(wire_tail_template, 2, 0);
+      auto peer = JoiningPeer(ConfigFor(wire_tail_template, 2, 1));
       auto engine = tigonkv::engine::KVEngine::Open(config, true);
       void *root = nullptr;
       star::CXLMemory::wait_and_retrieve_cxl_shared_data(
@@ -333,6 +392,7 @@ int main() {
     auto node1_cfg = ConfigFor(wire_ok_template, 2, 1);
     std::vector<std::pair<std::string, size_t>> remote_puts;
     {
+      JoiningPeer bootstrap(node1_cfg);
       auto probe = tigonkv::engine::KVEngine::Open(node0_cfg, true);
       for (size_t n : {size_t{0}, size_t{8}, size_t{32}}) {
         for (uint32_t i = 0; i < 4000; ++i) {
