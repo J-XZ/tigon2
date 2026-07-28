@@ -29,13 +29,24 @@ bool RelWithDebInfoBuild() {
 #endif
 }
 
-bool ValidateThrows(const Config &config) {
+bool ValidateThrows(Config config) {
   try {
     config.Validate();
   } catch (const std::invalid_argument &) {
     return true;
   }
   return false;
+}
+
+std::string Fixed(std::string_view value, uint32_t width) {
+  assert(value.size() <= width);
+  std::string fixed(value);
+  fixed.resize(width, '\0');
+  return fixed;
+}
+
+std::string MaxKey(uint32_t width) {
+  return std::string(width, static_cast<char>(0xff));
 }
 
 void SetTestRangePartitioning(Config *config) {
@@ -279,23 +290,25 @@ int main() {
   config.swcc_read_ns = 1;
   config.swcc_write_ns = 1;
   auto store = KVStore::Create(config, true);
-  assert(store->Put("alpha", "one").ok());
-  assert(store->Put("beta", "two").ok());
-  const auto scan = store->Scan("alpha", 0);
+  const auto key = [&](std::string_view text) { return Fixed(text, config.fixed_key_size); };
+  const auto value = [&](std::string_view text) { return Fixed(text, config.fixed_value_size); };
+  assert(store->Put(key("alpha"), value("one")).ok());
+  assert(store->Put(key("beta"), value("two")).ok());
+  const auto scan = store->Scan(key("alpha"), MaxKey(config.fixed_key_size), 0);
   assert(scan.status.ok() && scan.items.size() == 2);
-  assert(store->CompareExchange("alpha", "one", "three").exchanged);
-  assert(store->Increment("counter", 3).value == 3);
-  assert(store->Get("alpha").value == "three");
+  assert(store->CompareExchange(key("alpha"), value("one"), value("three")).exchanged);
+  assert(store->Increment(key("counter"), 3).value == 3);
+  assert(store->Get(key("alpha")).value == value("three"));
   std::vector<std::thread> workers;
   for (uint32_t worker = 0; worker < 4; ++worker) {
     workers.emplace_back([&, worker] {
       store->BindWorker(worker);
       for (uint32_t i = 0; i < 50; ++i) {
-        const std::string key =
-            "worker-" + std::to_string(worker) + "-" + std::to_string(i);
-        assert(store->Put(key, "value").ok());
-        const auto found = store->Get(key);
-        assert(found.status.ok() && found.value == "value");
+        const std::string worker_key = key(
+            "worker-" + std::to_string(worker) + "-" + std::to_string(i));
+        assert(store->Put(worker_key, value("value")).ok());
+        const auto found = store->Get(worker_key);
+        assert(found.status.ok() && found.value == value("value"));
       }
       store->ReleaseWorker();
     });
@@ -336,8 +349,8 @@ int main() {
   }
   store.reset();
   auto attached = KVStore::Create(config, false);
-  assert(attached->Get("alpha").value == "three");
-  assert(attached->Delete("beta").ok());
+  assert(attached->Get(key("alpha")).value == value("three"));
+  assert(attached->Delete(key("beta")).ok());
   std::remove(path.c_str());
   return 0;
 }

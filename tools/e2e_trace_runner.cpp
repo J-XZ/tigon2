@@ -1,4 +1,5 @@
 #include "kv/kv_store.h"
+#include "tools/e2e_trace_format.h"
 
 #include <algorithm>
 #include <atomic>
@@ -45,22 +46,8 @@ Status RunWithBusyRetry(KVStore &store, Op &&op) {
   return status;
 }
 
-uint64_t ReadDecimal(const std::string &line, size_t *pos, const std::string &label) {
-  const size_t begin = *pos;
-  while (*pos < line.size() && line[*pos] >= '0' && line[*pos] <= '9') ++*pos;
-  if (begin == *pos) Fail("missing " + label);
-  return ParseUnsigned(line.substr(begin, *pos - begin), label);
-}
-
-// Align with cxlkv FixedTraceKey: right-pad spaces to fixed_key_size.
-std::string FixedTraceKey(const std::string &key, uint32_t fixed_key_size) {
-  if (key.size() > fixed_key_size) {
-    Fail("trace key exceeds fixed_key_size: size=" + std::to_string(key.size()) +
-         " fixed_key_size=" + std::to_string(fixed_key_size));
-  }
-  std::string out = key;
-  out.resize(static_cast<size_t>(fixed_key_size), ' ');
-  return out;
+std::string ScanEndKey(uint32_t fixed_key_size) {
+  return std::string(static_cast<size_t>(fixed_key_size), static_cast<char>(0xff));
 }
 
 // Align with cxlkv FixedTraceValue: printable '!'..'~', length=fixed_value_size
@@ -210,25 +197,12 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_
   while (std::getline(input, line)) {
     ++line_no;
     if (line.empty() || line[0] == '#') continue;
-    size_t pos = 0;
-    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
-    const size_t op_begin = pos;
-    while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') ++pos;
-    if (op_begin == pos) Fail(trace + ": malformed line " + std::to_string(line_no));
-    const std::string op = line.substr(op_begin, pos - op_begin);
-    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
-    const size_t key_len = ReadDecimal(line, &pos, "key length");
-    if (pos >= line.size() || (line[pos] != ' ' && line[pos] != '\t'))
-      Fail(trace + ": missing LEN separator at line " + std::to_string(line_no));
-    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
-    const size_t len = ReadDecimal(line, &pos, "operation length");
-    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
-    if (line.size() - pos < key_len) Fail(trace + ": key length mismatch at line " + std::to_string(line_no));
-    const std::string raw_key = line.substr(pos, key_len);
-    for (size_t tail = pos + key_len; tail < line.size(); ++tail)
-      if (line[tail] != ' ' && line[tail] != '\t')
-        Fail(trace + ": trailing bytes after key at line " + std::to_string(line_no));
-    const std::string key = FixedTraceKey(raw_key, fixed_key_size);
+    tigonkv::e2e_trace::Operation operation;
+    if (!tigonkv::e2e_trace::ParseLine(line, trace, line_no, &operation)) continue;
+    const std::string_view op = operation.name;
+    const uint64_t len = operation.length;
+    const std::string key =
+        tigonkv::e2e_trace::FixedTraceKey(operation.raw_key, fixed_key_size);
     Status status;
     if (op == "PUT") {
       const std::string value = FixedTraceValue(rng, fixed_value_size);
@@ -252,7 +226,7 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_
     } else if (op == "SCAN") {
       ScanResult scan;
       status = RunWithBusyRetry(store, [&] {
-        scan = store.Scan(key, len);
+        scan = store.Scan(key, ScanEndKey(fixed_key_size), len);
         return scan.status;
       });
       if (status.ok()) {
@@ -514,25 +488,14 @@ int main(int argc, char **argv) {
     while (std::getline(input, line)) {
       ++line_no;
       if (line.empty() || line[0] == '#') continue;
-      size_t pos = 0;
-      while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
-      const size_t op_begin = pos;
-      while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') ++pos;
-      if (op_begin == pos) Fail(trace + ": malformed line " + std::to_string(line_no));
-      const std::string op = line.substr(op_begin, pos - op_begin);
-      last_op = op;
-      while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
-      const size_t key_len = ReadDecimal(line, &pos, "key length");
-      if (pos >= line.size() || (line[pos] != ' ' && line[pos] != '\t')) Fail(trace + ": missing LEN separator at line " + std::to_string(line_no));
-      while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
-      const size_t len = ReadDecimal(line, &pos, "operation length");
-      while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
-      if (pos > line.size() || line.size() - pos < key_len) Fail(trace + ": key length mismatch at line " + std::to_string(line_no));
-      const std::string raw_key = line.substr(pos, key_len);
-      last_key = raw_key;
-      for (size_t tail = pos + key_len; tail < line.size(); ++tail)
-        if (line[tail] != ' ' && line[tail] != '\t') Fail(trace + ": trailing bytes after key at line " + std::to_string(line_no));
-      const std::string key = FixedTraceKey(raw_key, config.fixed_key_size);
+      tigonkv::e2e_trace::Operation operation;
+      if (!tigonkv::e2e_trace::ParseLine(line, trace, line_no, &operation)) continue;
+      const std::string_view op = operation.name;
+      const uint64_t len = operation.length;
+      last_op.assign(op);
+      last_key.assign(operation.raw_key);
+      const std::string key = tigonkv::e2e_trace::FixedTraceKey(
+          operation.raw_key, config.fixed_key_size);
       Status status;
       if (op == "PUT") {
         const std::string value = FixedTraceValue(&rng, config.fixed_value_size);
@@ -556,7 +519,7 @@ int main(int argc, char **argv) {
       } else if (op == "SCAN") {
         ScanResult result;
         status = RunWithBusyRetry(*store, [&] {
-          result = store->Scan(key, len);
+          result = store->Scan(key, ScanEndKey(config.fixed_key_size), len);
           return result.status;
         });
         if (status.ok()) {

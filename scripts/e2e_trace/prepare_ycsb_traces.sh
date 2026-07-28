@@ -12,12 +12,16 @@ fi
 out=${1:-"$root/results/ycsb_traces"}
 records=${YCSB_RECORD_COUNT:-100000}
 ops=${YCSB_OPERATION_COUNT:-100000}
-workers=${YCSB_WORKERS:-1}
+workers=${YCSB_WORKERS:-4}
 workloads=${TIGONKV_YCSB_WORKLOADS:-"A B C D"}
-nodes=${TIGONKV_VM_COUNT:-2}
+nodes=${TIGONKV_VM_COUNT:-4}
 field_count=${YCSB_FIELD_COUNT:-10}
 field_length=${YCSB_FIELD_LENGTH:-64}
 mkdir -p "$out"
+[[ "$nodes" == 4 && "$workers" == 4 ]] || {
+  echo "formal trace preparation requires 4 VMs x 4 workers" >&2
+  exit 2
+}
 
 # Shared load phase via workloadc (cxlkv one-click / e2e_10 layout).
 "$ycsb/scripts/generate_cxlkv_trace.sh" \
@@ -33,6 +37,15 @@ mkdir -p "$out"
   --field-length "$field_length" \
   --request-distribution zipfian \
   --force
+
+splitter=${TIGONKV_YCSB_PARTITION_SPLITS:-"$root/build-relwithdebinfo/ycsb_partition_splits"}
+[[ -x "$splitter" ]] || {
+  echo "build ycsb_partition_splits before preparing formal traces: $splitter" >&2
+  exit 2
+}
+"$splitter" --trace-dir "$out/load" \
+  --config "${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}" \
+  --workers 16 --fixed-key-size 32
 
 for workload in $workloads; do
   wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')

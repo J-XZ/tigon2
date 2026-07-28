@@ -100,18 +100,14 @@
     "foreground_worker_count_per_vm": 4
   },
   "tigon_kv": {
-    "partition_count": 16,
+    "partition_count": 4,
     "partitioning": {
       "strategy": "range",
       "ranges": [
-        {"lower_key": "", "upper_key": "b"}, {"lower_key": "b", "upper_key": "d"},
-        {"lower_key": "d", "upper_key": "f"}, {"lower_key": "f", "upper_key": "h"},
-        {"lower_key": "h", "upper_key": "j"}, {"lower_key": "j", "upper_key": "l"},
-        {"lower_key": "l", "upper_key": "n"}, {"lower_key": "n", "upper_key": "p"},
-        {"lower_key": "p", "upper_key": "r"}, {"lower_key": "r", "upper_key": "t"},
-        {"lower_key": "t", "upper_key": "v"}, {"lower_key": "v", "upper_key": "x"},
-        {"lower_key": "x", "upper_key": "z"}, {"lower_key": "z", "upper_key": "|"},
-        {"lower_key": "|", "upper_key": "~"}, {"lower_key": "~", "upper_key": ""}
+        {"lower_key": "", "upper_key": "g"},
+        {"lower_key": "g", "upper_key": "n"},
+        {"lower_key": "n", "upper_key": "u"},
+        {"lower_key": "u", "upper_key": ""}
       ]
     },
     "fixed_key_size": 32,

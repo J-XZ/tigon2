@@ -62,6 +62,10 @@ tigonkv::Config ConfigFor(const std::string &path, uint32_t vm_count = 1,
   return config;
 }
 
+std::string ScanEndKey(uint32_t fixed_key_size = 32) {
+  return std::string(fixed_key_size, static_cast<char>(0xff));
+}
+
 }  // namespace
 
 int main() {
@@ -459,7 +463,7 @@ int main() {
     assert(engine->Put("counter", "1").ok());
     const auto incremented = engine->Increment("counter", 2);
     assert(incremented.status.ok() && incremented.value == 3);
-    const auto scan = engine->Scan("alpha", 0);
+    const auto scan = engine->Scan("alpha", ScanEndKey(), 0);
     assert(scan.status.ok() && scan.items.size() == 2);
     assert(scan.items[0].key == "alpha" && scan.items[0].value == "cas-value");
     assert(scan.items[1].key == "counter" && scan.items[1].value == "3");
@@ -574,7 +578,7 @@ int main() {
         expected.push_back(key);
         if (limit != 0 && expected.size() >= limit) break;
       }
-      const auto got = engine->Scan(start, limit);
+      const auto got = engine->Scan(start, ScanEndKey(), limit);
       assert(got.status.ok());
       assert(got.items.size() == expected.size());
       for (size_t i = 0; i < expected.size(); ++i) {
@@ -662,7 +666,7 @@ int main() {
         if (!promoted.status.ok() || promoted.value != "owner-authority") _exit(14);
       }
       const uint64_t tx_before_authoritative_scan = node_one->NetworkTxBytes();
-      const auto authoritative_scan = node_one->Scan("H-hybrid-", 100);
+      const auto authoritative_scan = node_one->Scan("H-hybrid-", ScanEndKey(), 100);
       const uint64_t authoritative_scan_tx =
           node_one->NetworkTxBytes() - tx_before_authoritative_scan;
       if (!authoritative_scan.status.ok() || authoritative_scan.items.size() != 100)
@@ -683,13 +687,13 @@ int main() {
           authoritative_scan_tx % scan_migrate_wire != 0 ||
           authoritative_scan_tx == 0)
         _exit(17);
-      const auto boundary_scan = node_one->Scan(promoted_scan_keys[63], 3);
+      const auto boundary_scan = node_one->Scan(promoted_scan_keys[63], ScanEndKey(), 3);
       if (!boundary_scan.status.ok() || boundary_scan.items.size() != 3)
         _exit(29);
       for (size_t i = 0; i < boundary_scan.items.size(); ++i)
         if (boundary_scan.items[i].key != promoted_scan_keys[63 + i])
           _exit(30);
-      const auto complete_hybrid_scan = node_one->Scan("H-hybrid-", 130);
+      const auto complete_hybrid_scan = node_one->Scan("H-hybrid-", ScanEndKey(), 130);
       if (!complete_hybrid_scan.status.ok() ||
           complete_hybrid_scan.items.size() != promoted_scan_keys.size())
         _exit(31);
@@ -706,7 +710,7 @@ int main() {
           node_one->BindWorker(worker);
           while (!start_concurrent_scans.load(std::memory_order_acquire))
             std::this_thread::yield();
-          const auto scan = node_one->Scan("H-hybrid-", 100);
+          const auto scan = node_one->Scan("H-hybrid-", ScanEndKey(), 100);
           if (!scan.status.ok() || scan.items.size() != 100) {
             concurrent_scan_failed.store(true, std::memory_order_release);
           } else {
@@ -722,8 +726,8 @@ int main() {
       for (auto &thread : scan_threads) thread.join();
       if (concurrent_scan_failed.load(std::memory_order_acquire)) _exit(18);
 
-      const auto distributed_scan = node_one->Scan("", 0);
-      const auto limited_scan = node_one->Scan("", 17);
+      const auto distributed_scan = node_one->Scan("", ScanEndKey(), 0);
+      const auto limited_scan = node_one->Scan("", ScanEndKey(), 17);
       bool saw_owner_zero = false;
       bool saw_owner_one = false;
       for (const auto &item : distributed_scan.items) {

@@ -221,7 +221,7 @@ KVEngine::~KVEngine() {
   KvMigrationRuntime::Instance().Reset();
 }
 
-std::unique_ptr<KVEngine> KVEngine::Open(const Config &config, bool reset) {
+std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   config.Validate();
   auto affinity_cpus = ResolveAffinityCpus(config);
   auto pool = std::make_unique<DualRegionMappedPool>(
@@ -502,7 +502,8 @@ Status KVEngine::Delete(std::string_view key) {
   }
 }
 
-ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
+ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
+                          uint64_t limit) {
   constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
   if (limit > kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
@@ -519,6 +520,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
     bool owner_exhausted_for_cursor = false;
     bool owner_no_predecessor_for_cursor = false;
     bool more = false;
+    bool reached_end = false;
   };
 
   auto append_items = [&](PartitionCursor *cursor,
@@ -526,12 +528,16 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
                           bool more, ScanResult *result) {
     for (auto &item : raw) {
       if (cursor->has_cursor && item.first <= cursor->cursor) continue;
+      if (!end_key.empty() && item.first >= end_key) {
+        cursor->reached_end = true;
+        break;
+      }
       cursor->cursor = item.first;
       cursor->has_cursor = true;
       result->items.push_back({std::move(item.first), std::move(item.second)});
       if (result->items.size() == target) break;
     }
-    cursor->more = more && result->items.size() < target;
+    cursor->more = more && !cursor->reached_end && result->items.size() < target;
   };
 
   auto probe_remote = [&](PartitionCursor *source, uint64_t page_limit,
@@ -648,6 +654,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, uint64_t limit) {
       if (!status.ok()) return {status, {}};
       if (!cursor.more) break;
     }
+    if (cursor.reached_end) break;
   }
   if (limit == 0 && result.items.size() == kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument,

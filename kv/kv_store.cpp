@@ -41,6 +41,13 @@ constexpr int kStoreBusyRetryBudget = 64;
 thread_local KVStore *TlsRuntimeOwner = nullptr;
 thread_local RuntimeStats *TlsRuntimeStats = nullptr;
 
+bool IsInternalMaxKey(std::string_view key) {
+  return !key.empty() && std::all_of(key.begin(), key.end(),
+                                     [](char byte) {
+                                       return static_cast<unsigned char>(byte) == 0xff;
+                                     });
+}
+
 template <typename Op>
 Status RunWithBusyRetry(KVStore *store, Op &&op) {
   Status status;
@@ -789,14 +796,15 @@ Config Config::FromJsonc(const std::string &path) {
   return c;
 }
 
-void Config::Validate() const {
+void Config::Validate() {
   if (size_mb == 0 || hwcc_size_mb > 1024 || hwcc_size_mb > size_mb ||
       swcc_size_mb > size_mb || hwcc_offset_mb + hwcc_size_mb > size_mb ||
       swcc_offset_mb + swcc_size_mb > size_mb || fixed_value_size == 0 ||
       (hwcc_offset_mb < swcc_offset_mb + swcc_size_mb &&
        swcc_offset_mb < hwcc_offset_mb + hwcc_size_mb))
     throw std::invalid_argument("invalid shared-memory capacity or HWCC budget");
-  if (vm_count == 0 || partition_count == 0 || fixed_key_size == 0 || fixed_key_size > kMaxKey ||
+  if (vm_count == 0 || partition_count == 0 || partition_count > engine::kMaxPartitions ||
+      fixed_key_size == 0 || fixed_key_size > kMaxKey ||
       fixed_value_size > kMaxValue || shared_memory_numa_node < -1 || vm_numa_node < -1 ||
       network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0 ||
       foreground_worker_count_per_vm > 64 || vm_count > 8)
@@ -804,31 +812,47 @@ void Config::Validate() const {
   if (partition_ranges.size() != partition_count)
     throw std::invalid_argument(
         "tigon_kv.partitioning.ranges must contain partition_count ranges");
+  auto normalize_boundary = [this](std::string *boundary) {
+    if (boundary->empty()) return;
+    if (boundary->size() > fixed_key_size)
+      throw std::invalid_argument("partition range boundary exceeds fixed_key_size");
+    const engine::FixedKey key = engine::FixedKey::From(*boundary, fixed_key_size);
+    boundary->assign(key.bytes, fixed_key_size);
+  };
+  if (!partition_ranges.front().lower_key.empty())
+    throw std::invalid_argument("first partition lower_key must be empty");
+  if (!partition_ranges.back().upper_key.empty())
+    throw std::invalid_argument("last partition upper_key must be empty");
+  // A boundary may be written on either adjacent range.  Normalize it once
+  // into both sides so all later routing is fixed-width bytewise comparison.
+  for (uint32_t partition = 1; partition < partition_count; ++partition) {
+    std::string &left = partition_ranges[partition - 1].upper_key;
+    std::string &right = partition_ranges[partition].lower_key;
+    if (left.empty() && right.empty())
+      throw std::invalid_argument("inner partition boundary cannot be empty on both sides");
+    if (left.empty()) left = right;
+    if (right.empty()) right = left;
+    normalize_boundary(&left);
+    normalize_boundary(&right);
+    const engine::FixedKey left_key = engine::FixedKey::From(left, fixed_key_size);
+    const engine::FixedKey right_key = engine::FixedKey::From(right, fixed_key_size);
+    if (left_key.Compare(right_key) != 0)
+      throw std::invalid_argument("partition ranges must be contiguous half-open intervals");
+  }
   for (uint32_t partition = 0; partition < partition_count; ++partition) {
-    const auto &range = partition_ranges[partition];
-    if (range.lower_key.size() > fixed_key_size ||
-        range.upper_key.size() > fixed_key_size)
-      throw std::invalid_argument(
-          "partition range boundary exceeds fixed_key_size");
-    if (partition == 0) {
-      if (!range.lower_key.empty())
-        throw std::invalid_argument("first partition lower_key must be empty");
-    } else {
-      const auto &previous = partition_ranges[partition - 1];
-      if (range.lower_key.empty() || previous.upper_key.empty() ||
-          previous.upper_key != range.lower_key)
-        throw std::invalid_argument(
-            "partition ranges must be contiguous half-open intervals");
-    }
-    if (partition + 1 == partition_count) {
-      if (!range.upper_key.empty())
-        throw std::invalid_argument("last partition upper_key must be empty");
-    } else if (range.upper_key.empty()) {
+    auto &range = partition_ranges[partition];
+    normalize_boundary(&range.lower_key);
+    normalize_boundary(&range.upper_key);
+    if (partition + 1 != partition_count && range.upper_key.empty())
       throw std::invalid_argument("only final partition may have empty upper_key");
+    if (!range.lower_key.empty() && !range.upper_key.empty()) {
+      const engine::FixedKey lower =
+          engine::FixedKey::From(range.lower_key, fixed_key_size);
+      const engine::FixedKey upper =
+          engine::FixedKey::From(range.upper_key, fixed_key_size);
+      if (lower.Compare(upper) >= 0)
+        throw std::invalid_argument("partition range must have lower_key < upper_key");
     }
-    if (!range.lower_key.empty() && !range.upper_key.empty() &&
-        range.lower_key >= range.upper_key)
-      throw std::invalid_argument("partition range must have lower_key < upper_key");
   }
   if (cpu_affinity && vm_core_count_per_vm != 0 &&
       vm_core_count_per_vm < foreground_worker_count_per_vm + 1)
@@ -899,14 +923,16 @@ void Config::Validate() const {
 }
 
 uint32_t Config::PartitionForKey(std::string_view key) const {
-  // Validate() establishes a total, contiguous partitioning.  This loop is
-  // intentionally simple: original Tigon's range partitioner makes the same
-  // ordered-boundary decision and partition_count is small (16 by default).
-  for (uint32_t partition = 0; partition < partition_ranges.size(); ++partition) {
-    const std::string &upper = partition_ranges[partition].upper_key;
-    if (upper.empty() || key < std::string_view(upper)) return partition;
-  }
-  throw std::logic_error("validated partition map does not cover key");
+  const engine::FixedKey fixed_key = engine::FixedKey::From(key, fixed_key_size);
+  const auto first_final = partition_ranges.end() - 1;
+  const auto it = std::upper_bound(
+      partition_ranges.begin(), first_final, fixed_key,
+      [this](const engine::FixedKey &needle, const PartitionRange &range) {
+        const engine::FixedKey boundary =
+            engine::FixedKey::From(range.upper_key, fixed_key_size);
+        return needle.Compare(boundary) < 0;
+      });
+  return static_cast<uint32_t>(it - partition_ranges.begin());
 }
 
 
@@ -982,9 +1008,9 @@ uint32_t KVStore::OwnerForKey(std::string_view key) const {
 }
 
 void KVStore::ValidateKeyValue(std::string_view key, std::string_view value) const {
-  if (key.empty() || key.size() > config_.fixed_key_size ||
-      value.size() > config_.fixed_value_size)
-    throw std::invalid_argument("key/value exceeds configured fixed size");
+  if (key.size() != config_.fixed_key_size || IsInternalMaxKey(key) ||
+      value.size() != config_.fixed_value_size)
+    throw std::invalid_argument("key/value must match configured fixed size");
 }
 
 RuntimeStats &KVStore::ThreadRuntime() {
@@ -1014,7 +1040,7 @@ GetResult KVStore::Get(std::string_view key) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
-  if (key.empty() || key.size() > config_.fixed_key_size)
+  if (key.size() != config_.fixed_key_size || IsInternalMaxKey(key))
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
@@ -1033,7 +1059,7 @@ Status KVStore::Delete(std::string_view key) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
-  if (key.empty() || key.size() > config_.fixed_key_size)
+  if (key.size() != config_.fixed_key_size || IsInternalMaxKey(key))
     return Status::Error(StatusCode::kInvalidArgument, "invalid key");
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
@@ -1056,18 +1082,25 @@ Status KVStore::MoveOut(std::string_view key) {
   return status;
 }
 
-ScanResult KVStore::Scan(std::string_view start_key, uint64_t limit) {
+ScanResult KVStore::Scan(std::string_view start_key, std::string_view end_key,
+                         uint64_t limit) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
   if (!config_.enable_scan)
     return {Status::Error(StatusCode::kInvalidArgument, "SCAN disabled"), {}};
+  if (start_key.size() != config_.fixed_key_size || IsInternalMaxKey(start_key) ||
+      (!end_key.empty() && end_key.size() != config_.fixed_key_size))
+    return {Status::Error(StatusCode::kInvalidArgument, "invalid scan range"), {}};
+  if (!end_key.empty() && !IsInternalMaxKey(end_key) && start_key >= end_key)
+    return {Status::Error(StatusCode::kInvalidArgument,
+                          "scan range is empty or inverted"), {}};
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
   ++runtime.scan_ops;
   ScanResult result;
   Status status = RunWithBusyRetry(this, [&] {
-    result = impl_->engine->Scan(start_key, limit);
+    result = impl_->engine->Scan(start_key, end_key, limit);
     return result.status;
   });
   result.status = status;
@@ -1087,6 +1120,9 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
   impl_->engine->PollTransport();
   try { ValidateKeyValue(key, desired); }
   catch (const std::exception &e) { return {Status::Error(StatusCode::kInvalidArgument, e.what()), false}; }
+  if (!expected.empty() && expected.size() != config_.fixed_value_size)
+    return {Status::Error(StatusCode::kInvalidArgument,
+                          "CAS expected value must be empty or fixed size"), false};
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
   CasResult result;
@@ -1105,7 +1141,7 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
   impl_->engine->PollTransport();
-  if (key.empty() || key.size() > config_.fixed_key_size)
+  if (key.size() != config_.fixed_key_size || IsInternalMaxKey(key))
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), 0};
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;

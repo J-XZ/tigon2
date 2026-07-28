@@ -24,6 +24,7 @@ while (($#)); do
   shift
 done
 for n in "$rounds" "$records" "$operations" "$threads" "$timeout" "$shared_size"; do [[ "$n" =~ ^[1-9][0-9]*$ ]] || { echo "positive integer required: $n" >&2; exit 2; }; done
+[[ "$threads" == 4 ]] || { echo "formal YCSB requires 4 foreground workers per VM" >&2; exit 2; }
 [[ -r "$base_config" ]] || { echo "base config unavailable: $base_config" >&2; exit 2; }
 # shellcheck source=scripts/tigonkv_ycsb_cpp_pin.sh
 source "$root/scripts/tigonkv_ycsb_cpp_pin.sh"
@@ -80,6 +81,12 @@ if [[ "$skip_trace_gen" != true ]]; then
     --request-distribution zipfian \
     --force \
     >"$out_dir/logs/trace_gen_load.log" 2>&1
+  cmake --build "$root/build-relwithdebinfo" --target ycsb_partition_splits -j4
+  "$root/build-relwithdebinfo/ycsb_partition_splits" \
+    --trace-dir "$out_dir/traces/load" \
+    --config "$generated_config" \
+    --workers 16 --fixed-key-size 32 \
+    >"$out_dir/logs/partition_splits.log" 2>&1
   for workload in "${selected[@]}"; do
     args=(
       --output-dir "$out_dir/traces"

@@ -180,7 +180,11 @@ struct Config {
   double latency_cache_hit_extra_ns = 0;
 
   static Config FromJsonc(const std::string &path);
-  void Validate() const;
+  // Normalizes non-infinite range boundaries into their persisted FixedKey
+  // representation, then validates the resulting contiguous range map.
+  // Config is immutable after construction/open, so routing never depends on
+  // a second parser or a process-local key cache.
+  void Validate();
   uint32_t PartitionForKey(std::string_view key) const;
 };
 
@@ -202,7 +206,8 @@ class KVStore {
   // keys are unique and strictly increasing, and migration alone is invisible.
   // This is not a multi-key snapshot; concurrent insert/delete may appear or
   // not according to whether it crosses the advancing cursor.
-  ScanResult Scan(std::string_view start_key, uint64_t limit);
+  ScanResult Scan(std::string_view start_key, std::string_view end_key,
+                  uint64_t limit);
   CasResult CompareExchange(std::string_view key, std::string_view expected,
                             std::string_view desired);
   IncrementResult Increment(std::string_view key, int64_t delta);

@@ -128,7 +128,7 @@ int main() {
       sampled_latencies.push_back(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - op_begin).count()));
   }
   const auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - read_begin).count();
-  auto scan = owner->Scan("00000000", kKeys);
+  auto scan = owner->Scan("00000000", std::string(8, static_cast<char>(0xff)), kKeys);
   assert(scan.status.ok() && scan.items.size() == kKeys);
   assert(owner->Memory().active_shared_rows > 0);
 

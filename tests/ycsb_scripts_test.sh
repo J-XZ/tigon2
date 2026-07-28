@@ -16,7 +16,7 @@ assert d['shared_memory']['numa_node'] == [1]
 assert d['vm']['numa_node'] == [0]
 assert d['vm']['ssh_base_port'] == 10022
 assert d['e2e']['foreground_worker_count_per_vm'] == 4
-assert 'tigon_kv' in d and d['tigon_kv']['partition_count'] == 16
+assert 'tigon_kv' in d and d['tigon_kv']['partition_count'] == 4
 assert d['tigon_kv']['fixed_key_size'] == 32
 assert d['tigon_kv']['fixed_value_size'] == 32
 assert d['tigon_kv']['cpu_affinity'] is True

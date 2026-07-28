@@ -34,14 +34,15 @@ namespace tigonkv::engine {
 // by kv_messages in M5 without changing this ownership boundary.
 class KVEngine {
  public:
-  static std::unique_ptr<KVEngine> Open(const Config &config, bool reset);
+  static std::unique_ptr<KVEngine> Open(Config config, bool reset);
   ~KVEngine();
 
   Status Put(std::string_view key, std::string_view value);
   GetResult Get(std::string_view key);
   Status Delete(std::string_view key);
   Status MoveOut(std::string_view key);
-  ScanResult Scan(std::string_view start_key, uint64_t limit);
+  ScanResult Scan(std::string_view start_key, std::string_view end_key,
+                  uint64_t limit);
   CasResult CompareExchange(std::string_view key, std::string_view expected,
                             std::string_view desired);
   IncrementResult Increment(std::string_view key, int64_t delta);
