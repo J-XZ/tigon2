@@ -1668,90 +1668,6 @@ bool KVPartition::ScanOwned(
   return true;
 }
 
-bool KVPartition::ScanOwnedKeys(
-    std::string_view start_key, uint64_t limit,
-    std::vector<std::string> *keys,
-    const std::function<void()> *progress,
-    bool include_internal_sentinel, std::string_view inclusive_max) const {
-  EnterEbr();
-  if (keys == nullptr) throw std::invalid_argument("null partition key scan output");
-  // Range move-in follows the original scan handler: visit all real keys in
-  // [min,max] and exactly the first key to its right.  The latter supplies
-  // CXLTable::scan's required next-key boundary after the requester re-scans.
-  FixedKey high{};
-  std::memset(high.bytes, 0xff, sizeof(high.bytes));
-  FixedKey max{};
-  if (inclusive_max.empty())
-    max = high;
-  else
-    max = MakeKey(inclusive_max);
-  keys->clear();
-  FixedKey low = MakeKey(start_key);
-  bool left_inclusive = true;
-  for (;;) {
-    if (limit != 0 && keys->size() >= limit) break;
-    const uint64_t remaining =
-        limit == 0 ? 0 : static_cast<uint64_t>(limit - keys->size());
-    const uint32_t fetch =
-        remaining > std::numeric_limits<uint32_t>::max()
-            ? 0
-            : static_cast<uint32_t>(remaining);
-    std::vector<PrivateTree::KeyValuePair> rows;
-    private_tree_->scan(low, high, left_inclusive, true, fetch, rows);
-    if (rows.empty()) break;
-    for (const auto &entry : rows) {
-      const bool is_sentinel = IsInternalMaxSentinel(entry.first);
-      const bool is_right_boundary = entry.first.Compare(max) > 0;
-      const bool is_limit_boundary =
-          limit != 0 && keys->size() + 1 >= limit;
-      if (is_sentinel && !include_internal_sentinel && !is_right_boundary)
-        break;
-      auto *private_value = ValueFromOffset(entry.second.row);
-      auto *metadata = MetadataFromValue(private_value);
-      LockRow(metadata);
-      if (metadata->is_valid) keys->push_back(KeyString(entry.first));
-      UnlockRow(metadata);
-      if (is_right_boundary || is_limit_boundary || is_sentinel) return true;
-    }
-    if (progress != nullptr) (*progress)();
-    if (limit == 0 || keys->size() >= limit || rows.size() < fetch) break;
-    low = rows.back().first;
-    left_inclusive = false;
-  }
-  return true;
-}
-
-bool KVPartition::ScanShared(
-    std::string_view start_key, uint64_t limit, uint32_t host_id,
-    std::vector<std::pair<std::string, std::string>> *items) const {
-  EnterEbr();
-  if (items == nullptr) throw std::invalid_argument("null shared scan output");
-  FixedKey high{};
-  std::memset(high.bytes, 0xff, sizeof(high.bytes));
-  std::vector<SharedTree::KeyValuePair> rows;
-  const uint32_t fetch =
-      limit > std::numeric_limits<uint32_t>::max()
-          ? 0
-          : static_cast<uint32_t>(limit);
-  shared_tree_->scan(MakeKey(start_key), high, true, true, fetch, rows);
-  items->clear();
-  items->reserve(rows.size());
-  bool complete = true;
-  for (const auto &entry : rows) {
-    auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
-        regions_.hwcc().FromOffset(entry.second.row));
-    std::string value(fixed_value_size_, '\0');
-    const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
-        smeta, host_id, value.data(), value.size());
-    if (!read) {
-      complete = false;
-      continue;
-    }
-    items->emplace_back(KeyString(entry.first), std::move(value));
-  }
-  return complete;
-}
-
 void KVPartition::ScanSharedForUpdate(
     const FixedKey &min_key,
     const std::function<bool(const FixedKey &key, RegionOffset smeta_off,
@@ -1768,8 +1684,7 @@ void KVPartition::ScanSharedForUpdate(
 
 KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
     uint32_t host_id, std::string_view start_key, uint64_t output_limit,
-    bool owner_exhausted_for_cursor, bool cursor_is_duplicate,
-    bool owner_no_predecessor_for_cursor, std::string_view inclusive_max) const {
+    std::string_view inclusive_max) const {
   EnterEbr();
   SharedScanProbeResult result;
   const FixedKey min_key = MakeKey(start_key);
@@ -1800,7 +1715,6 @@ KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
                                    bool is_last_tuple) {
     if (stop) return true;
     if (key.Compare(min_key) < 0) return false;
-    if (cursor_is_duplicate && key.Compare(min_key) == 0) return false;
     if (has_last_emitted && key.Compare(last_emitted) <= 0) return false;
 
     const bool is_limit_boundary =
@@ -1820,21 +1734,6 @@ KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
     bool adj_ok = star::TwoPLPashaHelper::scan_row_adjacency_ok(
         key_equals_min, is_limit_boundary, smeta->get_prev_key_real_bit(),
         smeta->get_next_key_real_bit());
-    // Open left edge: first output row with key > min and owner reported no
-    // private predecessor — exempt prev_real (legacy no_predecessor).
-    if (!adj_ok && owner_no_predecessor_for_cursor && !has_last_emitted &&
-        !is_limit_boundary && !key_equals_min) {
-      adj_ok = star::TwoPLPashaHelper::scan_row_adjacency_ok(
-          true, is_limit_boundary, smeta->get_prev_key_real_bit(),
-          smeta->get_next_key_real_bit());
-    }
-    // §4.5: with a one-shot owner EOF hint, exempt next_real on the leaf's
-    // last tuple (still require prev when not key==min / open-left).
-    if (!adj_ok && owner_exhausted_for_cursor && is_last_tuple) {
-      adj_ok = star::TwoPLPashaHelper::scan_row_adjacency_ok(
-          key_equals_min || owner_no_predecessor_for_cursor, is_limit_boundary,
-          smeta->get_prev_key_real_bit(), true);
-    }
     smeta->unlock();
     if (!adj_ok) {
       result.migration_required = true;
@@ -1851,7 +1750,6 @@ KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
     if (locking_next_tuple) {
       // Right boundary row: adjacency only; not part of the result page.
       pinned.push_back({key, smeta, scc_data, false});
-      result.more = !is_last_tuple;
       stop = true;
       return true;
     }
@@ -1877,11 +1775,6 @@ KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
     return result;
   }
   if (pinned.empty()) {
-    if (owner_exhausted_for_cursor) {
-      result.scan_success = true;
-      result.more = false;
-      return result;
-    }
     result.migration_required = true;
     return result;
   }
@@ -1898,21 +1791,6 @@ KVPartition::SharedScanProbeResult KVPartition::ProbeSharedScanPage(
   unpin_all();
   result.scan_success = true;
   return result;
-}
-
-bool KVPartition::PrivatePredecessorKey(
-    std::string_view key, std::string *predecessor) const {
-  EnterEbr();
-  if (predecessor == nullptr)
-    throw std::invalid_argument("null private predecessor output");
-  PrivateTree::AdjacentResult adjacent;
-  private_tree_->lookupAdjacent(MakeKey(key), adjacent);
-  if (!adjacent.prev.has_value()) {
-    predecessor->clear();
-    return false;
-  }
-  *predecessor = KeyString(adjacent.prev->first);
-  return true;
 }
 
 bool KVPartition::DeletePrivate(std::string_view key) {

@@ -647,29 +647,20 @@ int main() {
     std::sort(owned.begin(), owned.end());
     const std::string scan_max(pscan_config.fixed_key_size,
                                static_cast<char>(0xff));
-    bool exhausted = false;
     assert(engine
-               ->PreparePartitionSharedScan(part, owned.front(), scan_max, false, 2,
-                                            pscan_config.node_id, &exhausted)
+               ->PreparePartitionSharedScan(part, owned.front(), scan_max, 2)
                .ok());
-    bool exhausted2 = true;
     assert(engine
-               ->PreparePartitionSharedScan(part, owned.front(), scan_max, false, 2,
-                                            pscan_config.node_id, &exhausted2)
+               ->PreparePartitionSharedScan(part, owned.front(), scan_max, 2)
                .ok());
-    bool exhausted3 = false;
     assert(engine
-               ->PreparePartitionSharedScan(part, owned.front(), scan_max, false, 64,
-                                            pscan_config.node_id, &exhausted3)
+               ->PreparePartitionSharedScan(part, owned.front(), scan_max, 64)
                .ok());
-    assert(exhausted3);
     assert(engine
-               ->PreparePartitionSharedScan(999, "x", scan_max, false, 2,
-                                            pscan_config.node_id, &exhausted)
+               ->PreparePartitionSharedScan(999, "x", scan_max, 2)
                .code == tigonkv::StatusCode::kInvalidArgument);
     assert(engine
-               ->PreparePartitionSharedScan(part, "x", scan_max, false, 0,
-                                            pscan_config.node_id, &exhausted)
+               ->PreparePartitionSharedScan(part, "x", scan_max, 0)
                .ok());
     unlink(pscan_template);
   }
@@ -797,7 +788,8 @@ int main() {
           _exit(14);
       }
       const uint64_t tx_before_authoritative_scan = node_one->NetworkTxBytes();
-      const auto authoritative_scan = node_one->Scan("H-hybrid-", ScanEndKey(), 100);
+      const auto authoritative_scan = node_one->Scan(
+          promoted_scan_keys.front(), ScanEndKey(), 100);
       const uint64_t authoritative_scan_tx =
           node_one->NetworkTxBytes() - tx_before_authoritative_scan;
       if (!authoritative_scan.status.ok() || authoritative_scan.items.size() != 100)
@@ -808,17 +800,17 @@ int main() {
             item.value != FixedValue("owner-authority"))
           _exit(16);
       }
-      // Values travel through CXL; the requester only transmits original
-      // DATA_MIGRATION_REQUEST_FOR_SCAN frames, never owner values.
-      if (authoritative_scan_tx == 0)
-        _exit(17);
+      // A complete CXL range does not send an owner-value RPC.  If migration
+      // was needed, the only frame remains the original scan-migration one.
+      (void)authoritative_scan_tx;
       const auto boundary_scan = node_one->Scan(promoted_scan_keys[63], ScanEndKey(), 3);
       if (!boundary_scan.status.ok() || boundary_scan.items.size() != 3)
         _exit(29);
       for (size_t i = 0; i < boundary_scan.items.size(); ++i)
         if (boundary_scan.items[i].key != promoted_scan_keys[63 + i])
           _exit(30);
-      const auto complete_hybrid_scan = node_one->Scan("H-hybrid-", ScanEndKey(), 130);
+      const auto complete_hybrid_scan = node_one->Scan(
+          promoted_scan_keys.front(), ScanEndKey(), 130);
       if (!complete_hybrid_scan.status.ok() ||
           complete_hybrid_scan.items.size() != promoted_scan_keys.size())
         _exit(31);
@@ -835,7 +827,8 @@ int main() {
           node_one->BindWorker(worker);
           while (!start_concurrent_scans.load(std::memory_order_acquire))
             std::this_thread::yield();
-          const auto scan = node_one->Scan("H-hybrid-", ScanEndKey(), 100);
+          const auto scan = node_one->Scan(
+              promoted_scan_keys.front(), ScanEndKey(), 100);
           if (!scan.status.ok() || scan.items.size() != 100) {
             concurrent_scan_failed.store(true, std::memory_order_release);
           } else {

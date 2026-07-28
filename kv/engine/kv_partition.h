@@ -143,19 +143,6 @@ class KVPartition {
                  std::vector<std::pair<std::string, std::string>> *items,
                  const std::function<void()> *progress = nullptr,
                  std::string_view inclusive_max = {}) const;
-  // Key-only owner locator walk used by TwoPLPasha-style range move-in. It
-  // deliberately avoids reading values that the requester will read via CXL.
-  bool ScanOwnedKeys(
-      std::string_view start_key, uint64_t limit,
-      std::vector<std::string> *keys,
-      const std::function<void()> *progress = nullptr,
-      bool include_internal_sentinel = false,
-      std::string_view inclusive_max = {}) const;
-  // Test/legacy helper; formal Scan uses ProbeSharedScanPage. host_id is the
-  // SCC reader identity (requester), not owner_shard_.
-  bool ScanShared(
-      std::string_view start_key, uint64_t limit, uint32_t host_id,
-      std::vector<std::pair<std::string, std::string>> *items) const;
   // Thin CXLTable::scan-style entry: shared_tree_->scanForUpdate only.
   // Processor returns true to stop (BTreeOLC_CXL end semantics). Adapter does
   // ValueType→RegionOffset passthrough; no adjacency/migration logic (§4.3).
@@ -168,17 +155,13 @@ class KVPartition {
     Status status = Status::Ok();
     bool scan_success = false;
     bool migration_required = false;
-    bool more = false;
     std::vector<std::pair<std::string, std::string>> items;
   };
   // host_id is the requester (SCC cache bit / clflush identity), not the
   // partition owner. Matches original TwoPLPasha coordinator_id on remote scan.
   SharedScanProbeResult ProbeSharedScanPage(
       uint32_t host_id, std::string_view start_key, uint64_t output_limit,
-      bool owner_exhausted_for_cursor, bool cursor_is_duplicate,
-      bool owner_no_predecessor_for_cursor = false,
       std::string_view inclusive_max = {}) const;
-  bool PrivatePredecessorKey(std::string_view key, std::string *predecessor) const;
   void ClockLock();
   void ClockUnlock();
   void ClockTrackMigratedKey(const void *key_bytes);

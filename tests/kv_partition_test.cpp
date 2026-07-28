@@ -283,10 +283,6 @@ int main() {
   std::vector<std::pair<std::string, std::string>> latency_scan;
   assert(partition.ScanOwned("latency-only", 1, &latency_scan));
   assert(latency_scan.size() == 1 && latency_scan[0].second == FixedValue("payload"));
-  std::vector<std::string> latency_scan_keys;
-  assert(partition.ScanOwnedKeys("latency-only", 1, &latency_scan_keys));
-  assert(latency_scan_keys.size() == 1 &&
-         latency_scan_keys[0] == "latency-only");
   simulator.EndScopeAndDelay();
   auto latency_stats = simulator.TakeStatsAndReset();
   assert(latency_stats.swcc_raw_line_accesses > 0);
@@ -460,17 +456,19 @@ int main() {
   assert(scan.size() == 2);
   assert(scan[0].first == "alpha" && scan[1].first == "clock");
 
-  // Original TwoPLPasha range migration first walks owner locators without
-  // reading values, then move_row_in(..., inc_ref=false). The requester reads
-  // values only from CXL.
-  std::vector<std::string> scan_keys;
-  assert(partition.ScanOwnedKeys("alpha", 2, &scan_keys));
-  assert(scan_keys.size() == 2);
-  for (const auto &key : scan_keys)
+  // Remote scan consumes only CXL rows.  Move the two result rows plus the
+  // original right boundary, then hold all row locks/ref pins until the
+  // fragment has copied its values.
+  for (const auto &key : {"alpha", "clock", "counter"})
     assert(partition.EnsureInShared(key, 1) == tigonkv::StatusCode::kOk);
-  std::vector<std::pair<std::string, std::string>> shared_scan;
-  assert(partition.ScanShared("alpha", 2, /*host_id=*/1, &shared_scan));
-  assert(shared_scan == scan);
+  const std::string scan_max(regions.layout().fixed_key_size,
+                             static_cast<char>(0xff));
+  const auto shared_scan = partition.ProbeSharedScanPage(
+      /*host_id=*/1, "alpha", 2, scan_max);
+  assert(shared_scan.status.ok() && shared_scan.scan_success);
+  assert(shared_scan.items.size() == 2);
+  assert(shared_scan.items[0] == scan[0]);
+  assert(shared_scan.items[1] == scan[1]);
   // §4.3: ScanSharedForUpdate visits shared keys in order with is_last_tuple.
   {
     std::vector<tigonkv::engine::FixedKey> visited;

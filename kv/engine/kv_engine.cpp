@@ -711,12 +711,9 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
                          ScanResult *result) -> Status {
     auto *partition = partitions_[partition_id].get();
     bool migrated_once = false;
-    bool owner_exhausted = false;
-    bool owner_no_predecessor = false;
     for (;;) {
       KVPartition::SharedScanProbeResult probe = partition->ProbeSharedScanPage(
-          config_.node_id, min_key, scan_limit, owner_exhausted,
-          /*cursor_is_duplicate=*/false, owner_no_predecessor, inclusive_max);
+          config_.node_id, min_key, scan_limit, inclusive_max);
       ++TlsScanDiag.partition_probes;
       PollTransport();
       if (!probe.status.ok()) return probe.status;
@@ -730,8 +727,6 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
             OwnerForPartition(partition_id), inclusive_max, scan_limit);
         ++TlsScanDiag.migrate_rpcs;
         if (!migrated.ok()) return migrated;
-        owner_exhausted = false;
-        owner_no_predecessor = false;
         continue;
       }
       if (!probe.scan_success)
@@ -791,13 +786,7 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
 
 Status KVEngine::PreparePartitionSharedScan(
     uint32_t partition_id, std::string_view start_key,
-    std::string_view inclusive_max, bool cursor_is_duplicate,
-    uint64_t output_limit, uint32_t requester, bool *exhausted_out,
-    bool *no_predecessor_out) {
-  if (exhausted_out == nullptr)
-    return Status::Error(StatusCode::kInvalidArgument, "null exhausted_out");
-  *exhausted_out = false;
-  if (no_predecessor_out != nullptr) *no_predecessor_out = false;
+    std::string_view inclusive_max, uint64_t output_limit) {
   if (partition_id >= partitions_.size() ||
       partition_id >= config_.partition_count)
     return Status::Error(StatusCode::kInvalidArgument,
@@ -805,74 +794,23 @@ Status KVEngine::PreparePartitionSharedScan(
   if (OwnerForPartition(partition_id) != config_.node_id)
     return Status::Error(StatusCode::kOwnerViolation,
                          "scan migrate routed to non-owner");
-  auto *partition = partitions_[partition_id].get();
-  const uint64_t fetch = output_limit == 0 ||
-      output_limit == std::numeric_limits<uint64_t>::max()
-      ? 0
-      : output_limit + (cursor_is_duplicate ? 1 : 0) + 1;  // +1 right boundary
-  std::vector<std::string> keys;
-  if (!partition->ScanOwnedKeys(start_key, fetch, &keys, nullptr,
-                                /*include_internal_sentinel=*/true,
-                                inclusive_max))
+  // The scan request has no KV-specific page/exhaustion protocol.  Reuse the
+  // original handler's ITable callback: it moves [min,max] and the one right
+  // boundary, leaves requester refs at zero, and relies on the requester to
+  // re-run the same CXL scan after the original bool response.
+  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id);
+  if (table == nullptr)
     return Status::Error(StatusCode::kCorruption,
-                         "owner key-only range scan failed");
-  // A lower-bound start may fall between two owner keys.  CXLTable's original
-  // next-key check then needs that predecessor present so the first returned
-  // row has a real previous neighbour; it remains below min and is never a
-  // result on the requester.
-  if (!keys.empty() &&
-      FixedKey::From(keys.front(), config_.fixed_key_size)
-              .Compare(FixedKey::From(start_key, config_.fixed_key_size)) > 0) {
-    std::string predecessor;
-    if (partition->PrivatePredecessorKey(keys.front(), &predecessor))
-      keys.insert(keys.begin(), std::move(predecessor));
+                         "scan migration table adapter is unavailable");
+  const FixedKey min = FixedKey::From(start_key, config_.fixed_key_size);
+  const FixedKey max = FixedKey::From(inclusive_max, config_.fixed_key_size);
+  try {
+    star::TwoPLPashaMessageHandler::move_in_scan_range(
+        *table, min.bytes, max.bytes, output_limit);
+  } catch (const std::bad_alloc &) {
+    return Status::Error(StatusCode::kOutOfMemory,
+                         "scan range move-in allocation failed");
   }
-  FixedKey internal_max{};
-  std::memset(internal_max.bytes, 0xff, config_.fixed_key_size);
-  const bool includes_right_sentinel =
-      !keys.empty() && FixedKey::From(keys.back(), config_.fixed_key_size)
-                           .Compare(internal_max) == 0;
-  *exhausted_out = includes_right_sentinel || keys.size() < fetch;
-  // Open left edge: first key > start and its private predecessor is absent or
-  // strictly below start (outside this page's move-in set) (§4.4/§4.5).
-  if (!keys.empty() &&
-      FixedKey::From(keys.front(), config_.fixed_key_size)
-              .Compare(FixedKey::From(start_key, config_.fixed_key_size)) > 0) {
-    std::string predecessor;
-    if (!partition->PrivatePredecessorKey(keys.front(), &predecessor)) {
-      if (no_predecessor_out != nullptr) *no_predecessor_out = true;
-    } else if (FixedKey::From(predecessor, config_.fixed_key_size)
-                       .Compare(FixedKey::From(start_key, config_.fixed_key_size)) <
-                   0 &&
-               no_predecessor_out != nullptr) {
-      *no_predecessor_out = true;
-    }
-  } else if (keys.empty() && no_predecessor_out != nullptr) {
-    *no_predecessor_out = true;
-  }
-  uint64_t movein_attempted = 0;
-  for (const auto &key : keys) {
-    bool moved_in = false;
-    ++movein_attempted;
-    const StatusCode code =
-        partition->EnsureInShared(key, requester, &moved_in);
-    // Original TwoPLPashaMessage.h:353-361: NotFound is a race, skip the key.
-    if (code == StatusCode::kNotFound) continue;
-    if (code != StatusCode::kOk) {
-      scan_owner_rows_movein_attempted_.fetch_add(
-          movein_attempted, std::memory_order_relaxed);
-      return Status::Error(code, "partition scan range move-in failed");
-    }
-    if (moved_in) {
-      migration_in_.fetch_add(1, std::memory_order_relaxed);
-      shared_swcc_flushes_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
-  // One atomic add for the whole preparation RPC (§13 — not per Scan result row).
-  scan_owner_rows_movein_attempted_.fetch_add(movein_attempted,
-                                              std::memory_order_relaxed);
-  // Do NOT Clock-evict here: ack ScanMigrate first so the requester can probe
-  // the page that was just moved in (mirrors kMigrate ack-before-evict).
   return Status::Ok();
 }
 
@@ -1508,11 +1446,8 @@ void KVEngine::ServeTransportRequest(star::Message &message,
     decoder >> limit >> transaction_id >> key_offset;
     if (decoder.size() != 0 || key_offset != 0)
       TransportFatal(config_.node_id, "request", "bad scan migration request fields", &message);
-    bool exhausted = false;
-    bool no_predecessor = false;
     const Status status = PreparePartitionSharedScan(
-        piece.get_partition_id(), min_key, max_key, false, limit,
-        message.get_source_node_id(), &exhausted, &no_predecessor);
+        piece.get_partition_id(), min_key, max_key, limit);
     const bool success = status.ok();
     const auto size = star::MessagePiece::get_header_size() + sizeof(success) + sizeof(key_offset);
     star::Encoder encoder(response.data);

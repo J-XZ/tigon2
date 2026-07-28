@@ -153,6 +153,61 @@ class TwoPLPashaMessageHandler {
 	using Transaction = TwoPLPashaTransaction;
 
     public:
+        // The owner half of the original scan migration request.  Keeping it
+        // here lets the transaction handler and the transaction-free KV
+        // facade share the exact ITable scan / move_row_in sequence instead
+        // of growing a second range-paging protocol in KVPartition.
+        static void move_in_scan_range(ITable &table, const void *min_key,
+                                       const void *max_key, uint64_t limit)
+        {
+                std::vector<ITable::row_entity> scan_results;
+                auto scan_processor = [&](const void *key,
+                                          std::atomic<uint64_t> *meta_ptr,
+                                          void *data_ptr,
+                                          bool is_last_tuple) -> bool {
+                        (void)is_last_tuple;
+                        DCHECK(key != nullptr);
+                        DCHECK(meta_ptr != nullptr);
+                        DCHECK(data_ptr != nullptr);
+
+                        bool migrating_next_key = false;
+                        if (limit != 0 && scan_results.size() == limit) {
+                                migrating_next_key = true;
+                        } else if (table.compare_key(key, max_key) > 0) {
+                                migrating_next_key = true;
+                        }
+
+                        if (table.compare_key(key, min_key) >= 0) {
+                                if (scan_results.size() > 0 &&
+                                    table.compare_key(
+                                        key,
+                                        scan_results[scan_results.size() - 1].key) <= 0) {
+                                        return false;
+                                }
+                        } else {
+                                return false;
+                        }
+
+                        // The original handler deliberately ignores a race
+                        // between this scan and move_row_in.  The requester
+                        // re-runs the same CXL scan after the bool response.
+                        scan_results.emplace_back(key, table.key_size(), meta_ptr,
+                                                  data_ptr, table.value_size());
+                        return migrating_next_key;
+                };
+                table.scan(min_key, scan_processor);
+
+                for (auto &row : scan_results) {
+                        std::tuple<std::atomic<uint64_t> *, void *> row_tuple(
+                            row.meta, row.data);
+                        // Same original semantics: a missing/deleted row or
+                        // allocation failure is handled by the re-probe, and
+                        // this range migration never obtains requester refs.
+                        migration_manager->move_row_in(&table, row.key, row_tuple,
+                                                       false);
+                }
+        }
+
         static void data_migration_request_handler(MessagePiece inputPiece, Message &responseMessage, ITable &table, Transaction *txn)
 	{
 		DCHECK(inputPiece.get_message_type() == static_cast<uint32_t>(TwoPLPashaMessage::DATA_MIGRATION_REQUEST));
@@ -300,7 +355,8 @@ class TwoPLPashaMessageHandler {
                 bool success = false;
 
 		DCHECK(inputPiece.get_message_length() ==
-		       MessagePiece::get_header_size() + key_size + sizeof(transaction_id) + sizeof(key_offset));
+		       MessagePiece::get_header_size() + key_size + key_size +
+                       sizeof(limit) + sizeof(transaction_id) + sizeof(key_offset));
 
 		// get min_key
 		const void *min_key = stringPiece.data();
@@ -316,53 +372,7 @@ class TwoPLPashaMessageHandler {
 
 		DCHECK(dec.size() == 0);
 
-                // do a scan to find all the tuples within the range plus the next tuple
-                std::vector<ITable::row_entity> scan_results;
-                auto scan_processor = [&](const void *key, std::atomic<uint64_t> *meta_ptr, void *data_ptr, bool is_last_tuple) -> bool {
-                        DCHECK(key != nullptr);
-                        DCHECK(meta_ptr != nullptr);
-                        DCHECK(data_ptr != nullptr);
-
-                        bool migrating_next_key = false;
-
-                        if (limit != 0 && scan_results.size() == limit) {
-                                migrating_next_key = true;
-                        } else if (table.compare_key(key, max_key) > 0) {
-                                migrating_next_key = true;
-                        }
-
-                        if (table.compare_key(key, min_key) >= 0) {
-                                if (scan_results.size() > 0) {
-                                        if (table.compare_key(key, scan_results[scan_results.size() - 1].key) <= 0) {
-                                                return false;
-                                        }
-                                }
-                        } else {
-                                return false;
-                        }
-
-                        // record the current row in scan_results
-                        // we do not care about the return value of move_row_in
-                        ITable::row_entity cur_row(key, table.key_size(), meta_ptr, data_ptr, table.value_size());
-                        scan_results.push_back(cur_row);
-
-                        if (migrating_next_key == true) {
-                                return true;
-                        } else {
-                                return false;
-                        }
-                };
-                table.scan(min_key, scan_processor);
-
-                // there can be a race condition between scan and data move in
-                // since a tuple can be deleted after a scan is done
-
-                // move in every tuple - the return value does not matter
-                // note that we do NOT increase reference count here!
-                for (int i = 0; i < scan_results.size(); i++) {
-                        std::tuple<std::atomic<uint64_t> *, void *> row_tuple(scan_results[i].meta, scan_results[i].data);
-                        migration_manager->move_row_in(&table, scan_results[i].key, row_tuple, false);
-                }
+                move_in_scan_range(table, min_key, max_key, limit);
 
 		// prepare response message header
 		auto message_size = MessagePiece::get_header_size() + sizeof(success) + sizeof(key_offset);
