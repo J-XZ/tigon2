@@ -402,8 +402,10 @@ class TwoPLPashaHelper {
         // same window so move-out quiescence matches TwoPLPashaHelper
         // remote_take_*_lock_and_read / release_migrated_row.
         static bool kv_shared_read(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
-                                   void *dest, std::size_t size)
+                                   void *dest, std::size_t size,
+                                   KvSharedResult *result = nullptr)
         {
+                if (result != nullptr) *result = KvSharedResult::kBusy;
                 if (smeta == nullptr || scc_manager == nullptr) return false;
                 smeta->lock();
                 auto *scc_data = smeta->get_scc_data();
@@ -432,6 +434,9 @@ class TwoPLPashaHelper {
                 smeta->decrement_ref_cnt();
                 smeta->decrease_reader_count();
                 smeta->unlock();
+                if (result != nullptr)
+                        *result = valid ? KvSharedResult::kDone
+                                        : KvSharedResult::kMissing;
                 return valid;
         }
 
@@ -486,8 +491,10 @@ class TwoPLPashaHelper {
         }
 
         static bool kv_shared_write(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
-                                    const void *src, std::size_t size)
+                                    const void *src, std::size_t size,
+                                    KvSharedResult *result = nullptr)
         {
+                if (result != nullptr) *result = KvSharedResult::kBusy;
                 if (smeta == nullptr || scc_manager == nullptr) return false;
                 smeta->lock();
                 auto *scc_data = smeta->get_scc_data();
@@ -496,8 +503,8 @@ class TwoPLPashaHelper {
                 // internal reader-drain loop.
                 if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
                     smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
-                        smeta->unlock();
-                        return false;
+                    smeta->unlock();
+                    return false;
                 }
                 smeta->set_write_locked();
                 smeta->increment_ref_cnt();
@@ -516,21 +523,28 @@ class TwoPLPashaHelper {
                 smeta->decrement_ref_cnt();
                 smeta->clear_write_locked();
                 smeta->unlock();
+                if (result != nullptr) *result = KvSharedResult::kDone;
                 return true;
         }
 
         template <typename Mutator>
         static bool kv_shared_update(TwoPLPashaMetadataShared *smeta,
                                      std::size_t host_id, std::size_t capacity,
-                                     Mutator &&mutator, bool *changed)
+                                     Mutator &&mutator, bool *changed,
+                                     KvSharedResult *result = nullptr)
         {
+                if (result != nullptr) *result = KvSharedResult::kBusy;
                 if (smeta == nullptr || scc_manager == nullptr || changed == nullptr)
                         return false;
                 smeta->lock();
                 auto *scc_data = smeta->get_scc_data();
                 const uint64_t size = capacity;
-                if (!smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) ||
-                    smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
+                if (!smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index)) {
+                        smeta->unlock();
+                        if (result != nullptr) *result = KvSharedResult::kMissing;
+                        return false;
+                }
+                if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
                     smeta->get_ref_cnt() == std::numeric_limits<uint8_t>::max()) {
                         smeta->unlock();
                         return false;
@@ -576,6 +590,7 @@ class TwoPLPashaHelper {
                 smeta->clear_write_locked();
                 smeta->unlock();
                 *changed = write;
+                if (result != nullptr) *result = KvSharedResult::kDone;
                 return true;
         }
 
