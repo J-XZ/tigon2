@@ -22,10 +22,18 @@ SCC、Clock/MigrationManager 和 EBR；不要把它重写成另一套 KV。
 - 只有一张逻辑表：`kSingleTableId=0`。partition 是配置的连续半开键范围和
   并发分片，
   不是多表；不要恢复 table registry 或 transaction executor。
-- owner-private B+Tree、`PrivateRow` 和 Clock tracker 位于 SWCC
-  owner-private arena，只允许 owner VM 的 worker 访问。
-- shared B+Tree、smeta、root、EBR 和 transport 位于 HWCC；migrated value
-  位于 shared SWCC，通过 TwoPLPasha WriteThrough SCC、行锁和 flush 发布。
+- 外部KV API不暴露table id；下一步内部协议为复用原Tigon `MessagePiece`必须
+  保留该header字段并固定为0。施工目标允许原
+  `TwoPLPashaHelper::cxl_tbl_vecs`外层
+  固定size=1以直接复用helper，但不恢复通用Database/多表动态调度。不得为了
+  “单表化”重写原消息头或helper查询骨架。
+- owner-private B+Tree、`PrivateRow`和Clock tracker位于SWCC owner-private
+  arena，只允许owner VM的worker访问；当前EBR retire queue仍在进程DRAM，
+  下一步按方案迁入owner-private SWCC。
+- shared B+Tree、smeta、root、EBR global/local epoch和transport位于HWCC；
+  migrated value位于shared SWCC，通过TwoPLPasha WriteThrough SCC、行锁和
+  flush发布。进程内多态table wrapper只是可重建的non-owning handle；不得把
+  vptr、allocator对象或解析后的VA持久化进共享区域。
 - 非 owner 点操作先尝试 shared CXL；稳定 miss 才 Forward 或请求 owner
   move-in。Delete 始终以 owner 为权威。
 - Put/Get/Delete/CAS/Increment 提供单 key 线性一致，不提供多 key transaction。

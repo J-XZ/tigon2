@@ -143,7 +143,7 @@ python3 scripts/summarize_ycsb_experiment.py \
    兼容 Scan（hash partition k 路归并），**不等价**于原始 TwoPLPasha 单
    partition native Scan；正式报告须分开表述。DumpStats 的
    `scan_migrate_rpcs` / `scan_partition_probes` / `scan_rows_returned` 用于
-   判断 warm CXL 后是否仍大量 RPC、以及 Scan 是否真返回了行。
+   判断 shared-index 命中后是否仍大量 RPC、以及 Scan 是否真返回了行。
 5. 实际 init/kill 必须 `--allow-state-change`；Ask 模式我无法替你执行。
 
 核心就是：**RelWithDebInfo 构建 → init+check 4VM → 一条 `tigonkv_run_ycsb_experiment.sh`（1M/1M、4 线程、`a,b,c,d,e`、`--no-latency`）**。
