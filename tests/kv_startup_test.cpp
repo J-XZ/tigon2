@@ -75,6 +75,13 @@ int main() {
   auto vm1_engine = tigonkv::engine::KVEngine::Open(ConfigFor(path, 1), false);
   const auto &layout = vm1_engine->Memory();
   (void)layout;
+  const std::string internal_max(32, static_cast<char>(0xff));
+  assert(vm1_engine->Get(internal_max).status.code ==
+         tigonkv::StatusCode::kInvalidArgument);
+  assert(vm1_engine->Put(internal_max, std::string(128, '\0')).code ==
+         tigonkv::StatusCode::kInvalidArgument);
+  assert(vm1_engine->Scan(internal_max, {}, 1).status.code ==
+         tigonkv::StatusCode::kInvalidArgument);
   int status = 0;
   assert(waitpid(vm0, &status, 0) == vm0);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);

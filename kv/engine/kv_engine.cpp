@@ -59,6 +59,12 @@ class LayoutDigest {
   uint64_t value_ = 1469598103934665603ULL;
 };
 
+bool IsInternalMaxSentinel(std::string_view key) {
+  return !key.empty() && std::all_of(key.begin(), key.end(), [](char byte) {
+    return static_cast<unsigned char>(byte) == 0xff;
+  });
+}
+
 uint64_t SharedLayoutConfigDigest(const Config &config) {
   LayoutDigest digest;
   const auto u64 = [&](std::string_view name, uint64_t value) {
@@ -480,6 +486,9 @@ KVPartition *KVEngine::VisiblePartition(std::string_view key) const {
 }
 
 Status KVEngine::Put(std::string_view key, std::string_view value) {
+  if (IsInternalMaxSentinel(key))
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "internal max sentinel is reserved");
   MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
@@ -532,6 +541,9 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
 }
 
 GetResult KVEngine::Get(std::string_view key) {
+  if (IsInternalMaxSentinel(key))
+    return {Status::Error(StatusCode::kInvalidArgument,
+                          "internal max sentinel is reserved"), {}};
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
     auto *visible = route.partition;
@@ -576,6 +588,9 @@ GetResult KVEngine::Get(std::string_view key) {
 }
 
 Status KVEngine::Delete(std::string_view key) {
+  if (IsInternalMaxSentinel(key))
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "internal max sentinel is reserved");
   MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
@@ -602,6 +617,9 @@ Status KVEngine::Delete(std::string_view key) {
 
 ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
                           uint64_t limit) {
+  if (IsInternalMaxSentinel(start_key))
+    return {Status::Error(StatusCode::kInvalidArgument,
+                          "internal max sentinel is reserved"), {}};
   constexpr uint64_t kScanSafetyLimit = 1024 * 1024;
   if (limit > kScanSafetyLimit)
     return {Status::Error(StatusCode::kInvalidArgument, "scan limit exceeds safety cap"), {}};
@@ -833,6 +851,9 @@ Status KVEngine::PreparePartitionSharedScan(
 CasResult KVEngine::CompareExchange(std::string_view key,
                                     std::string_view expected,
                                     std::string_view desired) {
+  if (IsInternalMaxSentinel(key))
+    return {Status::Error(StatusCode::kInvalidArgument,
+                          "internal max sentinel is reserved"), false};
   MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
@@ -877,6 +898,9 @@ CasResult KVEngine::CompareExchange(std::string_view key,
 }
 
 IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
+  if (IsInternalMaxSentinel(key))
+    return {Status::Error(StatusCode::kInvalidArgument,
+                          "internal max sentinel is reserved"), 0};
   MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
@@ -1614,6 +1638,9 @@ void KVEngine::EnforceMigrationBudget(KVPartition &partition) {
 }
 
 Status KVEngine::MoveOut(std::string_view key) {
+  if (IsInternalMaxSentinel(key))
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "internal max sentinel is reserved");
   MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node)
