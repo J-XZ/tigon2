@@ -104,10 +104,10 @@
     "partitioning": {
       "strategy": "range",
       "ranges": [
-        {"lower_key": "", "upper_key": "g"},
-        {"lower_key": "g", "upper_key": "n"},
-        {"lower_key": "n", "upper_key": "u"},
-        {"lower_key": "u", "upper_key": ""}
+        {"lower_key": "", "upper_key": "user14236200627654984302        "},
+        {"lower_key": "user14236200627654984302        ", "upper_key": "user18420959041221258685        "},
+        {"lower_key": "user18420959041221258685        ", "upper_key": "user6008914743200902601         "},
+        {"lower_key": "user6008914743200902601         ", "upper_key": ""}
       ]
     },
     "fixed_key_size": 32,
