@@ -28,15 +28,14 @@ class RecordingScc final : public star::SCCManager {
     ++writes; std::memcpy(dst, src, bytes);
   }
   void prepare_read(void *, std::size_t, void *, uint64_t) override { ++prepares; }
-  void finish_write_bits(void *meta, std::size_t host) override {
-    ++finish_bits;
+  void finish_write(void *meta, std::size_t host, void *, uint64_t) override {
+    ++finishes;
     // Mirror WriteThrough: keep writer SCC bit under the caller's latch.
     auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(meta);
     smeta->clear_all_scc_bits();
     smeta->set_scc_bit(host);
   }
-  void finish_write(void *, std::size_t, void *, uint64_t) override { ++finishes; }
-  std::atomic<uint64_t> reads{0}, writes{0}, prepares{0}, finishes{0}, finish_bits{0};
+  std::atomic<uint64_t> reads{0}, writes{0}, prepares{0}, finishes{0};
 };
 
 tigonkv::engine::DualRegionConfig Config(size_t bytes) {
@@ -122,8 +121,8 @@ int main() {
   assert(star::TwoPLPashaHelper::kv_shared_read(meta, 1, out, sizeof(out)));
   assert(std::string(out, sizeof(out)) == shared_value);
   assert(meta->ref_cnt == 0);
-  assert(fake.writes == 1 && fake.finish_bits == 1 && fake.finishes == 0 &&
-         fake.prepares == 0 && fake.reads == 1);
+  assert(fake.writes == 1 && fake.finishes == 1 &&
+         fake.prepares == 2 && fake.reads == 1);
   assert(meta->get_reader_count() == 0 && !meta->is_write_locked());
   assert(star::TwoPLPashaHelper::kv_pin_shared_ref(meta));
   assert(meta->ref_cnt == 1);
@@ -200,6 +199,18 @@ int main() {
     assert(star::TwoPLPashaHelper::kv_shared_read_value(
         meta, 0, readable, sizeof(readable)));
     assert(std::string(readable, sizeof(readable)) == fixed("1000"));
+
+    meta->lock();
+    meta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+    meta->unlock();
+    star::TwoPLPashaHelper::KvSharedResult missing_result =
+        star::TwoPLPashaHelper::KvSharedResult::kDone;
+    assert(!star::TwoPLPashaHelper::kv_shared_read_value(
+        meta, 0, readable, sizeof(readable), false, &missing_result));
+    assert(missing_result == star::TwoPLPashaHelper::KvSharedResult::kMissing);
+    meta->lock();
+    meta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+    meta->unlock();
 
     meta->lock();
     meta->set_write_locked();

@@ -100,16 +100,6 @@ struct TwoPLPashaMetadataShared {
                     expected, desired, success, failure);
         }
 
-        bool compare_exchange_word_weak(
-            uint64_t &expected, uint64_t desired,
-            std::memory_order success = std::memory_order_seq_cst,
-            std::memory_order failure = std::memory_order_seq_cst)
-        {
-                tigonkv::engine::mem_access::HwccAtomicRmw(&atomic_word);
-                return atomic_word.compare_exchange_weak(
-                    expected, desired, success, failure);
-        }
-
         TwoPLPashaMetadataShared(TwoPLPashaSharedDataSCC *scc_data)
         {
                 uint64_t scc_data_cxl_offset = 0;
@@ -146,45 +136,11 @@ retry:
 
 	void unlock()
 	{
-                // CAS clear latch so concurrent bit RMWs (second-chance, SCC)
-                // are not lost by a plain store of a stale word.
-                uint64_t expected = load_atomic_word(std::memory_order_acquire);
-                for (;;) {
-                        DCHECK(((expected & (LATCH_BIT_MASK << LATCH_BIT_OFFSET)) != 0) == true);
-                        const uint64_t desired =
-                            expected & ~(LATCH_BIT_MASK << LATCH_BIT_OFFSET);
-                        if (compare_exchange_word_weak(
-                                expected, desired, std::memory_order_acq_rel,
-                                std::memory_order_acquire))
-                                return;
-                }
-	}
-
-        // Use when dropping the latch publishes metadata prepared under it.
-        // The raw CAS is intentionally preceded by the simulator settlement:
-        // peers cannot observe the new state until its HWCC load/RMW latency
-        // has been paid. Disabled mode adds only the existing fast gates.
-        void unlock_for_publication()
-        {
-                for (;;) {
-                        tigonkv::engine::mem_access::HwccAtomicLoad(
-                            &atomic_word);
-                        uint64_t expected =
-                            atomic_word.load(std::memory_order_acquire);
-                        DCHECK((expected &
-                                (LATCH_BIT_MASK << LATCH_BIT_OFFSET)) != 0);
-                        const uint64_t desired =
-                            expected &
-                            ~(LATCH_BIT_MASK << LATCH_BIT_OFFSET);
-                        tigonkv::engine::mem_access::HwccAtomicRmw(
-                            &atomic_word);
-                        tigonkv::engine::mem_access::DelayActiveScopeNow();
-                        if (atomic_word.compare_exchange_weak(
-                                expected, desired,
-                                std::memory_order_acq_rel,
-                                std::memory_order_acquire))
-                                return;
-                }
+		uint64_t v_before_unlock = load_atomic_word(std::memory_order_acquire);
+                uint64_t v_after_unlock =
+                    v_before_unlock & ~(LATCH_BIT_MASK << LATCH_BIT_OFFSET);
+                DCHECK(((v_before_unlock & (LATCH_BIT_MASK << LATCH_BIT_OFFSET)) != 0) == true);
+                store_atomic_word(v_after_unlock, std::memory_order_release);
         }
 
         TwoPLPashaSharedDataSCC *get_scc_data()
@@ -228,36 +184,20 @@ retry:
                 clear_bit(is_prev_key_real_bit_index);
         }
 
-        // Function to set a bit at a given position in the bitmap.
-        // CAS so concurrent lock()/unlock() latch updates are not lost — plain
-        // load/store RMW can clear another thread's latch (YCSB Debug FATAL at
-        // unlock DCHECK) when callers touch bits without holding the latch
-        // (e.g. NoteSharedAccess second-chance, KV unlock-across-clwb).
+        // Caller holds the original smeta latch for every mutable bit update.
         void set_bit(uint64_t bit_index)
         {
-                uint64_t expected = load_atomic_word(std::memory_order_acquire);
-                for (;;) {
-                        const uint64_t desired = expected | (1ull << bit_index);
-                        if (desired == expected) return;
-                        if (compare_exchange_word_weak(
-                                expected, desired, std::memory_order_acq_rel,
-                                std::memory_order_acquire))
-                                return;
-                }
+                uint64_t orig_atomic_word = load_atomic_word(std::memory_order_acquire);
+                store_atomic_word(orig_atomic_word | (1ull << bit_index),
+                                  std::memory_order_release);
         }
 
         // Function to clear a bit at a given position in the bitmap
         void clear_bit(uint64_t bit_index)
         {
-                uint64_t expected = load_atomic_word(std::memory_order_acquire);
-                for (;;) {
-                        const uint64_t desired = expected & ~(1ull << bit_index);
-                        if (desired == expected) return;
-                        if (compare_exchange_word_weak(
-                                expected, desired, std::memory_order_acq_rel,
-                                std::memory_order_acquire))
-                                return;
-                }
+                uint64_t orig_atomic_word = load_atomic_word(std::memory_order_acquire);
+                store_atomic_word(orig_atomic_word & ~(1ull << bit_index),
+                                  std::memory_order_release);
         }
 
         // Function to check if a bit is set (returns true if set, false if clear)
@@ -276,42 +216,26 @@ retry:
 
         void set_reader_count(uint64_t reader_count)
         {
-                uint64_t expected = load_atomic_word(std::memory_order_acquire);
-                for (;;) {
-                        uint64_t desired = expected;
-                        desired &= ~(READ_LOCK_BITS_MASK << READ_LOCK_BITS_OFFSET);
-                        desired |= (reader_count << READ_LOCK_BITS_OFFSET);
-                        if (compare_exchange_word_weak(
-                                expected, desired, std::memory_order_acq_rel,
-                                std::memory_order_acquire))
-                                return;
-                }
+                uint64_t orig_atomic_word = load_atomic_word(std::memory_order_acquire);
+                orig_atomic_word &= ~(READ_LOCK_BITS_MASK << READ_LOCK_BITS_OFFSET);
+                orig_atomic_word |= (reader_count << READ_LOCK_BITS_OFFSET);
+                store_atomic_word(orig_atomic_word, std::memory_order_release);
         }
 
         void increase_reader_count()
         {
-                uint64_t expected = load_atomic_word(std::memory_order_acquire);
-                for (;;) {
-                        const uint64_t desired =
-                            expected + (1ull << READ_LOCK_BITS_OFFSET);
-                        if (compare_exchange_word_weak(
-                                expected, desired, std::memory_order_acq_rel,
-                                std::memory_order_acquire))
-                                return;
-                }
+                uint64_t orig_atomic_word = load_atomic_word(std::memory_order_acquire);
+                store_atomic_word(orig_atomic_word +
+                                      (1ull << READ_LOCK_BITS_OFFSET),
+                                  std::memory_order_release);
         }
 
         void decrease_reader_count()
         {
-                uint64_t expected = load_atomic_word(std::memory_order_acquire);
-                for (;;) {
-                        const uint64_t desired =
-                            expected - (1ull << READ_LOCK_BITS_OFFSET);
-                        if (compare_exchange_word_weak(
-                                expected, desired, std::memory_order_acq_rel,
-                                std::memory_order_acquire))
-                                return;
-                }
+                uint64_t orig_atomic_word = load_atomic_word(std::memory_order_acquire);
+                store_atomic_word(orig_atomic_word -
+                                      (1ull << READ_LOCK_BITS_OFFSET),
+                                  std::memory_order_release);
         }
 
         uint64_t get_reader_count_max()
@@ -353,16 +277,10 @@ retry:
         // SCC
         void clear_all_scc_bits()
         {
-                uint64_t expected = load_atomic_word(std::memory_order_acquire);
-                for (;;) {
-                        const uint64_t desired =
-                            expected & ~(SCC_BITS_MASK << SCC_BITS_OFFSET);
-                        if (desired == expected) return;
-                        if (compare_exchange_word_weak(
-                                expected, desired, std::memory_order_acq_rel,
-                                std::memory_order_acquire))
-                                return;
-                }
+                uint64_t orig_atomic_word = load_atomic_word(std::memory_order_acquire);
+                store_atomic_word(orig_atomic_word &
+                                      ~(SCC_BITS_MASK << SCC_BITS_OFFSET),
+                                  std::memory_order_release);
         }
 
         void set_scc_bit(uint64_t host_id)
@@ -453,6 +371,8 @@ class TwoPLPashaHelper {
     public:
 	using MetaDataType = std::atomic<uint64_t>;
 
+        enum class KvSharedResult : uint8_t { kDone, kMissing, kBusy };
+
         TwoPLPashaHelper(std::size_t coordinator_id, Context context, std::vector<std::vector<CXLTableBase *> > &cxl_tbl_vecs)
                 : coordinator_id(coordinator_id)
                 , context(context)
@@ -496,20 +416,10 @@ class TwoPLPashaHelper {
                 }
                 smeta->increase_reader_count();
                 smeta->increment_ref_cnt();
-                const auto host_bit =
-                    host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
-                const bool need_fill = !smeta->is_bit_set(host_bit);
+                scc_manager->prepare_read(smeta, host_id, scc_data, size);
+                const bool valid =
+                    smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
                 smeta->unlock();
-                // clflush without latch; set_bit only under latch (same rule as
-                // finish_write_bits — unlocked RMW can clear a peer's latch).
-                if (need_fill) {
-                        scc_manager->invalidate_scc_data(scc_data, size);
-                        smeta->lock();
-                        if (!smeta->is_bit_set(host_bit))
-                                smeta->set_bit(host_bit);
-                        smeta->unlock();
-                }
-                const bool valid = smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
                 if (valid) {
                         tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
                         scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
@@ -528,8 +438,10 @@ class TwoPLPashaHelper {
         static bool kv_shared_read_value(TwoPLPashaMetadataShared *smeta,
                                          std::size_t host_id, void *dest,
                                          std::size_t capacity,
-                                         bool ref_already_pinned = false)
+                                         bool ref_already_pinned = false,
+                                         KvSharedResult *result = nullptr)
         {
+                if (result != nullptr) *result = KvSharedResult::kBusy;
                 if (smeta == nullptr || scc_manager == nullptr || capacity == 0)
                         return false;
                 smeta->lock();
@@ -545,23 +457,22 @@ class TwoPLPashaHelper {
                 }
                 smeta->increase_reader_count();
                 if (!ref_already_pinned) smeta->increment_ref_cnt();
-                const auto host_bit =
-                    host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
-                const bool need_fill = !smeta->is_bit_set(host_bit);
-                smeta->unlock();
-                if (need_fill) {
-                        scc_manager->invalidate_scc_data(scc_data, size);
-                        smeta->lock();
-                        if (!smeta->is_bit_set(host_bit))
-                                smeta->set_bit(host_bit);
-                        smeta->unlock();
-                }
+                scc_manager->prepare_read(smeta, host_id, scc_data, size);
                 const bool valid =
                     smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                if (valid) {
-                        tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
-                        scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
+                if (!valid) {
+                        if (!ref_already_pinned) {
+                                DCHECK(smeta->get_ref_cnt() > 0);
+                                smeta->decrement_ref_cnt();
+                        }
+                        smeta->decrease_reader_count();
+                        smeta->unlock();
+                        if (result != nullptr) *result = KvSharedResult::kMissing;
+                        return false;
                 }
+                smeta->unlock();
+                tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
+                scc_manager->do_read(smeta, host_id, dest, scc_data->data, size);
                 tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();
                 if (!ref_already_pinned) {
@@ -570,7 +481,8 @@ class TwoPLPashaHelper {
                 }
                 smeta->decrease_reader_count();
                 smeta->unlock();
-                return valid;
+                if (result != nullptr) *result = KvSharedResult::kDone;
+                return true;
         }
 
         static bool kv_shared_write(TwoPLPashaMetadataShared *smeta, std::size_t host_id,
@@ -589,29 +501,13 @@ class TwoPLPashaHelper {
                 }
                 smeta->set_write_locked();
                 smeta->increment_ref_cnt();
-                smeta->unlock();
-                // The write-through SCC protocol requires the writer's
-                // cache-valid bit before finish_write invalidates all peers.
-                const auto host_bit =
-                    host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
-                // clflush without latch; set_bit only under latch (RMW).
-                if (!smeta->is_bit_set(host_bit))
-                        scc_manager->invalidate_scc_data(scc_data, size);
+                scc_manager->prepare_read(smeta, host_id, scc_data, size);
                 tigonkv::engine::mem_access::SharedPayloadWrite(
                         scc_data->data, size);
                 scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
-                // atomic_word bit RMWs require the latch; clwb does not.
-                // Holding the latch across clwb livelocks hot keys across
-                // VMs — so: bits under latch, unlock, clwb, then release
-                // the write lock. Never call finish_write unlocked (its
-                // clear_all_scc_bits can drop another thread's latch bit).
-                smeta->lock();
-                if (!smeta->is_bit_set(host_bit))
-                        smeta->set_bit(host_bit);
                 smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                scc_manager->finish_write_bits(smeta, host_id);
+                scc_manager->finish_write(smeta, host_id, scc_data, size);
                 smeta->unlock();
-                scc_manager->flush_scc_data(scc_data, size);
                 // Keep write_locked/ref_cnt published until the
                 // synthetic payload/writeback latency has elapsed.
                 tigonkv::engine::mem_access::DelayActiveScopeNow();
@@ -641,17 +537,9 @@ class TwoPLPashaHelper {
                 }
                 smeta->set_write_locked();
                 smeta->increment_ref_cnt();
-                const auto host_bit =
-                    host_id + TwoPLPashaMetadataShared::scc_bits_base_index;
-                const bool need_fill = !smeta->is_bit_set(host_bit);
+                scc_manager->prepare_read(smeta, host_id, scc_data, size);
                 smeta->unlock();
 
-                if (need_fill) {
-                        scc_manager->invalidate_scc_data(scc_data, size);
-                        smeta->lock();
-                        if (!smeta->is_bit_set(host_bit)) smeta->set_bit(host_bit);
-                        smeta->unlock();
-                }
                 std::string current(size, '\0');
                 tigonkv::engine::mem_access::SharedPayloadRead(scc_data->data, size);
                 scc_manager->do_read(smeta, host_id, current.data(), scc_data->data, size);
@@ -677,9 +565,9 @@ class TwoPLPashaHelper {
                                               replacement.data(), replacement.size());
                         smeta->lock();
                         smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                        scc_manager->finish_write_bits(smeta, host_id);
+                        scc_manager->finish_write(smeta, host_id, scc_data,
+                                                  replacement.size());
                         smeta->unlock();
-                        scc_manager->flush_scc_data(scc_data, replacement.size());
                 }
                 tigonkv::engine::mem_access::DelayActiveScopeNow();
                 smeta->lock();

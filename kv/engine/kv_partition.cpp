@@ -444,16 +444,17 @@ SharedAccessState KVPartition::GetShared(std::string_view key, uint32_t host_id,
   const SharedAccessState pin = TryPinShared(fixed_key, &smeta, &smeta_offset);
   if (pin != SharedAccessState::kDone) return pin;
   std::string shared(fixed_value_size_, '\0');
+  star::TwoPLPashaHelper::KvSharedResult read_result =
+      star::TwoPLPashaHelper::KvSharedResult::kBusy;
   const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
-      smeta, host_id, shared.data(), shared.size());
-  const bool still_valid =
-      smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+      smeta, host_id, shared.data(), shared.size(), false, &read_result);
   if (read) {
     NoteSharedAccess(smeta);
   }
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   if (!read) {
-    if (!still_valid) return SharedAccessState::kMissing;
+    if (read_result == star::TwoPLPashaHelper::KvSharedResult::kMissing)
+      return SharedAccessState::kMissing;
     return SharedAccessState::kRetry;
   }
   *value = std::move(shared);
@@ -962,16 +963,16 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   RecordPrivateRowStateWrite(row);
   row->migrated_smeta_off = smeta_offset;
   row->is_migrated = 1;
-  star::scc_manager->finish_write_bits(smeta, owner_shard_);
+  star::scc_manager->finish_write(smeta, owner_shard_, payload,
+                                  fixed_value_size_);
   migration_policy_meta = &smeta->migration_policy_meta;
   smeta->unlock();
   RefreshAdjacencyLocked(neighborhood);
   UnlockNeighborhood(&neighborhood);
-  star::scc_manager->flush_scc_data(payload, fixed_value_size_);
   mem_access::DelayActiveScopeNow();
   smeta->lock();
   smeta->clear_write_locked();
-  smeta->unlock_for_publication();
+  smeta->unlock();
   PersistPrivateRootIfChanged();
   mem_access::HwccAtomicRmw(&directory_.migration_in_seq);
   directory_.migration_in_seq.fetch_add(1, std::memory_order_relaxed);
@@ -1061,7 +1062,7 @@ bool KVPartition::MoveOutPrivate(std::string_view key, uint32_t host_id) {
   mem_access::DelayActiveScopeNow();
   smeta->lock();
   smeta->clear_write_locked();
-  smeta->unlock_for_publication();
+  smeta->unlock();
   ebr_.add_retired_object(smeta, sizeof(star::TwoPLPashaMetadataShared),
                           star::CXLMemory::METADATA_FREE, owner_shard_);
   ebr_.add_retired_object(payload, fixed_value_size_,
