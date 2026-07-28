@@ -14,10 +14,10 @@
 
 namespace tigonkv::engine {
 
-// Thin ITable adapter so the original PolicyClock can address one KV partition
-// without rewriting the Clock tracker.  Only partitionID/key_size/value_size
-// are exercised by PolicyClock. Unsupported ITable operations hard-fail so a
-// future caller cannot silently mistake this adapter for a complete table.
+// Process-local, non-owning ITable view of one owner-private partition.  This
+// keeps PolicyClock and the original TwoPLPasha table callbacks on their
+// existing ITable contract; persistent rows and tree nodes remain owned by
+// KVPartition's owner-private SWCC arena.
 class KvPartitionTable final : public star::ITable {
  public:
   KvPartitionTable(KVPartition *partition, uint32_t key_size, uint32_t value_size)
@@ -25,79 +25,46 @@ class KvPartitionTable final : public star::ITable {
 
   KVPartition *partition() const { return partition_; }
 
-  uint64_t get_plain_key(const void *) override {
-    throw std::logic_error("KV migration adapter has no integral plain key");
-  }
-  int compare_key(const void *a, const void *b) override {
-    return std::memcmp(a, b, key_size_);
-  }
-  std::tuple<MetaDataType *, void *> search(const void *) override {
-    throw std::logic_error("KV migration adapter does not expose table search");
-  }
-  void *search_value(const void *) override {
-    throw std::logic_error("KV migration adapter does not expose table values");
-  }
-  MetaDataType *search_metadata(const void *) override {
-    throw std::logic_error("KV migration adapter does not expose table metadata");
-  }
+  uint64_t get_plain_key(const void *) override;
+  int compare_key(const void *a, const void *b) override;
+  std::tuple<MetaDataType *, void *> search(const void *) override;
+  void *search_value(const void *) override;
+  MetaDataType *search_metadata(const void *) override;
   void scan(const void *,
-            std::function<bool(const void *, MetaDataType *, void *, bool)>) override {
-    throw std::logic_error(
-        "KVPartition, not the migration adapter, owns adjacency-complete scan");
-  }
-  bool insert(const void *, const void *, bool = false) override {
-    throw std::logic_error("KV migration adapter does not implement insert");
-  }
+            std::function<bool(const void *, MetaDataType *, void *, bool)>) override;
+  bool insert(const void *, const void *, bool = false) override;
   bool insert_lock_next_key(
       const void *, const void *,
       std::function<bool(const void *, MetaDataType *, void *)>,
-      bool = false) override {
-    throw std::logic_error(
-        "KVPartition, not the migration adapter, maintains next-key state");
-  }
+      bool = false) override;
   bool insert_and_process_adjacent_tuples(
       const void *, const void *,
       std::function<bool(const void *, MetaDataType *, void *, const void *,
                          MetaDataType *, void *)>,
-      bool = false) override {
-    throw std::logic_error(
-        "KVPartition, not the migration adapter, maintains adjacency state");
-  }
-  bool remove(const void *) override {
-    throw std::logic_error("KV migration adapter does not implement remove");
-  }
+      bool = false) override;
+  bool remove(const void *) override;
   bool remove_and_process_adjacent_tuples(
       const void *,
       std::function<bool(const void *, void *, void *, const void *, void *,
-                         void *, const void *, void *, void *)>) override {
-    throw std::logic_error(
-        "KVPartition, not the migration adapter, maintains adjacency state");
-  }
+                         void *, const void *, void *, void *)>) override;
   void update(const void *, const void *,
-              std::function<void(const void *, const void *)> = {}) override {
-    throw std::logic_error("KV migration adapter does not implement update");
-  }
+              std::function<void(const void *, const void *)> = {}) override;
   bool search_and_update_next_key_info(
       const void *,
       std::function<void(const void *, void *, void *, const void *, void *,
-                         void *, const void *, void *, void *)>) override {
-    throw std::logic_error(
-        "KVPartition, not the migration adapter, maintains next-key state");
-  }
-  void deserialize_value(const void *, star::StringPiece) override {
-    throw std::logic_error("KV migration adapter does not deserialize values");
-  }
-  void serialize_value(star::Encoder &, const void *) override {
-    throw std::logic_error("KV migration adapter does not serialize values");
-  }
+                         void *, const void *, void *, void *)>) override;
+  void deserialize_value(const void *, star::StringPiece) override;
+  void serialize_value(star::Encoder &, const void *) override;
   std::size_t key_size() override { return key_size_; }
   std::size_t value_size() override { return value_size_; }
   std::size_t field_size() override { return value_size_; }
   std::size_t tableID() override { return 0; }
   std::size_t partitionID() override { return partition_->partition_id(); }
-  int tableType() override { return ITable::BTREE; }
+ int tableType() override { return ITable::BTREE; }
 
  private:
+  std::tuple<MetaDataType *, void *> Row(RegionOffset offset) const;
+  void FillAdjacent(RegionOffset *offset, void **meta, void **data) const;
   KVPartition *partition_;
   uint32_t key_size_;
   uint32_t value_size_;

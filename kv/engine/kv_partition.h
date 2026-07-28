@@ -18,6 +18,8 @@
 
 namespace tigonkv::engine {
 
+class KvPartitionTable;
+
 // One shared-tree probe result (§10.1). kRetry is contention; only kMissing may
 // trigger migrate/Forward.
 enum class SharedAccessState : uint8_t {
@@ -152,6 +154,7 @@ class KVPartition {
   bool MoveOutForMigrationManager(const void *key);
 
  private:
+  friend class KvPartitionTable;
   // Matches core/Executor: enter before observing shared tree/row/move paths.
   void EnterEbr() const { ebr_.enter_critical_section(); }
   FixedKey MakeKey(std::string_view key) const;

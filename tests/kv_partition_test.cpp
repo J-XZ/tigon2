@@ -121,6 +121,35 @@ int main() {
   }
   assert(wrong_owner_rejected);
   assert(partition.PutPrivate("alpha", "one"));
+  // The ITable view is a direct, non-owning view of the owner-private tree:
+  // it must expose the original lookup/scan callback contract rather than
+  // retaining KV-only throwing stubs.
+  auto *table = tigonkv::engine::KvMigrationRuntime::Instance().TableFor(5);
+  assert(table != nullptr);
+  const auto alpha_key = tigonkv::engine::FixedKey::From("alpha", 32);
+  auto [alpha_meta, alpha_data] = table->search(&alpha_key);
+  assert(alpha_meta != nullptr && alpha_data != nullptr);
+  assert(alpha_meta->load() != tigonkv::engine::kNullOffset);
+  assert(std::string(static_cast<char *>(alpha_data), 128) == FixedValue("one"));
+  bool table_scan_called = false;
+  table->scan(&alpha_key,
+              [&](const void *key, star::ITable::MetaDataType *meta, void *data,
+                  bool) {
+                assert(key != nullptr && meta != nullptr && data != nullptr);
+                table_scan_called = true;
+                return true;
+              });
+  assert(table_scan_called);
+  bool table_adjacent_called = false;
+  assert(table->search_and_update_next_key_info(
+      &alpha_key, [&](const void *, void *, void *, const void *current_key,
+                      void *current_meta, void *current_data, const void *,
+                      void *, void *) {
+        assert(current_key != nullptr && current_meta != nullptr &&
+               current_data != nullptr);
+        table_adjacent_called = true;
+      }));
+  assert(table_adjacent_called);
   const uint64_t root_pubs_after_create = partition.PrivateRootPublishCount();
   assert(root_pubs_after_create >= 1);
   // §11.6: value updates that do not change private root must not republish.
