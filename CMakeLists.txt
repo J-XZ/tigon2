@@ -76,6 +76,9 @@ add_custom_target(tigonkv_target ALL DEPENDS tigonkv)
 add_custom_target(e2e_trace_target DEPENDS e2e_trace_runner)
 
 add_test(NAME unit_tests COMMAND unit_tests)
+add_test(NAME ycsb_partition_splits_test
+         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/ycsb_partition_splits_test.sh
+                 $<TARGET_FILE:ycsb_partition_splits>)
 # Multi-VM × multi-thread guest e2e (cxlkv-aligned: 4 VM × 4 workers via SSH).
 add_test(NAME e2e_08_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_08_test.sh)
 add_test(NAME e2e_09_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_09_test.sh)

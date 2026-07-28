@@ -1,6 +1,7 @@
 #include "tools/e2e_trace_format.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -122,6 +123,8 @@ int main(int argc, char **argv) {
       throw std::runtime_error("formal partition split requires 16 workers and 1..32-byte keys");
 
     std::vector<std::string> samples;
+    std::vector<std::string> complete_keys;
+    uint64_t trace_digest = 1469598103934665603ULL;
     for (uint64_t worker = 0; worker < workers; ++worker) {
       const std::string path = trace_dir + "/worker" + std::to_string(worker) + ".txt";
       std::ifstream input(path);
@@ -135,33 +138,58 @@ int main(int argc, char **argv) {
         if (!tigonkv::e2e_trace::ParseLine(line, path, line_number, &operation) ||
             operation.name != "PUT")
           continue;
-        if ((valid_puts++ % 64) == 0)
-          samples.push_back(tigonkv::e2e_trace::FixedTraceKey(
-              operation.raw_key, fixed_key_size));
+        const std::string key = tigonkv::e2e_trace::FixedTraceKey(
+            operation.raw_key, fixed_key_size);
+        trace_digest = Fnv1a(key, trace_digest);
+        complete_keys.push_back(key);
+        if ((valid_puts++ % 64) == 0) samples.push_back(key);
       }
     }
-    std::sort(samples.begin(), samples.end());
-    samples.erase(std::unique(samples.begin(), samples.end()), samples.end());
+    const tigonkv::e2e_trace::FixedTraceKeyLess fixed_less;
+    std::sort(samples.begin(), samples.end(), fixed_less);
+    samples.erase(std::unique(samples.begin(), samples.end(),
+                              [&](const std::string &left, const std::string &right) {
+                                return !fixed_less(left, right) && !fixed_less(right, left);
+                              }),
+                  samples.end());
     if (samples.size() < 4)
       throw std::runtime_error("insufficient distinct load PUT samples for four ranges");
     std::vector<std::string> boundaries;
     for (size_t partition = 1; partition < 4; ++partition)
       boundaries.push_back(samples[(samples.size() * partition) / 4]);
-    if (!(boundaries[0] < boundaries[1] && boundaries[1] < boundaries[2]))
+    if (!(fixed_less(boundaries[0], boundaries[1]) &&
+          fixed_less(boundaries[1], boundaries[2])))
       throw std::runtime_error("sample quantiles do not define four non-empty ranges");
     ReplacePartitioning(config_path, boundaries);
+
+    std::array<uint64_t, 4> complete_counts{};
+    for (const auto &key : complete_keys) {
+      const auto partition = std::upper_bound(
+          boundaries.begin(), boundaries.end(), key,
+          [&](const std::string &needle, const std::string &boundary) {
+            return fixed_less(needle, boundary);
+          });
+      ++complete_counts[static_cast<size_t>(partition - boundaries.begin())];
+    }
+    const auto [min_count, max_count] =
+        std::minmax_element(complete_counts.begin(), complete_counts.end());
+    if (*min_count == 0 || *max_count * 4 > *min_count * 5)
+      throw std::runtime_error("sampled partition splits exceed 1.25 full-load imbalance");
 
     uint64_t digest = 1469598103934665603ULL;
     for (const auto &boundary : boundaries) digest = Fnv1a(boundary, digest);
     std::cout << "YCSB_PARTITION_SPLITS workers=16 sample_stride=64 samples="
-              << samples.size() << " partition_count=4 digest=" << digest << "\n";
+              << samples.size() << " partition_count=4 split_digest=" << digest
+              << " trace_digest=" << trace_digest << "\n";
     for (size_t partition = 0; partition < 4; ++partition) {
       const auto begin = partition == 0 ? samples.begin() :
-                                          std::lower_bound(samples.begin(), samples.end(), boundaries[partition - 1]);
+                                          std::lower_bound(samples.begin(), samples.end(), boundaries[partition - 1], fixed_less);
       const auto end = partition == 3 ? samples.end() :
-                                        std::lower_bound(samples.begin(), samples.end(), boundaries[partition]);
+                                        std::lower_bound(samples.begin(), samples.end(), boundaries[partition], fixed_less);
       std::cout << "YCSB_PARTITION_SPLIT partition=" << partition
-                << " sampled_keys=" << (end - begin) << "\n";
+                << " sampled_keys=" << (end - begin)
+                << " load_keys=" << complete_counts[partition]
+                << " owner=" << partition << "\n";
     }
     return 0;
   } catch (const std::exception &error) {

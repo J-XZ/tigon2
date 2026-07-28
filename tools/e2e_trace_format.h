@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -78,5 +79,17 @@ inline std::string FixedTraceKey(std::string_view key, uint32_t fixed_key_size) 
   fixed.resize(static_cast<size_t>(fixed_key_size), ' ');
   return fixed;
 }
+
+inline int CompareFixedTraceKey(std::string_view left, std::string_view right) {
+  if (left.size() != right.size())
+    throw std::invalid_argument("fixed trace key width mismatch");
+  return std::memcmp(left.data(), right.data(), left.size());
+}
+
+struct FixedTraceKeyLess {
+  bool operator()(std::string_view left, std::string_view right) const {
+    return CompareFixedTraceKey(left, right) < 0;
+  }
+};
 
 }  // namespace tigonkv::e2e_trace
