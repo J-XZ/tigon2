@@ -728,6 +728,32 @@ class TwoPLPashaHelper {
                 smeta->unlock();
         }
 
+        // Offset-backed KV facade counterpart of the original
+        // remote_modify_tuple_valid_bit().  Remote insert has already pinned
+        // ref_cnt in the owner-side move_row_in; the requester only publishes
+        // the placeholder and consumes that pin, without rewriting payload.
+        static bool kv_remote_publish_insert(TwoPLPashaMetadataShared *smeta,
+                                             std::size_t coordinator_id)
+        {
+                if (smeta == nullptr || scc_manager == nullptr) return false;
+                smeta->lock();
+                auto *scc_data = smeta->get_scc_data();
+                if (smeta->get_ref_cnt() == 0 ||
+                    smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index)) {
+                        smeta->unlock();
+                        return false;
+                }
+                smeta->set_flag(TwoPLPashaMetadataShared::valid_flag_index);
+                // This is the original value-only insertion publication.  It
+                // deliberately does not copy payload: owner move_row_in did
+                // the one private-to-shared copy before the response.
+                scc_manager->prepare_read(smeta, coordinator_id, scc_data, 0);
+                scc_manager->finish_write(smeta, coordinator_id, scc_data, 0);
+                smeta->decrement_ref_cnt();
+                smeta->unlock();
+                return true;
+        }
+
 	uint64_t read(const std::tuple<MetaDataType *, void *> &row, void *dest, std::size_t size, std::atomic<uint64_t> &local_cxl_access)
 	{
                 MetaDataType &meta = *std::get<0>(row);

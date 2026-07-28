@@ -81,6 +81,13 @@ class KVPartition {
   uint32_t partition_id() const { return partition_id_; }
   uint32_t owner_shard() const { return owner_shard_; }
   bool PutPrivate(std::string_view key, std::string_view value);
+  // Original REMOTE_INSERT owner half: install an invalid placeholder through
+  // the ITable adjacent callback, move it into CXL with one requester ref,
+  // then let the requester publish valid without another payload write.
+  StatusCode InsertRemotePlaceholder(std::string_view key,
+                                     std::string_view value,
+                                     uint32_t requester_id);
+  bool PublishRemotePlaceholder(std::string_view key, uint32_t requester_id);
   // Owner read: follows is_migrated to the shared SCC payload when present.
   bool GetPrivate(std::string_view key, std::string *value) const;
   bool DeletePrivate(std::string_view key);

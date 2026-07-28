@@ -520,14 +520,17 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
         Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
     if (migrated.ok()) return write_shared();
     if (migrated.code != StatusCode::kNotFound) return migrated;
-    // A true create needs the original owner-side placeholder/insert step.
-    // kPut publishes the new row to CXL before ack; this requester then does
-    // the write through that shared authority rather than treating the RPC as
-    // the final write path.
+    // A true create uses the original REMOTE_INSERT ownership split: the owner
+    // inserts an invalid placeholder and copies it into CXL with a requester
+    // ref; after the ack the requester publishes only valid (no second data
+    // write through the shared payload).
     const Status inserted =
         Forward(KvMessageType::kPut, key, value, nullptr, route.owner);
     if (!inserted.ok()) return inserted;
-    return write_shared();
+    if (!route.partition->PublishRemotePlaceholder(key, config_.node_id))
+      return Status::Error(StatusCode::kBusy,
+                           "remote insert placeholder publication failed");
+    return Status::Ok();
   }
   try {
     route.partition->PutPrivate(key, value);
@@ -1522,12 +1525,8 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
   };
   if (message.type == KvMessageType::kPut) {
     try {
-      (void)partition->PutPrivate(key, value);
-      // Remote create is the original owner-side insert/move-in handshake;
-      // the requester writes the acknowledged shared row after this reply.
-      // Existing rows also move in here only as a race fallback.
-      promote_updated_row();
-      response.status = static_cast<uint32_t>(StatusCode::kOk);
+      response.status = static_cast<uint32_t>(
+          partition->InsertRemotePlaceholder(key, value, message.source_node));
     } catch (const std::bad_alloc &) {
       response.status = static_cast<uint32_t>(StatusCode::kOutOfMemory);
     } catch (const std::runtime_error &e) {

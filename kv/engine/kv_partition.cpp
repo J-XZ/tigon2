@@ -387,6 +387,94 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
   }
 }
 
+StatusCode KVPartition::InsertRemotePlaceholder(std::string_view key,
+                                                std::string_view value,
+                                                uint32_t requester_id) {
+  EnterEbr();
+  if (value.size() > fixed_value_size_)
+    throw std::invalid_argument("remote insert value exceeds fixed value size");
+  std::string padded_value;
+  if (value.size() != fixed_value_size_) {
+    padded_value = PadFixedValue(value, fixed_value_size_);
+    value = padded_value;
+  }
+  const FixedKey fixed_key = MakeKey(key);
+  auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
+  if (table == nullptr) return StatusCode::kCorruption;
+
+  // This is the require_lock_next_key=false branch of the original
+  // insert_and_update_next_key_info.  The ITable callback retains the exact
+  // adjacent leaves while these migrated-neighbour bits are cleared.
+  const bool inserted = table->insert_and_process_adjacent_tuples(
+      &fixed_key, value.data(),
+      [&](const void *, std::atomic<uint64_t> *prev_meta, void *, const void *,
+          std::atomic<uint64_t> *next_meta, void *) {
+        const auto clear_adjacent = [&](std::atomic<uint64_t> *slot,
+                                        bool clear_next) {
+          if (slot == nullptr) return true;
+          auto *metadata = reinterpret_cast<PrivateMetadataLocal *>(slot);
+          // KvPartitionTable supplies resolved metadata for adjacent callbacks;
+          // its search() slot is never used here.
+          if (metadata == nullptr) return false;
+          LockRow(metadata);
+          bool ok = true;
+          if (metadata->is_migrated) {
+            if (metadata->migrated_smeta_off == kNullOffset) {
+              ok = false;
+            } else {
+              auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+                  regions_.hwcc().FromOffset(metadata->migrated_smeta_off));
+              smeta->lock();
+              if (clear_next)
+                smeta->clear_next_key_real_bit();
+              else
+                smeta->clear_prev_key_real_bit();
+              smeta->unlock();
+            }
+          }
+          UnlockRow(metadata);
+          return ok;
+        };
+        return clear_adjacent(prev_meta, true) &&
+               clear_adjacent(next_meta, false);
+      },
+      true);
+  if (!inserted) return StatusCode::kBusy;
+
+  // The original remote-insert owner moves the invalid placeholder in with a
+  // requester ref.  That ref spans this response and is consumed only by the
+  // requester's remote_modify_tuple_valid_bit analogue below.
+  star::TwoPLPashaMetadataShared *pinned = nullptr;
+  if (PromotePrivate(key, requester_id, &pinned)) return StatusCode::kOk;
+
+  // move_row_in failed before a remote-visible placeholder was acknowledged.
+  // Reuse the normal adjacent delete callback for rollback; it expects a
+  // valid local row, so make the never-published placeholder locally visible
+  // only for that synchronous cleanup.
+  RegionOffset row_offset = kNullOffset;
+  if (LookupPrivateOffset(fixed_key, &row_offset)) {
+    auto *metadata = MetadataFromValue(ValueFromOffset(row_offset));
+    LockRow(metadata);
+    metadata->is_valid = true;
+    RecordPrivateMetadataWrite(metadata);
+    UnlockRow(metadata);
+    (void)DeletePrivate(key);
+  }
+  return StatusCode::kBusy;
+}
+
+bool KVPartition::PublishRemotePlaceholder(std::string_view key,
+                                           uint32_t requester_id) {
+  EnterEbr();
+  RegionOffset smeta_offset = kNullOffset;
+  if (!LookupSharedOffset(MakeKey(key), &smeta_offset) ||
+      smeta_offset == kNullOffset)
+    return false;
+  auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
+      regions_.hwcc().FromOffset(smeta_offset));
+  return star::TwoPLPashaHelper::kv_remote_publish_insert(smeta, requester_id);
+}
+
 bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   EnterEbr();
   RegionOffset row_offset = kNullOffset;
@@ -411,7 +499,11 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   }
   if (!migrated) return false;
   LockRow(metadata);
-  if (!metadata->is_valid || !metadata->is_migrated) {
+  // REMOTE_INSERT initially leaves the owner placeholder invalid.  Once the
+  // requester publishes its pinned shared row, the owner observes that shared
+  // authority here and restores the local validity view, matching the
+  // original migrated-read branch.
+  if (!metadata->is_migrated) {
     UnlockRow(metadata);
     return false;
   }
@@ -427,6 +519,10 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
       smeta, owner_shard_, shared.data(), shared.size());
   if (read) {
+    if (!metadata->is_valid) {
+      metadata->is_valid = true;
+      RecordPrivateMetadataWrite(metadata);
+    }
     NoteSharedAccess(smeta);
     UnlockRow(metadata);
     *value = std::move(shared);
@@ -905,7 +1001,11 @@ star::migration_result KVPartition::MoveInForMigrationManager(
         auto run = [&]() -> star::migration_result {
   auto *private_value = neighborhood.current.value;
   auto *metadata = neighborhood.current.metadata;
-  if (!metadata->is_valid) {
+  // A remote insert follows the original placeholder path: its owner-private
+  // row is invalid until the requester publishes the shared valid bit, but it
+  // is moved in with an inc_ref pin first.  Ordinary migration never moves an
+  // invalid row.
+  if (!metadata->is_valid && !inc_ref_cnt) {
     UnlockAdjacentRows(&neighborhood);
     return star::migration_result::FAIL_OOM;
   }
@@ -978,7 +1078,10 @@ star::migration_result KVPartition::MoveInForMigrationManager(
     star::scc_manager->do_write(smeta, owner_shard_, payload->data,
                                 private_value->data, fixed_value_size_);
   }
-  smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+  if (metadata->is_valid)
+    smeta->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+  else
+    smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
   mem_access::HwccWrite(&smeta->tid, sizeof(smeta->tid));
   smeta->tid = metadata->tid;
   if (inc_ref_cnt) {
