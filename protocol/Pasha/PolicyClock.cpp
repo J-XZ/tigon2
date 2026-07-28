@@ -3,6 +3,8 @@
 #include "kv/engine/kv_migration.h"
 #include "kv/engine/kv_partition.h"
 
+#include <cstddef>
+
 namespace star
 {
 
@@ -33,15 +35,17 @@ void PolicyClock::init_migration_policy_metadata(
   (void)key;
   (void)row;
   (void)metadata_size;
-  ClockMeta *clock_meta = reinterpret_cast<ClockMeta *>(migration_policy_meta);
-  tigonkv::engine::mem_access::HwccWrite(clock_meta, sizeof(ClockMeta));
-  new (clock_meta) ClockMeta();
+  auto *smeta = PolicySmeta(migration_policy_meta);
+  smeta->lock();
+  smeta->clear_second_chance_bit();
+  smeta->unlock();
 }
 
 void PolicyClock::access_row(void *migration_policy_meta, uint64_t partition_id) {
-  ClockMeta *clock_meta = reinterpret_cast<ClockMeta *>(migration_policy_meta);
-  tigonkv::engine::mem_access::HwccAtomicStore(&clock_meta->second_chance);
-  clock_meta->second_chance.store(1, std::memory_order_relaxed);
+  auto *smeta = PolicySmeta(migration_policy_meta);
+  smeta->lock();
+  smeta->set_second_chance_bit();
+  smeta->unlock();
   (void)partition_id;
 }
 
@@ -101,6 +105,15 @@ tigonkv::engine::KVPartition *PolicyClock::PartitionOf(ITable *table) {
   auto *kv_table = dynamic_cast<tigonkv::engine::KvPartitionTable *>(table);
   if (kv_table == nullptr) return nullptr;
   return kv_table->partition();
+}
+
+TwoPLPashaMetadataShared *PolicyClock::PolicySmeta(
+    void *migration_policy_meta) {
+  if (migration_policy_meta == nullptr)
+    throw std::invalid_argument("null Clock migration policy metadata");
+  auto *bytes = static_cast<char *>(migration_policy_meta);
+  return reinterpret_cast<TwoPLPashaMetadataShared *>(
+      bytes - offsetof(TwoPLPashaMetadataShared, migration_policy_meta));
 }
 
 }  // namespace star

@@ -1091,17 +1091,19 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   }
   auto *payload = new (payload_mem) star::TwoPLPashaSharedDataSCC;
   auto *smeta = new (smeta_mem) star::TwoPLPashaMetadataShared(payload);
-  star::scc_manager->init_scc_metadata(smeta, owner_shard_);
-  smeta->lock();
-  // The shared-tree entry may become visible before synthetic latency is
-  // settled; write_locked keeps readers out without holding the HWCC latch.
-  smeta->set_write_locked();
+  // Keep the original migration lifecycle: policy metadata is initialized
+  // before SCC setup and before the caller holds the shared-row latch.
   if (star::migration_manager != nullptr) {
     star::migration_manager->init_migration_policy_metadata(
         &smeta->migration_policy_meta, nullptr, key,
         std::tuple<std::atomic<uint64_t> *, void *>{nullptr, nullptr},
         sizeof(star::TwoPLPashaMetadataShared));
   }
+  star::scc_manager->init_scc_metadata(smeta, owner_shard_);
+  smeta->lock();
+  // The shared-tree entry may become visible before synthetic latency is
+  // settled; write_locked keeps readers out without holding the HWCC latch.
+  smeta->set_write_locked();
   if (!reuse_cached_payload || metadata->is_data_modified_since_moved_out) {
     mem_access::PrivateRead(private_value->data, fixed_value_size_);
     mem_access::SharedPayloadWrite(payload->data, fixed_value_size_);
@@ -2002,10 +2004,11 @@ bool KVPartition::ClockEvictUntilUnderBudget(uint64_t hw_cc_budget) {
     }
     auto *smeta = static_cast<star::TwoPLPashaMetadataShared *>(
         regions_.hwcc().FromOffset(metadata->migrated_smeta_off));
-    auto *clock_meta =
-        reinterpret_cast<star::PolicyClock::ClockMeta *>(&smeta->migration_policy_meta);
-    mem_access::HwccAtomicRmw(&clock_meta->second_chance);
-    if (clock_meta->second_chance.exchange(0, std::memory_order_relaxed) == 1)
+    smeta->lock();
+    const bool second_chance = smeta->get_second_chance_bit();
+    if (second_chance) smeta->clear_second_chance_bit();
+    smeta->unlock();
+    if (second_chance)
       continue;
     const FixedKey victim_key = node->key;
     // Do not hold the Clock spinlock across move-out (§11.15).

@@ -185,6 +185,23 @@ retry:
                 clear_bit(is_prev_key_real_bit_index);
         }
 
+        // The original shared metadata word reserves bit 37 for Clock.  The
+        // caller holds this smeta latch, as it does for adjacency and dirty.
+        bool get_second_chance_bit()
+        {
+                return is_bit_set(second_chance_bit_index);
+        }
+
+        void set_second_chance_bit()
+        {
+                set_bit(second_chance_bit_index);
+        }
+
+        void clear_second_chance_bit()
+        {
+                clear_bit(second_chance_bit_index);
+        }
+
         // Caller holds the original smeta latch for every mutable bit update.
         void set_bit(uint64_t bit_index)
         {
@@ -311,6 +328,7 @@ retry:
 
         static constexpr int is_next_key_real_bit_index = 39;
         static constexpr int is_prev_key_real_bit_index = 38;
+        static constexpr int second_chance_bit_index = 37;
 
         static constexpr int valid_flag_index = 0;
 

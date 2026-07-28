@@ -6,7 +6,6 @@
 
 #include "stdint.h"
 
-#include <atomic>
 #include <functional>
 #include <string>
 #include <tuple>
@@ -24,15 +23,10 @@ class KvPartitionTable;
 namespace star
 {
 
+struct TwoPLPashaMetadataShared;
+
 class PolicyClock : public MigrationManager {
     public:
-        struct ClockMeta {
-                // A fresh move-in has not yet been accessed.  Preserve the
-                // original Clock initial state; access_row is the sole path
-                // that grants a second chance.
-                std::atomic<uint8_t> second_chance{0};
-        };
-
         PolicyClock(std::function<migration_result(ITable *, const void *, const std::tuple<std::atomic<uint64_t> *, void *> &, bool, void *&)> move_from_partition_to_shared_region,
                         std::function<bool(ITable *, const void *, const std::tuple<std::atomic<uint64_t> *, void *> &)> move_from_shared_region_to_partition,
                         std::function<bool(ITable *, const void *, bool, bool &, void *&)> delete_and_update_next_key_info,
@@ -55,6 +49,7 @@ class PolicyClock : public MigrationManager {
 
     private:
         static tigonkv::engine::KVPartition *PartitionOf(ITable *table);
+        static TwoPLPashaMetadataShared *PolicySmeta(void *migration_policy_meta);
 
         uint64_t hw_cc_budget{ 0 };
         uint64_t partition_num_{ 0 };
