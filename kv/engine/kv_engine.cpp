@@ -335,31 +335,46 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   engine->affinity_cpus_ = std::move(affinity_cpus);
   engine->rings_ = rings;
 
-  // Phase one: a VM constructs only the roots that it owns.  In particular,
-  // reset VM0 never writes another VM's owner-private arena merely because it
-  // happens to publish the static HWCC layout.
-  engine->pool_->allocator().InitializeOwnerPrivateArenas(config.node_id);
-  std::vector<std::unique_ptr<KVPartition>> initializer_partitions;
-  for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
-    if (engine->OwnerForPartition(partition) != config.node_id) continue;
-    const auto &directory = engine->pool_->allocator().layout().partitions[partition];
-    mem_access::HwccAtomicLoad(&directory.shared_root);
-    if (directory.shared_root.load(std::memory_order_acquire) != kNullOffset)
-      throw std::runtime_error(
-          "tigonkv: owner initialization found an already-published shared root");
-    initializer_partitions.emplace_back(std::make_unique<KVPartition>(
-        engine->pool_->allocator(), *engine->ebr_, partition,
-        engine->OwnerForPartition(partition), false, true));
+  // A joining VM attaches the static HWCC layout with reset=false, but still
+  // has to materialize its own SWCC arena/root while the first startup is
+  // Initializing.  Once Ready is published, the same path is a pure attach.
+  bool initialize_owner = reset;
+  if (!reset) {
+    const auto &layout = engine->pool_->allocator().layout();
+    mem_access::HwccAtomicLoad(&layout.state);
+    initialize_owner = layout.state.load(std::memory_order_acquire) ==
+        static_cast<uint32_t>(LayoutState::kInitializing);
   }
-  engine->pool_->allocator().PublishOwnerInitialized(config.node_id);
-  if (config.node_id == 0)
-    engine->pool_->allocator().WaitForOwnersAndPublishReady();
-  else
+  if (initialize_owner) {
+    // Phase one: a VM constructs only the roots that it owns.  In particular,
+    // reset VM0 never writes another VM's owner-private arena merely because
+    // it happens to publish the static HWCC layout.
+    engine->pool_->allocator().InitializeOwnerPrivateArenas(config.node_id);
+    std::vector<std::unique_ptr<KVPartition>> initializer_partitions;
+    for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
+      if (engine->OwnerForPartition(partition) != config.node_id) continue;
+      const auto &directory = engine->pool_->allocator().layout().partitions[partition];
+      mem_access::HwccAtomicLoad(&directory.shared_root);
+      if (directory.shared_root.load(std::memory_order_acquire) != kNullOffset)
+        throw std::runtime_error(
+            "tigonkv: owner initialization found an already-published shared root");
+      initializer_partitions.emplace_back(std::make_unique<KVPartition>(
+          engine->pool_->allocator(), *engine->ebr_, partition,
+          engine->OwnerForPartition(partition), false, true));
+    }
+    engine->pool_->allocator().PublishOwnerInitialized(config.node_id);
+    if (config.node_id == 0)
+      engine->pool_->allocator().WaitForOwnersAndPublishReady();
+    else
+      engine->pool_->allocator().WaitUntilReady();
+  } else {
+    // Reattach after Ready observes the immutable layout only.  Re-running
+    // owner initialization here would publish a second root.
     engine->pool_->allocator().WaitUntilReady();
+  }
 
-  // Initializer handles never serve requests.  Reconstruct the regular
-  // non-owning tree handles only after Ready made every root visible.
-  initializer_partitions.clear();
+  // Regular non-owning handles are reconstructed only after Ready made every
+  // root visible, for both reset and attach.
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     const auto &directory = engine->pool_->allocator().layout().partitions[partition];
     mem_access::HwccAtomicLoad(&directory.shared_root);
