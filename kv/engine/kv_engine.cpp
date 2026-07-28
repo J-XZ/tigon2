@@ -623,8 +623,8 @@ GetResult KVEngine::Get(std::string_view key) {
     const Status migrated =
         Forward(RpcKind::kMigrate, key, {}, route.partition_id, route.owner);
     if (!migrated.ok()) return {migrated, {}};
-    const SharedAccessState second =
-        visible->GetShared(key, config_.node_id, &shared);
+    const SharedAccessState second = visible->GetShared(
+        key, config_.node_id, &shared, /*record_clock_access=*/false);
     if (second == SharedAccessState::kDone) {
       shared_gets_.fetch_add(1, std::memory_order_relaxed);
       return {Status::Ok(), std::move(shared)};

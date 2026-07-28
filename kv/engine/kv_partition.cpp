@@ -541,7 +541,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       bool write_locked = false;
       bool migrated = false;
       const uint64_t previous_tid =
-          star::TwoPLPashaHelper::kv_take_private_write_lock(
+          star::TwoPLPashaHelper::take_write_lock(
               *metadata, write_locked, &migrated);
       if (!write_locked && !migrated) {
         // Concurrent delete/reader/writer: do not report Ok without a
@@ -584,7 +584,7 @@ bool KVPartition::PutPrivate(std::string_view key, std::string_view value) {
       std::memcpy(private_value->data, value.data(), value.size());
       mem_access::PrivateWrite(private_value->data, fixed_value_size_);
       metadata->is_data_modified_since_moved_out = true;
-      star::TwoPLPashaHelper::kv_private_write_lock_release(
+      star::TwoPLPashaHelper::write_lock_release(
           *metadata, star::TwoPLPashaHelper::kv_next_commit_tid(previous_tid));
       RecordPrivateMetadataWrite(metadata);
       return false;
@@ -700,18 +700,18 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
   bool local_success = false;
   bool migrated = false;
   RecordPrivateMetadataRead(metadata);
-  star::TwoPLPashaHelper::kv_take_private_read_lock_and_read(
+  star::TwoPLPashaHelper::take_read_lock_and_read(
       *metadata, private_value->data, local.data(), local.size(), local_success,
       &migrated);
   if (local_success) {
     mem_access::PrivateRead(private_value->data, fixed_value_size_);
-    star::TwoPLPashaHelper::kv_private_read_lock_release(*metadata);
+    star::TwoPLPashaHelper::read_lock_release(*metadata);
     RecordPrivateMetadataWrite(metadata);
     *value = std::move(local);
     return true;
   }
   if (!migrated) {
-    // kv_take_private_read_lock_and_read deliberately has one failure return
+    // take_read_lock_and_read deliberately has one failure return
     // for an invalid row and for ordinary reader/writer contention.  Recheck
     // under the owner-private latch before mapping it to the KV API: a live
     // non-migrated row can only be Busy, never NotFound.
@@ -759,7 +759,8 @@ bool KVPartition::GetPrivate(std::string_view key, std::string *value) const {
 }
 
 SharedAccessState KVPartition::GetShared(std::string_view key, uint32_t host_id,
-                                           std::string *value) const {
+                                           std::string *value,
+                                           bool record_clock_access) const {
   EnterEbr();
   if (value == nullptr) throw std::invalid_argument("null shared GET output");
   const FixedKey fixed_key = MakeKey(key);
@@ -767,14 +768,15 @@ SharedAccessState KVPartition::GetShared(std::string_view key, uint32_t host_id,
   RegionOffset smeta_offset = kNullOffset;
   const SharedAccessState pin = TryPinShared(fixed_key, &smeta, &smeta_offset);
   if (pin != SharedAccessState::kDone) return pin;
+  // A stable shared-index hit is the original get_migrated_row(ref=true)
+  // path: it grants one Clock access while its one ref is held. A successful
+  // migration response deliberately re-locates without this second chance.
+  if (record_clock_access) NoteSharedAccess(smeta);
   std::string shared(fixed_value_size_, '\0');
   star::TwoPLPashaHelper::KvSharedResult read_result =
       star::TwoPLPashaHelper::KvSharedResult::kBusy;
   const bool read = star::TwoPLPashaHelper::kv_shared_read_value(
-      smeta, host_id, shared.data(), shared.size(), false, &read_result);
-  if (read) {
-    NoteSharedAccess(smeta);
-  }
+      smeta, host_id, shared.data(), shared.size(), true, &read_result);
   star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
   if (!read) {
     if (read_result == star::TwoPLPashaHelper::KvSharedResult::kMissing)
@@ -974,13 +976,20 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   }
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
-  LockRow(metadata);
-  if (!metadata->is_valid) {
+  bool write_locked = false;
+  bool migrated = false;
+  const uint64_t observed_tid =
+      star::TwoPLPashaHelper::take_write_lock(
+          *metadata, write_locked, &migrated);
+  if (!write_locked && !migrated) {
+    // The original lock primitive intentionally combines invalid and
+    // contended outcomes. Resolve only that public-KV distinction after the
+    // lock attempt; never write a private row under the locator latch alone.
+    LockRow(metadata);
+    const bool valid = metadata->is_valid;
     UnlockRow(metadata);
-    // A create placeholder is visible in the tree before its owner publishes
-    // valid. This is contention, not a stable missing key; the facade owns
-    // the bounded operation retry.
-    throw std::runtime_error("private CAS create placeholder busy");
+    if (!valid) return false;
+    throw std::runtime_error("private CAS write lock busy");
   }
   if (!metadata->is_migrated) {
     const std::string_view current(private_value->data, fixed_value_size_);
@@ -989,12 +998,19 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
       std::memcpy(private_value->data, desired.data(), desired.size());
       mem_access::PrivateWrite(private_value->data, fixed_value_size_);
       metadata->is_data_modified_since_moved_out = true;
-      metadata->tid = star::TwoPLPashaHelper::kv_next_commit_tid(metadata->tid);
       RecordPrivateMetadataWrite(metadata);
       *exchanged = true;
     }
-    UnlockRow(metadata);
+    star::TwoPLPashaHelper::write_lock_release(
+        *metadata, *exchanged
+            ? star::TwoPLPashaHelper::kv_next_commit_tid(observed_tid)
+            : observed_tid);
     return true;
+  }
+  LockRow(metadata);
+  if (!metadata->is_valid || !metadata->is_migrated) {
+    UnlockRow(metadata);
+    throw std::runtime_error("migrated CAS locator busy");
   }
   const RegionOffset smeta_offset = metadata->migrated_smeta_off;
   if (smeta_offset == kNullOffset ||
@@ -1049,17 +1065,29 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
   }
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
-  LockRow(metadata);
-  if (!metadata->is_valid) {
+  bool write_locked = false;
+  bool migrated = false;
+  const uint64_t observed_tid =
+      star::TwoPLPashaHelper::take_write_lock(
+          *metadata, write_locked, &migrated);
+  if (!write_locked && !migrated) {
+    LockRow(metadata);
+    const bool valid = metadata->is_valid;
     UnlockRow(metadata);
-    return false;
+    if (!valid) return false;
+    throw std::runtime_error("private increment write lock busy");
   }
   std::string current;
   star::TwoPLPashaMetadataShared *smeta = nullptr;
-  if (!metadata->is_migrated) {
+  if (!migrated) {
     current.assign(private_value->data, fixed_value_size_);
     mem_access::PrivateRead(private_value->data, fixed_value_size_);
   } else {
+    LockRow(metadata);
+    if (!metadata->is_valid || !metadata->is_migrated) {
+      UnlockRow(metadata);
+      throw std::runtime_error("migrated increment locator busy");
+    }
     const RegionOffset smeta_offset = metadata->migrated_smeta_off;
     if (smeta_offset == kNullOffset ||
         !regions_.IsHwccAddress(regions_.hwcc().FromOffset(smeta_offset))) {
@@ -1111,23 +1139,25 @@ bool KVPartition::IncrementPrivate(std::string_view key, int64_t delta,
     if (!DecodeCanonicalFixedDecimal(current, &previous) ||
         (delta > 0 && previous > std::numeric_limits<int64_t>::max() - delta) ||
         (delta < 0 && previous < std::numeric_limits<int64_t>::min() - delta)) {
-      UnlockRow(metadata);
+      star::TwoPLPashaHelper::write_lock_release(
+          *metadata, observed_tid);
       throw std::invalid_argument(
           "increment requires a non-overflowing int64 value");
     }
     const int64_t next = previous + delta;
     std::string encoded;
     if (!EncodeCanonicalFixedDecimal(next, fixed_value_size_, &encoded)) {
-      UnlockRow(metadata);
+      star::TwoPLPashaHelper::write_lock_release(
+          *metadata, observed_tid);
       throw std::invalid_argument("increment value exceeds fixed value size");
     }
     std::memcpy(private_value->data, encoded.data(), encoded.size());
     mem_access::PrivateWrite(private_value->data, fixed_value_size_);
     metadata->is_data_modified_since_moved_out = true;
-    metadata->tid = star::TwoPLPashaHelper::kv_next_commit_tid(metadata->tid);
     RecordPrivateMetadataWrite(metadata);
     *value = next;
-    UnlockRow(metadata);
+    star::TwoPLPashaHelper::write_lock_release(
+        *metadata, star::TwoPLPashaHelper::kv_next_commit_tid(observed_tid));
     return true;
   }
 }

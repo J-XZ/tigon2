@@ -411,7 +411,7 @@ class TwoPLPashaHelper {
         // latch/tid/valid fields as TwoPLPashaMetadataLocal; the KV layout
         // supplies it through ValueStruct::meta rather than a persisted VA.
         template <typename LocalMetadata>
-        static uint64_t kv_take_private_read_lock_and_read(
+        static uint64_t take_read_lock_and_read(
             LocalMetadata &lmeta, const void *src, void *dest, std::size_t size,
             bool &success, bool *migrated = nullptr)
         {
@@ -437,7 +437,7 @@ class TwoPLPashaHelper {
         }
 
         template <typename LocalMetadata>
-        static uint64_t kv_take_private_write_lock(LocalMetadata &lmeta,
+        static uint64_t take_write_lock(LocalMetadata &lmeta,
                                                    bool &success,
                                                    bool *migrated = nullptr)
         {
@@ -461,7 +461,7 @@ class TwoPLPashaHelper {
         }
 
         template <typename LocalMetadata>
-        static void kv_private_read_lock_release(LocalMetadata &lmeta)
+        static void read_lock_release(LocalMetadata &lmeta)
         {
                 lmeta.lock();
                 const uint64_t old_value = lmeta.tid;
@@ -472,7 +472,7 @@ class TwoPLPashaHelper {
         }
 
         template <typename LocalMetadata>
-        static void kv_private_write_lock_release(LocalMetadata &lmeta,
+        static void write_lock_release(LocalMetadata &lmeta,
                                                   uint64_t new_tid)
         {
                 lmeta.lock();

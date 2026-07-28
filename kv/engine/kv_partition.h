@@ -105,7 +105,8 @@ class KVPartition {
   // ops use TryPinShared + SCC.
   // SharedAccessState distinguishes miss vs contention (§10.1); HasShared gone.
   SharedAccessState GetShared(std::string_view key, uint32_t host_id,
-                              std::string *value) const;
+                              std::string *value,
+                              bool record_clock_access = true) const;
   SharedAccessState PutShared(std::string_view key, uint32_t host_id,
                               std::string_view value);
   SharedAccessState CompareExchangeShared(std::string_view key, uint32_t host_id,
