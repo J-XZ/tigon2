@@ -319,12 +319,13 @@ bool KvDeleteAndUpdateNextKeyInfo(star::ITable *table, const void *key,
                                   bool is_delete_local, bool &need_move_out,
                                   void *&migration_policy_meta) {
   auto *kv_table = dynamic_cast<KvPartitionTable *>(table);
-  if (kv_table == nullptr || kv_table->partition() == nullptr ||
-      !is_delete_local)
+  if (kv_table == nullptr || kv_table->partition() == nullptr)
     return false;
   return kv_table->partition()->DeletePrivateForMigrationManager(
       std::string_view(static_cast<const char *>(key), table->key_size()),
-      &need_move_out, &migration_policy_meta);
+      &need_move_out, &migration_policy_meta,
+      /*writer_prelocked=*/is_delete_local,
+      /*requester_prelocked=*/!is_delete_local);
 }
 
 }  // namespace tigonkv::engine

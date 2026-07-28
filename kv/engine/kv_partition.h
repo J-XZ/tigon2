@@ -94,7 +94,8 @@ class KVPartition {
   // PolicyClock callback. The caller holds this partition's Clock tracker.
   bool DeletePrivateForMigrationManager(
       std::string_view key, bool *need_untrack,
-      void **migration_policy_meta, bool writer_prelocked = false);
+      void **migration_policy_meta, bool writer_prelocked = false,
+      bool requester_prelocked = false);
   bool CompareExchangePrivate(std::string_view key, std::string_view expected,
                               std::string_view desired, bool *exchanged,
                               bool *inserted = nullptr);
@@ -113,6 +114,12 @@ class KVPartition {
                                           bool *exchanged);
   SharedAccessState IncrementShared(std::string_view key, uint32_t host_id,
                                     int64_t delta, int64_t *value);
+  // Original REMOTE_DELETE requester half: hold the shared write lock and
+  // ref while publishing invalid; owner deletion consumes both on success.
+  SharedAccessState PrepareRemoteDelete(
+      std::string_view key, uint32_t host_id,
+      star::TwoPLPashaMetadataShared **locked_row);
+  void AbortRemoteDelete(star::TwoPLPashaMetadataShared *locked_row);
   // Owner DATA_MIGRATION analogue: move_row_in(inc_ref=false). Returns Ok on
   // SUCCESS or FAIL_ALREADY_IN_CXL, NotFound if absent, OutOfMemory otherwise.
   // When non-null, *moved_in is set true only on fresh SUCCESS.

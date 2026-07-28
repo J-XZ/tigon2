@@ -602,13 +602,33 @@ Status KVEngine::Delete(std::string_view key) {
   MarkLayoutDirty();
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
-    // Establish the original shared reference before asking the owner to do
-    // its private-table delete/adjacency update.  The delete request remains
-    // owner-authoritative, but does not bypass the migration discipline.
     const Status migrated =
         Forward(KvMessageType::kMigrate, key, {}, nullptr, route.owner);
     if (!migrated.ok()) return migrated;
-    return Forward(KvMessageType::kDelete, key, {}, nullptr, route.owner);
+    star::TwoPLPashaMetadataShared *locked_row = nullptr;
+    const SharedAccessState prepared = route.partition->PrepareRemoteDelete(
+        key, config_.node_id, &locked_row);
+    if (prepared == SharedAccessState::kMissing)
+      return Status::Error(StatusCode::kNotFound, "key not found");
+    if (prepared != SharedAccessState::kDone)
+      return Status::Error(StatusCode::kBusy, "remote delete shared row busy");
+    bool owner_responded = false;
+    const Status deleted = Forward(KvMessageType::kDelete, key, {}, nullptr,
+                                   route.owner, &owner_responded);
+    // A successful owner callback consumes the requester write/ref pin with
+    // the retired row.  On an unsuccessful ack it is still live and must be
+    // restored before the facade retries.
+    if (!deleted.ok()) {
+      if (!owner_responded) {
+        // The owner may still consume the row after this requester times out.
+        // Restoring the valid bit or unpinning here would race EBR retirement;
+        // this is an unrecoverable transport failure, not a retryable Busy.
+        LOG(FATAL) << "remote delete completion is unknown after requester "
+                   << "published invalid";
+      }
+      route.partition->AbortRemoteDelete(locked_row);
+    }
+    return deleted;
   }
   try {
     return route.partition->DeletePrivate(key)
@@ -1177,7 +1197,8 @@ Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_v
 }
 
 Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_view value,
-                         std::string *response_value, uint32_t owner) {
+                         std::string *response_value, uint32_t owner,
+                         bool *response_received) {
   const uint64_t request_id = NextRequestId(config_.node_id);
   auto pending = RegisterPendingResponse(request_id);
   try {
@@ -1187,7 +1208,7 @@ Status KVEngine::Forward(KvMessageType type, std::string_view key, std::string_v
     RemovePendingResponse(request_id);
     throw;
   }
-  return AwaitResponse(request_id, pending, response_value);
+  return AwaitResponse(request_id, pending, response_value, response_received);
 }
 
 Status KVEngine::RequestMigrate(std::string_view key) {
@@ -1241,7 +1262,8 @@ bool KVEngine::ConsumeAbandonedRequestLocked(uint64_t request_id) {
 
 Status KVEngine::AwaitResponse(
     uint64_t request_id, const std::shared_ptr<PendingResponse> &pending,
-    std::string *response_value) {
+    std::string *response_value, bool *response_received) {
+  if (response_received != nullptr) *response_received = false;
   const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::seconds(config_.sync_timeout_sec);
   for (;;) {
@@ -1268,6 +1290,7 @@ Status KVEngine::AwaitResponse(
     KvMessage response = pending->message;
     lock.unlock();
     RemovePendingResponse(request_id);
+    if (response_received != nullptr) *response_received = true;
     if (response_value != nullptr)
       response_value->assign(response.value.data(), response.value_size);
     const StatusCode code = static_cast<StatusCode>(response.status);
@@ -1554,8 +1577,15 @@ void KVEngine::ServeTransportRequest(const KvMessage &message) {
     }
   } else if (message.type == KvMessageType::kDelete) {
     try {
-      response.status = static_cast<uint32_t>(partition->DeletePrivate(key)
-          ? StatusCode::kOk : StatusCode::kNotFound);
+      auto *table = KvMigrationRuntime::Instance().TableFor(
+          partition->partition_id());
+      if (table == nullptr || star::migration_manager == nullptr)
+        throw std::runtime_error("remote delete has no installed migration callback");
+      const FixedKey fixed_key = FixedKey::From(key, config_.fixed_key_size);
+      response.status = static_cast<uint32_t>(
+          star::migration_manager->delete_specific_row_and_move_out(
+              table, &fixed_key, /*is_delete_local=*/false)
+              ? StatusCode::kOk : StatusCode::kNotFound);
     } catch (const std::runtime_error &e) {
       response.status = static_cast<uint32_t>(
           std::string_view(e.what()).find("busy") != std::string_view::npos

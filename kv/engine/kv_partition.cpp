@@ -1,4 +1,6 @@
 #include "kv/engine/kv_partition.h"
+
+#include "kv/engine/kv_migration.h"
 #include "kv/engine/fixed_value.h"
 #include "kv/engine/kv_migration.h"
 #include "kv/engine/mem_access.h"
@@ -810,6 +812,48 @@ SharedAccessState KVPartition::PutShared(std::string_view key, uint32_t host_id,
   return written ? SharedAccessState::kDone : SharedAccessState::kRetry;
 }
 
+SharedAccessState KVPartition::PrepareRemoteDelete(
+    std::string_view key, uint32_t host_id,
+    star::TwoPLPashaMetadataShared **locked_row) {
+  EnterEbr();
+  if (locked_row == nullptr)
+    throw std::invalid_argument("null remote delete lock output");
+  *locked_row = nullptr;
+  star::TwoPLPashaMetadataShared *smeta = nullptr;
+  RegionOffset smeta_offset = kNullOffset;
+  const SharedAccessState pin = TryPinShared(MakeKey(key), &smeta, &smeta_offset);
+  if (pin != SharedAccessState::kDone) return pin;
+  smeta->lock();
+  if (!smeta->get_flag(star::TwoPLPashaMetadataShared::valid_flag_index)) {
+    smeta->unlock();
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    return SharedAccessState::kMissing;
+  }
+  if (smeta->is_write_locked() || smeta->get_reader_count() != 0) {
+    smeta->unlock();
+    star::TwoPLPashaHelper::kv_unpin_shared_ref(smeta);
+    return SharedAccessState::kRetry;
+  }
+  smeta->set_write_locked();
+  smeta->clear_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+  smeta->unlock();
+  (void)host_id;
+  *locked_row = smeta;
+  return SharedAccessState::kDone;
+}
+
+void KVPartition::AbortRemoteDelete(
+    star::TwoPLPashaMetadataShared *locked_row) {
+  if (locked_row == nullptr) return;
+  locked_row->lock();
+  DCHECK(locked_row->is_write_locked());
+  DCHECK(locked_row->get_ref_cnt() > 0);
+  locked_row->set_flag(star::TwoPLPashaMetadataShared::valid_flag_index);
+  locked_row->clear_write_locked();
+  locked_row->decrement_ref_cnt();
+  locked_row->unlock();
+}
+
 SharedAccessState KVPartition::CompareExchangeShared(
     std::string_view key, uint32_t host_id, std::string_view expected,
     std::string_view desired, bool *exchanged) {
@@ -938,7 +982,10 @@ bool KVPartition::CompareExchangePrivate(std::string_view key,
   LockRow(metadata);
   if (!metadata->is_valid) {
     UnlockRow(metadata);
-    return false;
+    // A create placeholder is visible in the tree before its owner publishes
+    // valid. This is contention, not a stable missing key; the facade owns
+    // the bounded operation retry.
+    throw std::runtime_error("private CAS create placeholder busy");
   }
   if (!metadata->is_migrated) {
     const std::string_view current(private_value->data, fixed_value_size_);
@@ -1821,11 +1868,12 @@ bool KVPartition::DeletePrivate(std::string_view key) {
   // Match the original read-and-delete order: take the write lock first,
   // then let the PolicyClock callback consume it with the deleted row.  The
   // successful callback retires the row, so it must not be released again.
-  bool need_untrack = false;
-  void *migration_policy_meta = nullptr;
   try {
-    const bool deleted = DeletePrivateForMigrationManager(
-        key, &need_untrack, &migration_policy_meta, true);
+    auto *table = KvMigrationRuntime::Instance().TableFor(partition_id_);
+    if (table == nullptr || star::migration_manager == nullptr)
+      throw std::runtime_error("owner delete has no installed migration callback");
+    const bool deleted = star::migration_manager->delete_specific_row_and_move_out(
+        table, &fixed_key, /*is_delete_local=*/true);
     if (!deleted)
       ReleaseOwnerNextRowWriteLock(row_lock, 0, false);
     return deleted;
@@ -1837,7 +1885,8 @@ bool KVPartition::DeletePrivate(std::string_view key) {
 
 bool KVPartition::DeletePrivateForMigrationManager(
     std::string_view key, bool *need_untrack,
-    void **migration_policy_meta, bool writer_prelocked) {
+    void **migration_policy_meta, bool writer_prelocked,
+    bool requester_prelocked) {
   EnterEbr();
   if (need_untrack == nullptr || migration_policy_meta == nullptr)
     throw std::invalid_argument("null Clock delete output");
@@ -1928,8 +1977,11 @@ bool KVPartition::DeletePrivateForMigrationManager(
             unlock();
             return false;
           }
-          if (smeta->get_ref_cnt() != 0 || smeta->get_reader_count() != 0 ||
-              (!writer_prelocked && smeta->is_write_locked())) {
+          if (smeta->get_reader_count() != 0 ||
+              (requester_prelocked
+                   ? (smeta->get_ref_cnt() != 1 || !smeta->is_write_locked())
+                   : (smeta->get_ref_cnt() != 0 ||
+                      (!writer_prelocked && smeta->is_write_locked())))) {
             smeta->unlock();
             metadata->is_valid = true;
             RecordPrivateMetadataWrite(metadata);

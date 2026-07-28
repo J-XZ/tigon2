@@ -1058,7 +1058,15 @@ int main() {
       for (uint32_t w = 0; w < 4; ++w) {
         casters.emplace_back([&, w] {
           engine->BindWorker(w);
-          const auto r = engine->CompareExchange(cas_key, "", "won");
+          tigonkv::CasResult r;
+          // KVEngine exposes one primitive attempt. A create-race loser may
+          // observe the owner's still-invalid placeholder as Busy; the facade
+          // is the sole operation-level retry boundary.
+          for (uint32_t attempt = 0; attempt != 64; ++attempt) {
+            r = engine->CompareExchange(cas_key, "", "won");
+            if (r.status.code != tigonkv::StatusCode::kBusy) break;
+            std::this_thread::yield();
+          }
           if (r.status.ok() && r.exchanged)
             winners.fetch_add(1, std::memory_order_relaxed);
           else if (r.status.code != tigonkv::StatusCode::kCompareFailed)

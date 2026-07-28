@@ -88,7 +88,8 @@ class KVEngine {
   Status Forward(KvMessageType type, std::string_view key, std::string_view value,
                  std::string *response_value);
   Status Forward(KvMessageType type, std::string_view key, std::string_view value,
-                 std::string *response_value, uint32_t owner);
+                 std::string *response_value, uint32_t owner,
+                 bool *response_received = nullptr);
   // TwoPLPasha DATA_MIGRATION: ask owner to move_row_in, then requester CXL-accesses.
   Status RequestMigrate(std::string_view key);
   struct PendingResponse {
@@ -104,7 +105,8 @@ class KVEngine {
   bool ConsumeAbandonedRequestLocked(uint64_t request_id);
   Status AwaitResponse(uint64_t request_id,
                        const std::shared_ptr<PendingResponse> &pending,
-                       std::string *response_value);
+                       std::string *response_value,
+                       bool *response_received = nullptr);
   // Demuxer path: apply responses / queue requests. Never sends.
   void DemuxTransportMessage(const KvMessage &message);
   void WakePendingForwarders();
