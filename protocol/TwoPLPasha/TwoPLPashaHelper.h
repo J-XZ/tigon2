@@ -628,6 +628,19 @@ class TwoPLPashaHelper {
                 return remove_lock_bit(old_value);
         }
 
+        // Offset-backed owner rows retain the original lock-and-read contract
+        // without recreating the old pointer-based MetaDataType tuple.  A
+        // migrated row is deliberately reported to its existing SCC path.
+        template <typename LocalMetadata>
+        static uint64_t take_write_lock_and_read(
+            LocalMetadata &lmeta, const void *src, void *dest,
+            std::size_t size, bool &success, bool *migrated = nullptr)
+        {
+                const uint64_t tid = take_write_lock(lmeta, success, migrated);
+                if (success) std::memcpy(dest, src, size);
+                return tid;
+        }
+
         template <typename LocalMetadata>
         static void read_lock_release(LocalMetadata &lmeta)
         {
