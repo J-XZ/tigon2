@@ -18,8 +18,9 @@
 | Gate | Result |
 | --- | --- |
 | Rel 20k E | **PASS** (`tigon2-scanfix-rel20k-20260731T072449Z`) |
-| Rel 25k / 50k E | **STALL ops=0**（GDB：`move_in_scan_range`→`move_row_in` 在 private `_lookupForNextKeyUpdate` OLC 重试空转；证据 `tigon2-scanfix-rel50k-gdb-20260731T073002Z`） |
-| Rel 1M E | 未跑（先破 25k 悬崖） |
+| Rel 25k E | **PASS**（`STALL_SEC=600`：`tigon2-scanfix-rel25k-long-20260731T073850Z`）；`STALL_SEC=180` 偶发误杀） |
+| Rel 50k E | **硬 STALL ops=0 ≥575s**（`tigon2-scanfix-rel50k-20260731T074041Z`；GDB `tigon2-scanfix-rel50k-gdb-20260731T073002Z`：migrate 卡在 private `_lookupForNextKeyUpdate`） |
+| Rel 1M E | 未跑（50k 未破） |
 | layout/partition/engine unit | PASS |
 
 否决：probe-skip、互斥拖到 move_out、禁止 Await 嵌套、layout 25 多槽重叠互斥。
