@@ -45,17 +45,10 @@ class PolicyClock : public MigrationManager {
 
         bool delete_specific_row_and_move_out(ITable *table, const void *key, bool is_delete_local) override;
 
-        void run_under_partition_clock(ITable *table,
-                                       const std::function<void()> &fn) override;
-
-        bool try_run_under_partition_clock(
-            ITable *table, const std::function<void()> &fn) override;
-
     private:
         class ClockTracker;
         static tigonkv::engine::KVPartition *PartitionOf(ITable *table);
         static TwoPLPashaMetadataShared *PolicySmeta(void *migration_policy_meta);
-        static tigonkv::engine::KVPartition *&HeldClockPartition();
 
         uint64_t hw_cc_budget{ 0 };
         uint64_t partition_num_{ 0 };

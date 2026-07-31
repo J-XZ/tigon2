@@ -30,13 +30,6 @@ class PolicyClock::ClockTracker {
     tigonkv::engine::mem_access::PrivateAtomicRmw(lock);
     pthread_spin_lock(&control->lock);
   }
-  bool try_lock() {
-    auto *control = partition_.ClockTrackerControl();
-    const volatile void *volatile_lock = &control->lock;
-    auto *lock = const_cast<const void *>(volatile_lock);
-    tigonkv::engine::mem_access::PrivateAtomicRmw(lock);
-    return pthread_spin_trylock(&control->lock) == 0;
-  }
   void unlock() {
     auto *control = partition_.ClockTrackerControl();
     const volatile void *volatile_lock = &control->lock;
@@ -239,86 +232,24 @@ void PolicyClock::access_row(void *migration_policy_meta, uint64_t partition_id)
   (void)partition_id;
 }
 
-tigonkv::engine::KVPartition *&PolicyClock::HeldClockPartition() {
-  thread_local tigonkv::engine::KVPartition *held = nullptr;
-  return held;
-}
-
-void PolicyClock::run_under_partition_clock(
-    ITable *table, const std::function<void()> &fn) {
-  if (!try_run_under_partition_clock(table, fn)) {
-    // Blocking fallback for non-cooperative callers (matches spin_lock).
-    auto *partition = PartitionOf(table);
-    if (partition == nullptr) {
-      fn();
-      return;
-    }
-    if (HeldClockPartition() == partition) {
-      fn();
-      return;
-    }
-    if (HeldClockPartition() != nullptr)
-      throw std::logic_error("nested Clock critical section across partitions");
-    ClockTracker clock_tracker(*partition);
-    clock_tracker.lock();
-    HeldClockPartition() = partition;
-    try {
-      fn();
-    } catch (...) {
-      HeldClockPartition() = nullptr;
-      clock_tracker.unlock();
-      throw;
-    }
-    HeldClockPartition() = nullptr;
-    clock_tracker.unlock();
-  }
-}
-
-bool PolicyClock::try_run_under_partition_clock(
-    ITable *table, const std::function<void()> &fn) {
-  auto *partition = PartitionOf(table);
-  if (partition == nullptr) {
-    fn();
-    return true;
-  }
-  if (HeldClockPartition() == partition) {
-    fn();
-    return true;
-  }
-  // Cross-partition nesting under cooperative poll: treat as Busy rather than
-  // hard-failing the worker that still owes a peer response.
-  if (HeldClockPartition() != nullptr) return false;
-  ClockTracker clock_tracker(*partition);
-  if (!clock_tracker.try_lock()) return false;
-  HeldClockPartition() = partition;
-  try {
-    fn();
-  } catch (...) {
-    HeldClockPartition() = nullptr;
-    clock_tracker.unlock();
-    throw;
-  }
-  HeldClockPartition() = nullptr;
-  clock_tracker.unlock();
-  return true;
-}
-
 migration_result PolicyClock::move_row_in(
     ITable *table, const void *key,
     const std::tuple<MetaDataType *, void *> &row, bool inc_ref_cnt) {
+  // Master: lock → move_from_partition_to_shared_region → track → unlock.
+  // Offset adapter allocates the tracker node before the move so OOM can
+  // return FAIL_OOM without leaking a half-published shared row.
   auto *partition = PartitionOf(table);
   if (partition == nullptr) return migration_result::FAIL_OOM;
   ClockTracker clock_tracker(*partition);
-  const bool nested = HeldClockPartition() == partition;
   void *migration_policy_meta = nullptr;
-  if (!nested) clock_tracker.lock();
+  clock_tracker.lock();
   auto *tracker_node = static_cast<tigonkv::engine::PrivateClockTrackerNode *>(
       nullptr);
   try {
     try {
       tracker_node = clock_tracker.allocate();
     } catch (const std::bad_alloc &) {
-      if (!nested) clock_tracker.unlock();
+      clock_tracker.unlock();
       return migration_result::FAIL_OOM;
     }
     const migration_result ret = move_from_partition_to_shared_region(
@@ -329,42 +260,34 @@ migration_result PolicyClock::move_row_in(
     } else {
       clock_tracker.discard(tracker_node);
     }
-    if (!nested) clock_tracker.unlock();
+    clock_tracker.unlock();
     return ret;
   } catch (...) {
     if (tracker_node != nullptr) clock_tracker.discard(tracker_node);
-    if (!nested) clock_tracker.unlock();
+    clock_tracker.unlock();
     throw;
   }
 }
 
 bool PolicyClock::move_row_out(uint64_t partition_id) {
+  // Same control flow as master PolicyClock::move_row_out: blocking tracker
+  // lock, unbounded second-chance walk, cursor advance before untrack.
   if (partition_id >= partition_num_) return false;
   auto *kv_table = tigonkv::engine::KvMigrationRuntime::Instance().TableFor(
       static_cast<uint32_t>(partition_id));
   if (kv_table == nullptr || kv_table->partition() == nullptr) return false;
   auto *partition = kv_table->partition();
   ClockTracker clock_tracker(*partition);
-  const bool nested = HeldClockPartition() == partition;
   bool ret = false;
-  // Under AwaitResponse nesting, never spin on Clock held by a long
-  // move_in_scan_range: skip this OnDemand pass; a later call retries.
-  if (!nested && !clock_tracker.try_lock()) return false;
+  clock_tracker.lock();
   try {
     if (cxl_memory.get_stats(CXLMemory::TOTAL_HW_CC_USAGE) < hw_cc_budget) {
-      if (!nested) clock_tracker.unlock();
+      clock_tracker.unlock();
       return ret;
     }
-    // Cap one OnDemand walk so a large tracker list cannot hold the partition
-    // Clock across a full ring under Scan storms (100k YCSB E).  Later
-    // OnDemand calls resume from the same cursor, matching master's repeated
-    // move_row_out invocations after further move-ins.
-    constexpr int kMaxCandidatesPerCall = 64;
-    int examined = 0;
-    while (examined < kMaxCandidatesPerCall) {
+    while (true) {
       auto *victim = clock_tracker.move_forward_and_get_cursor(kv_table);
       if (victim == nullptr) break;
-      ++examined;
       auto *smeta = PolicySmeta(victim->row_entity.migration_manager_meta);
       smeta->lock();
       const bool second_chance = smeta->get_second_chance_bit();
@@ -375,11 +298,9 @@ bool PolicyClock::move_row_out(uint64_t partition_id) {
           victim->row_entity.table, victim->row_entity.key,
           victim->row_entity.local_row);
       if (moved) {
-        // The offset adapter materializes callback state in one scratch node.
-        // Keep the original victim stable across the master-prescribed cursor
-        // advance below; that advance overwrites the scratch view.
+        // Scratch view is overwritten by the master-prescribed cursor advance;
+        // keep a stable copy for untrack like master's victim pointer.
         ClockTracker::ClockTrackerNode original_victim = *victim;
-        // Preserve the original cursor advance before unlinking its victim.
         (void)clock_tracker.move_forward_and_get_cursor(kv_table);
         clock_tracker.untrack(&original_victim);
         if (cxl_memory.get_stats(CXLMemory::TOTAL_HW_CC_USAGE) < hw_cc_budget) {
@@ -388,31 +309,32 @@ bool PolicyClock::move_row_out(uint64_t partition_id) {
         }
       }
     }
-    if (!nested) clock_tracker.unlock();
+    clock_tracker.unlock();
     return ret;
   } catch (...) {
-    if (!nested) clock_tracker.unlock();
+    clock_tracker.unlock();
     throw;
   }
 }
 
 bool PolicyClock::delete_specific_row_and_move_out(ITable *table, const void *key,
                                                    bool is_delete_local) {
+  // Master locks the tracker around delete_and_update_next_key_info.  The
+  // documented E-class fix also frees the tracker node when need_move_out.
   auto *partition = PartitionOf(table);
   if (partition == nullptr) return false;
   ClockTracker clock_tracker(*partition);
-  const bool nested = HeldClockPartition() == partition;
   void *migration_policy_meta = nullptr;
   bool need_move_out = false;
-  if (!nested) clock_tracker.lock();
+  clock_tracker.lock();
   try {
     const bool ret = delete_and_update_next_key_info(
         table, key, is_delete_local, need_move_out, migration_policy_meta);
     if (ret && need_move_out) clock_tracker.untrack_key(key);
-    if (!nested) clock_tracker.unlock();
+    clock_tracker.unlock();
     return ret;
   } catch (...) {
-    if (!nested) clock_tracker.unlock();
+    clock_tracker.unlock();
     throw;
   }
 }

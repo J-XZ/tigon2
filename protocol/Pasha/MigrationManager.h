@@ -79,26 +79,6 @@ class MigrationManager {
         virtual bool move_row_out(uint64_t partition_id) = 0;
         virtual bool delete_specific_row_and_move_out(ITable *table, const void *key, bool is_delete_local) = 0;
 
-        // Serialize owner-private tree access for scan-range move-in: the
-        // original handler runs table.scan (scanForUpdate) then move_row_in per
-        // key.  Without one Clock critical section around both, concurrent
-        // workers interleave leaf write locks from scanForUpdate with
-        // lookupForNextKeyUpdate under Clock and livelock under Scan storms.
-        virtual void run_under_partition_clock(ITable *table,
-                                               const std::function<void()> &fn) {
-                (void)try_run_under_partition_clock(table, fn);
-        }
-
-        // Non-blocking variant for cooperative PollTransport: contended Clock
-        // must return Busy at the KV operation boundary instead of spinning
-        // inside AwaitResponse while peers await this worker's response.
-        virtual bool try_run_under_partition_clock(
-            ITable *table, const std::function<void()> &fn) {
-                (void)table;
-                fn();
-                return true;
-        }
-
         // user-provided functions
         std::function<migration_result(ITable *, const void *, const std::tuple<std::atomic<uint64_t> *, void *> &, bool inc_ref_cnt, void *&)> move_from_partition_to_shared_region;
         std::function<bool(ITable *, const void *, const std::tuple<std::atomic<uint64_t> *, void *> &)> move_from_shared_region_to_partition;
