@@ -1,96 +1,67 @@
 # YCSB-E Scan 迁移 stall（ops=0）
 
-## 状态
+## 状态（2026-07-31 已修）
 
 - **合同：** `partition优化方案.md` §3.7.9 / **§3.9.1** —— **per-partition 单飞**
-  （layout 26，`scan_range_migrate_inflight`）。
-- **实现：**
-  1. HWCC 单飞覆盖 `Prepare`/`move_in`；
-  2. point Busy / ScanLocal Busy / Forward 前 Busy / skip point-migrate move_out；
-  3. scan-migrate **先 Flush 再 move_out**；
-  4. `AwaitResponse` 优先排空响应；等待中且 in-flight/done 时快速 Busy；
-  5. `move_in_scan_range` 对齐 master 主体。
+  （layout 26，`scan_range_migrate_inflight`），未变。
+- **直接根因（已用实机数据钉死）：** `BTreeLeaf::split` 漏更新旧右兄弟的 `pre_`
+  回链（master 同缺陷）。split 后 `old_next->pre_` 仍指向旧左叶，叶首键在
+  `_lookupForNextKeyUpdate` 回调里读到**错误前驱**，`MoveInForMigrationManager`
+  的 already-migrated 位修复据此写错 `prev_key_real_bit`；probe 对这些行永远
+  `prev=0`，`Forward→move_in→re-probe fail→Busy→retry` 死循环独占单飞旗标与
+  Clock，其余范围的迁移（能真正修复前驱/后继的行）被饿死 → 4VM 全 `ops=0`。
+- **最小补丁：** `common/btree_olc_cxl/BTreeOLC_CXL.h` `BTreeLeaf::split` 补
+  `newLeaf->next_->pre_ = newLeaf`（镜像 erase-merge 的回链写法 + 同域
+  `RecordTreeDataWrite`）。只修树结构一处，不碰 Clock/SCC/消息骨架/Scan 协议。
 
-### 门禁
+### 门禁（修复后）
 
 | Gate | Result |
 | --- | --- |
-| Rel 20k E | **PASS** |
-| Rel 25k E | **PASS**（建议 `STALL_SEC=600`） |
-| Rel 50k E | **硬 STALL ops=0**（migrate 卡在 private `_lookupForNextKeyUpdate`） |
-| Rel 1M E | 未跑（50k 未破） |
-| unit tests | PASS |
+| Rel 20k E | PASS（回归） |
+| Rel 25k E | PASS（回归） |
+| Rel 50k E | **PASS ×2**（此前硬 STALL ops=0；约 20–30s 跑完） |
+| Rel 100k E | **PASS**（约 45s 跑完） |
+| Rel 1M E（正式入口 `tigonkv_run_ycsb_experiment.sh`） | **PASS**（1M load ≈192s、1M run ≈507s，scan_ops=950k） |
+| Debug 100k E（`STALL_SEC=90`） | **PASS**（约 90s 跑完） |
+| unit tests（unit/kv_layout/btree_binding/kv_partition/kv_engine） | PASS |
 
-否决：probe-skip、互斥拖到 move_out、禁止 Await 嵌套、多槽 range 互斥。
+否决：probe-skip、互斥拖到 move_out、禁止 Await 嵌套、多槽 range 互斥、
+owner 侧第二遍 repair 扫描。
 
 ## 症状
 
 - 4VM × 4 foreground + demuxer=1；`load` 通过；`run` Workload E 心跳长期 `ops=0 total=0`。
 - 宿主 workflow：`stall: no E2E_TRACE_HEARTBEAT growth for ${STALL_SEC}s (ops=0)`。
-- 合同口径 Debug E：`TIGONKV_E2E_STALL_SEC=90`，必须 GDB，不得靠一味加长 stall 掩盖。
 
-## GDB 形态（与数据量无关的稳定模式）
+## 证据链（2026-07-31）
 
-跨 VM 循环等待：
+- GDB/perf（`/mnt/xz_vm_storage/tigon2-scanfix-rel50k-*-gdb-*/`）：owner move-in 线程
+  在 `move_in_scan_range → move_row_in → MoveInForMigrationManager` 内轮转，其余
+  worker 在 shared `ScanShared`/`smeta->lock()` 自旋；`scan_range_migrate_inflight`
+  四分区恒为 1。
+- 临时 SCANTRACE（已回滚）：同一行 `prev=0` 失败十多万次；re-probe 在 move-in 后
+  仍 80–100% `migration_required`；失败行分布 `prev=0 next=1` 占 ~75%。
+- 宿主侧共享池解析（`/tmp/walk_*.py`，已留档）：失败行 user14862824324880098893 /
+  user16376311102338332121 的**私树前驱已迁移**（is_migrated=1、共享树存在），但
+  smeta `prev_real=0` 稳定不变；repair 尝试 75 次无效果。叶链检查发现
+  `LEAF B.pre_ = 0xad9c6500` ≠ 真前驱叶 A（`0xadcb6440`），而 A.next_ = B：
+  **单向叶链**。这正是 split 缺 `old_next->pre_` 回链的现场形态。
 
-1. Foreground Scan → Forward `DATA_MIGRATION_REQUEST_FOR_SCAN` → `AwaitResponse` → 嵌套 `PollTransport`
-2. 嵌套服务：`PreparePartitionSharedScan` / `move_in_scan_range` → `PolicyClock::move_row_in` → `MoveInForMigrationManager` → private B+Tree `_lookupForNextKeyUpdate`
-3. 其余 worker：`AwaitResponse` yield，或卡在 Clock / smeta（`update_adjacent_migrated_rows`）自旋
-4. 典型栈：`AwaitResponse` → `PollTransport` → `move_in_scan_range` → Clock / private lookup / smeta adjacency
+## 修复（与 master 的关系）
 
-## 根因（Debug GDB 已定位，尚未最小补丁）
+master `BTreeOLC.h::BTreeLeaf::split` 同样只做
+`newLeaf->next_ = next_; newLeaf->pre_ = this; next_ = newLeaf;`，漏
+`old_next->pre_ = newLeaf`；其 erase-merge 路径（`sibling->next_->pre_ = this`）
+有回链，说明 split 是笔误。KV 的 `_lookupForNextKeyUpdate` 依赖 `pre_` 取前驱来
+重建邻接位，因此该缺陷在 Workload E 扫描风暴下放大为系统级活锁。修复是 master
+同函数的 3 行补丁，不改变任何锁序/Clock/SCC/消息语义。
 
-证据：`/mnt/xz_vm_storage/tigon2-debug-50k-gdb-20260731T025050Z/`（`ROOT_CAUSE.txt`、
-`gdb/vm*-bt.txt`、`gdb/vm{0,3}-deep{1,2}.txt`）。Debug 50k E、`STALL_SEC=600`、
-正式 config；四 VM `ops=0` 窗口内双采样。
-
-**直接机制：**
-
-1. Scan miss → `Forward(DATA_MIGRATION_REQUEST_FOR_SCAN)` → `AwaitResponse` →
-   嵌套 `PollTransport` → 在同一 worker 上 `ServeTransportRequest` 执行
-   `move_in_scan_range`。
-2. `move_in_scan_range` 仍是 master 形态：先 `scanForUpdate`（叶子写锁、无 Clock），
-   再逐 key `move_row_in`（**partition Clock 覆盖整个** `MoveInForMigrationManager` /
-   `_lookupForNextKeyUpdate` 叶子锁与 smeta/adjacency）。
-3. 4×4 Scan 风暴下，同一 owner partition 上多个嵌套 `move_in_scan_range` 并发：
-   - 线程 A 持叶子锁做 scan；线程 B 持 Clock 等同一叶子 →；A 随后要 Clock
-   - 形成 **private leaf lock ↔ partition Clock 的 ABBA**，外加 Clock 车队
-     （双采样可见 holder 在 worker 间轮转，但 RPC 完不成）。
-4. Owner 迟迟不能 `flush` scan-migrate 响应；其余 VM 永久 `AwaitResponse` →
-   宿主 `ops=0`。
-
-**不是：** Clock unlock 丢失（holder 在采样间前进）；也不是已删除的 HeldClock /
-try_lock / candidate-cap 残留（删除后 ≥25k Rel / ≥50k Debug 仍 stall）。
-
-**与 master 的关系：** Clock 覆盖单次 `move_row_in` 与 `move_in_scan_range` 两段式
-结构与 master 一致；KV 放大点是 **合作式嵌套服务超长 scan-range move-in**。
-禁止再靠加长外层 Clock CS / try_lock Busy / RPC key cap 掩盖。
-
-## 规模二分（RelWithDebInfo + 根目录正式 `experiment_config.jsonc` splits）
-
-| record_count = operation_count | Clock 残留时期 | Clock 恢复 master 同形后 |
-| --- | --- | --- |
-| 10k / 12k / 15k / 16k / 18k | PASS | PASS（18k 复核） |
-| **20k** | **STALL，`ops=0`** | **PASS ×2**（心跳有 ops 增长） |
-| **25k** | STALL | **STALL，`ops=0`**（当前最小稳定复现） |
-| 50k / 100k | STALL | 未重跑；预期仍 stall |
-
-补充证据：
-
-`/mnt/xz_vm_storage/tigon2-clock-restore-20260731T023927Z/`  
-（`VERDICT.txt`、18k/20k/25k logs、Rel runner SHA）
-
-历史二分目录仍保留：
-
-`/mnt/xz_vm_storage/tigon2-stageP-20260730T170434Z/e-repro-bisect/`
-
-## 推荐快速复现（约 1–2 min wall）
-
-前置：已授权的 4VM 已 `tigonkv_init_vms.sh` 就绪（`tigonkv_check_vms.sh` 通过）。
+## 验证
 
 ```bash
+# 4VM 拓扑（tigonkv_init_vms.sh --allow-state-change 已授权）
 REPRO=/mnt/xz_vm_storage/tigon2-stageP-20260730T170434Z/e-repro-bisect
-# 25k traces 已存在时直接跑；否则用 prepare_ycsb_traces.sh 生成
 env -u TIGONKV_E2E_TEST_VALUE_HEX -u TIGONKV_E2E_REQUIRE_GET_FOUND -u TIGONKV_E2E_SCAN_MAX_KEY \
   -u TIGONKV_VM_SSH_BASE_PORT -u TIGONKV_VM_SSH_KEY -u TIGONKV_VM_REMOTE_ROOT \
   -u TIGONKV_SHARED_MEMORY_PATH \
@@ -98,33 +69,42 @@ env -u TIGONKV_E2E_TEST_VALUE_HEX -u TIGONKV_E2E_REQUIRE_GET_FOUND -u TIGONKV_E2
   TIGONKV_POOL_INITER=/root/code/tigon2/build-relwithdebinfo/cxl_pool_initer \
   TIGONKV_EXPERIMENT_CONFIG_JSONC=/root/code/tigon2/experiment_config.jsonc \
   TIGONKV_E2E_ROUNDS=1 TIGONKV_YCSB_WORKLOADS=E \
-  TIGONKV_E2E_STALL_SEC=45 TIGONKV_E2E_TIMEOUT_SEC=1800 \
+  TIGONKV_E2E_STALL_SEC=600 TIGONKV_E2E_TIMEOUT_SEC=1800 \
   TIGONKV_E2E_SCAN_EXPECT_NONEMPTY=1 \
-  bash /root/code/tigon2/scripts/e2e_trace/run_guest_ycsb_workflows.sh \
-    "$REPRO/traces-25k" /tmp/tigonkv-e-25k-logs 1 E
+  bash scripts/e2e_trace/run_guest_ycsb_workflows.sh "$REPRO/traces-50k" <LOGS> 1 E
 ```
 
-期望：`phase=load pass`；`phase=run` 在约 45s 内因 `ops=0` stall 失败。
-
-合同级 Debug 100k E（勿用加长 stall 代替修 bug）：
-
-```bash
-# 见 下一步修改.md §19 P2：STALL_SEC=90、build-debug runner、
-# debug-ycsb-traces、TIGONKV_E2E_SCAN_EXPECT_NONEMPTY=1
-```
-
-## 修复约束（摘自仓库合同）
-
-- 先最小复现 + Debug/GDB，对照 `master` 同函数；只修直接根因，禁止 sleep / 吞异常 / 靠加长 stall 或降并发掩盖。
-- 竞争与稳定 miss 区分：正常竞争 Busy 并在完整 KV 操作边界重试。
-- 不新增第二套 Scan/迁移协议或后台搬运器；优先薄适配原 `move_in_scan_range` / TwoPLPasha / Clock。
-- 任意候选补丁必须先复跑 **20k PASS** 与 **25k STALL→修后 PASS**，再回到 Debug 100k E（`STALL_SEC=90`）。
-- 禁止再引入 HeldClock 外层 CS、`move_row_out` `try_lock` 跳过、OnDemand candidate cap。
+修复后 50k/100k E 均 `phase=run pass`，心跳 ops 正常增长。
 
 ## 下一步
 
-1. 按上节机制设计**最小**补丁：保持单次 `move_row_in` 的 master Clock 覆盖，消除
-   嵌套 `move_in_scan_range` 下 leaf↔Clock ABBA / 车队导致的响应饿死；不得回归
-   HeldClock 外层 CS、`try_lock` 跳过、RPC key cap。
-2. 补丁门禁：Rel **20k PASS + 25k PASS**，再 Debug **100k E @ STALL_SEC=90**，然后
-   继续阶段 P 其余项。
+### 已完成（2026-07-31 全部收口）
+
+1. **正式 1M E**：`tigonkv_run_ycsb_experiment.sh --rounds 1 --record-count 1000000
+   --operation-count 1000000 --threads-per-node 4 --workloads e --no-latency
+   --shared-size-mb 32768` PASS；报告与 JSON 在
+   `/mnt/xz_vm_storage/tigon2-1m-formal-20260731T100813Z/`
+   （`YCSB实验报告.md`、`ycsb_summary.json`、`run_meta.json`）。run 阶段
+   replayed 1,000,000 ops / 507s、scan_ops=950,195、scan_rows=47,998,859，
+   无 `ops=0` stall。
+2. **Debug 100k E**：`build-debug/e2e_trace_runner` + debug-ycsb-traces（100k）、
+   根正式 config、`TIGONKV_E2E_STALL_SEC=90`、`TIMEOUT_SEC=7200`、
+   `TIGONKV_E2E_SCAN_EXPECT_NONEMPTY=1` PASS（约 90s 跑完，心跳全程增长）。
+3. **legacy 树取舍：维持 KV-only，不修 `common/btree_olc/BTreeOLC.h`。**
+   - 生产路径只用 `btreeolc_cxl::BPlusTree`（`kv/engine/kv_migration.h` 的
+     KvTableBase），本次修复已覆盖；`common/btree_olc/BTreeOLC.h` 只被
+     `core/Table.h` 的 legacy `star::TableBTreeOLC` 模板默认参数引用，该模板仅由
+     legacy transaction benchmark 源码使用（`CMakeLists.txt`：legacy benchmarks
+     保持 source-only reference，不编译进 `tigonkv`）。
+   - 仓库合同明确要求本地 `common/btree_olc/BTreeOLC.h` 保持 master 原样
+     （`下一步修改.md` §J1 "本地 BTreeOLC.h 保持 master，不借本项现代化"；
+     `partition优化方案.md` "恢复为 master 原样；不要顺手修显示函数"），
+     `master差分allowlist.md` 亦将其列为不承载生产控制流的 include/行尾差异。
+   - 结论：master/legacy 树的同款 split 漏回链缺陷属实（与本次 KV 修复同根因），
+     但修回 legacy 树既违背仓库合同也不影响 `tigonkv` 产物；如需在原始 Tigon
+     基准上复现/修复，应单独立项并先在 master 提交，不混入本仓生产 diff。
+
+### 遗留（有意不做，非部分完成）
+
+- 不修 legacy `BTreeOLC.h`（见上，合同约束 + 非生产路径）。
+- 未 commit / 未推送 / 未新建分支（用户未要求；产物与 diff 均在工作树）。

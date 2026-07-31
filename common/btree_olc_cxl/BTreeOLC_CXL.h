@@ -1072,6 +1072,15 @@ class BPlusTree {
 			newLeaf->recordEntriesWrite(0, moved);
 			RecordTreeDataWrite(&next_, sizeof(next_));
 			next_ = newLeaf;
+			// Master's split forgot the backward link: the old right sibling
+			// still points at this leaf, so leaf-first-key callbacks observe a
+			// stale predecessor and the migrated prev/next bits stay wrong
+			// (YCSB-E scan probe livelock). Mirror the erase-merge back-link.
+			if (newLeaf->next_.get() != nullptr) {
+				RecordTreeDataWrite(&newLeaf->next_->pre_,
+				                    sizeof(newLeaf->next_->pre_));
+				newLeaf->next_->pre_ = newLeaf;
+			}
 
 			for (uint16_t i = 0; i < newLeaf->getCount(); i++) {
 				new (&newLeaf->keys_[i]) KeyType{ keys_[i + this->getCount()] }; // Placement new
