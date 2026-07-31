@@ -23,7 +23,10 @@ def parse_ycsb(ycsb_res_dir, motor_ycsb_csv, rw_ratio, zipf_theta):
         header_row = ["Remote_Ratio", "0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"]
         parse_results(input_file_list, output_file_name, header_row)
         # add Motor numbers
-        append_motor_numbers(output_file_name, motor_ycsb_csv)
+        if os.path.exists(motor_ycsb_csv):
+                append_motor_numbers(output_file_name, motor_ycsb_csv)
+        else:
+                print("motor baseline missing, skipping: " + motor_ycsb_csv, file=sys.stderr)
 
 
 if len(sys.argv) != 2:

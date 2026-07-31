@@ -49,7 +49,7 @@ unbound worker fallback、前台全局统计、`kv_shared_*`、pending/timeout/t
 |---|---|---|
 | `TwoPLPashaHelper::get_migrated_row` | A,B,D | 固定 value 字节数和 RegionOffset 查找通过 optional 参数进入原 lookup/latch/ref/Clock 主体；当前 KV hit 使用它，首次 SCC prepare 覆盖完整 SCC allocation。4VM E2E 覆盖 shared Scan move-in 后访问。 |
 | `TwoPLPashaHelper::kv_next_commit_tid`（KV adapter） | C | 去掉函数级权威 TLS；显式接收 `KVEngine::WorkerRuntime::max_tid`，保留 `max(row_tid,worker_max_tid)+1` 和原 bit 上限。worker binding TLS 仅保存该 slot 的非 owning 指针。 |
-| `KVPartition::ClockTrackerTrack/Untrack/MoveForwardAndGetCursor` | A | 去掉 lmeta reverse link；membership 仅在独立 owner-private `PrivateClockTrackerNode` 链中，按原 tracker 的线性查找/offset 链接处理。布局版本升至 22，禁止旧 backing attach。 |
+| `KVPartition::ClockTrackerTrack/Untrack/MoveForwardAndGetCursor` | A | 去掉 lmeta reverse link；membership 仅在独立 owner-private `PrivateClockTrackerNode` 链中，按原 tracker 的线性查找/offset 链接处理。布局版本现为 26（`kSharedLayoutVersion`，§3.9.1 单飞；22/24/25 为历史值），禁止旧 backing attach。 |
 | `KVPartition::MoveOutForMigrationManager` / `PolicyClock::move_row_out` | A,C | 删除正式 public `MoveOutPrivate`；生产 move-out 仅经 PolicyClock victim loop 或 delete callback。测试也不再保留 move-out adapter。 |
 | `DualRegionAllocator::Arena/BindOwnerPrivateArenaHandles` | A,B | attach/init 一次性为本 VM 所有 owner-private partitions 建立 non-owning VA handle；动态 Allocate/Free 不再读取 HWCC layout，未绑定/非 owner partition hard-fail。物理 HWCC 容量未改。 |
 | `TwoPLPashaMessagePrimitive::{append,decode}_*` | C,D | 保留原 header/字段/精确长度，给没有非 owner private table 的 KV facade 提供 table-id/size 薄 framing；不保存 Transaction 或 pending 状态。 |

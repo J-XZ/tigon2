@@ -70,14 +70,14 @@ cmake --build build-relwithdebinfo -j$(nproc)
 
 脚本内部会：
 
-1. 生成 `configs/experiment_config_ycsb_4vm.jsonc`：HWCC 1024MB、SWCC=rest、`fixed_*=32/32`、关闭 latency  
-2. 用本仓 YCSB-cpp 生成 trace：  
-   - 共享 **load**（via workloadc）  
-   - `workloada`…`workloade` 的 **run**（A 带 UPDATE→GET+PUT；D 用 `latest`；其余 zipfian）  
-3. `cmake --build build-relwithdebinfo --target e2e_trace_runner`  
-4. `tigonkv_check_vms.sh`（可用 `--skip-vm-init` 若刚检查过）  
-5. `run_guest_ycsb_workflows.sh`：对每个 workload 做 **load → run**（4×4 回放）  
-6. `summarize_ycsb_experiment.py` 出汇总  
+1. 生成 `configs/experiment_config_ycsb_4vm.jsonc`：HWCC 1024MB、SWCC=rest、`fixed_*=32/32`、关闭 latency
+2. 用本仓 YCSB-cpp 生成 trace：
+   - 共享 **load**（via workloadc）
+   - `workloada`…`workloade` 的 **run**（A 带 UPDATE→GET+PUT；D 用 `latest`；其余 zipfian）
+3. `cmake --build build-relwithdebinfo --target e2e_trace_runner`
+4. `tigonkv_check_vms.sh`（可用 `--skip-vm-init` 若刚检查过）
+5. `run_guest_ycsb_workflows.sh`：对每个 workload 做 **load → run**（4×4 回放）
+6. `summarize_ycsb_experiment.py` 出汇总
 
 若 VM 已 OK、二进制已编好，可加：`--skip-build --skip-vm-init`。
 
@@ -121,16 +121,16 @@ load 行数、owner 与代表 key。正式运行前必须保留该文件，确�
 
 输出目录大致包括：
 
-- `run_meta.json` — record/op/threads/workloads、32/32  
-- `configs/experiment_config_ycsb_4vm.jsonc`  
-- `traces/load/`、`traces/workloada/`…  
-- `round_logs/round1-workload{a-e}-{load,run}/vm{0-3}.log`  
+- `run_meta.json` — record/op/threads/workloads、32/32
+- `configs/experiment_config_ycsb_4vm.jsonc`
+- `traces/load/`、`traces/workloada/`…
+- `round_logs/round1-workload{a-e}-{load,run}/vm{0-3}.log`
 - 汇总 CSV/JSON/报告（`summarize_ycsb_experiment.py`）
 
 每 VM 日志应有：
 
-- `E2E_THREAD_TOPOLOGY foreground=4 demuxer=1 …`  
-- `E2E_TRACE_TIME_US …`（计时只认这个）  
+- `E2E_THREAD_TOPOLOGY foreground=4 demuxer=1 …`
+- `E2E_TRACE_TIME_US …`（计时只认这个）
 - `e2e_trace_runner[nodeN]: passed.`
 
 单独重汇总：

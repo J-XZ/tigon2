@@ -84,7 +84,7 @@ not real CXL hardware measurements.
 ![](emulation.png)
 
 ## Important Notes
-* Since Motor[^5] (one of our baselines) requires special hardware (4 machines connected via RDMA), we provide pre-measured raw numbers in ``results/motor``. If you would like to run Motor, please refer to https://github.com/minghust/motor
+* Since Motor[^5] (one of our baselines) requires special hardware (4 machines connected via RDMA), the pre-measured raw numbers formerly shipped in ``results/motor`` were removed from the working tree (historical experiment outputs; the directory is gitignored). See git history for the original CSVs. If you would like to run Motor, please refer to https://github.com/minghust/motor
 * Please run all commands under project root directory
 
 ## Testbed Setup

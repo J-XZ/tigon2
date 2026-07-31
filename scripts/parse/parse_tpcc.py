@@ -59,4 +59,7 @@ motor_tpcc_csv = script_directory + "/../../results/motor/tpcc.csv"
 parse_tpcc_baseline(tpcc_res_dir)
 
 ### Tigon and baselines ###
-parse_tpcc(tpcc_res_dir, motor_tpcc_csv)
+if os.path.exists(motor_tpcc_csv):
+        parse_tpcc(tpcc_res_dir, motor_tpcc_csv)
+else:
+        print("motor baseline missing, skipping: " + motor_tpcc_csv, file=sys.stderr)

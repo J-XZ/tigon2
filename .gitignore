@@ -3,6 +3,7 @@
 settings.json
 *.swp
 *~
+core.*
 
 build
 build-*/
