@@ -1035,8 +1035,8 @@ StatusCode KVPartition::EnsureInShared(std::string_view key, uint32_t host_id,
   if (star::scc_manager == nullptr) return StatusCode::kOutOfMemory;
   // Point move-in takes partition Clock then private leaf locks. A concurrent
   // move_in_scan_range holds leaf locks in scanForUpdate then needs Clock —
-  // ABBA if we only Busy on key∈range (Rel50k GDB). Any in-flight on this
-  // partition Busy here; Scan TryBegin/Forward still use overlap-only (§3.9.1).
+  // ABBA. Busy while any scan-range migrate is in flight on this partition
+  // (§3.9.1); the migrate itself calls move_row_in directly.
   if (ScanRangeMigrateInFlight()) return StatusCode::kBusy;
   const FixedKey fixed_key = MakeKey(key);
   star::migration_result result = star::migration_result::FAIL_OOM;

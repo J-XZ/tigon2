@@ -1072,38 +1072,30 @@ migration 开销，也不得用更差的新策略人为拖慢 Tigon。SWCC/HWCC 
 执行；KV 去掉事务后，`Scan→Forward→AwaitResponse` 在等待环内嵌套服务完整
 `move_in_scan_range`（数十次 `move_row_in` + 随后 `move_row_out`）。响应在
 move_out 走完前不上 CXL，对端长期 `ops=0`；多路嵌套还会 private leaf↔Clock ABBA。
-禁止 HeldClock / try_lock Busy / RPC key cap / 第二套邻接或后台搬运器。
+禁止 HeldClock / try_lock Busy / RPC key cap / 第二套邻接、后台搬运器或多槽
+range 互斥表。
 
-**允许的 Scan 专用控制流（尽量保并发与吞吐）：**
+**选定实现：Owner 每 partition 单飞**（HWCC
+`PartitionDirectoryEntry::scan_range_migrate_inflight` + `HwccAtomic*`）。
 
 1. **保留** `move_in_scan_range` 主体（`ITable::scan` → 逐 key `move_row_in`）、
    CXL `scanForUpdate`、K1 薄适配、bool+key_offset 响应 framing、跨 partition
    顺序拼接；不新增 Scan 状态机类或 owner 回传 value。
-2. **Owner 每 partition 单飞** `DATA_MIGRATION_REQUEST_FOR_SCAN`：已有 in-flight
-   时立即 Busy（facade 完整操作重试）。旗标放在 HWCC
-   `PartitionDirectoryEntry::scan_range_migrate_inflight`（跨 VM 可见），用既有
-   `HwccAtomic*` 记账。**默认覆盖** `TryBegin`→`move_in_scan_range`→`End`。
-   不得拖到整段 OnDemand `move_out`（Rel25k Busy 风暴）或仅拖到 Flush 却饿死
-   Rel20k。
-   **关于「重叠才锁」：** 多槽闭区间互斥已在 layout 25 实现并在 Rel50k E 复现
-   `ops=0`（GDB：private leaf↔Clock / 共享 leaf 残余）。且 YCSB Scan 的
-   `inclusive_max` 通常是 partition 上界，同 partition 上任意两窗必然重叠，
-   与单飞等价。当前合同以单飞为保证活性的最小实现；更细粒度仅在不破坏
-   leaf/Clock 活性证据后才能再开。
+2. **单飞生命周期**：`TryBegin`→`move_in_scan_range`→`End`（与 `Prepare` 同生命周期）。
+   已有 in-flight 则 Busy（facade 完整操作重试）。不得拖到整段 OnDemand
+   `move_out`（Busy 风暴）或仅拖到 Flush 却饿死对端。
 3. **In-flight 窗口内**：point `EnsureInShared` / remote-insert Busy；并发点迁移的
-   OnDemand `move_row_out` 跳过；**owner `ScanLocal` Busy**（把 private 树让给
-   `move_in_scan_range`）。**不要**与「远端总是跳过 probe」同时启用。
-4. **远端 Scan 路径**：默认不在 CXL `ScanShared` helper 内因 in-flight Busy，
-   也不因 in-flight **总是跳过 probe**。允许在 `scan_remote` 于 **Forward 之前**
-   读 HWCC 单飞：已 in-flight 则 facade Busy、不再 `Forward`。
-5. **Scan-migrate 响应提前上 CXL**：`move_in_scan_range` 成功并封包后，先
+   OnDemand `move_row_out` 跳过；**owner `ScanLocal` Busy**。禁止「远端总是跳过
+   probe」。
+4. **远端 Scan**：不在 `ScanShared` 内因 in-flight Busy。允许 `scan_remote` 在
+   **Forward 之前**读单飞旗标：已 in-flight 则 facade Busy、不再 Forward。
+5. **响应提前上 CXL**：`move_in_scan_range` 成功封包后，先
    `FlushOutboundMessages`，再 OnDemand `move_row_out`（§3.7 第 9 条 Scan 例外）。
-   不得整段跳过 scan 路径的 `move_out`。点迁移仍保持「move_out 后发送」。
-6. **嵌套策略**：允许在 `AwaitResponse` 的 `PollTransport` 中服务 scan-migrate。
-   若本 worker 正在等待 RPC，且目标 partition 已有 in-flight，则对该
-   scan-migrate **快速 Busy 响应**。不得为 Scan 新增专用后台线程或让 demuxer
-   执行 move-in。
-7. 性能目标：4VM×4 foreground + demuxer=1 下 Rel 25k/50k E 有心跳增长；不得靠
+   不得整段跳过 scan 路径的 `move_out`。点迁移仍「move_out 后发送」。
+6. **嵌套**：允许 `AwaitResponse`→`PollTransport` 服务 scan-migrate。若本 worker
+   正在等待 RPC 且目标 partition 已 in-flight，则对该请求快速 Busy。不得新增
+   Scan 专用后台线程或让 demuxer 执行 move-in。
+7. **性能**：4VM×4 foreground + demuxer=1 下 Rel 25k/50k E 有心跳增长；不得靠
    降并发、sleep、加长 stall 掩盖。正式 fair 比较口径不变。
 
 测试方法：

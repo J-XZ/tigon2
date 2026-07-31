@@ -38,8 +38,7 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // v23: owner allocator controls are fixed slots before partition arenas and
 // private roots are atomic RegionOffsets.
 // v24: partition-wide scan-range migrate single-flight flag.
-// v25: overlap slot table (reverted: Rel50k ops=0 under multi-slot / leaf ABBA).
-// v26: restore partition-wide scan-range migrate single-flight (v24 semantics).
+// v26: same single-flight semantics (v25 multi-slot experiment dropped).
 constexpr uint32_t kSharedLayoutVersion = 26;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
@@ -199,9 +198,7 @@ struct alignas(64) PartitionDirectoryEntry {
   std::atomic<RegionOffset> shared_root{kNullOffset};
   RegionOffset private_arena = kNullOffset;
   // Owner sets for scan-migrate through move_in (not whole move_out; §3.9.1).
-  // Partition-wide: YCSB inclusive_max is the partition high bound, so
-  // range-overlap mutual exclusion collapses to one in-flight migrate; multi-slot
-  // overlap was tried (layout 25) and stalled Rel50k on private leaf↔Clock.
+  // One in-flight DATA_MIGRATION_REQUEST_FOR_SCAN per owner partition.
   std::atomic<uint32_t> scan_range_migrate_inflight{0};
 };
 static_assert(sizeof(PartitionDirectoryEntry) == 64,

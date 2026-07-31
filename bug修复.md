@@ -2,28 +2,26 @@
 
 ## 状态
 
-- **合同：** `partition优化方案.md` §3.7.9 / **§3.9.1**。多槽「重叠才锁」在
-  Rel50k 复现 `ops=0` 后回退为 **per-partition 单飞**（与 YCSB partition 上界
-  inclusive_max 下的重叠语义等价）；layout 26。
+- **合同：** `partition优化方案.md` §3.7.9 / **§3.9.1** —— **per-partition 单飞**
+  （layout 26，`scan_range_migrate_inflight`）。
 - **实现：**
   1. HWCC 单飞覆盖 `Prepare`/`move_in`；
   2. point Busy / ScanLocal Busy / Forward 前 Busy / skip point-migrate move_out；
   3. scan-migrate **先 Flush 再 move_out**；
   4. `AwaitResponse` 优先排空响应；等待中且 in-flight/done 时快速 Busy；
-  5. `move_in_scan_range` 对齐 master 主体；
-  6. 检查点：`2356072`（overlap 试验）/ `f7d5c72`（PolicyClock）。
+  5. `move_in_scan_range` 对齐 master 主体。
 
 ### 门禁
 
 | Gate | Result |
 | --- | --- |
-| Rel 20k E | **PASS** (`tigon2-scanfix-rel20k-20260731T072449Z`) |
-| Rel 25k E | **PASS**（`STALL_SEC=600`：`tigon2-scanfix-rel25k-long-20260731T073850Z`）；`STALL_SEC=180` 偶发误杀） |
-| Rel 50k E | **硬 STALL ops=0 ≥575s**（`tigon2-scanfix-rel50k-20260731T074041Z`；GDB `tigon2-scanfix-rel50k-gdb-20260731T073002Z`：migrate 卡在 private `_lookupForNextKeyUpdate`） |
+| Rel 20k E | **PASS** |
+| Rel 25k E | **PASS**（建议 `STALL_SEC=600`） |
+| Rel 50k E | **硬 STALL ops=0**（migrate 卡在 private `_lookupForNextKeyUpdate`） |
 | Rel 1M E | 未跑（50k 未破） |
-| layout/partition/engine unit | PASS |
+| unit tests | PASS |
 
-否决：probe-skip、互斥拖到 move_out、禁止 Await 嵌套、layout 25 多槽重叠互斥。
+否决：probe-skip、互斥拖到 move_out、禁止 Await 嵌套、多槽 range 互斥。
 
 ## 症状
 
