@@ -798,6 +798,12 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
     PollTransport();
     if (!probe.status.ok()) return probe.status;
     if (probe.migration_required) {
+      // §3.9.1: while an overlapping range migrate is in flight, Busy at the
+      // facade without another Forward. Do not skip probes via TLS (Rel25k
+      // stall) and do not Busy inside ScanShared (Rel20k livelock).
+      if (partition->ScanRangeMigrateOverlaps(min_key, inclusive_max))
+        return Status::Error(StatusCode::kBusy,
+                             "owner overlapping scan range migrate in flight");
       const Status migrated = Forward(
           star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN, min_key, {}, partition_id,
           OwnerForPartition(partition_id), inclusive_max, scan_limit);
@@ -871,7 +877,8 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
 
 Status KVEngine::PreparePartitionSharedScan(
     uint32_t partition_id, std::string_view start_key,
-    std::string_view inclusive_max, uint64_t output_limit) {
+    std::string_view inclusive_max, uint64_t output_limit,
+    bool retain_inflight_on_success) {
   RequireBoundWorker();
   EbrOperationScope ebr_scope(ebr_);
   if (partition_id >= partitions_.size() ||
@@ -889,6 +896,27 @@ Status KVEngine::PreparePartitionSharedScan(
   if (table == nullptr)
     return Status::Error(StatusCode::kCorruption,
                          "scan migration table adapter is unavailable");
+  auto *partition = table->partition();
+  if (partition == nullptr)
+    return Status::Error(StatusCode::kCorruption,
+                         "scan migration partition handle is unavailable");
+  // Overlap-only in-flight slot (HWCC; §3.9.1). Covers move_in; optional retain
+  // through flush+OnDemand move_out when retain_inflight_on_success. Do not Busy
+  // remote ScanShared.
+  const int slot =
+      partition->TryBeginScanRangeMigrate(start_key, inclusive_max);
+  if (slot < 0)
+    return Status::Error(StatusCode::kBusy,
+                         "overlapping scan range migrate in progress");
+  struct ScanRangeMigrateGuard {
+    KVPartition *partition = nullptr;
+    int slot = -1;
+    bool release = true;
+    ~ScanRangeMigrateGuard() {
+      if (release && partition != nullptr && slot >= 0)
+        partition->EndScanRangeMigrate(slot);
+    }
+  } guard{partition, slot, true};
   const FixedKey min = FixedKey::From(start_key, config_.fixed_key_size);
   const FixedKey max = FixedKey::From(inclusive_max, config_.fixed_key_size);
   try {
@@ -898,6 +926,7 @@ Status KVEngine::PreparePartitionSharedScan(
     return Status::Error(StatusCode::kOutOfMemory,
                          "scan range move-in allocation failed");
   }
+  if (retain_inflight_on_success) guard.release = false;
   return Status::Ok();
 }
 
@@ -1371,22 +1400,14 @@ void KVEngine::PollTransport() {
   RequireBoundWorker();
   EbrOperationScope ebr_scope(ebr_);
   WorkerMailbox &mailbox = CurrentMailbox();
-  while (!mailbox.inbox.empty()) {
-    std::unique_ptr<star::Message> message(mailbox.inbox.front());
-    if (!mailbox.inbox.pop())
-      TransportFatal(config_.node_id, "worker_inbox", "SPSC pop failed");
+  const bool awaiting = mailbox.operation.expected_response_type != 0;
+
+  auto dispatch_one = [&](std::unique_ptr<star::Message> message) {
     const auto piece = *message->begin();
     if (IsResponseType(piece.get_message_type())) {
-      // AwaitResponse has no active request scope.  Its continuation starts
-      // only after the matching response has been decoded.
       DispatchMessage(*message, mailbox);
-      continue;
+      return;
     }
-
-    // A foreground data phase may opportunistically service a peer request.
-    // End it rather than preserving it in a nested/isolated scope; the peer
-    // request then has one independent phase and the interrupted foreground
-    // operation begins a new continuation afterward.
     const bool resume_foreground = mem_access::HasActiveScope();
     if (resume_foreground) mem_access::EndActiveScopeAndDelay();
     {
@@ -1394,6 +1415,62 @@ void KVEngine::PollTransport() {
       DispatchMessage(*message, mailbox);
     }
     if (resume_foreground) mem_access::BeginForegroundScope();
+  };
+
+  // Finish requests deferred from a previous await that already completed.
+  if (!awaiting && !mailbox.deferred_requests.empty()) {
+    std::vector<std::unique_ptr<star::Message>> held;
+    held.swap(mailbox.deferred_requests);
+    for (auto &message : held) dispatch_one(std::move(message));
+  }
+
+  // §3.9.1: while awaiting, peel requests off the FIFO so a matching response
+  // behind them is handled before nesting move_in_scan_range.
+  while (!mailbox.inbox.empty()) {
+    std::unique_ptr<star::Message> message(mailbox.inbox.front());
+    if (!mailbox.inbox.pop())
+      TransportFatal(config_.node_id, "worker_inbox", "SPSC pop failed");
+    const auto piece = *message->begin();
+    if (awaiting && !IsResponseType(piece.get_message_type())) {
+      mailbox.deferred_requests.push_back(std::move(message));
+      continue;
+    }
+    dispatch_one(std::move(message));
+    if (awaiting && mailbox.operation.done) break;
+  }
+
+  std::vector<std::unique_ptr<star::Message>> held;
+  held.swap(mailbox.deferred_requests);
+
+  if (awaiting && mailbox.operation.done) {
+    // Our response arrived: Busy-reject deferred scan-migrates (handler sees
+    // operation.done) and keep other requests for the next poll.
+    for (auto &message : held) {
+      const auto piece = *message->begin();
+      if (piece.get_message_type() == static_cast<uint32_t>(
+              star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN)) {
+        dispatch_one(std::move(message));
+      } else {
+        mailbox.deferred_requests.push_back(std::move(message));
+      }
+    }
+    return;
+  }
+
+  for (size_t i = 0; i < held.size(); ++i) {
+    dispatch_one(std::move(held[i]));
+    if (awaiting && mailbox.operation.done) {
+      for (size_t j = i + 1; j < held.size(); ++j) {
+        const auto piece = *held[j]->begin();
+        if (piece.get_message_type() == static_cast<uint32_t>(
+                star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN)) {
+          dispatch_one(std::move(held[j]));
+        } else {
+          mailbox.deferred_requests.push_back(std::move(held[j]));
+        }
+      }
+      return;
+    }
   }
 }
 
@@ -1412,10 +1489,9 @@ void KVEngine::DispatchMessage(star::Message &message, WorkerMailbox &mailbox) {
     ConsumeTransportResponse(message, piece, mailbox);
   else
     ServeTransportRequest(message, piece, mailbox);
-  // Mirror Executor::process_request(): dispatch the request handler first,
-  // then publish its completed per-destination Message.  In particular,
-  // ServeTransportRequest may run the original OnDemand Clock step after
-  // response.flush() and before this actual CXL send.
+  // Point-migrate handlers may run OnDemand move_out before this send.
+  // Scan-migrate handlers flush inside after_response before move_out (§3.9.1),
+  // so this call is a no-op when that path already published.
   FlushOutboundMessages(mailbox);
 }
 
@@ -1541,6 +1617,12 @@ void KVEngine::ServeTransportRequest(star::Message &message,
               }
             },
             [this, partition_id = piece.get_partition_id()] {
+              // Skip OnDemand move_out while any scan-range migrate holds
+              // private leaf locks in scanForUpdate (leaf ↔ Clock ABBA).
+              auto *partition = partitions_[partition_id].get();
+              if (partition != nullptr &&
+                  partition->ScanRangeMigrateAnyInFlight())
+                return;
               if (star::migration_manager != nullptr &&
                   star::migration_manager->when_to_move_out ==
                       star::MigrationManager::OnDemand &&
@@ -1629,17 +1711,31 @@ void KVEngine::ServeTransportRequest(star::Message &message,
     const bool framed = star::TwoPLPashaMessageHandler::
         data_migration_request_for_scan_handler(
             piece, response, *table, config_.fixed_key_size,
-            [this, piece](const void *raw_min_key, const void *raw_max_key,
+            [this, piece, &mailbox](const void *raw_min_key, const void *raw_max_key,
                           uint64_t limit) {
+              // §3.9.1: once our own RPC response is in, or an overlapping
+              // range migrate is already running while we await, Busy without
+              // nesting move_in_scan_range so AwaitResponse can complete.
+              if (mailbox.operation.done) return false;
               const std::string_view min_key(
                   static_cast<const char *>(raw_min_key), config_.fixed_key_size);
               const std::string_view max_key(
                   static_cast<const char *>(raw_max_key), config_.fixed_key_size);
+              auto *partition = partitions_[piece.get_partition_id()].get();
+              if (mailbox.operation.expected_response_type != 0 &&
+                  partition != nullptr &&
+                  partition->ScanRangeMigrateOverlaps(min_key, max_key))
+                return false;
               return PreparePartitionSharedScan(
                          piece.get_partition_id(), min_key, max_key, limit)
                   .ok();
             },
-            [this, partition_id = piece.get_partition_id()] {
+            [this, partition_id = piece.get_partition_id(), &mailbox] {
+              // §3.9.1: publish the scan-migrate bool response before OnDemand
+              // move_out so AwaitResponse peers are not stuck behind the Clock
+              // victim walk. Skipping move_out entirely filled CXL and stalled
+              // Rel20k mid-run — keep OnDemand reclaim after Flush.
+              FlushOutboundMessages(mailbox);
               if (star::migration_manager != nullptr &&
                   star::migration_manager->when_to_move_out ==
                       star::MigrationManager::OnDemand &&

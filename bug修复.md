@@ -2,19 +2,27 @@
 
 ## 状态
 
-- **未修复（阈值已上移）。** 仍阻塞 `下一步修改.md` 阶段 P：Debug/Rel 合同项中的
-  100k Workload E，以及正式 Rel 1M E。
-- Rel **≤20k** record/op：可通过（Clock 恢复 master 同形锁语义后，原 20k 最小复现
-  已不再稳定复现 stall）；**≥25k**：run 阶段 `ops=0` 直至 stall 超时。
-- 已证伪（会把原先可通过的 10k E 打成 `ops=0`，已撤回）：
-  - `move_in_scan_range` 外层长持 partition Clock（scan + 全部 `move_row_in`）
-  - Clock `try_lock` 失败即 Busy
-  - 单次 scan-migrate RPC 键数硬 cap（如 16）
-- 当前生产路径：`move_in_scan_range` 为 master 形态（先 `table.scan`，再逐 key
-  `move_row_in`，无外层 Clock CS）。`PolicyClock::move_row_out` 已恢复为 master
-  同形阻塞 `lock` + 无界 second-chance walk；已删除 `HeldClockPartition` /
-  `run_under_partition_clock` / `try_lock` 跳过 / `kMaxCandidatesPerCall` 等
-  失败补丁残留。
+- **合同已修订：** `partition优化方案.md` §3.7.9 / **§3.9.1**（Scan 专用传输控制流；
+  **重叠才锁**，非整 partition 单飞）。
+- **实现（未提交）：**
+  1. HWCC 区间槽表覆盖 `Prepare`/`move_in`（layout 25）；
+  2. 仅 key/range **重叠**时 point Busy / ScanLocal Busy / Forward 前 Busy；
+  3. partition 任一 in-flight 时 skip concurrent point-migrate move_out；
+  4. scan-migrate **先 Flush 再 move_out**；
+  5. `AwaitResponse` 优先排空响应；等待中且 **重叠** in-flight/done 时快速 Busy；
+  6. 回滚检查点：`f7d5c72`。
+
+### 门禁
+
+| Gate | Result |
+| --- | --- |
+| Rel 20k / 25k / 50k E | 重叠互斥后待重跑 |
+| Debug 25k verbose | 待重跑 |
+| Debug 50k（formal 或 verbose） | **此前仍 STALL**；见 `/mnt/xz_vm_storage/tigon2-scanfix-dbg50k-20260731T051335Z/` |
+| `kv_layout_test` / `kv_engine_test` / `kv_partition_test` | 待重跑 |
+
+否决：probe-skip（± ScanLocal Busy）、互斥拖到 move_out、禁止 Await 嵌套 migrate、
+整 partition 单飞（过粗，已改为重叠才锁）。
 
 ## 症状
 

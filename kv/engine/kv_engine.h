@@ -63,10 +63,14 @@ class KVEngine {
   RuntimeStats EngineRuntime() const;
   RuntimeStats &CurrentWorkerRuntime();
   // Single-partition owner range move-in (§5.2). Does not return values.
+  // When retain_inflight_on_success is true, the HWCC overlap slot stays
+  // occupied after a successful move_in; caller must EndScanRangeMigrate after
+  // publishing the response and optional OnDemand move_out (§3.9.1).
   Status PreparePartitionSharedScan(uint32_t partition_id,
                                     std::string_view start_key,
                                     std::string_view inclusive_max,
-                                    uint64_t output_limit);
+                                    uint64_t output_limit,
+                                    bool retain_inflight_on_success = false);
 
  private:
   struct KeyRoute {
@@ -104,6 +108,9 @@ class KVEngine {
     // owns its buffers; SendTransportMessage copies the one-piece frame before
     // it is cleared for reuse.
     std::vector<std::unique_ptr<star::Message>> outbound;
+    // Requests deferred while awaiting so responses ahead in the FIFO can be
+    // processed first (§3.9.1).  Drained before PollTransport returns.
+    std::vector<std::unique_ptr<star::Message>> deferred_requests;
     OperationContext operation;
     uint64_t next_operation_sequence = 1;
   };
@@ -124,9 +131,9 @@ class KVEngine {
                                 star::MessagePiece piece,
                                 WorkerMailbox &mailbox);
   star::Message &OutboundMessage(WorkerMailbox &mailbox, uint32_t destination);
-  // The direct-CXL counterpart of Executor::flush_messages().  A foreground
-  // worker finishes every handler before publishing that handler's one-piece
-  // response, preserving the original OnDemand move-out ordering.
+  // The direct-CXL counterpart of Executor::flush_messages().  Point-migrate
+  // handlers keep master order (move_out then publish).  Scan-migrate handlers
+  // publish inside after_response before move_out (§3.9.1).
   void FlushOutboundMessages(WorkerMailbox &mailbox);
   void SendTransportMessage(star::Message &message);
   void StartInboundDemuxer();

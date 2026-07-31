@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -113,6 +114,116 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
 KVPartition::~KVPartition() {
   delete shared_table_;
   delete shared_tree_;
+}
+
+int KVPartition::TryBeginScanRangeMigrate(std::string_view min_key,
+                                          std::string_view inclusive_max) {
+  const FixedKey lo = MakeKey(min_key);
+  const FixedKey hi = NormalizeScanMax(inclusive_max);
+  if (lo.Compare(hi) > 0) return -1;
+  LockScanMigrateSlots();
+  for (size_t i = 0; i < kMaxScanRangeMigrateSlots; ++i) {
+    auto &slot = directory_.scan_migrate_slots[i];
+    mem_access::HwccAtomicLoad(&slot.occupied);
+    if (slot.occupied.load(std::memory_order_acquire) == 0) continue;
+    mem_access::HwccRead(&slot.min_key, sizeof(slot.min_key));
+    mem_access::HwccRead(&slot.max_key, sizeof(slot.max_key));
+    if (ClosedRangesOverlap(lo, hi, slot.min_key, slot.max_key)) {
+      UnlockScanMigrateSlots();
+      return -1;
+    }
+  }
+  for (size_t i = 0; i < kMaxScanRangeMigrateSlots; ++i) {
+    auto &slot = directory_.scan_migrate_slots[i];
+    mem_access::HwccAtomicLoad(&slot.occupied);
+    if (slot.occupied.load(std::memory_order_acquire) != 0) continue;
+    mem_access::HwccWrite(&slot.min_key, sizeof(slot.min_key));
+    mem_access::HwccWrite(&slot.max_key, sizeof(slot.max_key));
+    slot.min_key = lo;
+    slot.max_key = hi;
+    mem_access::HwccAtomicStore(&slot.occupied);
+    slot.occupied.store(1, std::memory_order_release);
+    UnlockScanMigrateSlots();
+    return static_cast<int>(i);
+  }
+  UnlockScanMigrateSlots();
+  return -1;
+}
+
+void KVPartition::EndScanRangeMigrate(int slot) {
+  if (slot < 0 || static_cast<size_t>(slot) >= kMaxScanRangeMigrateSlots)
+    throw std::invalid_argument("invalid scan-range migrate slot");
+  LockScanMigrateSlots();
+  auto &entry = directory_.scan_migrate_slots[static_cast<size_t>(slot)];
+  mem_access::HwccAtomicStore(&entry.occupied);
+  entry.occupied.store(0, std::memory_order_release);
+  UnlockScanMigrateSlots();
+}
+
+bool KVPartition::ScanRangeMigrateOverlaps(
+    std::string_view min_key, std::string_view inclusive_max) const {
+  const FixedKey lo = MakeKey(min_key);
+  const FixedKey hi = NormalizeScanMax(inclusive_max);
+  LockScanMigrateSlots();
+  for (size_t i = 0; i < kMaxScanRangeMigrateSlots; ++i) {
+    auto &slot = directory_.scan_migrate_slots[i];
+    mem_access::HwccAtomicLoad(&slot.occupied);
+    if (slot.occupied.load(std::memory_order_acquire) == 0) continue;
+    mem_access::HwccRead(&slot.min_key, sizeof(slot.min_key));
+    mem_access::HwccRead(&slot.max_key, sizeof(slot.max_key));
+    if (ClosedRangesOverlap(lo, hi, slot.min_key, slot.max_key)) {
+      UnlockScanMigrateSlots();
+      return true;
+    }
+  }
+  UnlockScanMigrateSlots();
+  return false;
+}
+
+bool KVPartition::ScanRangeMigrateCoversKey(std::string_view key) const {
+  return ScanRangeMigrateOverlaps(key, key);
+}
+
+bool KVPartition::ScanRangeMigrateAnyInFlight() const {
+  LockScanMigrateSlots();
+  for (size_t i = 0; i < kMaxScanRangeMigrateSlots; ++i) {
+    auto &slot = directory_.scan_migrate_slots[i];
+    mem_access::HwccAtomicLoad(&slot.occupied);
+    if (slot.occupied.load(std::memory_order_acquire) != 0) {
+      UnlockScanMigrateSlots();
+      return true;
+    }
+  }
+  UnlockScanMigrateSlots();
+  return false;
+}
+
+void KVPartition::LockScanMigrateSlots() const {
+  uint32_t expected = 0;
+  for (;;) {
+    mem_access::HwccAtomicRmw(&directory_.scan_migrate_slots_lock);
+    expected = 0;
+    if (directory_.scan_migrate_slots_lock.compare_exchange_weak(
+            expected, 1, std::memory_order_acq_rel, std::memory_order_acquire))
+      return;
+    _mm_pause();
+  }
+}
+
+void KVPartition::UnlockScanMigrateSlots() const {
+  mem_access::HwccAtomicStore(&directory_.scan_migrate_slots_lock);
+  directory_.scan_migrate_slots_lock.store(0, std::memory_order_release);
+}
+
+FixedKey KVPartition::NormalizeScanMax(std::string_view inclusive_max) const {
+  if (inclusive_max.empty()) return FixedKey::InternalMax(fixed_key_size_);
+  return MakeKey(inclusive_max);
+}
+
+bool KVPartition::ClosedRangesOverlap(const FixedKey &a_lo, const FixedKey &a_hi,
+                                      const FixedKey &b_lo, const FixedKey &b_hi) {
+  // Closed intervals: overlap unless a_hi < b_lo or b_hi < a_lo.
+  return a_hi.Compare(b_lo) >= 0 && b_hi.Compare(a_lo) >= 0;
 }
 
 FixedKey KVPartition::MakeKey(std::string_view key) const {
@@ -439,6 +550,7 @@ StatusCode KVPartition::InsertRemotePlaceholder(std::string_view key,
                                                 uint32_t requester_id) {
   if (value.size() != fixed_value_size_)
     throw std::invalid_argument("remote insert value must match fixed value size");
+  if (ScanRangeMigrateCoversKey(key)) return StatusCode::kBusy;
   const FixedKey fixed_key = MakeKey(key);
   auto *table = private_table_.get();
   if (table == nullptr) return StatusCode::kCorruption;
@@ -1014,6 +1126,11 @@ StatusCode KVPartition::EnsureInShared(std::string_view key, uint32_t host_id,
   (void)host_id;
   if (moved_in != nullptr) *moved_in = false;
   if (star::scc_manager == nullptr) return StatusCode::kOutOfMemory;
+  // Point move-in takes partition Clock then private leaf locks.  A concurrent
+  // overlapping move_in_scan_range holds leaf locks in scanForUpdate then needs
+  // Clock — that ABBA livelocks Scan storms (Debug GDB). Busy only when this
+  // key falls in an in-flight range; the migrate itself calls move_row_in.
+  if (ScanRangeMigrateCoversKey(key)) return StatusCode::kBusy;
   const FixedKey fixed_key = MakeKey(key);
   star::migration_result result = star::migration_result::FAIL_OOM;
   if (star::migration_manager != nullptr) {
@@ -1401,6 +1518,11 @@ bool KVPartition::ScanLocalPartition(
     std::vector<std::pair<std::string, std::string>> *items,
     std::string_view inclusive_max) const {
   if (items == nullptr) throw std::invalid_argument("null partition scan output");
+  // §3.9.1: yield the private tree only when this Scan overlaps an in-flight
+  // range migrate. Rel25k GDB with probe-skip alone still showed move_in stuck
+  // in private B+Tree while sibling workers Busy-spun — ScanLocal was a
+  // remaining contender on overlapping windows.
+  if (ScanRangeMigrateOverlaps(start_key, inclusive_max)) return false;
   auto *table = private_table_.get();
   if (table == nullptr)
     throw std::runtime_error("owner scan table is unavailable");
