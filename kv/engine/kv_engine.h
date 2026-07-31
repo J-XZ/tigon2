@@ -63,8 +63,8 @@ class KVEngine {
   RuntimeStats EngineRuntime() const;
   RuntimeStats &CurrentWorkerRuntime();
   // Single-partition owner range move-in (§5.2). Does not return values.
-  // When retain_inflight_on_success is true, the HWCC overlap slot stays
-  // occupied after a successful move_in; caller must EndScanRangeMigrate after
+  // When retain_inflight_on_success is true, the HWCC single-flight flag stays
+  // set after a successful move_in; caller must EndScanRangeMigrate after
   // publishing the response and optional OnDemand move_out (§3.9.1).
   Status PreparePartitionSharedScan(uint32_t partition_id,
                                     std::string_view start_key,

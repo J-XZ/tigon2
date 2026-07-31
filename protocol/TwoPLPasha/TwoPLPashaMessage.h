@@ -515,6 +515,8 @@ class TwoPLPashaMessageHandler {
         static void move_in_scan_range(ITable &table, const void *min_key,
                                        const void *max_key, uint64_t limit)
         {
+                // Extracted from master data_migration_request_for_scan_handler
+                // (scan + per-key move_row_in). KV owns response / move_out order.
                 std::vector<ITable::row_entity> scan_results;
                 table.scan(min_key, [&](const void *key,
                                         ITable::MetaDataType *meta,
@@ -522,22 +524,34 @@ class TwoPLPashaMessageHandler {
                         DCHECK(key != nullptr);
                         DCHECK(meta != nullptr);
                         DCHECK(data != nullptr);
-                        const bool migrating_next_key =
-                            (limit != 0 && scan_results.size() == limit) ||
-                            table.compare_key(key, max_key) > 0;
-                        if (table.compare_key(key, min_key) < 0) return false;
-                        if (!scan_results.empty() &&
-                            table.compare_key(key, scan_results.back().key) <= 0)
+                        bool migrating_next_key = false;
+                        if (limit != 0 && scan_results.size() == limit) {
+                                migrating_next_key = true;
+                        } else if (table.compare_key(key, max_key) > 0) {
+                                migrating_next_key = true;
+                        }
+                        if (table.compare_key(key, min_key) >= 0) {
+                                if (scan_results.size() > 0) {
+                                        if (table.compare_key(
+                                                key,
+                                                scan_results[scan_results.size() -
+                                                             1]
+                                                    .key) <= 0) {
+                                                return false;
+                                        }
+                                }
+                        } else {
                                 return false;
+                        }
                         scan_results.emplace_back(key, table.key_size(), meta, data,
                                                   table.value_size());
                         return migrating_next_key;
                 });
-                for (auto &row : scan_results) {
+                for (int i = 0; i < static_cast<int>(scan_results.size()); i++) {
                         std::tuple<ITable::MetaDataType *, void *> row_tuple(
-                            row.meta, row.data);
-                        (void)migration_manager->move_row_in(
-                            &table, row.key, row_tuple, false);
+                            scan_results[i].meta, scan_results[i].data);
+                        migration_manager->move_row_in(
+                            &table, scan_results[i].key, row_tuple, false);
                 }
         }
 

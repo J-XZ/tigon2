@@ -41,7 +41,7 @@ SCC、Clock/MigrationManager 和 EBR；不要把它重写成另一套 KV。
   远端 CXL-first；adjacency 不完整时才向该 partition owner 请求 range move-in，
   owner 不返回 value。禁止 partial CXL 与 owner value 混源或全分区 k 路归并。
 - Scan **传输/等待控制流**允许按 `partition优化方案.md` §3.9.1 相对 master
-  Executor 重设计（range 重叠才互斥、scan-migrate 响应可先于 OnDemand
+  Executor 重设计（per-partition scan-migrate 单飞、响应可先于 OnDemand
   move_out 上 CXL）；`move_in_scan_range` 主体、邻接与 K1 仍复用原路径。
 - Scan 不是跨 partition 的全局线性一致 snapshot；不得重新加入
   `ScanCertificate`、mutation generation、全局 Scan mutex 或结果缓存。

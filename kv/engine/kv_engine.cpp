@@ -798,12 +798,12 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
     PollTransport();
     if (!probe.status.ok()) return probe.status;
     if (probe.migration_required) {
-      // §3.9.1: while an overlapping range migrate is in flight, Busy at the
-      // facade without another Forward. Do not skip probes via TLS (Rel25k
+      // §3.9.1: while the owner already has a range migrate in flight, Busy at
+      // the facade without another Forward. Do not skip probes via TLS (Rel25k
       // stall) and do not Busy inside ScanShared (Rel20k livelock).
-      if (partition->ScanRangeMigrateOverlaps(min_key, inclusive_max))
+      if (partition->ScanRangeMigrateInFlight())
         return Status::Error(StatusCode::kBusy,
-                             "owner overlapping scan range migrate in flight");
+                             "owner scan range migrate in flight");
       const Status migrated = Forward(
           star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN, min_key, {}, partition_id,
           OwnerForPartition(partition_id), inclusive_max, scan_limit);
@@ -900,23 +900,19 @@ Status KVEngine::PreparePartitionSharedScan(
   if (partition == nullptr)
     return Status::Error(StatusCode::kCorruption,
                          "scan migration partition handle is unavailable");
-  // Overlap-only in-flight slot (HWCC; §3.9.1). Covers move_in; optional retain
-  // through flush+OnDemand move_out when retain_inflight_on_success. Do not Busy
+  // One in-flight range migrate per owner partition (HWCC; §3.9.1). Covers
+  // move_in; optional retain through flush+OnDemand move_out. Do not Busy
   // remote ScanShared.
-  const int slot =
-      partition->TryBeginScanRangeMigrate(start_key, inclusive_max);
-  if (slot < 0)
+  if (!partition->TryBeginScanRangeMigrate())
     return Status::Error(StatusCode::kBusy,
-                         "overlapping scan range migrate in progress");
+                         "scan range migrate already in progress");
   struct ScanRangeMigrateGuard {
     KVPartition *partition = nullptr;
-    int slot = -1;
     bool release = true;
     ~ScanRangeMigrateGuard() {
-      if (release && partition != nullptr && slot >= 0)
-        partition->EndScanRangeMigrate(slot);
+      if (release && partition != nullptr) partition->EndScanRangeMigrate();
     }
-  } guard{partition, slot, true};
+  } guard{partition, true};
   const FixedKey min = FixedKey::From(start_key, config_.fixed_key_size);
   const FixedKey max = FixedKey::From(inclusive_max, config_.fixed_key_size);
   try {
@@ -1620,8 +1616,7 @@ void KVEngine::ServeTransportRequest(star::Message &message,
               // Skip OnDemand move_out while any scan-range migrate holds
               // private leaf locks in scanForUpdate (leaf ↔ Clock ABBA).
               auto *partition = partitions_[partition_id].get();
-              if (partition != nullptr &&
-                  partition->ScanRangeMigrateAnyInFlight())
+              if (partition != nullptr && partition->ScanRangeMigrateInFlight())
                 return;
               if (star::migration_manager != nullptr &&
                   star::migration_manager->when_to_move_out ==
@@ -1713,19 +1708,19 @@ void KVEngine::ServeTransportRequest(star::Message &message,
             piece, response, *table, config_.fixed_key_size,
             [this, piece, &mailbox](const void *raw_min_key, const void *raw_max_key,
                           uint64_t limit) {
-              // §3.9.1: once our own RPC response is in, or an overlapping
-              // range migrate is already running while we await, Busy without
-              // nesting move_in_scan_range so AwaitResponse can complete.
+              // §3.9.1: once our own RPC response is in, or another range
+              // migrate is already running while we await, Busy without nesting
+              // move_in_scan_range so AwaitResponse can complete.
               if (mailbox.operation.done) return false;
+              auto *partition = partitions_[piece.get_partition_id()].get();
+              if (mailbox.operation.expected_response_type != 0 &&
+                  partition != nullptr &&
+                  partition->ScanRangeMigrateInFlight())
+                return false;
               const std::string_view min_key(
                   static_cast<const char *>(raw_min_key), config_.fixed_key_size);
               const std::string_view max_key(
                   static_cast<const char *>(raw_max_key), config_.fixed_key_size);
-              auto *partition = partitions_[piece.get_partition_id()].get();
-              if (mailbox.operation.expected_response_type != 0 &&
-                  partition != nullptr &&
-                  partition->ScanRangeMigrateOverlaps(min_key, max_key))
-                return false;
               return PreparePartitionSharedScan(
                          piece.get_partition_id(), min_key, max_key, limit)
                   .ok();

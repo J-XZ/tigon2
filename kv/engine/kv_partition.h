@@ -162,14 +162,10 @@ class KVPartition {
       uint32_t host_id, std::string_view start_key, uint64_t output_limit,
       std::string_view inclusive_max = {},
       bool allow_lower_bound_left_boundary = false) const;
-  // Overlap-only scan-range migrate slots (§3.9.1). Returns slot index or -1.
-  int TryBeginScanRangeMigrate(std::string_view min_key,
-                               std::string_view inclusive_max);
-  void EndScanRangeMigrate(int slot);
-  bool ScanRangeMigrateOverlaps(std::string_view min_key,
-                                std::string_view inclusive_max) const;
-  bool ScanRangeMigrateCoversKey(std::string_view key) const;
-  bool ScanRangeMigrateAnyInFlight() const;
+  // Partition-wide scan-range migrate single-flight (§3.9.1).
+  bool TryBeginScanRangeMigrate();
+  void EndScanRangeMigrate();
+  bool ScanRangeMigrateInFlight() const;
 
   // PolicyClock owns the tracker algorithm; these methods only expose the
   // owner-private control and allocation/resolution primitives.
@@ -240,11 +236,6 @@ class KVPartition {
   bool CreatePrivateWithOwnerInsert(const FixedKey &key,
                                     std::string_view value);
   void FreeUnpublishedPrivateValue(PrivateValueStruct *value);
-  void LockScanMigrateSlots() const;
-  void UnlockScanMigrateSlots() const;
-  FixedKey NormalizeScanMax(std::string_view inclusive_max) const;
-  static bool ClosedRangesOverlap(const FixedKey &a_lo, const FixedKey &a_hi,
-                                  const FixedKey &b_lo, const FixedKey &b_hi);
   DualRegionAllocator &regions_;
   star::CXL_EBR &ebr_;
   uint32_t partition_id_;

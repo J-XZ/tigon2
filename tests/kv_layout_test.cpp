@@ -16,9 +16,8 @@ int main() {
   assert(kSingleTableId == 0);
   assert(kMaxFixedKeyBytes == 32);
   assert(kMaxPartitions >= 16);
-  assert(kSharedLayoutVersion == 25);
-  assert(sizeof(ScanRangeMigrateSlot) == 72);
-  assert(sizeof(PartitionDirectoryEntry) == 640);
+  assert(kSharedLayoutVersion == 26);
+  assert(sizeof(PartitionDirectoryEntry) == 64);
   assert(sizeof(PrivateValueStruct) == sizeof(RegionOffset));
   assert(alignof(PrivateMetadataLocal) == alignof(uint64_t));
   assert(sizeof(PrivateMetadataLocal) ==

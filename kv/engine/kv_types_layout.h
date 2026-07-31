@@ -37,10 +37,10 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // node link.
 // v23: owner allocator controls are fixed slots before partition arenas and
 // private roots are atomic RegionOffsets.
-// v24: partition-wide scan-range migrate single-flight flag (superseded).
-// v25: overlap-only scan-range migrate slots on PartitionDirectoryEntry.
-constexpr uint32_t kSharedLayoutVersion = 25;
-constexpr size_t kMaxScanRangeMigrateSlots = 8;
+// v24: partition-wide scan-range migrate single-flight flag.
+// v25: overlap slot table (reverted: Rel50k ops=0 under multi-slot / leaf ABBA).
+// v26: restore partition-wide scan-range migrate single-flight (v24 semantics).
+constexpr uint32_t kSharedLayoutVersion = 26;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -193,29 +193,19 @@ struct OwnerPrivateClockTrackerControl {
   RegionOffset cursor{kNullOffset};
 };
 
-// One in-flight scan-range migrate window on an owner partition (HWCC; §3.9.1).
-// Mutual exclusion is by closed-interval overlap, not whole-partition single-flight.
-struct alignas(8) ScanRangeMigrateSlot {
-  std::atomic<uint32_t> occupied{0};
-  uint32_t reserved = 0;
-  FixedKey min_key{};
-  FixedKey max_key{};
-};
-static_assert(sizeof(ScanRangeMigrateSlot) == 72,
-              "scan-migrate slot is fixed-width HWCC state");
-
 struct alignas(64) PartitionDirectoryEntry {
   // Shared-tree live root (HWCC). Updated on makeRoot/merge; every shared
   // tree op loads this atomically so already-attached peers see splits.
   std::atomic<RegionOffset> shared_root{kNullOffset};
   RegionOffset private_arena = kNullOffset;
-  // Short spinlock guarding scan_migrate_slots publish/retire (§3.9.1).
-  std::atomic<uint32_t> scan_migrate_slots_lock{0};
-  uint32_t reserved = 0;
-  std::array<ScanRangeMigrateSlot, kMaxScanRangeMigrateSlots> scan_migrate_slots{};
+  // Owner sets for scan-migrate through move_in (not whole move_out; §3.9.1).
+  // Partition-wide: YCSB inclusive_max is the partition high bound, so
+  // range-overlap mutual exclusion collapses to one in-flight migrate; multi-slot
+  // overlap was tried (layout 25) and stalled Rel50k on private leaf↔Clock.
+  std::atomic<uint32_t> scan_range_migrate_inflight{0};
 };
-static_assert(sizeof(PartitionDirectoryEntry) == 640,
-              "directory holds shared-tree root plus overlap migrate slots");
+static_assert(sizeof(PartitionDirectoryEntry) == 64,
+              "directory contains only globally coherent shared-tree state");
 
 // The first object in the HWCC region. Fields are fixed-width so an attach in a
 // separately mapped process can validate the complete layout before dereference.
