@@ -11,6 +11,7 @@
 #include "common/Socket.h"
 #include "common/MPSCRingBuffer.h"
 #include "common/CXLTransport.h"
+#include "core/CxlIncomingDispatcher.h"
 #include "core/ControlMessage.h"
 #include "core/Worker.h"
 #include <atomic>
@@ -34,6 +35,7 @@ class IncomingDispatcher {
 		, out_to_in_queue(out_to_in_queue)
 		, stopFlag(stopFlag)
 		, context(context)
+		, cxl_ringbuffer(context.use_cxl_transport ? &cxl_ringbuffers[coord_id] : nullptr)
 	{
 		LOG(INFO) << "IncomingDispatcher " << group_id << " coord_id " << coord_id;
 
@@ -56,6 +58,18 @@ class IncomingDispatcher {
 
 		LOG(INFO) << "Incoming Dispatcher started, numCoordinators = " << numCoordinators << ", numWorkers = " << numWorkers
 			  << ", group id = " << group_id << ", coordinator = " << coord_id;
+
+		if (context.use_cxl_transport) {
+			RunCxlIncomingLoop(
+				*cxl_ringbuffer, coord_id, static_cast<uint32_t>(numWorkers), stopFlag,
+				[this](uint32_t worker_id, std::unique_ptr<Message> message) {
+					if (message->get_is_replica())
+						workers[worker_id]->push_replica_message(message.release());
+					else
+						workers[worker_id]->push_message(message.release());
+				});
+			return;
+		}
 
 		auto process_internal_message_tranfer = [&, this]() {
 			while (out_to_in_queue.empty() == false) {
@@ -182,6 +196,7 @@ class IncomingDispatcher {
 	std::size_t io_thread_num;
 	std::size_t network_size;
 	std::vector<BufferedReader> buffered_readers;
+	MPSCRingBuffer *cxl_ringbuffer;
 	std::vector<std::shared_ptr<Worker> > workers;
 	LockfreeQueue<Message *> &coordinator_queue;
 	LockfreeQueue<Message *> &out_to_in_queue;

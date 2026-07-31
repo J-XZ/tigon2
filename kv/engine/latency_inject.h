@@ -105,17 +105,10 @@ public:
 
   void BeginScope(ScopeKind scope);
   void EndScopeAndDelay();
-  // Run one independently timed request while preserving any outer foreground
-  // scope on this thread. Only one isolated request may be active at a time.
-  void BeginIsolatedScope(ScopeKind scope);
-  void EndIsolatedScopeAndDelay();
-  // Pay the currently active scope at a safe publication boundary without
-  // ending it. Later accesses remain in the same scope.
-  void DelayActiveScopeNow();
-  // Safe-point settlement used immediately before publishing a response.
-  // The isolated scope remains active so later transport accesses stay
-  // attributed to the request rather than its outer helper operation.
-  void DelayIsolatedScopeNow();
+  // True only while this thread owns one active non-nested phase.  RPC
+  // dispatch uses this to end the caller phase before it creates an
+  // independent peer-request phase; it never saves/restores a scope stack.
+  bool HasActiveScopeForCurrentThread() const;
 
   void RecordRange(PoolKind pool, AccessKind kind, const void *addr,
                    uint64_t bytes);

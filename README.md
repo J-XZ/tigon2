@@ -31,17 +31,19 @@ results, never as real CXL hardware performance.
 The default experiment paths come from `experiment_config.jsonc`
 (`shared_memory.path` / `device_path`, `vm.storage_path`). `scripts/vm/*` only
 inspects or reuses an existing topology and deliberately refuses to start/reboot
-VMs, configure networking, or change host tuning. The authoritative next-step
-construction plan is [partition优化方案.md](partition优化方案.md); it describes
-the target, not features already completed. Do not treat older slot-layout notes
-(if found in git history) as the current target architecture.
+VMs, configure networking, or change host tuning. The authoritative construction
+contract and final-verification procedure are
+[partition优化方案.md](partition优化方案.md). The current operational data path is
+recorded in [当前对比口径.md](当前对比口径.md); do not treat older slot-layout notes
+(if found in git history) as current architecture.
 
-Build and local verification:
+Build and local verification (the laboratory correctness gate is the isolated 4VM
+end-to-end workflow; do not run the full CTest suite merely as routine coverage):
 
 ```bash
 cmake -S . -B build-relwithdebinfo -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build-relwithdebinfo -j2
-ctest --test-dir build-relwithdebinfo --output-on-failure
+# Run only the focused target relevant to a local change when needed.
 ```
 
 The maintained comparison targets are `tigonkv`, `e2e_trace_runner`, the focused

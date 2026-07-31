@@ -107,24 +107,32 @@ void ReplacePartitioning(const std::string &config_path,
 
 int main(int argc, char **argv) {
   try {
-    if (argc != 9 || std::string_view(argv[1]) != "--trace-dir" ||
+    if ((argc != 9 && argc != 11) || std::string_view(argv[1]) != "--trace-dir" ||
         std::string_view(argv[3]) != "--config" ||
         std::string_view(argv[5]) != "--workers" ||
-        std::string_view(argv[7]) != "--fixed-key-size")
+        std::string_view(argv[7]) != "--fixed-key-size" ||
+        (argc == 11 && std::string_view(argv[9]) != "--sample-stride"))
       throw std::runtime_error(
           "usage: ycsb_partition_splits --trace-dir DIR --config FILE "
-          "--workers N --fixed-key-size N");
+          "--workers N --fixed-key-size N [--sample-stride N]");
     const std::string trace_dir = argv[2];
     const std::string config_path = argv[4];
     const uint64_t workers = ParseUnsigned(argv[6], "workers");
     const uint32_t fixed_key_size = static_cast<uint32_t>(
         ParseUnsigned(argv[8], "fixed-key-size"));
+    constexpr uint64_t kDefaultSampleStride = 64;
+    const uint64_t sample_stride = argc == 11
+        ? ParseUnsigned(argv[10], "sample-stride")
+        : kDefaultSampleStride;
     if (workers != 16 || fixed_key_size == 0 || fixed_key_size > 32)
       throw std::runtime_error("formal partition split requires 16 workers and 1..32-byte keys");
+    if (sample_stride == 0)
+      throw std::runtime_error("sample-stride must be positive");
 
     std::vector<std::string> samples;
     std::vector<std::string> complete_keys;
-    uint64_t trace_digest = 1469598103934665603ULL;
+    uint64_t load_key_digest = 1469598103934665603ULL;
+    std::array<std::string, 4> representative_keys;
     for (uint64_t worker = 0; worker < workers; ++worker) {
       const std::string path = trace_dir + "/worker" + std::to_string(worker) + ".txt";
       std::ifstream input(path);
@@ -140,9 +148,9 @@ int main(int argc, char **argv) {
           continue;
         const std::string key = tigonkv::e2e_trace::FixedTraceKey(
             operation.raw_key, fixed_key_size);
-        trace_digest = Fnv1a(key, trace_digest);
+        load_key_digest = Fnv1a(key, load_key_digest);
         complete_keys.push_back(key);
-        if ((valid_puts++ % 64) == 0) samples.push_back(key);
+        if ((valid_puts++ % sample_stride) == 0) samples.push_back(key);
       }
     }
     const tigonkv::e2e_trace::FixedTraceKeyLess fixed_less;
@@ -170,6 +178,11 @@ int main(int argc, char **argv) {
             return fixed_less(needle, boundary);
           });
       ++complete_counts[static_cast<size_t>(partition - boundaries.begin())];
+      const size_t partition_id =
+          static_cast<size_t>(partition - boundaries.begin());
+      if (representative_keys[partition_id].empty() ||
+          fixed_less(key, representative_keys[partition_id]))
+        representative_keys[partition_id] = key;
     }
     const auto [min_count, max_count] =
         std::minmax_element(complete_counts.begin(), complete_counts.end());
@@ -178,18 +191,27 @@ int main(int argc, char **argv) {
 
     uint64_t digest = 1469598103934665603ULL;
     for (const auto &boundary : boundaries) digest = Fnv1a(boundary, digest);
-    std::cout << "YCSB_PARTITION_SPLITS workers=16 sample_stride=64 samples="
+    std::cout << "YCSB_PARTITION_SPLITS workers=16 sample_stride=" << sample_stride
+              << " samples="
               << samples.size() << " partition_count=4 split_digest=" << digest
-              << " trace_digest=" << trace_digest << "\n";
+              << " load_key_digest=" << load_key_digest << "\n";
     for (size_t partition = 0; partition < 4; ++partition) {
-      const auto begin = partition == 0 ? samples.begin() :
-                                          std::lower_bound(samples.begin(), samples.end(), boundaries[partition - 1], fixed_less);
-      const auto end = partition == 3 ? samples.end() :
-                                        std::lower_bound(samples.begin(), samples.end(), boundaries[partition], fixed_less);
+      if (representative_keys[partition].empty())
+        throw std::runtime_error("full load partition has no representative key");
+      const auto sampled_begin = partition == 0 ? samples.begin() :
+          std::lower_bound(samples.begin(), samples.end(), boundaries[partition - 1], fixed_less);
+      const auto sampled_end = partition == 3 ? samples.end() :
+          std::lower_bound(samples.begin(), samples.end(), boundaries[partition], fixed_less);
       std::cout << "YCSB_PARTITION_SPLIT partition=" << partition
-                << " sampled_keys=" << (end - begin)
+                << " sampled_keys=" << (sampled_end - sampled_begin)
                 << " load_keys=" << complete_counts[partition]
-                << " owner=" << partition << "\n";
+                << " owner=" << partition
+                << " representative_key_hex=";
+      for (unsigned char byte : representative_keys[partition]) {
+        static constexpr char kHex[] = "0123456789abcdef";
+        std::cout << kHex[byte >> 4] << kHex[byte & 0xf];
+      }
+      std::cout << "\n";
     }
     return 0;
   } catch (const std::exception &error) {

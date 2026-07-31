@@ -1,5 +1,6 @@
 #include "kv/kv_store.h"
 #include "kv/engine/latency_inject.h"
+#include "kv/engine/kv_types_layout.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -132,7 +133,56 @@ std::string ReplaceLatencyObjectWithFalse(std::string text) {
 
 }  // namespace
 
-int main() {
+void RunConfigOnly() {
+  for (const uint32_t width : {8U, 32U}) {
+    const auto sentinel = tigonkv::engine::FixedKey::InternalMax(width);
+    for (uint32_t i = 0; i < width; ++i)
+      assert(static_cast<unsigned char>(sentinel.bytes[i]) == 0xff);
+    for (uint32_t i = width; i < tigonkv::engine::kMaxFixedKeyBytes; ++i)
+      assert(sentinel.bytes[i] == 0);
+    bool short_rejected = false;
+    try {
+      (void)tigonkv::engine::FixedKey::From(std::string(width - 1, 'x'), width);
+    } catch (const std::invalid_argument &) {
+      short_rejected = true;
+    }
+    assert(short_rejected);
+  }
+
+  Config zero;
+  zero.partition_count = 0;
+  zero.partition_ranges.clear();
+  assert(ValidateThrows(zero));
+  Config one;
+  one.vm_count = 4;
+  one.node_id = 3;
+  one.partition_count = 1;
+  one.partition_ranges = {{"", ""}};
+  one.Validate();
+  assert(one.PartitionForKey(Fixed("any", one.fixed_key_size)) == 0);
+  Config seven = one;
+  seven.partition_count = 7;
+  SetTestRangePartitioning(&seven);
+  seven.Validate();
+
+  const auto root = Config::FromJsonc(std::string(TIGONKV_SOURCE_DIR) +
+                                      "/experiment_config.jsonc");
+  assert(root.hwcc_size_mb == 1024 && root.swcc_size_mb == 31744 &&
+         root.partition_count == 4 && root.fixed_key_size == 32 &&
+         root.fixed_value_size == 32);
+  const auto fixture = Config::FromJsonc(
+      std::string(TIGONKV_SOURCE_DIR) + "/tests/fixtures/experiment_config.jsonc");
+  assert(fixture.size_mb == 64 && fixture.hwcc_size_mb == 32 &&
+         fixture.swcc_size_mb == 32 && fixture.hw_cc_budget_mb == 32);
+}
+
+int main(int argc, char **argv) {
+  if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--config-only"))
+    return 2;
+  if (argc == 2) {
+    RunConfigOnly();
+    return 0;
+  }
   const std::string latency_config_path =
       "/tmp/tigonkv-latency-config-" + std::to_string(getpid()) + ".jsonc";
   std::string base_config_text;
@@ -238,11 +288,11 @@ int main() {
   std::remove(latency_config_path.c_str());
 
   Config uneven;
-  uneven.size_mb = 32;
-  uneven.hwcc_size_mb = 16;
-  uneven.swcc_offset_mb = 16;
-  uneven.swcc_size_mb = 16;
-  uneven.hw_cc_budget_mb = 4;
+  uneven.size_mb = 64;
+  uneven.hwcc_size_mb = 32;
+  uneven.swcc_offset_mb = 32;
+  uneven.swcc_size_mb = 32;
+  uneven.hw_cc_budget_mb = 32;
   uneven.vm_count = 2;
   uneven.node_id = 1;
   uneven.partition_count = 7;
@@ -255,10 +305,20 @@ int main() {
   one_sided_boundary.Validate();
   assert(one_sided_boundary.partition_ranges[0].upper_key ==
          one_sided_boundary.partition_ranges[1].lower_key);
-  assert(one_sided_boundary.PartitionForKey("m") == 1);
+  assert(one_sided_boundary.PartitionForKey(Fixed("m", 32)) == 1);
   Config missing_boundary = one_sided_boundary;
   missing_boundary.partition_ranges = {{"", ""}, {"", ""}};
   assert(ValidateThrows(missing_boundary));
+  // Original modulo owner mapping accepts any positive partition count.  The
+  // formal 4VM runner enforces its own partition_count == vm_count == 4
+  // preflight; generic layout validation must not reject fewer partitions.
+  Config fewer_partitions_than_vms = uneven;
+  fewer_partitions_than_vms.vm_count = 4;
+  fewer_partitions_than_vms.node_id = 3;
+  fewer_partitions_than_vms.partition_count = 1;
+  fewer_partitions_than_vms.partition_ranges = {{"", ""}};
+  fewer_partitions_than_vms.Validate();
+  assert(fewer_partitions_than_vms.PartitionForKey(Fixed("any", 32)) == 0);
   Config reserved_boundary = one_sided_boundary;
   reserved_boundary.partition_ranges[0].upper_key = MaxKey(32);
   reserved_boundary.partition_ranges[1].lower_key = MaxKey(32);
@@ -266,15 +326,19 @@ int main() {
   Config too_many_partitions = uneven;
   too_many_partitions.partition_count = 257;
   assert(ValidateThrows(too_many_partitions));
+  Config zero_partitions = uneven;
+  zero_partitions.partition_count = 0;
+  zero_partitions.partition_ranges.clear();
+  assert(ValidateThrows(zero_partitions));
   const std::string path = "/tmp/tigonkv-facade-" + std::to_string(getpid());
   std::remove(path.c_str());
   Config config;
   config.shared_memory_path = path;
-  config.size_mb = 32;
-  config.hwcc_size_mb = 16;
-  config.swcc_offset_mb = 16;
-  config.swcc_size_mb = 16;
-  config.hw_cc_budget_mb = 4;
+  config.size_mb = 64;
+  config.hwcc_size_mb = 32;
+  config.swcc_offset_mb = 32;
+  config.swcc_size_mb = 32;
+  config.hw_cc_budget_mb = 32;
   config.vm_count = 1;
   config.partition_count = 8;
   config.fixed_key_size = 32;
@@ -306,7 +370,19 @@ int main() {
   config.latency_stats_enabled = true;
   config.swcc_read_ns = 1;
   config.swcc_write_ns = 1;
+  // HWCC is bounded by the configured physical shared region, not by an
+  // arbitrary 1GiB validation ceiling.  Larger verified configurations are
+  // permitted when a smaller policy budget cannot satisfy a focused test.
+  Config larger_hwcc = config;
+  larger_hwcc.size_mb = 4096;
+  larger_hwcc.hwcc_offset_mb = 2048;
+  larger_hwcc.hwcc_size_mb = 2048;
+  larger_hwcc.swcc_offset_mb = 0;
+  larger_hwcc.swcc_size_mb = 2048;
+  larger_hwcc.hw_cc_budget_mb = 2048;
+  larger_hwcc.Validate();
   auto store = KVStore::Create(config, true);
+  store->BindWorker(0);
   const auto key = [&](std::string_view text) { return Fixed(text, config.fixed_key_size); };
   const auto value = [&](std::string_view text) { return Fixed(text, config.fixed_value_size); };
   // Public KV calls keep the fixed-width storage contract explicit.  The
@@ -318,6 +394,10 @@ int main() {
          StatusCode::kInvalidArgument);
   assert(store->Scan(key("alpha"), "short", 0).status.code ==
          StatusCode::kInvalidArgument);
+  // Empty and inverted half-open intervals are valid empty scans, and the
+  // comparison must be the same fixed-width comparator used by routing.
+  assert(store->Scan(key("beta"), key("alpha"), 0).status.ok());
+  assert(store->Scan(key("beta"), key("alpha"), 0).items.empty());
   assert(store->CompareExchange(key("alpha"), "short", value("one"))
              .status.code == StatusCode::kInvalidArgument);
   assert(store->Put(key("alpha"), value("one")).ok());
@@ -327,6 +407,8 @@ int main() {
   assert(store->CompareExchange(key("alpha"), value("one"), value("three")).exchanged);
   assert(store->Increment(key("counter"), 3).value == 3);
   assert(store->Get(key("alpha")).value == value("three"));
+  // The foreground threads below exercise all four worker identities.
+  store->ReleaseWorker();
   std::vector<std::thread> workers;
   for (uint32_t worker = 0; worker < 4; ++worker) {
     workers.emplace_back([&, worker] {
@@ -365,7 +447,6 @@ int main() {
   assert(memory.unclassified_shared_bytes == 0);
   const std::string stats = store->DumpStats();
   assert(stats.find("allocator_shared_overhead_bytes=") != std::string::npos);
-  assert(stats.find("reclaimed_total_bytes=") != std::string::npos);
   assert(stats.find("network_tx_bytes=") != std::string::npos);
   if (RelWithDebInfoBuild()) {
     assert(stats.find("\nswcc_raw=0\n") == std::string::npos);
@@ -374,10 +455,14 @@ int main() {
     assert(stats.find("\nswcc_raw=0\n") != std::string::npos);
     assert(stats.find("\nhwcc_raw=0\n") != std::string::npos);
   }
+  store->BindWorker(0);
+  store->ReleaseWorker();
   store.reset();
   auto attached = KVStore::Create(config, false);
+  attached->BindWorker(0);
   assert(attached->Get(key("alpha")).value == value("three"));
   assert(attached->Delete(key("beta")).ok());
+  attached->ReleaseWorker();
   std::remove(path.c_str());
   return 0;
 }

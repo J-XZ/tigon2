@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <pthread.h>
 #include <string>
 #include <string_view>
@@ -20,6 +21,27 @@
 namespace tigonkv::engine {
 
 class KvPartitionTable;
+struct RegionOffsetRowStorage;
+
+struct RegionOffsetSharedRowReference {
+  using StoredRow = RegionOffset;
+  DualRegionAllocator *regions = nullptr;
+  uint32_t owner_shard = 0;
+
+  StoredRow Null() const { return kNullOffset; }
+  bool IsNull(StoredRow row) const { return row == kNullOffset; }
+  StoredRow Encode(void *row) const {
+    if (regions == nullptr) throw std::runtime_error("shared row resolver is unbound");
+    return regions->ToDynamicHwccOffset(row, owner_shard);
+  }
+  void *Resolve(StoredRow row) const {
+    if (row == kNullOffset) return nullptr;
+    if (regions == nullptr) throw std::runtime_error("shared row resolver is unbound");
+    return regions->ResolveDynamicHwcc(
+        row, sizeof(star::TwoPLPashaMetadataShared), owner_shard);
+  }
+  bool Equal(StoredRow left, StoredRow right) const { return left == right; }
+};
 
 // One shared-tree probe result (§10.1). kRetry is contention; only kMissing may
 // trigger migrate/Forward.
@@ -36,23 +58,13 @@ enum class SharedAccessState : uint8_t {
 // (star::migration_manager); this class supplies the KV move-in/out callbacks.
 class KVPartition {
  public:
-  struct PrivateTreeValue {
-    RegionOffset row{kNullOffset};
-  };
-  struct PrivateTreeValueComparator {
-    int operator()(const PrivateTreeValue &left,
-                   const PrivateTreeValue &right) const {
-      return left.row == right.row ? 0 : 1;
-    }
-  };
   // Reuse the original CXLTableBTreeOLC leaf wrapper.  Its offset_ptr is
   // position independent because it is stored with the HWCC leaf; it never
   // persists a process VA.  The C++ table object below remains a non-owning
   // process-local handle.
-  using SharedTable = star::CXLTableBTreeOLC<FixedKey, FixedKeyComparator>;
+  using SharedTable = star::CXLTableBTreeOLC<
+      FixedKey, FixedKeyComparator, RegionOffsetSharedRowReference>;
   using SharedTreeValue = SharedTable::BTreeOLCValue;
-  using PrivateTree = btreeolc_cxl::BPlusTree<
-      FixedKey, PrivateTreeValue, FixedKeyComparator, PrivateTreeValueComparator>;
   using SharedTree = SharedTable::CXLBTree;
 
   KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
@@ -62,7 +74,9 @@ class KVPartition {
 
   uint32_t partition_id() const { return partition_id_; }
   uint32_t owner_shard() const { return owner_shard_; }
-  bool PutPrivate(std::string_view key, std::string_view value);
+  KvPartitionTable *private_table() const { return private_table_.get(); }
+  star::CXLTableBase *shared_cxl_table() const { return shared_table_; }
+  star::RowOutcome PutPrivate(std::string_view key, std::string_view value);
   // Original REMOTE_INSERT owner half: install an invalid placeholder through
   // the ITable adjacent callback, move it into CXL with one requester ref,
   // then let the requester publish valid without another payload write.
@@ -71,18 +85,21 @@ class KVPartition {
                                      uint32_t requester_id);
   bool PublishRemotePlaceholder(std::string_view key, uint32_t requester_id);
   // Owner read: follows is_migrated to the shared SCC payload when present.
-  bool GetPrivate(std::string_view key, std::string *value) const;
-  bool DeletePrivate(std::string_view key);
+  star::RowOutcome GetPrivate(std::string_view key, std::string *value) const;
+  star::RowOutcome DeletePrivate(std::string_view key);
   // PolicyClock callback. The caller holds this partition's Clock tracker.
   bool DeletePrivateForMigrationManager(
       std::string_view key, bool *need_untrack,
       void **migration_policy_meta, bool writer_prelocked = false,
       bool requester_prelocked = false);
-  bool CompareExchangePrivate(std::string_view key, std::string_view expected,
-                              std::string_view desired, bool *exchanged,
-                              bool *inserted = nullptr);
-  bool IncrementPrivate(std::string_view key, int64_t delta, int64_t *value,
-                        bool *inserted = nullptr);
+  star::RowOutcome CompareExchangePrivate(std::string_view key,
+                                           std::string_view expected,
+                                           std::string_view desired,
+                                           bool *exchanged,
+                                           bool *inserted = nullptr);
+  star::RowOutcome IncrementPrivate(std::string_view key, int64_t delta,
+                                    int64_t *value,
+                                    bool *inserted = nullptr);
   // Non-owner APIs never touch owner-private ValueStruct/local metadata. Point
   // ops use TryPinShared + SCC.
   // SharedAccessState distinguishes miss vs contention (§10.1); HasShared gone.
@@ -106,30 +123,24 @@ class KVPartition {
       std::string_view key, uint32_t host_id,
       star::TwoPLPashaMetadataShared **locked_row,
       bool record_clock_access = true);
-  void AbortRemoteDelete(star::TwoPLPashaMetadataShared *locked_row);
+  void AbortRemoteDelete(star::TwoPLPashaMetadataShared *locked_row,
+                         uint32_t host_id);
   // Owner DATA_MIGRATION analogue: move_row_in(inc_ref=false). Returns Ok on
   // SUCCESS or FAIL_ALREADY_IN_CXL, NotFound if absent, OutOfMemory otherwise.
   // When non-null, *moved_in is set true only on fresh SUCCESS.
   StatusCode EnsureInShared(std::string_view key, uint32_t host_id,
                             bool *moved_in = nullptr);
-  bool PromotePrivate(std::string_view key, uint32_t host_id);
+  star::migration_result PromotePrivate(std::string_view key, uint32_t host_id);
   // Like PromotePrivate, but when the row is already shared pins payload
   // ref_cnt (FAIL_ALREADY_IN_CXL) and returns that smeta via *pinned_existing
   // for the caller to unpin after the request completes.
-  bool PromotePrivate(std::string_view key, uint32_t host_id,
-                      star::TwoPLPashaMetadataShared **pinned_existing);
-  bool MoveOutPrivate(std::string_view key, uint32_t host_id);
+  star::migration_result PromotePrivate(
+      std::string_view key, uint32_t host_id,
+      star::TwoPLPashaMetadataShared **pinned_existing);
   // Original ITable local scan fragment. Engine calls it only for the owner.
   bool ScanLocalPartition(std::string_view start_key, uint64_t limit,
                           std::vector<std::pair<std::string, std::string>> *items,
                           std::string_view inclusive_max = {}) const;
-  // Thin CXLTable::scan-style entry: shared_tree_->scanForUpdate only.
-  // Processor returns true to stop (BTreeOLC_CXL end semantics). Adapter does
-  // ValueType→RegionOffset passthrough; no adjacency/migration logic (§4.3).
-  void ScanSharedForUpdate(
-      const FixedKey &min_key,
-      const std::function<bool(const FixedKey &key, RegionOffset smeta_off,
-                               bool is_last_tuple)> &processor) const;
   // Original CXLTable scan fragment: adjacency under leaf latch, values while
   // the fragment's reader/ref pins remain held.
   struct SharedScanResult {
@@ -140,26 +151,37 @@ class KVPartition {
   };
   // host_id is the requester (SCC cache bit / clflush identity), not the
   // partition owner. Matches original TwoPLPasha coordinator_id on remote scan.
+  // allow_lower_bound_left_boundary is the K1 thin adapter: only the prescribed
+  // post-move-in re-probe may set it. The first probe stays on master's
+  // exact-min / size==limit / otherwise predicate so a distant migrated island
+  // cannot be accepted while [min, island) is still private-only; otherwise
+  // move_in(min, limit) burns its budget on the gap and never repairs the
+  // island trailing edge (Busy livelock).
   SharedScanResult ScanSharedPartition(
       uint32_t host_id, std::string_view start_key, uint64_t output_limit,
-      std::string_view inclusive_max = {}) const;
-  void ClockLock();
-  void ClockUnlock();
-  void ClockTrackMigratedKey(const void *key_bytes);
-  void ClockUntrackMigratedKey(const void *key_bytes);
-  void ClockUntrackRowOffset(RegionOffset row_off);
-  // Returns the private ValueStruct offset under the Clock cursor (or null).
-  RegionOffset ClockAdvanceCursor();
-  bool ClockVictim(RegionOffset node_off, FixedKey *key,
-                   star::TwoPLPashaMetadataShared **smeta) const;
+      std::string_view inclusive_max = {},
+      bool allow_lower_bound_left_boundary = false) const;
+  // PolicyClock owns the tracker algorithm; these methods only expose the
+  // owner-private control and allocation/resolution primitives.
+  OwnerPrivateClockTrackerControl *ClockTrackerControl() const {
+    if (private_arena_ == nullptr)
+      throw std::runtime_error("non-owner partition has no private Clock control");
+    return &private_arena_->clock;
+  }
+  PrivateClockTrackerNode *ResolveClockTrackerNode(RegionOffset offset) const;
+  PrivateClockTrackerNode *AllocateClockTrackerNode();
+  void FreeClockTrackerNode(PrivateClockTrackerNode *node);
+  RegionOffset ClockTrackerNodeOffset(const PrivateClockTrackerNode *node) const;
+  RegionOffset ClockTrackerLocalRowOffset(
+      const std::tuple<std::atomic<uint64_t> *, void *> &row) const;
+  RegionOffset ClockTrackerSharedRowOffset(void *smeta) const;
+  std::tuple<std::atomic<uint64_t> *, void *> ClockTrackerLocalRow(
+      RegionOffset row_offset) const;
+  star::TwoPLPashaMetadataShared *ClockTrackerSharedRow(
+      RegionOffset smeta_offset) const;
+  bool ClockTrackerNodeMatches(const PrivateClockTrackerNode &node) const;
   uint64_t shared_payload_used_bytes() const;
   uint64_t shared_payload_capacity_bytes() const;
-  uint64_t hwcc_used_bytes() const;
-
-  // Must be called after an operation which might split or collapse a root.
-  // It writes only region-relative offsets into the persistent directory.
-  void PersistPrivateRootIfChanged();
-  uint64_t PrivateRootPublishCount() const { return private_root_publishes_; }
 
   // KV-adapted Helper move-in/out bodies used as PolicyClock callbacks.
   // Caller (PolicyClock) already holds the per-partition Clock tracker lock.
@@ -169,51 +191,25 @@ class KVPartition {
 
  private:
   friend class KvPartitionTable;
+  friend struct RegionOffsetRowStorage;
   // Matches core/Executor: enter before observing shared tree/row/move paths.
   FixedKey MakeKey(std::string_view key) const;
   bool MoveOutPrivateRaw(std::string_view key, uint32_t host_id);
   bool LookupPrivateOffset(const FixedKey &key, RegionOffset *offset) const;
-  bool LookupSharedOffset(const FixedKey &key, RegionOffset *offset) const;
+  bool LookupSharedReference(const FixedKey &key, RegionOffset *offset) const;
   PrivateValueStruct *ValueFromOffset(RegionOffset offset) const;
   PrivateMetadataLocal *MetadataFromValue(PrivateValueStruct *value) const;
-  PrivateClockTrackerNode *ClockNodeFromOffset(RegionOffset offset) const;
-  PrivateValueStruct *AllocateValue(std::string_view value);
-  PrivateMetadataLocal *AllocateMetadata();
+  star::TwoPLPashaMetadataShared *SharedMetadataFromOffset(
+      RegionOffset offset) const;
+  uint64_t NextCommitTid(uint64_t observed_tid) const;
   static void LockRow(PrivateMetadataLocal *metadata);
   static void UnlockRow(PrivateMetadataLocal *metadata);
   std::string KeyString(const FixedKey &key) const;
-  void NoteSharedAccess(star::TwoPLPashaMetadataShared *smeta) const;
   // Pin shared smeta so MoveOut cannot retire it between tree lookup and SCC
-  // access.
+  // access. Clock access remains inside the original get_migrated_row body.
   SharedAccessState TryPinShared(const FixedKey &key,
                                  star::TwoPLPashaMetadataShared **smeta,
-                                 RegionOffset *smeta_offset) const;
-  bool TryPinSharedEntry(
-      const FixedKey &key, RegionOffset expected_offset,
-      star::TwoPLPashaMetadataShared **smeta) const;
-  struct RowRef {
-    FixedKey key{};
-    RegionOffset offset = kNullOffset;
-    PrivateValueStruct *value = nullptr;
-    PrivateMetadataLocal *metadata = nullptr;
-  };
-  // Ephemeral arguments supplied by one B+Tree leaf callback.  This is not a
-  // second lookup/retry state machine; all three entries are valid only while
-  // that callback retains the original leaf latches.
-  struct AdjacentRows {
-    bool has_prev = false;
-    bool has_current = false;
-    bool has_next = false;
-    RowRef prev;
-    RowRef current;
-    RowRef next;
-  };
-  static void UnlockAdjacentRows(AdjacentRows *rows);
-  void SetNextReal(const RowRef &row, bool real);
-  void SetPrevReal(const RowRef &row, bool real);
-  void ApplySharedAdjacency(const AdjacentRows &rows);
-  void ClearSharedAdjacency(const AdjacentRows &rows);
-  bool InsertPrivateValue(const FixedKey &key, PrivateValueStruct *value);
+                                 bool record_clock_access) const;
   struct OwnerNextRowLock {
     PrivateValueStruct *value = nullptr;
     PrivateMetadataLocal *metadata = nullptr;
@@ -241,18 +237,17 @@ class KVPartition {
   const uint32_t fixed_key_size_;
   const uint32_t fixed_value_size_;
   PartitionDirectoryEntry &directory_;
-  OwnerPrivateArenaHeader &private_arena_;
+  // Only the partition owner materializes this non-owning SWCC handle.
+  // Non-owners retain the shared-tree handle only and must never resolve an
+  // owner-private arena during construction or lookup.
+  OwnerPrivateArenaHeader *private_arena_ = nullptr;
   btreeolc_cxl::TreeNodeAllocation private_binding_;
   btreeolc_cxl::TreeNodeAllocation shared_binding_;
-  PrivateTree *private_tree_ = nullptr;
+  // The owner-private TableBTreeOLC is a process-local handle.  It owns the
+  // reconstructed B+Tree handle; persistent nodes and rows remain in SWCC.
+  std::unique_ptr<KvPartitionTable> private_table_;
   SharedTree *shared_tree_ = nullptr;
   SharedTable *shared_table_ = nullptr;
-  // Process-local cache of the last published private root offset (§11.6).
-  RegionOffset persisted_private_root_offset_ = kNullOffset;
-  uint64_t private_root_publishes_ = 0;
-  // Process-local Clock list lock; list nodes live in owner-private metadata.
-  pthread_spinlock_t clock_lock_{};
-  bool clock_lock_inited_ = false;
 };
 
 }  // namespace tigonkv::engine

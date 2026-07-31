@@ -9,6 +9,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include(CTest)
 enable_testing()
 
+# Keep the single-config default identical to the documented production
+# build before any build-type-specific flags are selected.  An explicit
+# caller value, and multi-config generators, remain untouched.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 add_compile_options(-Wall -Wextra -Wpedantic -fno-omit-frame-pointer
   -march=native
   -Wno-unused-variable -Wno-unused-but-set-variable -Wno-variadic-macros
@@ -21,22 +28,23 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
   add_compile_options(-O3 -g3 -march=native)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_compile_options(-flto)
+    add_link_options(-flto)
   else()
     add_compile_options(-flto=full)
+    add_link_options(-flto=full)
   endif()
-elseif(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_library(tigonkv STATIC kv/kv_store.cpp kv/engine/latency_inject.cpp
+  core/Table.cpp
   kv/engine/kv_engine.cpp kv/engine/kv_partition.cpp kv/engine/kv_migration.cpp
   kv/engine/region_allocator.cpp
   common/CXLMemory.cpp common/CXL_EBR.cpp common/Time.cpp
   common/btree_olc_cxl/BTreeOLC_CXL.cpp
   protocol/Pasha/SCCManager.cpp protocol/Pasha/MigrationManager.cpp
-  protocol/Pasha/PolicyClock.cpp)
+  protocol/Pasha/PolicyClock.cpp protocol/TwoPLPasha/TwoPLPashaHelper.cpp)
 target_link_libraries(tigonkv PUBLIC pthread glog)
 target_compile_definitions(tigonkv PUBLIC
   TIGONKV_CMAKE_BUILD_TYPE="$<CONFIG>")
@@ -72,6 +80,8 @@ add_executable(kv_shared_protocol_test tests/kv_shared_protocol_test.cpp)
 target_link_libraries(kv_shared_protocol_test PRIVATE tigonkv glog)
 add_executable(region_allocator_test tests/region_allocator_test.cpp)
 target_link_libraries(region_allocator_test PRIVATE tigonkv)
+add_executable(cxl_ebr_test tests/cxl_ebr_test.cpp)
+target_link_libraries(cxl_ebr_test PRIVATE tigonkv)
 add_executable(numa_placement_probe tools/numa_placement_probe.cpp)
 add_executable(cxl_pool_initer tools/cxl_pool_initer.cpp)
 
@@ -87,9 +97,15 @@ add_test(NAME e2e_08_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_08_test.sh)
 add_test(NAME e2e_09_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_09_test.sh)
 add_test(NAME e2e_ycsb_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_ycsb_test.sh)
 add_test(NAME e2e_ycsb_entrypoints_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_ycsb_entrypoints_test.sh)
-set_tests_properties(e2e_08_test e2e_09_test PROPERTIES
+# Every guest/QEMU-backed e2e owns shared backing, ports and guest runners.
+# RUN_SERIAL is deliberately applied to the whole e2e group so CTest never
+# overlaps an e2e with unit tests or another e2e.
+set_tests_properties(e2e_08_test e2e_09_test e2e_ycsb_test
+                     e2e_ycsb_entrypoints_test PROPERTIES
   TIMEOUT 3600
   RUN_SERIAL TRUE)
+set_tests_properties(e2e_08_test e2e_09_test e2e_ycsb_test PROPERTIES
+  ENVIRONMENT "TIGONKV_E2E_BINARY_DIR=${CMAKE_BINARY_DIR}")
 add_test(NAME latency_modes_test COMMAND latency_modes_test)
 add_test(NAME kv_layout_test COMMAND kv_layout_test)
 add_test(NAME btree_binding_test COMMAND btree_binding_test)
@@ -99,6 +115,16 @@ add_test(NAME kv_startup_test COMMAND kv_startup_test)
 add_test(NAME scc_protocol_test COMMAND scc_protocol_test)
 add_test(NAME kv_shared_protocol_test COMMAND kv_shared_protocol_test)
 add_test(NAME region_allocator_test COMMAND region_allocator_test)
+add_test(NAME cxl_ebr_test COMMAND cxl_ebr_test)
 add_test(NAME vm_scripts_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/vm_scripts_test.sh)
 add_test(NAME ycsb_cpp_pin_test COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/tigonkv_ycsb_cpp_pin.sh)
 add_test(NAME ycsb_scripts_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/ycsb_scripts_test.sh)
+
+# The file-backed unit fixtures and the guest/QEMU fixtures must never share
+# a test invocation: both can touch the configured backing path, process
+# names, or host VM state.  RUN_SERIAL on the guest tests is not enough when a
+# caller supplies `ctest -j`; one common CTest resource makes that exclusion
+# explicit for every registered test.
+get_property(TIGONKV_REGISTERED_TESTS DIRECTORY PROPERTY TESTS)
+set_tests_properties(${TIGONKV_REGISTERED_TESTS} PROPERTIES
+  RESOURCE_LOCK tigonkv_test_environment)

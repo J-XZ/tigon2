@@ -78,6 +78,8 @@ sync_guest_runtime() {
   done
 }
 
+tigonkv_assert_host_test_isolated
+tigonkv_assert_qemu_group expected
 sync_guest_runtime
 
 sync_traces() {
@@ -118,8 +120,16 @@ run_fixed() {
   # on a caller remembering to enable verbose output.
   local scan_expect="${TIGONKV_E2E_SCAN_EXPECT_NONEMPTY:-0}"
   local scan_max_key="${TIGONKV_E2E_SCAN_MAX_KEY:-}"
+  local test_value_hex="${TIGONKV_E2E_TEST_VALUE_HEX:-}"
+  local require_get_found="${TIGONKV_E2E_REQUIRE_GET_FOUND:-0}"
+  [[ "$require_get_found" == 0 || "$require_get_found" == 1 ]] || {
+    echo "TIGONKV_E2E_REQUIRE_GET_FOUND must be 0 or 1" >&2
+    return 2
+  }
   local scan_env="TIGONKV_E2E_SCAN_EXPECT_NONEMPTY=$scan_expect"
   [[ -n "$scan_max_key" ]] && scan_env="$scan_env TIGONKV_E2E_SCAN_MAX_KEY='$scan_max_key'"
+  [[ -n "$test_value_hex" ]] && scan_env="$scan_env TIGONKV_E2E_TEST_VALUE_HEX='$test_value_hex'"
+  scan_env="$scan_env TIGONKV_E2E_REQUIRE_GET_FOUND=$require_get_found"
   local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed '$remote_runner'"
   # Pre-create the log so the host wait loop never races rg against ENOENT.
   : >"$log"
@@ -154,7 +164,9 @@ watch_phase_progress() {
         fi
       done
       if (( all_replayed == 1 )); then
-        local release_file="$remote_root/ycsb-guest-release/round${round}-workload${workload}-${phase}"
+        local wl
+        wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
+        local release_file="$remote_root/ycsb-guest-release/round${round}-workload${wl}-${phase}"
         for ((vm = 0; vm < vm_count; vm++)); do
           remote "$vm" "touch '$release_file'"
         done
@@ -198,23 +210,17 @@ for ((round = 1; round <= rounds; round++)); do
       phase_log="$log_root/round${round}-workload${wl}-${phase}"
       mkdir -p "$phase_log"
       pids=()
-      first_vm=0
-      if [[ "$phase" == load ]]; then
-        run_fixed "$round" "$wl" "$phase" 0 1 "$phase_log/vm0.log" &
-        pids+=("$!")
-        # VM0 must finish constructing all in-process worker stores before
-        # peers attach.  A fixed sleep races with a cold guest; use the
-        # runner's explicit verbose stage marker instead.
-        deadline=$((SECONDS + ${TIGONKV_E2E_TIMEOUT_SEC:-600}))
-        while ! rg -q 'E2E_TRACE_STAGE .*stage=opened' "$phase_log/vm0.log" 2>/dev/null; do
-          kill -0 "${pids[0]}" 2>/dev/null || { wait "${pids[0]}" || true; exit 1; }
-          (( SECONDS < deadline )) || { echo "timeout waiting for VM0 layout publication" >&2; exit 1; }
-          sleep 0.05
-        done
-        first_vm=1
-      fi
-      for ((vm = first_vm; vm < vm_count; vm++)); do
+      for ((vm = 0; vm < vm_count; vm++)); do
         reset=0
+        # VM0 publishes static HWCC roots, but Ready requires every range
+        # owner to attach. Start all four together; peers wait on the original
+        # root publication instead of an orchestration-only serial delay.
+        [[ "$phase" == load && "$vm" == 0 ]] && reset=1
+        # The watcher starts concurrently with run_fixed. Clear the previous
+        # phase marker before either can run, otherwise a fast watcher can
+        # mistake stale replay_done output for this phase and release a peer
+        # while other VMs still need its demuxer.
+        : >"$phase_log/vm$vm.log"
         run_fixed "$round" "$wl" "$phase" "$vm" "$reset" "$phase_log/vm$vm.log" &
         pids+=("$!")
       done

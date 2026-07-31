@@ -4,6 +4,7 @@
 #undef NDEBUG
 #endif
 #include <cassert>
+#include <stdexcept>
 
 namespace {
 
@@ -68,8 +69,11 @@ int main() {
                        latency_sim::AccessKind::kWrite,
                        reinterpret_cast<void *>(0x2100));
   assert(simulator.PendingDelayNsForTest() == 50);
-  simulator.DelayActiveScopeNow();
+  // Mid-scope settlement is forbidden; end the phase before peer work.
+  simulator.EndScopeAndDelay();
   assert(simulator.PendingDelayNsForTest() == 0);
+  assert(!simulator.HasActiveScopeForCurrentThread());
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   simulator.RecordLine(latency_sim::PoolKind::kHwcc,
                        latency_sim::AccessKind::kAtomicStore,
                        reinterpret_cast<void *>(0x2100));
@@ -83,23 +87,37 @@ int main() {
                        latency_sim::AccessKind::kRead,
                        reinterpret_cast<void *>(0x5000));
   assert(simulator.PendingDelayNsForTest() == 10);
-  simulator.BeginIsolatedScope(latency_sim::ScopeKind::kForeground);
+  // RPC phases are sequential: request publication ends the local phase;
+  // peer work never saves/restores an outer latency scope.
+  simulator.EndScopeAndDelay();
   assert(simulator.PendingDelayNsForTest() == 0);
+  assert(!simulator.HasActiveScopeForCurrentThread());
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   simulator.RecordLine(latency_sim::PoolKind::kHwcc,
                        latency_sim::AccessKind::kRead,
                        reinterpret_cast<void *>(0x6000));
   assert(simulator.PendingDelayNsForTest() == 40);
-  simulator.DelayIsolatedScopeNow();
-  assert(simulator.PendingDelayNsForTest() == 0);
   simulator.RecordLine(latency_sim::PoolKind::kHwcc,
                        latency_sim::AccessKind::kWrite,
                        reinterpret_cast<void *>(0x6000));
-  assert(simulator.PendingDelayNsForTest() == 50);
-  simulator.EndIsolatedScopeAndDelay();
-  assert(simulator.PendingDelayNsForTest() == 10);
+  assert(simulator.PendingDelayNsForTest() == 90);
+  simulator.EndScopeAndDelay();
+  assert(simulator.PendingDelayNsForTest() == 0);
   stats = simulator.SnapshotStats();
   assert(stats.swcc_raw_line_accesses == 1);
   assert(stats.hwcc_raw_line_accesses == 2);
+  simulator.TakeStatsAndReset();
+
+  // Nested BeginScope must hard-fail rather than silently stack.
+  simulator.Configure(BaseConfig());
+  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  bool nested_rejected = false;
+  try {
+    simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  } catch (const std::logic_error &) {
+    nested_rejected = true;
+  }
+  assert(nested_rejected);
   simulator.EndScopeAndDelay();
   simulator.TakeStatsAndReset();
 

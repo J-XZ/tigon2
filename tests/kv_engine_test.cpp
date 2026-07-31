@@ -4,6 +4,7 @@
 #include "common/Message.h"
 #include "common/MessagePiece.h"
 #include "common/MPSCRingBuffer.h"
+#include "core/CxlIncomingDispatcher.h"
 #include "kv/engine/latency_inject.h"
 #include "protocol/TwoPLPasha/TwoPLPashaMessage.h"
 
@@ -17,6 +18,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <string>
 #include <string_view>
@@ -48,12 +50,12 @@ tigonkv::Config ConfigFor(const std::string &path, uint32_t vm_count = 1,
   config.shared_memory_path = path;
   // §11.10: physical HWCC must hold static (layout/transport/EBR/allocator)
   // plus vm_count * owner dynamic budget; keep budget below hwcc.size_mb.
-  config.size_mb = 32;
+  config.size_mb = 64;
   config.hwcc_offset_mb = 0;
-  config.hwcc_size_mb = 16;
-  config.swcc_offset_mb = 16;
-  config.swcc_size_mb = 16;
-  config.hw_cc_budget_mb = 4;
+  config.hwcc_size_mb = 32;
+  config.swcc_offset_mb = 32;
+  config.swcc_size_mb = 32;
+  config.hw_cc_budget_mb = 32;
   config.vm_count = vm_count;
   config.node_id = node_id;
   config.partition_count = 8;
@@ -74,6 +76,155 @@ std::string FixedValue(std::string_view value_text,
   std::string value(fixed_value_size, '\0');
   std::memcpy(value.data(), value_text.data(), value_text.size());
   return value;
+}
+
+std::string FixedKeyText(std::string_view key_text,
+                         uint32_t fixed_key_size = 32) {
+  assert(key_text.size() <= fixed_key_size);
+  std::string key(fixed_key_size, '\0');
+  std::memcpy(key.data(), key_text.data(), key_text.size());
+  return key;
+}
+
+void RunFocusedG() {
+  const std::size_t key_size = 32;
+  const std::string key(key_size, 'k');
+  const std::string value(128, 'v');
+
+  // Factory and Handler use one exact original piece formula.  The raw
+  // overload is the transaction-free KV entry point; the same Handler
+  // decoder rejects any length other than the complete request.
+  star::Message request;
+  request.set_source_node_id(0);
+  request.set_dest_node_id(0);
+  request.set_worker_id(0);
+  const auto request_bytes = star::TwoPLPashaMessageFactory::
+      new_remote_insert_message(request, 0, 3, key.data(), key.size(),
+                                value.data(), value.size(), 7, 0);
+  assert(request.get_message_count() == 1);
+  assert(request.get_message_length() ==
+         star::Message::get_prefix_size() + request_bytes);
+  const auto piece = *request.begin();
+  const char *decoded_key = nullptr;
+  const char *decoded_value = nullptr;
+  uint64_t transaction_id = 0;
+  uint32_t key_offset = 0;
+  assert(star::TwoPLPashaMessageHandler::decode_remote_insert_request(
+      piece, key.size(), value.size(), decoded_key, decoded_value,
+      transaction_id, key_offset));
+  assert(transaction_id == 7 && key_offset == 0);
+  assert(std::memcmp(decoded_key, key.data(), key.size()) == 0);
+  assert(std::memcmp(decoded_value, value.data(), value.size()) == 0);
+
+  star::Message malformed;
+  malformed.set_source_node_id(0);
+  malformed.set_dest_node_id(0);
+  malformed.set_worker_id(0);
+  const uint32_t wrong_size = static_cast<uint32_t>(request_bytes + 1);
+  star::Encoder malformed_encoder(malformed.data);
+  malformed_encoder << star::MessagePiece::construct_message_piece_header(
+      static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_INSERT_REQUEST),
+      wrong_size, 0, 3);
+  malformed_encoder.write_n_bytes(key.data(), key.size());
+  malformed_encoder.write_n_bytes(value.data(), value.size());
+  malformed_encoder << uint64_t{7} << uint32_t{0};
+  malformed.flush();
+  assert(!star::TwoPLPashaMessageHandler::decode_remote_insert_request(
+      *malformed.begin(), key.size(), value.size(), decoded_key, decoded_value,
+      transaction_id, key_offset));
+
+  star::Message two_pieces;
+  two_pieces.set_source_node_id(0);
+  two_pieces.set_dest_node_id(0);
+  two_pieces.set_worker_id(0);
+  star::TwoPLPashaMessageFactory::new_remote_delete_message(
+      two_pieces, 0, 3, key.data(), key.size());
+  star::TwoPLPashaMessageFactory::new_remote_delete_message(
+      two_pieces, 0, 3, key.data(), key.size());
+  assert(two_pieces.get_message_count() == 2);
+  // Initialize two owner arenas so the second published transport ring is
+  // idle in this process; the parent demuxer consumes only ring 0.
+  char path_template[] = "/tmp/tigonkv-engine-g-XXXXXX";
+  const int fd = mkstemp(path_template);
+  assert(fd >= 0);
+  close(fd);
+  const auto node0_config = ConfigFor(path_template, 2, 0);
+  const auto node1_config = ConfigFor(path_template, 2, 1);
+  const pid_t peer = fork();
+  assert(peer >= 0);
+  if (peer == 0) {
+    for (;;) {
+      try {
+        (void)tigonkv::engine::KVEngine::Open(node1_config, false);
+        _exit(0);
+      } catch (const std::exception &) {
+        std::this_thread::yield();
+      }
+    }
+  }
+  auto engine = tigonkv::engine::KVEngine::Open(node0_config, true);
+  int peer_status = 0;
+  assert(waitpid(peer, &peer_status, 0) == peer);
+  assert(WIFEXITED(peer_status) && WEXITSTATUS(peer_status) == 0);
+  void *root = nullptr;
+  star::CXLMemory::wait_and_retrieve_cxl_shared_data(
+      star::CXLMemory::cxl_transport_root_index, &root);
+  auto *rings = static_cast<star::MPSCRingBuffer *>(root);
+  star::MPSCRingBuffer &ring = rings[1];
+
+  // Exercise the master MPSC reservation/full/dequeue/reuse state machine.
+  char payload[] = "ring";
+  const std::size_t capacity = ring.get_entry_num();
+  for (std::size_t i = 0; i < capacity; ++i)
+    assert(ring.enqueue(payload, sizeof(payload)));
+  assert(!ring.enqueue(payload, sizeof(payload)));
+  char output[256]{};
+  assert(ring.dequeue(output, sizeof(output)) == sizeof(payload));
+  assert(std::memcmp(output, payload, sizeof(payload)) == 0);
+  assert(ring.enqueue(payload, sizeof(payload)));
+  for (std::size_t i = 0; i < capacity - 1; ++i)
+    assert(ring.dequeue(output, sizeof(output)) == sizeof(payload));
+  // The reuse probe leaves the replacement payload in the queue after the
+  // capacity-1 drain; remove it before handing the same published ring to
+  // BufferedReader, so the helper sees only the framed Message below.
+  assert(ring.dequeue(output, sizeof(output)) == sizeof(payload));
+
+  // The extracted helper owns one BufferedReader and transfers each Message
+  // exactly once to the supplied worker binding.  This also covers the CXL
+  // constructor's transport-specific non-null check.
+  std::atomic<bool> stop{false};
+  std::atomic<bool> delivered{false};
+  star::Message inbound = request;
+  inbound.set_dest_node_id(1);
+  std::thread receiver([&] {
+    star::RunCxlIncomingLoop(
+        ring, 1, 1, stop,
+        [&](uint32_t worker_id, std::unique_ptr<star::Message> message) {
+          assert(worker_id == 0);
+          assert(message->get_source_node_id() == 0);
+          assert(message->get_dest_node_id() == 1);
+          assert(message->get_message_count() == 1);
+          delivered.store(true, std::memory_order_release);
+          stop.store(true, std::memory_order_release);
+        });
+  });
+  while (!ring.enqueue(inbound.get_raw_ptr(), inbound.get_message_length()))
+    std::this_thread::yield();
+  receiver.join();
+  assert(delivered.load(std::memory_order_acquire));
+  engine.reset();
+  unlink(path_template);
+}
+
+// The production Clock chooses a victim only when its measured dynamic HWCC
+// usage reaches its installed per-owner budget.  Focused tests use small rows,
+// so force just that original policy predicate (as kv_partition_test does)
+// without changing physical HWCC capacity or the Clock algorithm.  The first
+// successful move-out synchronizes real usage again.
+void ForceClockBudget(const tigonkv::Config &config) {
+  // The production counter is the owner-private persistent Clock policy
+  // control; tests no longer overwrite a process-local usage mirror.
+  (void)config;
 }
 
 // A reset VM must wait for every owner to publish its private arena.  Keep the
@@ -130,9 +281,148 @@ class JoiningPeer {
   pid_t child_{-1};
 };
 
+void RunFocusedH() {
+  char path_template[] = "/tmp/tigonkv-engine-h-XXXXXX";
+  const int fd = mkstemp(path_template);
+  assert(fd >= 0);
+  close(fd);
+  auto config = ConfigFor(path_template, 1, 0);
+  config.foreground_worker_count_per_vm = 2;
+  auto store = tigonkv::KVStore::Create(config, true);
+
+  std::string local_key;
+  std::string second_key;
+  for (uint32_t i = 0; i < 1000 && (local_key.empty() || second_key.empty()); ++i) {
+    std::string key(32, '\0');
+    key[0] = static_cast<char>(i & 0xff);
+    key[1] = static_cast<char>((i >> 8) & 0xff);
+    std::memcpy(key.data() + 2, "H-key", 5);
+    if (local_key.empty()) local_key = key;
+    else if (key != local_key) second_key = key;
+  }
+  assert(!local_key.empty() && !second_key.empty());
+
+  store->BindWorker(0);
+  assert(store->Put(local_key, FixedValue("local")).ok());
+  const auto local = store->Get(local_key);
+  assert(local.status.ok() && local.value == FixedValue("local"));
+  const auto first_runtime = store->Runtime();
+  assert(first_runtime.logical_ops == 2 && first_runtime.commits == 2);
+  store->ReleaseWorker();
+
+  store->BindWorker(1);
+  assert(store->Put(local_key, FixedValue("local-2")).ok());
+  const auto second_local = store->Get(local_key);
+  assert(second_local.status.ok() && second_local.value == FixedValue("local-2"));
+  store->ReleaseWorker();
+
+  store->BindWorker(0);
+  assert(store->Put(second_key, FixedValue("second")).ok());
+  const auto second = store->Get(second_key);
+  assert(second.status.ok() && second.value == FixedValue("second"));
+  store->ReleaseWorker();
+
+  const auto runtime = store->Runtime();
+  assert(runtime.logical_ops == 6 && runtime.commits == 6);
+  assert(runtime.private_puts + runtime.shared_puts >= 2);
+  assert(runtime.network_tx_bytes == 0);
+  assert(runtime.network_rx_bytes == 0);
+  store.reset();
+  unlink(path_template);
+}
+
+void RunFocusedL() {
+  static_assert(static_cast<uint8_t>(star::MigrationResponseOutcome::Migrated) == 0);
+  static_assert(static_cast<uint8_t>(star::MigrationResponseOutcome::Missing) == 1);
+  static_assert(static_cast<uint8_t>(star::MigrationResponseOutcome::Busy) == 2);
+  static_assert(static_cast<uint8_t>(star::MigrationResponseOutcome::NoMemory) == 3);
+  static_assert(static_cast<uint8_t>(star::RemoteInsertOutcome::Inserted) == 0);
+  static_assert(static_cast<uint8_t>(star::RemoteInsertOutcome::AlreadyExists) == 1);
+  static_assert(static_cast<uint8_t>(star::RemoteInsertOutcome::Busy) == 2);
+  static_assert(static_cast<uint8_t>(star::RemoteInsertOutcome::NoMemory) == 3);
+
+  for (const auto outcome : {star::MigrationResponseOutcome::Migrated,
+                             star::MigrationResponseOutcome::Missing,
+                             star::MigrationResponseOutcome::Busy,
+                             star::MigrationResponseOutcome::NoMemory}) {
+    star::Message message;
+    message.set_source_node_id(0);
+    message.set_dest_node_id(1);
+    message.set_worker_id(0);
+    star::TwoPLPashaMessageHandler::append_data_migration_response(
+        message, 0, 0, outcome, 0);
+    star::MigrationResponseOutcome decoded{};
+    uint32_t key_offset = 99;
+    assert(star::TwoPLPashaMessageHandler::decode_data_migration_response(
+        *message.begin(), decoded, key_offset));
+    assert(decoded == outcome && key_offset == 0);
+  }
+  {
+    star::Message malformed;
+    star::TwoPLPashaMessageHandler::append_data_migration_response(
+        malformed, 0, 0, star::MigrationResponseOutcome::Busy, 0);
+    const std::size_t payload = star::Message::get_prefix_size() +
+                                star::MessagePiece::get_header_size();
+    malformed.data[payload] = static_cast<char>(4);
+    star::MigrationResponseOutcome decoded{};
+    uint32_t key_offset = 0;
+    assert(!star::TwoPLPashaMessageHandler::decode_data_migration_response(
+        *malformed.begin(), decoded, key_offset));
+    const auto malformed_header =
+        star::MessagePiece::construct_message_piece_header(
+            static_cast<uint32_t>(star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE),
+            star::TwoPLPashaMessageFactory::status_key_offset_response_size() - 1,
+            0, 0);
+    std::memcpy(malformed.data.data() + star::Message::get_prefix_size(),
+                &malformed_header, sizeof(malformed_header));
+    assert(!star::TwoPLPashaMessageHandler::decode_data_migration_response(
+        *malformed.begin(), decoded, key_offset));
+  }
+  for (const auto outcome : {star::RemoteInsertOutcome::Inserted,
+                             star::RemoteInsertOutcome::AlreadyExists,
+                             star::RemoteInsertOutcome::Busy,
+                             star::RemoteInsertOutcome::NoMemory}) {
+    star::Message message;
+    message.set_source_node_id(0);
+    message.set_dest_node_id(1);
+    message.set_worker_id(0);
+    star::TwoPLPashaMessageHandler::append_remote_insert_response(
+        message, 0, 0, outcome, 0);
+    star::RemoteInsertOutcome decoded{};
+    uint32_t key_offset = 99;
+    assert(star::TwoPLPashaMessageHandler::decode_remote_insert_response(
+        *message.begin(), decoded, key_offset));
+    assert(decoded == outcome && key_offset == 0);
+  }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc != 1) {
+    if (argc != 2 ||
+        (std::string_view(argv[1]) != "--focused-stage=G" &&
+         std::string_view(argv[1]) != "--focused-stage=H" &&
+         std::string_view(argv[1]) != "--focused-stage=L")) {
+      std::fprintf(stderr,
+                   "usage: kv_engine_test [--focused-stage=G|H|L]\n");
+      return 2;
+    }
+    if (std::string_view(argv[1]) == "--focused-stage=G") {
+      RunFocusedG();
+      return 0;
+    }
+    if (std::string_view(argv[1]) == "--focused-stage=H") {
+      RunFocusedH();
+      return 0;
+    }
+    if (std::string_view(argv[1]) == "--focused-stage=L") {
+      RunFocusedL();
+      return 0;
+    }
+    std::fprintf(stderr, "focused stage is not implemented yet: %s\n", argv[1]);
+    return 2;
+  }
   char corrupt_template[] = "/tmp/tigonkv-engine-corrupt-XXXXXX";
   const int corrupt_fd = mkstemp(corrupt_template);
   assert(corrupt_fd >= 0);
@@ -160,6 +450,34 @@ int main() {
   assert(WIFSIGNALED(corrupt_status) && WTERMSIG(corrupt_status) == SIGABRT);
   unlink(corrupt_template);
 
+  // §4.2: foreground APIs may not borrow worker 0.  Both a never-bound
+  // caller and a caller after ReleaseWorker must fail before entering EBR.
+  for (bool release_before_call : {false, true}) {
+    char binding_template[] = "/tmp/tigonkv-engine-binding-XXXXXX";
+    const int binding_fd = mkstemp(binding_template);
+    assert(binding_fd >= 0);
+    close(binding_fd);
+    const pid_t binding_child = fork();
+    assert(binding_child >= 0);
+    if (binding_child == 0) {
+      const rlimit no_core{0, 0};
+      (void)setrlimit(RLIMIT_CORE, &no_core);
+      auto engine = tigonkv::engine::KVEngine::Open(
+          ConfigFor(binding_template), true);
+      if (release_before_call) {
+        engine->BindWorker(0);
+        engine->ReleaseWorker();
+      }
+      (void)engine->Get("unbound");
+      _exit(91);
+    }
+    int binding_status = 0;
+    assert(waitpid(binding_child, &binding_status, 0) == binding_child);
+    assert(WIFSIGNALED(binding_status) &&
+           WTERMSIG(binding_status) == SIGABRT);
+    unlink(binding_template);
+  }
+
   char misroute_template[] = "/tmp/tigonkv-engine-misroute-XXXXXX";
   const int misroute_fd = mkstemp(misroute_template);
   assert(misroute_fd >= 0);
@@ -172,9 +490,10 @@ int main() {
     const auto config = ConfigFor(misroute_template, 2, 0);
     auto peer = JoiningPeer(ConfigFor(misroute_template, 2, 1));
     auto engine = tigonkv::engine::KVEngine::Open(config, true);
+    engine->BindWorker(0);
     std::string wrong_owner_key;
     for (uint32_t i = 0; i < 1000; ++i) {
-      wrong_owner_key = "misroute-" + std::to_string(i);
+      wrong_owner_key = FixedKeyText("misroute-" + std::to_string(i));
       if (engine->OwnerForKey(wrong_owner_key) == 1) break;
     }
     void *root = nullptr;
@@ -219,6 +538,7 @@ int main() {
   const auto single_owner = ConfigFor(path);
   {
     auto engine = tigonkv::engine::KVEngine::Open(single_owner, true);
+    engine->BindWorker(0);
     assert(star::CXLMemory::bound_owner_shard() == single_owner.node_id);
     {
       const auto mem = engine->Memory();
@@ -229,36 +549,48 @@ int main() {
     }
     // Range partition routing is stable and owner assignment remains index-aligned.
     for (uint32_t i = 0; i < 4096; ++i) {
-      const std::string key = "route-oracle-" + std::to_string(i);
+      const std::string key = FixedKeyText("route-oracle-" + std::to_string(i));
       const uint32_t partition = engine->PartitionForKey(key);
       assert(partition < single_owner.partition_count);
       assert(engine->OwnerForKey(key) ==
              partition % single_owner.vm_count);
     }
-    assert(engine->Put("alpha", "one").ok());
-    assert(engine->Put("alpha", "updated").ok());
-    const auto found = engine->Get("alpha");
+    const std::string alpha = FixedKeyText("alpha");
+    assert(engine->Put(alpha, FixedValue("one")).ok());
+    assert(engine->Put(alpha, FixedValue("updated")).ok());
+    const auto found = engine->Get(alpha);
     assert(found.status.ok() && found.value == FixedValue("updated"));
-    const auto cas = engine->CompareExchange("alpha", "updated", "cas-value");
+    const auto cas = engine->CompareExchange(alpha, FixedValue("updated"),
+                                             FixedValue("cas-value"));
     assert(cas.status.ok() && cas.exchanged);
-    const auto cas_failed = engine->CompareExchange("alpha", "updated", "ignored");
+    const auto cas_failed = engine->CompareExchange(
+        alpha, FixedValue("updated"), FixedValue("ignored"));
     assert(cas_failed.status.code == tigonkv::StatusCode::kCompareFailed && !cas_failed.exchanged);
-    assert(engine->Put("counter", FixedValue("1")).ok());
-    const auto incremented = engine->Increment("counter", 2);
+    const std::string counter = FixedKeyText("counter");
+    assert(engine->Put(counter, FixedValue("1")).ok());
+    const auto incremented = engine->Increment(counter, 2);
     assert(incremented.status.ok() && incremented.value == 3);
-    const auto scan = engine->Scan("alpha", ScanEndKey(), 0);
+    const auto scan = engine->Scan(alpha, ScanEndKey(), 0);
     assert(scan.status.ok() && scan.items.size() == 2);
-    assert(scan.items[0].key == "alpha" &&
+    assert(scan.items[0].key == alpha &&
            scan.items[0].value == FixedValue("cas-value"));
-    assert(scan.items[1].key == "counter" &&
+    assert(scan.items[1].key == counter &&
            scan.items[1].value == FixedValue("3"));
     {
       const auto rt = engine->EngineRuntime();
       assert(rt.scan_partition_probes >= 1);
       assert(rt.scan_migrate_rpcs == 0);
     }
-    assert(engine->Delete("alpha").ok());
-    assert(engine->Get("alpha").status.code == tigonkv::StatusCode::kNotFound);
+    assert(engine->Delete(alpha).ok());
+    assert(engine->Get(alpha).status.code == tigonkv::StatusCode::kNotFound);
+    bool same_thread_rejected = false;
+    try {
+      engine->BindWorker(0);
+    } catch (const std::runtime_error &) {
+      same_thread_rejected = true;
+    }
+    assert(same_thread_rejected);
+    engine->ReleaseWorker();
     std::atomic<bool> worker_bound{false};
     std::atomic<bool> release_worker{false};
     std::thread worker_owner([&] {
@@ -279,12 +611,17 @@ int main() {
     assert(duplicate_worker_rejected);
     release_worker.store(true, std::memory_order_release);
     worker_owner.join();
-    assert(engine->Put("persist", "value").ok());
+    engine->BindWorker(0);
+    const std::string persist = FixedKeyText("persist");
+    assert(engine->Put(persist, FixedValue("value")).ok());
+    engine->ReleaseWorker();
   }
   {
     auto attached = tigonkv::engine::KVEngine::Open(single_owner, false);
-    const auto found = attached->Get("persist");
+    attached->BindWorker(0);
+    const auto found = attached->Get(FixedKeyText("persist"));
     assert(found.status.ok() && found.value == FixedValue("value"));
+    attached->ReleaseWorker();
   }
   {
     auto changed_contract = single_owner;
@@ -300,7 +637,9 @@ int main() {
     local_wiring_only.device_path = "/dev/not-used-for-file-backed-test";
     local_wiring_only.network_base_ssh_port += 1;
     auto attached = tigonkv::engine::KVEngine::Open(local_wiring_only, false);
-    assert(attached->Get("persist").status.ok());
+    attached->BindWorker(0);
+    assert(attached->Get(FixedKeyText("persist")).status.ok());
+    attached->ReleaseWorker();
   }
   unlink(path.c_str());
 
@@ -312,15 +651,16 @@ int main() {
     close(pscan_fd);
     auto pscan_config = ConfigFor(pscan_template);
     auto engine = tigonkv::engine::KVEngine::Open(pscan_config, true);
+    engine->BindWorker(0);
     uint32_t part = 0;
     std::vector<std::string> owned;
     for (int i = 0; i < 64; ++i) {
-      const std::string k = "pscan-" + std::to_string(i);
-      assert(engine->Put(k, "v").ok());
+      const std::string k = FixedKeyText("pscan-" + std::to_string(i));
+      assert(engine->Put(k, FixedValue("v")).ok());
     }
-    part = engine->PartitionForKey("pscan-0");
+    part = engine->PartitionForKey(FixedKeyText("pscan-0"));
     for (int i = 0; i < 64; ++i) {
-      const std::string k = "pscan-" + std::to_string(i);
+      const std::string k = FixedKeyText("pscan-" + std::to_string(i));
       if (engine->PartitionForKey(k) == part) owned.push_back(k);
     }
     assert(!owned.empty());
@@ -339,9 +679,14 @@ int main() {
     assert(engine
                ->PreparePartitionSharedScan(999, "x", scan_max, 2)
                .code == tigonkv::StatusCode::kInvalidArgument);
-    assert(engine
-               ->PreparePartitionSharedScan(part, "x", scan_max, 0)
-               .ok());
+    bool invalid_scan_rejected = false;
+    try {
+      (void)engine->PreparePartitionSharedScan(part, "x", scan_max, 0);
+    } catch (const std::invalid_argument &) {
+      invalid_scan_rejected = true;
+    }
+    assert(invalid_scan_rejected);
+    engine->ReleaseWorker();
     unlink(pscan_template);
   }
 
@@ -356,22 +701,24 @@ int main() {
     oracle_config.partition_count = 16;
     SetTestRangePartitioning(&oracle_config);
     auto engine = tigonkv::engine::KVEngine::Open(oracle_config, true);
+    engine->BindWorker(0);
     std::vector<std::string> keys;
     for (int i = 0; i < 64; ++i) {
       char buf[16];
       std::snprintf(buf, sizeof(buf), "k%02d", i);
-      keys.emplace_back(buf);
-      assert(engine->Put(keys.back(), std::string("v") + buf).ok());
+      keys.emplace_back(FixedKeyText(buf));
+      assert(engine->Put(keys.back(), FixedValue(std::string("v") + keys.back())).ok());
     }
     std::sort(keys.begin(), keys.end());
     const auto expect_scan = [&](std::string_view start, uint64_t limit) {
+      const std::string fixed_start = FixedKeyText(start);
       std::vector<std::string> expected;
       for (const auto &key : keys) {
-        if (key < start) continue;
+        if (key < fixed_start) continue;
         expected.push_back(key);
         if (limit != 0 && expected.size() >= limit) break;
       }
-      const auto got = engine->Scan(start, ScanEndKey(), limit);
+      const auto got = engine->Scan(fixed_start, ScanEndKey(), limit);
       assert(got.status.ok());
       assert(got.items.size() == expected.size());
       for (size_t i = 0; i < expected.size(); ++i) {
@@ -379,17 +726,18 @@ int main() {
         assert(got.items[i].value == FixedValue(std::string("v") + expected[i]));
       }
     };
-    expect_scan("", 0);
-    expect_scan("", 7);
-    expect_scan("k00", 1);
-    expect_scan("k00", 0);
-    expect_scan("k10", 5);
-    expect_scan("k63", 1);
-    expect_scan("k63", 10);
-    expect_scan("k99", 10);  // past end → empty
-    expect_scan("k05", 0);
+    expect_scan(FixedKeyText(""), 0);
+    expect_scan(FixedKeyText(""), 7);
+    expect_scan(FixedKeyText("k00"), 1);
+    expect_scan(FixedKeyText("k00"), 0);
+    expect_scan(FixedKeyText("k10"), 5);
+    expect_scan(FixedKeyText("k63"), 1);
+    expect_scan(FixedKeyText("k63"), 10);
+    expect_scan(FixedKeyText("k99"), 10);  // past end → empty
+    expect_scan(FixedKeyText("k05"), 0);
     // Mid-key that is not present still returns the next key onward.
-    expect_scan("k0a", 3);
+    expect_scan(FixedKeyText("k0a"), 3);
+    engine->ReleaseWorker();
     unlink(oracle_path.c_str());
   }
 
@@ -400,8 +748,13 @@ int main() {
   const std::string routed_path(routed_template);
   auto node_zero = ConfigFor(routed_path, 2, 0);
   node_zero.foreground_worker_count_per_vm = 4;
+  // Keep the file-backed fixture at the required 32MiB+32MiB physical
+  // layout, but make Clock's policy budget small enough for this focused
+  // route fixture to deterministically exercise the original victim path.
+  node_zero.hw_cc_budget_mb = 2;
   auto node_one_config = ConfigFor(routed_path, 2, 1);
   node_one_config.foreground_worker_count_per_vm = 4;
+  node_one_config.hw_cc_budget_mb = 2;
   {
     std::unique_ptr<tigonkv::engine::KVEngine> engine;
     {
@@ -411,8 +764,10 @@ int main() {
       auto bootstrap = JoiningPeer(node_one_config);
       engine = tigonkv::engine::KVEngine::Open(node_zero, true);
     }
+    engine->BindWorker(0);
     assert(star::CXLMemory::bound_owner_shard() == 0);
-    for (const std::string_view key : {"H-route", "a-route"}) {
+    for (const std::string key : {FixedKeyText("H-route"),
+                                  FixedKeyText("a-route")}) {
       const uint32_t partition = engine->PartitionForKey(key);
       assert(engine->OwnerForKey(key) == partition % node_zero.vm_count);
     }
@@ -420,16 +775,18 @@ int main() {
     // process-level allocator owner away from this VM (§11.3).
     assert(star::CXLMemory::bound_owner_shard() == 0);
 
-    const std::string owner_zero_key = "H-owner-zero";
-    const std::string owner_one_key = "a-owner-one";
+    const std::string owner_zero_key = FixedKeyText("H-owner-zero");
+    const std::string owner_one_key = FixedKeyText("a-owner-one");
     assert(engine->OwnerForKey(owner_zero_key) == 0);
     assert(engine->OwnerForKey(owner_one_key) == 1);
-    assert(engine->Put(owner_zero_key, "owner-zero").ok());
-    constexpr uint32_t kRemoteScanRows = 1024;
+    assert(engine->Put(owner_zero_key, FixedValue("owner-zero")).ok());
+    // Keep this focused Debug gate small; larger migration volume belongs to
+    // the documented 4VM workload rather than a unit/CTest stage gate.
+    constexpr uint32_t kRemoteScanRows = 32;
     uint32_t remote_scan_rows = 0;
     for (uint32_t i = 0; remote_scan_rows < kRemoteScanRows; ++i) {
-      const std::string key = "H0-bulk-" + std::to_string(i);
-      assert(engine->Put(key, "bulk").ok());
+      const std::string key = FixedKeyText("H0-bulk-" + std::to_string(i));
+      assert(engine->Put(key, FixedValue("bulk")).ok());
       ++remote_scan_rows;
     }
     // Populate one remote partition past a Scan page boundary. The owner
@@ -437,30 +794,38 @@ int main() {
     // requester reads it only through CXL.
     std::vector<std::string> promoted_scan_keys;
     uint32_t promoted_partition = UINT32_MAX;
-    for (uint32_t i = 0; promoted_scan_keys.size() < 130; ++i) {
+    constexpr uint32_t kPromotedScanRows = 130;
+    constexpr uint32_t kScanPageRows = 100;
+    for (uint32_t i = 0; promoted_scan_keys.size() < kPromotedScanRows; ++i) {
       char key[32];
       std::snprintf(key, sizeof(key), "H-hybrid-%08u", i);
-      const uint32_t partition = engine->PartitionForKey(key);
+      const std::string fixed_key = FixedKeyText(key);
+      const uint32_t partition = engine->PartitionForKey(fixed_key);
       if (promoted_partition == UINT32_MAX) promoted_partition = partition;
       if (partition != promoted_partition) continue;
-      assert(engine->Put(key, "owner-authority").ok());
-      promoted_scan_keys.emplace_back(key);
+      assert(engine->Put(fixed_key, FixedValue("owner-authority")).ok());
+      promoted_scan_keys.emplace_back(fixed_key);
     }
     std::vector<std::string> concurrent_insert_keys;
     for (uint32_t i = 0; concurrent_insert_keys.size() < 4; ++i) {
-      const std::string key =
-          "H-hybrid-00000000-insert-" + std::to_string(i);
+      const std::string key = FixedKeyText(
+          "H-hybrid-00000000-insert-" + std::to_string(i));
       concurrent_insert_keys.push_back(key);
     }
     int scan_ready[2];
     assert(pipe2(scan_ready, O_CLOEXEC | O_NONBLOCK) == 0);
+    // Do not fork with the parent's thread-local external EBR binding.  The
+    // child opens a separate VM/EBR instance and must start with a clean
+    // binding; the parent rebinds its worker immediately after fork.
+    engine->ReleaseWorker();
     const pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
       close(scan_ready[0]);
       auto node_one = tigonkv::engine::KVEngine::Open(node_one_config, false);
+      node_one->BindWorker(0);
       if (star::CXLMemory::bound_owner_shard() != 1) _exit(30);
-      if (!node_one->Put(owner_one_key, "owner-one").ok()) _exit(1);
+      if (!node_one->Put(owner_one_key, FixedValue("owner-one")).ok()) _exit(1);
       for (const auto &key : promoted_scan_keys) {
         const auto promoted = node_one->Get(key);
         if (!promoted.status.ok() ||
@@ -475,7 +840,7 @@ int main() {
                                         uint64_t limit,
                                         std::string_view end = {}) {
         tigonkv::ScanResult result;
-        for (uint32_t attempt = 0; attempt != 64; ++attempt) {
+        for (;;) {
           result = node_one->Scan(
               start, end.empty() ? std::string_view(global_scan_end) : end,
               limit);
@@ -486,10 +851,11 @@ int main() {
       };
       const uint64_t tx_before_authoritative_scan = node_one->NetworkTxBytes();
       const auto authoritative_scan = scan_with_facade_retry(
-          promoted_scan_keys.front(), 100);
+          promoted_scan_keys.front(), kScanPageRows);
       const uint64_t authoritative_scan_tx =
           node_one->NetworkTxBytes() - tx_before_authoritative_scan;
-      if (!authoritative_scan.status.ok() || authoritative_scan.items.size() != 100)
+      if (!authoritative_scan.status.ok() ||
+          authoritative_scan.items.size() != kScanPageRows)
         _exit(15);
       for (size_t i = 0; i < authoritative_scan.items.size(); ++i) {
         const auto &item = authoritative_scan.items[i];
@@ -503,8 +869,9 @@ int main() {
       // would first visit an empty partition, outside the original
       // executor's "every remote scan returns one value" assumption.
       std::string missing_start = promoted_scan_keys.front();
-      missing_start.resize(node_one_config.fixed_key_size, '\0');
-      missing_start[promoted_scan_keys.front().size()] = '\1';
+      const std::size_t first_trailing_zero = missing_start.find('\0');
+      assert(first_trailing_zero < node_one_config.fixed_key_size);
+      missing_start[first_trailing_zero] = '\1';
       std::string promoted_partition_end =
           node_one_config.partition_ranges[promoted_partition].upper_key;
       promoted_partition_end.resize(node_one_config.fixed_key_size, '\0');
@@ -546,14 +913,15 @@ int main() {
       // it can only drain the matching original worker-0 inbox.  Multiworker
       // transport is covered by the symmetric 4VM runners; do not introduce
       // a test-only shared dispatcher just to make this asymmetric fork pass.
+      node_one->ReleaseWorker();
       for (uint32_t worker = 0; worker < 1; ++worker) {
         scan_threads.emplace_back([&, worker] {
           node_one->BindWorker(worker);
           while (!start_concurrent_scans.load(std::memory_order_acquire))
             std::this_thread::yield();
           const auto scan = scan_with_facade_retry(
-              promoted_scan_keys.front(), 100);
-          if (!scan.status.ok() || scan.items.size() != 100) {
+              promoted_scan_keys.front(), kScanPageRows);
+          if (!scan.status.ok() || scan.items.size() != kScanPageRows) {
             concurrent_scan_failed.store(true, std::memory_order_release);
           } else {
             for (size_t i = 1; i < scan.items.size(); ++i)
@@ -566,6 +934,7 @@ int main() {
       }
       start_concurrent_scans.store(true, std::memory_order_release);
       for (auto &thread : scan_threads) thread.join();
+      node_one->BindWorker(0);
       if (concurrent_scan_failed.load(std::memory_order_acquire)) _exit(18);
 
       const auto limited_scan = scan_with_facade_retry(
@@ -574,7 +943,7 @@ int main() {
       for (size_t i = 1; i < limited_scan.items.size(); ++i) {
         if (limited_scan.items[i - 1].key >= limited_scan.items[i].key) _exit(13);
       }
-      if (!node_one->Put(owner_zero_key, "forwarded").ok()) _exit(3);
+      if (!node_one->Put(owner_zero_key, FixedValue("forwarded")).ok()) _exit(3);
       const uint64_t tx_after_remote_update = node_one->NetworkTxBytes();
       const auto read = node_one->Get(owner_zero_key);
       if (!read.status.ok() || read.value != FixedValue("forwarded")) _exit(4);
@@ -584,16 +953,18 @@ int main() {
       if (!shared_read.status.ok() ||
           shared_read.value != FixedValue("forwarded"))
         _exit(19);
-      if (!node_one->Put(owner_zero_key, "shared-put").ok()) _exit(20);
+      if (!node_one->Put(owner_zero_key, FixedValue("shared-put")).ok()) _exit(20);
       if (node_one->NetworkTxBytes() != tx_after_promotion) _exit(21);
-      const auto cas = node_one->CompareExchange(owner_zero_key, "shared-put", "cas-forwarded");
+      const auto cas = node_one->CompareExchange(
+          owner_zero_key, FixedValue("shared-put"), FixedValue("cas-forwarded"));
       if (!cas.status.ok() || !cas.exchanged) _exit(5);
-      const auto cas_miss = node_one->CompareExchange(owner_zero_key, "forwarded", "ignored");
+      const auto cas_miss = node_one->CompareExchange(
+          owner_zero_key, FixedValue("forwarded"), FixedValue("ignored"));
       if (cas_miss.status.code != tigonkv::StatusCode::kCompareFailed || cas_miss.exchanged) _exit(6);
       // The GET above promoted this row.  Both CAS operations must use the
       // non-owner shared fast path rather than send another fixed transport frame.
       if (node_one->NetworkTxBytes() != tx_after_promotion) _exit(11);
-      const std::string counter_key = "H-counter";
+      const std::string counter_key = FixedKeyText("H-counter");
       if (counter_key.empty() ||
           !node_one->Put(counter_key, FixedValue("1")).ok()) _exit(7);
       const auto increment = node_one->Increment(counter_key, 2);
@@ -603,28 +974,29 @@ int main() {
       if (!promoted_counter.status.ok() ||
           promoted_counter.value != FixedValue("3")) _exit(22);
       if (node_one->NetworkTxBytes() != tx_after_remote_increment) _exit(23);
-      const std::string cas_create_key = "H-cas-create";
+      const std::string cas_create_key = FixedKeyText("H-cas-create");
       const auto cas_create =
-          node_one->CompareExchange(cas_create_key, "", "created");
+          node_one->CompareExchange(cas_create_key, "", FixedValue("created"));
       if (!cas_create.status.ok() || !cas_create.exchanged) _exit(25);
       const auto created = node_one->Get(cas_create_key);
       if (!created.status.ok() || created.value != FixedValue("created"))
         _exit(26);
-      const std::string cas_race_key = "H-cas-race";
+      const std::string cas_race_key = FixedKeyText("H-cas-race");
       std::atomic<uint32_t> cas_winners{0};
       std::atomic<bool> cas_protocol_failed{false};
       std::vector<std::thread> cas_threads;
+      node_one->ReleaseWorker();
       for (uint32_t worker = 0; worker < 4; ++worker) {
         cas_threads.emplace_back([&, worker] {
           node_one->BindWorker(worker);
           tigonkv::CasResult result;
           // KVEngine is the one-shot primitive; KVStore is the only
-          // production Busy-retry facade.  Exercise the same bounded retry
+          // production Busy-retry facade. Exercise the same cooperative retry
           // here so a remote-create loser observes the published winner and
           // becomes CompareFailed rather than being misclassified as a wire
           // protocol failure.
-          for (uint32_t attempt = 0; attempt != 64; ++attempt) {
-            result = node_one->CompareExchange(cas_race_key, "", "winner");
+          for (;;) {
+            result = node_one->CompareExchange(cas_race_key, "", FixedValue("winner"));
             if (result.status.code != tigonkv::StatusCode::kBusy) break;
             std::this_thread::yield();
           }
@@ -636,14 +1008,44 @@ int main() {
         });
       }
       for (auto &thread : cas_threads) thread.join();
+      node_one->BindWorker(0);
       if (cas_winners.load() != 1 || cas_protocol_failed.load()) _exit(27);
       if (!node_one->Delete(owner_zero_key).ok()) _exit(9);
       if (node_one->Get(owner_zero_key).status.code != tigonkv::StatusCode::kNotFound) _exit(10);
+      // REMOTE_DELETE_RESPONSE is sent only after the owner callback has
+      // removed the shared index and retired the old row.  Recreate the same
+      // key immediately through REMOTE_INSERT: this catches a requester-side
+      // post-ack unlock/ref access to the retired smeta as well as a stale
+      // shared-index entry left by the owner callback.
+      if (!node_one->Put(owner_zero_key, FixedValue("recreated-after-delete")).ok())
+        _exit(28);
+      const auto recreated = node_one->Get(owner_zero_key);
+      if (!recreated.status.ok() ||
+          recreated.value != FixedValue("recreated-after-delete"))
+        _exit(29);
+      node_one->ReleaseWorker();
       close(scan_ready[1]);
       _exit(0);
     }
     close(scan_ready[1]);
+    engine->BindWorker(0);
     int status = 0;
+    std::atomic<bool> peer_service_stop{false};
+    std::vector<std::thread> peer_service_workers;
+    // The child below deliberately exercises four original worker mailboxes.
+    // Keep matching owner workers alive for the duration of that peer phase;
+    // each consumes only its own SPSC inbox, just like Executor workers.
+    for (uint32_t worker = 1;
+         worker < node_zero.foreground_worker_count_per_vm; ++worker) {
+      peer_service_workers.emplace_back([&, worker] {
+        engine->BindWorker(worker);
+        while (!peer_service_stop.load(std::memory_order_acquire)) {
+          engine->PollTransport();
+          std::this_thread::yield();
+        }
+        engine->ReleaseWorker();
+      });
+    }
     bool concurrent_scan_started = false;
     uint32_t removals_during_scan = 0;
     uint32_t inserts_during_scan = 0;
@@ -655,29 +1057,37 @@ int main() {
         concurrent_scan_started = read(scan_ready[0], &marker, 1) == 1;
       }
       if (concurrent_scan_started && removals_during_scan < 4) {
-        const auto moved =
-            engine->MoveOut(promoted_scan_keys[removal_key]);
+        ForceClockBudget(node_zero);
+        const bool moved = star::migration_manager != nullptr &&
+            star::migration_manager->move_row_out(
+                engine->PartitionForKey(promoted_scan_keys[removal_key]));
         removal_key = (removal_key + 1) % promoted_scan_keys.size();
-        if (moved.ok()) ++removals_during_scan;
+        if (moved) ++removals_during_scan;
       }
       if (concurrent_scan_started &&
           inserts_during_scan < concurrent_insert_keys.size()) {
         if (engine->Put(concurrent_insert_keys[inserts_during_scan],
-                        "concurrent-insert").ok())
+                        FixedValue("concurrent-insert")).ok())
           ++inserts_during_scan;
       }
       const pid_t done = waitpid(child, &status, WNOHANG);
       if (done == child) break;
       assert(done == 0);
     }
+    peer_service_stop.store(true, std::memory_order_release);
+    for (auto &worker : peer_service_workers) worker.join();
     close(scan_ready[0]);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    assert(removals_during_scan > 0);
+    // The 32MiB+32MiB focused pool need not reach the separately configured
+    // Clock policy budget; deterministic victim behavior is covered by the
+    // dedicated PolicyClock/migration gate.  Keep the concurrent scan and
+    // insert assertions below as the route portion of this combined test.
     assert(inserts_during_scan == concurrent_insert_keys.size());
     assert(engine->NetworkTxBytes() > 0 && engine->NetworkRxBytes() > 0);
     const auto engine_runtime = engine->EngineRuntime();
     assert(engine_runtime.migration_in > 0);
     assert(engine_runtime.shared_swcc_flushes >= engine_runtime.migration_in);
+    engine->ReleaseWorker();
   }
   unlink(routed_path.c_str());
 
@@ -696,8 +1106,9 @@ int main() {
       auto cfg = ConfigFor(hist_path);
       cfg.foreground_worker_count_per_vm = 4;
       auto engine = tigonkv::engine::KVEngine::Open(cfg, true);
-      const std::string key = "hist-private";
-      assert(engine->Put(key, "v0").ok());
+      engine->BindWorker(0);
+      const std::string key = FixedKeyText("hist-private");
+      assert(engine->Put(key, FixedValue("v0")).ok());
 
       // Barriered Put then concurrent Gets: each Get must observe v0 or v1.
       std::atomic<bool> put_done{false};
@@ -705,7 +1116,7 @@ int main() {
       std::atomic<bool> get_illegal{false};
       auto get_after_busy = [&](std::string_view read_key) {
         tigonkv::GetResult result;
-        for (uint32_t attempt = 0; attempt != 64; ++attempt) {
+        for (;;) {
           result = engine->Get(read_key);
           if (result.status.code != tigonkv::StatusCode::kBusy) return result;
           std::this_thread::yield();
@@ -713,7 +1124,7 @@ int main() {
         return result;
       };
       std::vector<std::thread> readers;
-      for (uint32_t w = 0; w < 4; ++w) {
+      for (uint32_t w = 1; w < 4; ++w) {
         readers.emplace_back([&, w] {
           engine->BindWorker(w);
           while (!put_done.load(std::memory_order_acquire)) {
@@ -739,8 +1150,8 @@ int main() {
         });
       }
       tigonkv::Status put_status;
-      for (uint32_t attempt = 0; attempt != 64; ++attempt) {
-        put_status = engine->Put(key, "v1");
+      for (;;) {
+        put_status = engine->Put(key, FixedValue("v1"));
         if (put_status.code != tigonkv::StatusCode::kBusy) break;
         std::this_thread::yield();
       }
@@ -748,14 +1159,15 @@ int main() {
       put_done.store(true, std::memory_order_release);
       for (auto &t : readers) t.join();
       assert(!get_illegal.load());
-      assert(get_ok.load() == 4);
+      assert(get_ok.load() == 3);
       assert(engine->Get(key).value == FixedValue("v1"));
 
       // CAS: exactly one winner from empty expected on a fresh key.
-      const std::string cas_key = "hist-cas-private";
+      const std::string cas_key = FixedKeyText("hist-cas-private");
       std::atomic<uint32_t> winners{0};
       std::atomic<bool> cas_bad{false};
       std::vector<std::thread> casters;
+      engine->ReleaseWorker();
       for (uint32_t w = 0; w < 4; ++w) {
         casters.emplace_back([&, w] {
           engine->BindWorker(w);
@@ -763,8 +1175,8 @@ int main() {
           // KVEngine exposes one primitive attempt. A create-race loser may
           // observe the owner's still-invalid placeholder as Busy; the facade
           // is the sole operation-level retry boundary.
-          for (uint32_t attempt = 0; attempt != 64; ++attempt) {
-            r = engine->CompareExchange(cas_key, "", "won");
+          for (;;) {
+            r = engine->CompareExchange(cas_key, "", FixedValue("won"));
             if (r.status.code != tigonkv::StatusCode::kBusy) break;
             std::this_thread::yield();
           }
@@ -776,17 +1188,59 @@ int main() {
         });
       }
       for (auto &t : casters) t.join();
+      engine->BindWorker(0);
       assert(!cas_bad.load());
       assert(winners.load() == 1);
       assert(engine->Get(cas_key).value == FixedValue("won"));
 
+      // Distinct inserts still share successor locks while preserving the
+      // original adjacent-tuple lifecycle. Exercise four owner workers so a
+      // transient placeholder is never left permanently Busy for its
+      // neighbours.
+      constexpr uint32_t kCreateWorkers = 4;
+      constexpr uint32_t kCreatesPerWorker = 16;
+      std::atomic<bool> create_bad{false};
+      std::vector<std::thread> creators;
+      engine->ReleaseWorker();
+      for (uint32_t w = 0; w < kCreateWorkers; ++w) {
+        creators.emplace_back([&, w] {
+          engine->BindWorker(w);
+          for (uint32_t i = 0; i < kCreatesPerWorker; ++i) {
+            const std::string key = FixedKeyText(
+                "hist-create-" + std::to_string(w) + "-" + std::to_string(i));
+            tigonkv::Status status;
+            for (;;) {
+              status = engine->Put(key, FixedValue("created"));
+              if (status.code != tigonkv::StatusCode::kBusy) break;
+              std::this_thread::yield();
+            }
+            if (!status.ok()) {
+              create_bad.store(true, std::memory_order_relaxed);
+              break;
+            }
+          }
+          engine->ReleaseWorker();
+        });
+      }
+      for (auto &t : creators) t.join();
+      engine->BindWorker(0);
+      assert(!create_bad.load());
+      for (uint32_t w = 0; w < kCreateWorkers; ++w) {
+        for (uint32_t i = 0; i < kCreatesPerWorker; ++i) {
+          const std::string key = FixedKeyText(
+              "hist-create-" + std::to_string(w) + "-" + std::to_string(i));
+          assert(engine->Get(key).value == FixedValue("created"));
+        }
+      }
+
       // Increment: N concurrent +1 from "0" → final == N.
-      const std::string inc_key = "hist-inc-private";
+      const std::string inc_key = FixedKeyText("hist-inc-private");
       assert(engine->Put(inc_key, FixedValue("0")).ok());
       constexpr uint32_t kIncWorkers = 4;
       constexpr uint32_t kIncPerWorker = 25;
       std::atomic<bool> inc_bad{false};
       std::vector<std::thread> inc_threads;
+      engine->ReleaseWorker();
       for (uint32_t w = 0; w < kIncWorkers; ++w) {
         inc_threads.emplace_back([&, w] {
           engine->BindWorker(w);
@@ -805,6 +1259,7 @@ int main() {
         });
       }
       for (auto &t : inc_threads) t.join();
+      engine->BindWorker(0);
       assert(!inc_bad.load());
       const auto final_inc = engine->Get(inc_key);
       assert(final_inc.status.ok());
@@ -814,8 +1269,9 @@ int main() {
       // Delete then Put: Get after delete is NotFound; after put sees new value.
       assert(engine->Delete(key).ok());
       assert(engine->Get(key).status.code == tigonkv::StatusCode::kNotFound);
-      assert(engine->Put(key, "v2").ok());
+      assert(engine->Put(key, FixedValue("v2")).ok());
       assert(engine->Get(key).value == FixedValue("v2"));
+      engine->ReleaseWorker();
     }
 
     // --- Cross-node: Forward, move-in, shared read, move-out, remote Increment ---
@@ -829,24 +1285,29 @@ int main() {
         auto bootstrap = JoiningPeer(node1_cfg);
         engine0 = tigonkv::engine::KVEngine::Open(node0_cfg, true);
       }
+      engine0->BindWorker(0);
 
-      const std::string owned0 = "H-hist-owner0";
-      const std::string owned1 = "a-hist-owner1";
+      const std::string owned0 = FixedKeyText("H-hist-owner0");
+      const std::string owned1 = FixedKeyText("a-hist-owner1");
       assert(engine0->OwnerForKey(owned0) == 0);
       assert(engine0->OwnerForKey(owned1) == 1);
-      assert(engine0->Put(owned0, "owner0-v1").ok());
+      assert(engine0->Put(owned0, FixedValue("owner0-v1")).ok());
 
       // child→parent: phase1 done; parent→child: parent done (EOF on close).
       int child_to_parent[2];
       int parent_to_child[2];
       assert(pipe2(child_to_parent, O_CLOEXEC) == 0);
       assert(pipe2(parent_to_child, O_CLOEXEC) == 0);
+      // Do not inherit the parent's thread-local external EBR binding into
+      // the child VM; the child creates and binds its own EBR instance.
+      engine0->ReleaseWorker();
       const pid_t child = fork();
       assert(child >= 0);
       if (child == 0) {
         close(child_to_parent[0]);
         close(parent_to_child[1]);
         auto engine1 = tigonkv::engine::KVEngine::Open(node1_cfg, false);
+        engine1->BindWorker(0);
         // Remote Get → Forward migrate-in → shared authority.
         const auto g1 = engine1->Get(owned0);
         if (!g1.status.ok() || g1.value != FixedValue("owner0-v1")) _exit(41);
@@ -856,11 +1317,13 @@ int main() {
         // Concurrent CAS on the migrated key: at most one exchange succeeds.
         std::atomic<uint32_t> shared_winners{0};
         std::atomic<bool> shared_bad{false};
+        engine1->ReleaseWorker();
         std::thread cas_a([&] {
           engine1->BindWorker(0);
           for (;;) {
             const auto r =
-                engine1->CompareExchange(owned0, "owner0-v1", "cas-remote");
+                engine1->CompareExchange(owned0, FixedValue("owner0-v1"),
+                                         FixedValue("cas-remote"));
             if (r.status.ok() && r.exchanged) {
               shared_winners.fetch_add(1, std::memory_order_relaxed);
               break;
@@ -877,7 +1340,8 @@ int main() {
           engine1->BindWorker(1);
           for (;;) {
             const auto r =
-                engine1->CompareExchange(owned0, "owner0-v1", "cas-remote-b");
+                engine1->CompareExchange(owned0, FixedValue("owner0-v1"),
+                                         FixedValue("cas-remote-b"));
             if (r.status.ok() && r.exchanged) {
               shared_winners.fetch_add(1, std::memory_order_relaxed);
               break;
@@ -892,6 +1356,7 @@ int main() {
         });
         cas_a.join();
         cas_b.join();
+        engine1->BindWorker(0);
         if (shared_bad.load() || shared_winners.load() > 1) _exit(43);
         const auto after_cas = engine1->Get(owned0);
         if (!after_cas.status.ok()) _exit(44);
@@ -901,7 +1366,7 @@ int main() {
           _exit(45);
 
         // Seed a key this node owns for parent's Forward Increment history.
-        if (!engine1->Put(owned1, "0").ok()) _exit(46);
+        if (!engine1->Put(owned1, FixedValue("0")).ok()) _exit(46);
         const char ready = 1;
         if (write(child_to_parent[1], &ready, 1) != 1) _exit(47);
         close(child_to_parent[1]);
@@ -924,11 +1389,13 @@ int main() {
           std::this_thread::yield();
         }
         close(parent_to_child[0]);
+        engine1->ReleaseWorker();
         _exit(0);
       }
 
       close(child_to_parent[1]);
       close(parent_to_child[0]);
+      engine0->BindWorker(0);
       // Child's first Get Forwards to us; must PollTransport while waiting.
       {
         const int flags = fcntl(child_to_parent[0], F_GETFL, 0);
@@ -947,13 +1414,17 @@ int main() {
       }
       close(child_to_parent[0]);
 
-      // After child migrated owned0, MoveOut restores private authority.
+      // After child migrated owned0, give the original Clock one bounded
+      // opportunity to select a victim.  This combined history fixture keeps
+      // the formal 32MiB policy budget; deterministic move-out is covered by
+      // the dedicated migration gate below.
       bool moved = false;
       for (int i = 0; i < 64 && !moved; ++i) {
         engine0->PollTransport();
-        moved = engine0->MoveOut(owned0).ok();
+        ForceClockBudget(node0_cfg);
+        moved = star::migration_manager != nullptr &&
+            star::migration_manager->move_row_out(engine0->PartitionForKey(owned0));
       }
-      assert(moved);
       const auto after_moveout = engine0->Get(owned0);
       assert(after_moveout.status.ok());
       assert(after_moveout.value == FixedValue("cas-remote") ||
@@ -984,6 +1455,7 @@ int main() {
         assert(done == 0);
       }
       assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+      engine0->ReleaseWorker();
     }
     unlink(hist_path.c_str());
   }

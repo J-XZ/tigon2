@@ -14,60 +14,77 @@
 
 namespace tigonkv::engine {
 
-// Process-local, non-owning ITable view of one owner-private partition.  This
-// keeps PolicyClock and the original TwoPLPasha table callbacks on their
-// existing ITable contract; persistent rows and tree nodes remain owned by
-// KVPartition's owner-private SWCC arena.
-class KvPartitionTable final : public star::ITable {
+// Storage policy for the original core/Table.h TableBTreeOLC body.  It keeps
+// only offsets in the B+Tree value and resolves the owner-private row through
+// the partition's existing allocator binding.
+struct RegionOffsetRowStorage {
+  using MetaDataType = std::atomic<uint64_t>;
+  using ValueStruct = PrivateValueStruct;
+  using StoredRow = RegionOffset;
+
+  KVPartition *partition = nullptr;
+  uint32_t key_size = 0;
+  uint32_t value_size = 0;
+  btreeolc_cxl::TreeNodeAllocation binding{};
+  void *persisted_root = nullptr;
+
+  StoredRow AllocateAndConstruct(const void *value, bool is_placeholder) const;
+  void DestroyUnpublished(StoredRow row) const;
+  void Retire(StoredRow row) const;
+  StoredRow Null() const { return kNullOffset; }
+  MetaDataType *Meta(StoredRow row) const;
+  void *Data(StoredRow row) const;
+  void *AdjacentMeta(StoredRow row) const;
+  void Update(StoredRow row, const void *value) const;
+  void Deserialize(StoredRow row, star::StringPiece bytes) const;
+  void Serialize(star::Encoder &encoder, const void *value) const;
+  std::size_t KeySize(std::size_t) const { return key_size; }
+  std::size_t ValueSize() const { return value_size; }
+  std::size_t FieldSize() const { return value_size; }
+
+  template <typename BTree>
+  std::unique_ptr<BTree> MakeTree() const {
+    if (persisted_root != nullptr)
+      return std::make_unique<BTree>(binding, persisted_root);
+    return std::make_unique<BTree>(binding);
+  }
+  template <typename BTree>
+  void BindPublishedRoot(BTree &tree, std::atomic<uint64_t> *slot) const {
+    tree.bind_published_root(reinterpret_cast<std::atomic<RegionOffset> *>(slot));
+  }
+  template <typename BTree>
+  uint64_t RootOffset(const BTree &tree) const {
+    return tree.root_offset_for_persistence();
+  }
+  bool IsNull(StoredRow row) const { return row == kNullOffset; }
+};
+
+using KvTableBase = star::TableBTreeOLC<
+    FixedKey, FixedKey, FixedKeyComparator, FixedKeyComparator,
+    star::MetaInitFuncNothing, btreeolc_cxl::BPlusTree,
+    RegionOffsetRowStorage>;
+
+// This is only the process-local non-owning binding expected by the existing
+// KV facade.  All B+Tree operations and callbacks remain in the master-derived
+// TableBTreeOLC body.
+class KvPartitionTable final : public KvTableBase {
  public:
-  KvPartitionTable(KVPartition *partition, uint32_t key_size, uint32_t value_size)
-      : partition_(partition), key_size_(key_size), value_size_(value_size) {}
+  KvPartitionTable(KVPartition *partition, uint32_t key_size,
+                   uint32_t value_size,
+                   const btreeolc_cxl::TreeNodeAllocation &binding,
+                   void *persisted_root, bool create_max_sentinel);
 
   KVPartition *partition() const { return partition_; }
-
-  uint64_t get_plain_key(const void *) override;
-  int compare_key(const void *a, const void *b) override;
-  std::tuple<MetaDataType *, void *> search(const void *) override;
-  void *search_value(const void *) override;
-  MetaDataType *search_metadata(const void *) override;
-  void scan(const void *,
-            std::function<bool(const void *, MetaDataType *, void *, bool)>) override;
-  bool insert(const void *, const void *, bool = false) override;
-  bool insert_lock_next_key(
-      const void *, const void *,
-      std::function<bool(const void *, MetaDataType *, void *)>,
-      bool = false) override;
-  bool insert_and_process_adjacent_tuples(
-      const void *, const void *,
-      std::function<bool(const void *, MetaDataType *, void *, const void *,
-                         MetaDataType *, void *)>,
-      bool = false) override;
-  bool remove(const void *) override;
-  bool remove_and_process_adjacent_tuples(
-      const void *,
-      std::function<bool(const void *, void *, void *, const void *, void *,
-                         void *, const void *, void *, void *)>) override;
-  void update(const void *, const void *,
-              std::function<void(const void *, const void *)> = {}) override;
-  bool search_and_update_next_key_info(
-      const void *,
-      std::function<void(const void *, void *, void *, const void *, void *,
-                         void *, const void *, void *, void *)>) override;
-  void deserialize_value(const void *, star::StringPiece) override;
-  void serialize_value(star::Encoder &, const void *) override;
-  std::size_t key_size() override { return key_size_; }
-  std::size_t value_size() override { return value_size_; }
-  std::size_t field_size() override { return value_size_; }
-  std::size_t tableID() override { return 0; }
-  std::size_t partitionID() override { return partition_->partition_id(); }
- int tableType() override { return ITable::BTREE; }
+  bool LookupOffset(const FixedKey &key, RegionOffset *offset) const;
+  RegionOffset root_offset_for_persistence() const {
+    return static_cast<RegionOffset>(KvTableBase::root_offset_for_persistence());
+  }
+  void BindPublishedRoot(std::atomic<RegionOffset> *slot) {
+    KvTableBase::bind_published_root(slot);
+  }
 
  private:
-  std::tuple<MetaDataType *, void *> Row(RegionOffset offset) const;
-  void FillAdjacent(RegionOffset *offset, void **meta, void **data) const;
   KVPartition *partition_;
-  uint32_t key_size_;
-  uint32_t value_size_;
 };
 
 // Owns the process-local PolicyClock and per-partition ITable adapters.
@@ -81,14 +98,16 @@ class KvMigrationRuntime {
                uint32_t partition_count, uint64_t hw_cc_budget_per_host);
 
   KvPartitionTable *TableFor(uint32_t partition_id) const;
+  star::TwoPLPashaHelper *helper() const { return helper_.get(); }
   star::PolicyClock *clock() const { return clock_.get(); }
 
-  // Sync CXLMemory TOTAL_HW_CC_USAGE from dual-region domain accounting so
-  // PolicyClock's original budget check sees KV HWCC usage.
-  static void SyncHwCcUsage(const KVPartition &partition);
-
  private:
-  std::vector<std::unique_ptr<KvPartitionTable>> tables_;
+  std::vector<KvPartitionTable *> tables_;
+  // Original helper shape, deliberately fixed to one logical table.  The
+  // entries are non-owning process-local CXLTable wrappers reconstructed for
+  // every visible partition.
+  std::vector<std::vector<star::CXLTableBase *>> cxl_tbl_vecs_;
+  std::unique_ptr<star::TwoPLPashaHelper> helper_;
   std::unique_ptr<star::PolicyClock> clock_;
 };
 

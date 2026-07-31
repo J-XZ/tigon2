@@ -26,11 +26,11 @@ TigonKV 不使用 `dependencies/cxlalloc/libcxlalloc_static.a` 作为最终共�
 |---|---|
 | attach | 同一 mmap 文件在独立进程重新映射后 offset 可恢复 |
 | 分域 | HWCC 动态域、owner-private/shared-payload SWCC 及两池 allocator metadata 均独立记账 |
-| 回收 | 本地及 remote free 可复用，owner-shard 不匹配 hard fail |
+| 回收 | 仅 owner 对本 arena 的本地 free 可复用；跨 owner free 是协议错误并 hard-fail |
 | 可见性 | SWCC 链发布在 flush/fence 后对远端可见 |
-| 有界性 | 每线程 size-class TLS cache（容量 32，miss 时批量 refill）有固定上限；进程 DRAM 不随 KV 数线性增长 |
+| 有界性 | freelist/bump 在 owner-private control 下按 size-class 工作，无每线程 TLS cache/batch refill；进程 DRAM 不随 KV 数线性增长 |
 
-`region_allocator_test` 覆盖 attach、域记账、remote free、reuse、并发及跨域
+`region_allocator_test` 覆盖 attach、域记账、跨 owner free 拒绝、reuse、并发及跨域
 拒绝；这些场景由同一测试程序一次执行，不再用多个别名重复计入测试数量。用户
 已授权真实 VM/NUMA 操作；已有历史证据不替代当前 HEAD 的 fresh validation，
 最终结论以本轮 preflight 与连续测试记录为准。

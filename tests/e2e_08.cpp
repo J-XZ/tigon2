@@ -76,6 +76,7 @@ int main() {
   const std::string path = EnvOr("TIGONKV_E2E_BACKING", "/tmp/tigonkv-e2e-08-" + std::to_string(getpid()));
   std::remove(path.c_str());
   auto owner = KVStore::Create(ConfigFor(path, 0), true);
+  owner->BindWorker(0);
   int stop_pipe[2];
   int ack_pipe[2];
   assert(pipe(stop_pipe) == 0);
@@ -89,6 +90,7 @@ int main() {
     if (flags < 0 || fcntl(stop_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) _exit(20);
     try {
       auto remote_owner = tigonkv::engine::KVEngine::Open(ConfigFor(path, 1), false);
+      remote_owner->BindWorker(0);
       char stop = 0;
       for (;;) {
         const ssize_t read_bytes = read(stop_pipe[0], &stop, 1);
@@ -96,9 +98,15 @@ int main() {
           const char ack = 'd';
           if (write(ack_pipe[1], &ack, 1) != 1) _exit(25);
         }
-        if (read_bytes == 1 && stop == 'q') _exit(0);
+        if (read_bytes == 1 && stop == 'q') {
+          remote_owner->ReleaseWorker();
+          _exit(0);
+        }
         if (read_bytes == 1 && stop != 'd') _exit(21);
-        if (read_bytes == 0) _exit(0);
+        if (read_bytes == 0) {
+          remote_owner->ReleaseWorker();
+          _exit(0);
+        }
         if (read_bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) _exit(22);
         remote_owner->PollTransport();
       }
@@ -163,6 +171,7 @@ int main() {
   int service_status = 0;
   assert(waitpid(service, &service_status, 0) == service);
   assert(WIFEXITED(service_status) && WEXITSTATUS(service_status) == 0);
+  owner->ReleaseWorker();
   owner.reset(); std::remove(path.c_str());
   return 0;
 }

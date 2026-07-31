@@ -306,16 +306,6 @@ inline void PrintThreadTopology(const Config &config, uint64_t foreground) {
             << "\n";
 }
 
-inline void DrainTransport(KVStore &store) {
-  const uint64_t drain_ms = PositiveEnv("TIGONKV_E2E_TRANSPORT_DRAIN_MS", 5000);
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(drain_ms);
-  while (std::chrono::steady_clock::now() < deadline) {
-    const Status status = store.PollTransport();
-    if (!status.ok()) throw std::runtime_error("phase transport drain failed: " + status.message);
-    std::this_thread::yield();
-  }
-}
-
 // Reuse the trace-runner host-release protocol for the standalone guest E2E
 // suites. Guests do not share a filesystem; the host creates the same marker
 // locally on every VM only after every replay has completed. Until then this
@@ -388,7 +378,6 @@ inline int RunE2E08MultiVm() {
   } else {
     throw std::invalid_argument("e2e08 phase must be fill or read");
   }
-  DrainTransport(*main_store);
   std::cout << "E2E_08_PHASE_TIME_US node=" << config.node_id << " phase=" << phase
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";
   std::cout << "E2E_08_THREADS node=" << config.node_id << " threads="
@@ -444,7 +433,6 @@ inline int RunE2E09MultiVm() {
   } else {
     throw std::invalid_argument("e2e09 phase must be fill, update, read, or mixed");
   }
-  DrainTransport(*main_store);
   std::cout << "E2E_09_PHASE_TIME_US node=" << config.node_id << " phase=" << phase
             << " duration_us=" << result.duration_us << " op_count=" << result.operations << "\n";
   std::cout << "E2E_09_THREADS node=" << config.node_id << " threads="

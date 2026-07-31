@@ -1,5 +1,7 @@
 #include "core/Table.h"
 
+bool do_tid_check = false;
+
 namespace star {
 
 void tid_check()

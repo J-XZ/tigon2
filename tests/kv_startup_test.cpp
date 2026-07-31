@@ -4,12 +4,14 @@
 #undef NDEBUG
 #endif
 #include <cassert>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <fcntl.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 namespace {
@@ -22,12 +24,12 @@ void SetTestRangePartitioning(tigonkv::Config *config) {
 tigonkv::Config ConfigFor(const std::string &path, uint32_t node_id) {
   tigonkv::Config config;
   config.shared_memory_path = path;
-  config.size_mb = 32;
+  config.size_mb = 64;
   config.hwcc_offset_mb = 0;
-  config.hwcc_size_mb = 16;
-  config.swcc_offset_mb = 16;
-  config.swcc_size_mb = 16;
-  config.hw_cc_budget_mb = 4;
+  config.hwcc_size_mb = 32;
+  config.swcc_offset_mb = 32;
+  config.swcc_size_mb = 32;
+  config.hw_cc_budget_mb = 32;
   config.vm_count = 2;
   config.node_id = node_id;
   config.partition_count = 2;
@@ -48,19 +50,79 @@ tigonkv::Config OneVmConfigFor(const std::string &path, uint32_t value_size) {
   return config;
 }
 
-void WaitForStaticLayout(const char *path) {
-  const int fd = open(path, O_RDONLY);
-  assert(fd >= 0);
-  tigonkv::engine::SharedLayoutHeader header{};
-  for (;;) {
-    const ssize_t bytes = pread(fd, &header, sizeof(header), 0);
-    if (bytes == static_cast<ssize_t>(sizeof(header)) &&
-        header.magic == tigonkv::engine::kSharedLayoutMagic &&
-        header.layout_version == tigonkv::engine::kSharedLayoutVersion)
-      break;
+void WaitForBackingFile(const char *path, off_t bytes) {
+  struct stat info {};
+  while (::stat(path, &info) != 0 || info.st_size != bytes)
     std::this_thread::yield();
+}
+
+tigonkv::engine::DualRegionConfig LayoutOnlyConfig(const std::string &path) {
+  (void)path;
+  tigonkv::engine::DualRegionConfig config;
+  config.total_pool_bytes = 64 * 1024 * 1024;
+  config.hwcc_size_bytes = 32 * 1024 * 1024;
+  config.swcc_offset_bytes = 32 * 1024 * 1024;
+  config.swcc_size_bytes = 32 * 1024 * 1024;
+  config.config_hash = 0x4a1b2c3dULL;
+  config.vm_count = 4;
+  config.partition_count = 1;
+  config.fixed_key_size = 32;
+  config.fixed_value_size = 128;
+  return config;
+}
+
+void RunLayoutOnlyFourVmCase() {
+  char path[] = "/tmp/tigonkv-startup-layout-XXXXXX";
+  const int seed = mkstemp(path);
+  assert(seed >= 0);
+  close(seed);
+  const std::string barrier = std::string(path) + ".attach-barrier";
+  assert(setenv("TIGONKV_TEST_STARTUP_ATTACH_BARRIER", barrier.c_str(), 1) == 0);
+  const auto config = LayoutOnlyConfig(path);
+  const pid_t vm0 = fork();
+  assert(vm0 >= 0);
+  if (vm0 == 0) {
+    try {
+      auto pool = tigonkv::engine::DualRegionMappedPool::Open(path, config, true);
+      pool.allocator().FinalizeStaticHwccLayout();
+      pool.allocator().PublishStaticHwccLayout();
+      pool.allocator().InitializeOwnerPrivateArenas(0);
+      pool.allocator().PublishOwnerInitialized(0);
+      pool.allocator().WaitForOwnersAndPublishReady();
+      _exit(0);
+    } catch (...) {
+      _exit(2);
+    }
   }
-  close(fd);
+  WaitForBackingFile(path, 64 * 1024 * 1024);
+  std::array<pid_t, 3> peers{};
+  for (uint32_t node = 1; node < 4; ++node) {
+    const pid_t child = fork();
+    assert(child >= 0);
+    peers[node - 1] = child;
+    if (child == 0) {
+      try {
+        auto pool = tigonkv::engine::DualRegionMappedPool::Open(path, config, false);
+        pool.allocator().InitializeOwnerPrivateArenas(node);
+        pool.allocator().PublishOwnerInitialized(node);
+        pool.allocator().WaitUntilReady();
+        _exit(0);
+      } catch (...) {
+        _exit(3);
+      }
+    }
+  }
+  int status = 0;
+  assert(waitpid(vm0, &status, 0) == vm0);
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  for (const pid_t peer : peers) {
+    assert(waitpid(peer, &status, 0) == peer);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+  unsetenv("TIGONKV_TEST_STARTUP_ATTACH_BARRIER");
+  unlink(path);
+  unlink(barrier.c_str());
+  unlink((barrier + ".release").c_str());
 }
 
 }  // namespace
@@ -70,6 +132,8 @@ int main() {
   const int seed = mkstemp(path);
   assert(seed >= 0);
   close(seed);
+  const std::string barrier = std::string(path) + ".attach-barrier";
+  assert(setenv("TIGONKV_TEST_STARTUP_ATTACH_BARRIER", barrier.c_str(), 1) == 0);
 
   const pid_t vm0 = fork();
   assert(vm0 >= 0);
@@ -80,21 +144,32 @@ int main() {
     _exit(0);
   }
 
-  WaitForStaticLayout(path);
+  // The attach barrier is intentionally later than file sizing: it proves
+  // that VM1 has entered Attach while VM0 is before the magic publication.
+  WaitForBackingFile(path, 64 * 1024 * 1024);
   auto vm1_engine = tigonkv::engine::KVEngine::Open(ConfigFor(path, 1), false);
   const auto &layout = vm1_engine->Memory();
   (void)layout;
   const std::string internal_max(32, static_cast<char>(0xff));
+  // Public foreground APIs require an explicit worker binding even when this
+  // focused startup check exits at fixed-key validation before touching a row.
+  vm1_engine->BindWorker(0);
   assert(vm1_engine->Get(internal_max).status.code ==
          tigonkv::StatusCode::kInvalidArgument);
   assert(vm1_engine->Put(internal_max, std::string(128, '\0')).code ==
          tigonkv::StatusCode::kInvalidArgument);
   assert(vm1_engine->Scan(internal_max, {}, 1).status.code ==
          tigonkv::StatusCode::kInvalidArgument);
+  vm1_engine->ReleaseWorker();
   int status = 0;
   assert(waitpid(vm0, &status, 0) == vm0);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  unsetenv("TIGONKV_TEST_STARTUP_ATTACH_BARRIER");
   unlink(path);
+  unlink(barrier.c_str());
+  unlink((barrier + ".release").c_str());
+
+  RunLayoutOnlyFourVmCase();
 
   // Original Message/MessagePiece framing must fit one MPSC record. The
   // largest remote-insert request is 108 bytes plus the fixed value: 1931

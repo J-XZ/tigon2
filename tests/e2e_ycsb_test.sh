@@ -18,6 +18,8 @@ tigonkv_e2e_multivm_preflight
 traces=${TIGONKV_E2E_YCSB_TRACES:-$root/results/e2e_ycsb_traces}
 logs=${TIGONKV_E2E_CTEST_LOG_ROOT:-$(mktemp -d /tmp/tigonkv-e2e-ycsb-XXXXXX)}
 mkdir -p "$logs"
+prepare_config=""
+trap '[[ -z ${prepare_config:-} ]] || rm -f -- "$prepare_config"' EXIT
 
 need_prepare=0
 if [[ ! -d "$traces/load" || ! -d "$traces/workloada" ]]; then
@@ -29,6 +31,15 @@ else
 fi
 if (( need_prepare )); then
   echo "TIGONKV_E2E_YCSB preparing traces at $traces"
+  prepare_config=$(mktemp "$logs/prepare-config.XXXXXX")
+  cp -- "$TIGONKV_EXPERIMENT_CONFIG_JSONC" "$prepare_config"
+  splitter="$TIGONKV_E2E_BINARY_DIR/ycsb_partition_splits"
+  [[ -x "$splitter" ]] || {
+    echo "missing build-tree splitter: $splitter" >&2
+    exit 2
+  }
+  TIGONKV_EXPERIMENT_CONFIG_JSONC="$prepare_config" \
+  TIGONKV_YCSB_PARTITION_SPLITS="$splitter" \
   "$root/prepare_e2e_ycsb_traces.sh" --out-dir "$traces" \
     --record-count "${TIGONKV_E2E10_RECORD_COUNT:-100000}" \
     --operation-count "${TIGONKV_E2E10_OPERATION_COUNT:-100000}" \

@@ -4,6 +4,8 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 config="${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}"; check_ssh=true
 while (($#)); do case "$1" in --config) config=$2; shift;; --no-ssh) check_ssh=false;; -h|--help) echo "usage: $0 [--config PATH] [--no-ssh]"; exit 0;; *) echo "unknown option: $1" >&2; exit 2;; esac; shift; done
 source "$root/scripts/tigonkv_vm_common.sh"; tigonkv_load_vm_config "$config"; tigonkv_validate_vm_config false
+tigonkv_assert_host_test_isolated
+tigonkv_assert_qemu_group expected
 
 [[ -e "$TIGONKV_SHARED_BACKING" ]] || { echo "shared backing missing: $TIGONKV_SHARED_BACKING" >&2; exit 2; }
 mountpoint -q -- "$TIGONKV_SHARED_PATH" || { echo "shared_memory.path is not a mountpoint: $TIGONKV_SHARED_PATH" >&2; exit 2; }

@@ -99,6 +99,22 @@ cmake --build build-relwithdebinfo -j$(nproc)
 
 确认 `traces/`、`run_meta.json` 后再去掉 `--prepare-only` 正式跑（可加 `--skip-trace-gen` 复用）。
 
+准备阶段会在生成共享 load trace 后调用：
+
+```bash
+build-relwithdebinfo/ycsb_partition_splits \
+  --trace-dir OUT/traces/load --config OUT/configs/experiment_config_ycsb_4vm.jsonc \
+  --workers 16 --fixed-key-size 32 [--sample-stride N]
+```
+
+该工具默认以固定 stride=64 采样 load key，写入三个严格递增的 range split，并在
+`logs/partition_splits.log` 记录 trace/split digest、sample stride、每 partition 的
+load 行数、owner 与代表 key。正式运行前必须保留该文件，确认四个 partition 均有行且
+没有全 `0xff` 内部哨兵；不能按 A--E 访问热度重新分割。若完整 load 核对不满足
+1.25 均衡要求，只能显式将 `--sample-stride` 设为更小的固定值以提高采样密度（例如 16）并重新生成
+整套配置和 trace 元数据；这不是运行时自适应，实际使用的 stride 必须记录在
+`run_meta.json` 与 `partition_splits.log`。
+
 ---
 
 ## 4. 产物与怎么看结果
@@ -139,9 +155,11 @@ python3 scripts/summarize_ycsb_experiment.py \
 1. **1M 不是脚本默认**（默认 10 万）；必须显式传 `1000000`。
 2. **`--no-latency` 必加**，否则可能仍带默认 latency 配置（脚本只在该开关下关 enabled）。
 3. **`--shared-size-mb 32768`** 与根配置一致；若 OOM/arena 不够再升到 `65536`（须为 2 的幂）。
-4. 含 **E** 时 Scan 更重，可把 `--round-timeout` 调大（默认 7200s）。E 是全局
-   兼容 Scan（hash partition k 路归并），**不等价**于原始 TwoPLPasha 单
-   partition native Scan；正式报告须分开表述。DumpStats 的
+4. 含 **E** 时 Scan 更重，可把 `--round-timeout` 调大（默认 7200s）。E 使用
+   TigonKV 的原生 range-partition Scan：从 `PartitionForKey(start)` 按范围顺序
+   推进，远端先 CXL 探测，只有 adjacency 不完整才请求该 owner 做 key-only range
+   move-in；不做 hash partition 或全分区 k 路归并。它仍与 cxlkv 的单全局树 Scan
+   有结构差异，正式报告须单独说明。DumpStats 的
    `scan_migrate_rpcs` / `scan_partition_probes` / `scan_rows_returned` 用于
    判断 shared-index 命中后是否仍大量 RPC、以及 Scan 是否真返回了行。
 5. 实际 init/kill 必须 `--allow-state-change`；Ask 模式我无法替你执行。

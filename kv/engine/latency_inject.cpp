@@ -245,14 +245,8 @@ struct CacheState {
 struct ThreadState {
   const LatencySimulator *active = nullptr;
   ScopeKind scope = ScopeKind::kOther;
-  uint64_t scope_depth = 0;
   uint64_t generation = 0;
   uint64_t pending_delay_ns = 0;
-  bool isolated = false;
-  const LatencySimulator *saved_active = nullptr;
-  ScopeKind saved_scope = ScopeKind::kOther;
-  uint64_t saved_scope_depth = 0;
-  uint64_t saved_pending_delay_ns = 0;
   uint64_t rng = 0x6a09e667f3bcc909ULL;
   CacheState cache;
 };
@@ -377,13 +371,11 @@ void LatencySimulator::BeginScope(ScopeKind scope) {
   }
   ThreadState &state = StateFor(this, config_, generation_);
   if (state.active == this) {
-    ++state.scope_depth;
-    return;
+    throw std::logic_error("nested latency scope is forbidden");
   }
   state.active = ScopeEnabled(config_, scope) ? this : nullptr;
   state.scope = scope;
   state.pending_delay_ns = 0;
-  state.scope_depth = state.active == this ? 1 : 0;
 }
 
 void LatencySimulator::EndScopeAndDelay() {
@@ -394,70 +386,16 @@ void LatencySimulator::EndScopeAndDelay() {
   if (state.active != this) {
     return;
   }
-  if (state.scope_depth > 1) {
-    --state.scope_depth;
-    return;
-  }
   const uint64_t delay_ns = state.pending_delay_ns;
   state.pending_delay_ns = 0;
-  state.scope_depth = 0;
   state.active = nullptr;
   DelaySpinNs(delay_ns);
 }
 
-void LatencySimulator::BeginIsolatedScope(ScopeKind scope) {
-  if (!g_instrumentation_enabled.load(std::memory_order_relaxed)) return;
-  ThreadState &state = StateFor(this, config_, generation_);
-  if (state.isolated)
-    throw std::runtime_error("nested isolated latency scopes are forbidden");
-  state.isolated = true;
-  state.saved_active = state.active;
-  state.saved_scope = state.scope;
-  state.saved_scope_depth = state.scope_depth;
-  state.saved_pending_delay_ns = state.pending_delay_ns;
-  state.active = ScopeEnabled(config_, scope) ? this : nullptr;
-  state.scope = scope;
-  state.scope_depth = state.active == this ? 1 : 0;
-  state.pending_delay_ns = 0;
-}
-
-void LatencySimulator::DelayActiveScopeNow() {
-  if (!g_instrumentation_enabled.load(std::memory_order_relaxed)) return;
-  ThreadState &state = StateFor(this, config_, generation_);
-  if (state.active != this) return;
-  const uint64_t delay_ns = state.pending_delay_ns;
-  state.pending_delay_ns = 0;
-  DelaySpinNs(delay_ns);
-}
-
-void LatencySimulator::DelayIsolatedScopeNow() {
-  if (!g_instrumentation_enabled.load(std::memory_order_relaxed)) return;
-  ThreadState &state = StateFor(this, config_, generation_);
-  if (!state.isolated || state.active != this) return;
-  const uint64_t delay_ns = state.pending_delay_ns;
-  state.pending_delay_ns = 0;
-  DelaySpinNs(delay_ns);
-}
-
-void LatencySimulator::EndIsolatedScopeAndDelay() {
-  if (!g_instrumentation_enabled.load(std::memory_order_relaxed)) return;
-  ThreadState &state = StateFor(this, config_, generation_);
-  if (!state.isolated)
-    throw std::runtime_error("isolated latency scope is not active");
-  if (state.active == this) {
-    const uint64_t delay_ns = state.pending_delay_ns;
-    state.pending_delay_ns = 0;
-    DelaySpinNs(delay_ns);
-  }
-  state.active = state.saved_active;
-  state.scope = state.saved_scope;
-  state.scope_depth = state.saved_scope_depth;
-  state.pending_delay_ns = state.saved_pending_delay_ns;
-  state.isolated = false;
-  state.saved_active = nullptr;
-  state.saved_scope = ScopeKind::kOther;
-  state.saved_scope_depth = 0;
-  state.saved_pending_delay_ns = 0;
+bool LatencySimulator::HasActiveScopeForCurrentThread() const {
+  if (!g_instrumentation_enabled.load(std::memory_order_relaxed)) return false;
+  const auto it = g_tls.find(this);
+  return it != g_tls.end() && it->second.active == this;
 }
 
 void LatencySimulator::RecordLine(PoolKind pool, AccessKind kind,

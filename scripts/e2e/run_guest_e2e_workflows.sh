@@ -41,26 +41,10 @@ remote() {
 }
 
 kill_guest_suite() {
-  local suite=$1 vm=$2 runner quoted_runner
-  runner="$remote_root/build/e2e_${suite}"
-  printf -v quoted_runner '%q' "$runner"
-  # Guest images need not provide killall.  Match /proc/exe rather than COMM:
-  # an interrupted run can otherwise keep the shared transport rings live
-  # while the next fresh-pool round starts.
-  remote "$vm" "runner=$quoted_runner; \
-for proc in /proc/[0-9]*; do \
-  exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); \
-  case \"\$exe\" in \
-    \"\$runner\"|\"\$runner (deleted)\") kill -9 \"\${proc##*/}\" 2>/dev/null || true ;; \
-  esac; \
-done; \
-for proc in /proc/[0-9]*; do \
-  exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); \
-  case \"\$exe\" in \
-    \"\$runner\"|\"\$runner (deleted)\") \
-      echo \"failed to stop stale guest runner pid=\${proc##*/} exe=\$exe\" >&2; exit 1 ;; \
-  esac; \
-done"
+  local suite=$1 vm=$2 quoted_root
+  printf -v quoted_root '%q' "$remote_root"
+  # Match /proc/exe rather than COMM and clean all three exact runner paths.
+  remote "$vm" "for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); case \"\$exe\" in \"\$runner\"|\"\$runner (deleted)\") kill -9 \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; for proc in /proc/[0-9]*; do exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); case \"\$exe\" in \"\$runner\"|\"\$runner (deleted)\") echo \"failed to stop stale guest runner pid=\${proc##*/} exe=\$exe\" >&2; exit 1 ;; esac; done; done"
 }
 
 sync_guest_binary() {

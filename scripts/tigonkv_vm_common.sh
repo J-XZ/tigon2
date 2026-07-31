@@ -116,3 +116,93 @@ tigonkv_validate_vm_config() {
     done
   fi
 }
+
+# Reject any host-side test, runner, transport service, or pool initializer
+# before a VM-backed test mutates the shared environment.  Match the complete
+# executable basename; do not kill the process so its owner can diagnose it.
+tigonkv_assert_host_test_isolated() {
+  local proc exe name
+  for proc in /proc/[0-9]*; do
+    exe=$(readlink "$proc/exe" 2>/dev/null || true)
+    name=${exe##*/}
+    case "$name" in
+      unit_tests|latency_modes_test|kv_layout_test|btree_binding_test|kv_partition_test|kv_engine_test|kv_startup_test|scc_protocol_test|kv_shared_protocol_test|region_allocator_test|cxl_ebr_test|e2e_08|e2e_09|e2e_trace_runner|cxl_pool_initer|ivshmem-server)
+        echo "host test environment is busy: pid=${proc##*/} exe=$exe" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+# Prove the host has either no QEMU group or exactly the four pidfile-backed
+# QEMUs for the currently loaded configuration.  This intentionally checks
+# all qemu-system-* processes, including ones attached to another backing.
+tigonkv_assert_qemu_group() {
+  local mode=${1:-}
+  local IFS=$' \t\n'
+  [[ "$mode" == empty || "$mode" == expected ]] || {
+    echo "usage: tigonkv_assert_qemu_group <empty|expected>" >&2
+    return 2
+  }
+
+  local -a qemu_pids=()
+  local proc exe name pid vm pidfile cmd
+  for proc in /proc/[0-9]*; do
+    exe=$(readlink "$proc/exe" 2>/dev/null || true)
+    name=${exe##*/}
+    [[ "$name" == qemu-system-* ]] || continue
+    qemu_pids+=("${proc##*/}")
+  done
+  IFS=$'\n' qemu_pids=($(printf '%s\n' "${qemu_pids[@]}" | sort -n))
+
+  if [[ "$mode" == empty ]]; then
+    (( ${#qemu_pids[@]} == 0 )) || {
+      echo "expected no host QEMU processes; found ${qemu_pids[*]}" >&2
+      return 1
+    }
+    return 0
+  fi
+
+  [[ "${TIGONKV_VM_COUNT:-}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "TIGONKV_VM_COUNT is not loaded for QEMU check" >&2
+    return 2
+  }
+  if (( ${#qemu_pids[@]} != TIGONKV_VM_COUNT )); then
+    echo "expected exactly $TIGONKV_VM_COUNT QEMUs attached; found ${qemu_pids[*]}" >&2
+    return 1
+  fi
+
+  local -a expected_pids=()
+  for ((vm = 0; vm < TIGONKV_VM_COUNT; vm++)); do
+    pidfile="$TIGONKV_VM_STORAGE/vm_${vm}/qemu.pid"
+    [[ -r "$pidfile" ]] || {
+      echo "missing expected QEMU pid file: $pidfile" >&2
+      return 1
+    }
+    pid=$(<"$pidfile")
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/exe" ]] || {
+      echo "expected QEMU is not alive: vm=$vm pid=$pid" >&2
+      return 1
+    }
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    name=${exe##*/}
+    [[ "$name" == qemu-system-* ]] || {
+      echo "pidfile is not a QEMU: vm=$vm pid=$pid exe=$exe" >&2
+      return 1
+    }
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+    [[ "$cmd" == *"${TIGONKV_SHARED_BACKING}"* ]] || {
+      echo "QEMU has wrong backing: vm=$vm pid=$pid backing=$TIGONKV_SHARED_BACKING" >&2
+      return 1
+    }
+    expected_pids+=("$pid")
+  done
+
+  local actual_set expected_set
+  actual_set=$(printf '%s\n' "${qemu_pids[@]}" | sort -n)
+  expected_set=$(printf '%s\n' "${expected_pids[@]}" | sort -n)
+  [[ "$actual_set" == "$expected_set" ]] || {
+    echo "host QEMU set differs from configured pidfiles: actual=[$actual_set] expected=[$expected_set]" >&2
+    return 1
+  }
+}

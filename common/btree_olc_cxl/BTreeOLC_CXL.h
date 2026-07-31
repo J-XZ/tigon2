@@ -2,7 +2,8 @@
 // Adapted from https://github.com/zxjcarrot/spitfire/blob/main/include/engine/btreeolc.h
 // Contributors: Jie Hou, Yilin Chen, Xinjing ZHou
 
-// The shared-memory version of BTreeOLC, which uses offset_ptr for position-independence
+// The shared-memory version of BTreeOLC, with RegionOffset links for
+// position-independent persistence.
 // and cxlalloc for dynamic memory management
 
 #include <immintrin.h>
@@ -24,8 +25,6 @@
 #include "kv/engine/region_allocator.h"
 #include "kv/engine/mem_access.h"
 
-#include "common/atomic_offset_ptr.hpp"
-#include <boost/interprocess/offset_ptr.hpp>
 
 #include "glog/logging.h"
 
@@ -70,8 +69,9 @@ struct TreeNodeAllocation {
 			throw std::invalid_argument("BPlusTree requires a region allocation binding");
 		if (offset == tigonkv::engine::kNullOffset) return nullptr;
 		return domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc
-		           ? regions->swcc().FromOffset(offset)
-		           : regions->hwcc().FromOffset(offset);
+		           ? regions->ResolveOwnerPrivate(offset, kPageSize,
+		                                         private_partition, owner_shard)
+		           : regions->ResolveDynamicHwcc(offset, kPageSize, owner_shard);
 	}
 
 	tigonkv::engine::RegionOffset ToOffset(void *pointer) const {
@@ -79,12 +79,62 @@ struct TreeNodeAllocation {
 			throw std::invalid_argument("BPlusTree requires a region allocation binding");
 		if (pointer == nullptr) return tigonkv::engine::kNullOffset;
 		return domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc
-		           ? regions->swcc().ToOffset(pointer)
+		           ? regions->ToOwnerPrivateOffset(pointer, private_partition)
 		           : regions->hwcc().ToOffset(pointer);
 	}
 };
 
 inline thread_local bool TreeAccessIsHwcc = true;
+inline thread_local const TreeNodeAllocation *TreeAccessBinding = nullptr;
+
+template <typename T>
+class PersistentOffset {
+ public:
+  PersistentOffset() = default;
+  PersistentOffset(std::nullptr_t) {}
+  PersistentOffset(T *pointer) { assign(pointer); }
+  T *get() const {
+    if (offset_ == tigonkv::engine::kNullOffset) return nullptr;
+    if (TreeAccessBinding == nullptr)
+      throw std::runtime_error("persistent tree offset resolved without binding");
+    return static_cast<T *>(TreeAccessBinding->FromOffset(offset_));
+  }
+  T *operator->() const { return get(); }
+  explicit operator bool() const { return offset_ != tigonkv::engine::kNullOffset; }
+  operator T *() const { return get(); }
+  PersistentOffset &operator=(std::nullptr_t) {
+    offset_ = tigonkv::engine::kNullOffset;
+    return *this;
+  }
+  PersistentOffset &operator=(T *pointer) {
+    assign(pointer);
+    return *this;
+  }
+  bool operator==(std::nullptr_t) const { return !static_cast<bool>(*this); }
+  bool operator!=(std::nullptr_t) const { return static_cast<bool>(*this); }
+  bool operator==(const PersistentOffset &other) const {
+    return offset_ == other.offset_;
+  }
+  bool operator!=(const PersistentOffset &other) const {
+    return offset_ != other.offset_;
+  }
+
+ private:
+  void assign(T *pointer) {
+    if (pointer == nullptr) {
+      offset_ = tigonkv::engine::kNullOffset;
+      return;
+    }
+    if (TreeAccessBinding == nullptr)
+      throw std::runtime_error("persistent tree offset assigned without binding");
+    offset_ = TreeAccessBinding->ToOffset(pointer);
+  }
+  tigonkv::engine::RegionOffset offset_{tigonkv::engine::kNullOffset};
+};
+
+static_assert(sizeof(PersistentOffset<void>) ==
+                  sizeof(tigonkv::engine::RegionOffset),
+              "persistent tree links must preserve the original offset slot width");
 
 // A tree's allocation binding, not the last node visited by this thread,
 // determines the memory domain. Nested private/shared operations restore the
@@ -92,14 +142,19 @@ inline thread_local bool TreeAccessIsHwcc = true;
 class TreeAccessScope {
  public:
   explicit TreeAccessScope(const TreeNodeAllocation &allocation)
-      : previous_(TreeAccessIsHwcc) {
+      : previous_(TreeAccessIsHwcc), previous_binding_(TreeAccessBinding) {
     TreeAccessIsHwcc =
         allocation.domain != tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc;
+    TreeAccessBinding = &allocation;
   }
-  ~TreeAccessScope() { TreeAccessIsHwcc = previous_; }
+  ~TreeAccessScope() {
+    TreeAccessIsHwcc = previous_;
+    TreeAccessBinding = previous_binding_;
+  }
 
  private:
   bool previous_;
+  const TreeNodeAllocation *previous_binding_;
 };
 
 inline void RecordTreeDataRead(const void *address, uint64_t bytes) {
@@ -372,22 +427,14 @@ class BPlusTree {
 
 		void iteratorEnter(bool &needRestart)
 		{
-			// Shared-pessimistic acquire (OLC): bump reader count only while
-			// unlocked. Plain fetch_add raced with writeLock and could leave the
-			// lock word with both the lock bit and a reader count set; a later
-			// mismatched iteratorLeave then permanently corrupted the version.
-			uint64_t version = load(std::memory_order_relaxed);
-			for (;;) {
-				if (isLocked(version) || (version & kReaderMask) == kReaderMask) {
-					needRestart = true;
-					_mm_pause();
-					return;
-				}
-				if (compareExchangeWeak(version, version + 1,
-				                        std::memory_order_acquire,
-							        std::memory_order_relaxed))
-					return;
+			uint64_t version;
+			version = load(std::memory_order_relaxed);
+			if (isLocked(version)) {
+				needRestart = true;
+				_mm_pause();
+				return;
 			}
+			fetchAdd(1);
 		}
 
 		void iteratorLeave()
@@ -680,7 +727,7 @@ class BPlusTree {
 	 * class StackNodeElement - used when delete nodes recursively
 	 */
 	struct StackNodeElement {
-		boost::interprocess::offset_ptr<NodeBase> node;
+		PersistentOffset<NodeBase> node;
 		int pos;
 		uint64_t version;
 	};
@@ -690,11 +737,11 @@ class BPlusTree {
 	 */
 	class BTreeLeaf : public NodeBase {
 	    public:
-		static constexpr uint64_t maxEntries = (LeafPageSize - sizeof(NodeBase) - sizeof(boost::interprocess::offset_ptr<BTreeLeaf>) * 2) / (sizeof(KeyValuePair));
+		static constexpr uint64_t maxEntries = (LeafPageSize - sizeof(NodeBase) - sizeof(PersistentOffset<BTreeLeaf>) * 2) / (sizeof(KeyValuePair));
 		static_assert(maxEntries >= 3, "maxEntries of BTreeLeaf must >= 3");
 
-		boost::interprocess::offset_ptr<BTreeLeaf> pre_;
-		boost::interprocess::offset_ptr<BTreeLeaf> next_;
+		PersistentOffset<BTreeLeaf> pre_;
+		PersistentOffset<BTreeLeaf> next_;
 
 		/** This is the array that we perform search on */
 		KeyType keys_[maxEntries];
@@ -1067,7 +1114,7 @@ class BPlusTree {
 	 */
 	class BTreeInner : public NodeBase {
 	    public:
-		static constexpr uint64_t maxEntries = (InnerPageSize - sizeof(NodeBase)) / (sizeof(KeyType) + sizeof(boost::interprocess::offset_ptr<NodeBase>));
+		static constexpr uint64_t maxEntries = (InnerPageSize - sizeof(NodeBase)) / (sizeof(KeyType) + sizeof(PersistentOffset<NodeBase>));
 		static_assert(maxEntries >= 3, "maxEntries of BTreeInner must >= 3");
 
 		static constexpr uint64_t childOffset = maxEntries * sizeof(KeyType);
@@ -1093,14 +1140,14 @@ class BPlusTree {
 			return *key;
 		}
 
-		boost::interprocess::offset_ptr<NodeBase> &childAt(size_t i)
+		PersistentOffset<NodeBase> &childAt(size_t i)
 		{
 			auto *child =
-			    reinterpret_cast<boost::interprocess::offset_ptr<NodeBase> *>(
+			    reinterpret_cast<PersistentOffset<NodeBase> *>(
 			        reinterpret_cast<intptr_t>(data_) + childOffset +
-			        i * sizeof(boost::interprocess::offset_ptr<NodeBase>));
+			        i * sizeof(PersistentOffset<NodeBase>));
 			RecordTreeDataRead(
-			    child, sizeof(boost::interprocess::offset_ptr<NodeBase>));
+			    child, sizeof(PersistentOffset<NodeBase>));
 			return *child;
 		}
 
@@ -1115,11 +1162,11 @@ class BPlusTree {
 		void setChildAt(size_t i, NodeBase *child)
 		{
 			auto *slot =
-			    reinterpret_cast<boost::interprocess::offset_ptr<NodeBase> *>(
+			    reinterpret_cast<PersistentOffset<NodeBase> *>(
 			        reinterpret_cast<intptr_t>(data_) + childOffset +
-			        i * sizeof(boost::interprocess::offset_ptr<NodeBase>));
+			        i * sizeof(PersistentOffset<NodeBase>));
 			RecordTreeDataWrite(
-			    slot, sizeof(boost::interprocess::offset_ptr<NodeBase>));
+			        slot, sizeof(PersistentOffset<NodeBase>));
 			*slot = child;
 		}
 
@@ -1162,7 +1209,7 @@ class BPlusTree {
 			keyAt(this->getCount() - 1).~KeyType(); // call dtor manually
 
 			// always merge nodes to the left node, so remove the `pos + 1` child
-			// memmove(&childAt(pos + 1), &childAt(pos + 2), sizeof(boost::interprocess::offset_ptr<NodeBase>) * (this->getCount() - pos - 1));
+			// memmove(&childAt(pos + 1), &childAt(pos + 2), sizeof(RegionOffset) * (this->getCount() - pos - 1));
                         for (int i = 0; i < this->getCount() - pos - 1; i++) {
                                 setChildAt(pos + 1 + i, childAt(pos + 2 + i).get());
                         }
@@ -1191,7 +1238,7 @@ class BPlusTree {
 			allocation.Retire(ptr, kLeafPageSize);
 
 			// always merge nodes to the left node, so remove the `pos + 1` child
-			// memmove(&childAt(pos + 1), &childAt(pos + 2), sizeof(boost::interprocess::offset_ptr<NodeBase>) * (this->getCount() - pos - 1));
+			// memmove(&childAt(pos + 1), &childAt(pos + 2), sizeof(RegionOffset) * (this->getCount() - pos - 1));
                         for (int i = 0; i < this->getCount() - pos - 1; i++) {
                                 setChildAt(pos + 1 + i, childAt(pos + 2 + i).get());
                         }
@@ -1221,7 +1268,7 @@ class BPlusTree {
 				sibling->keyAt(i).~KeyType(); // call dtor manually
 			}
 
-			// memmove(&childAt(this->getCount() + 1), &sibling->childAt(0), sizeof(boost::interprocess::offset_ptr<NodeBase>) * (sibling->getCount() + 1));
+			// memmove(&childAt(this->getCount() + 1), &sibling->childAt(0), sizeof(RegionOffset) * (sibling->getCount() + 1));
                         for (int i = 0; i < sibling->getCount() + 1; i++) {
                                 setChildAt(this->getCount() + 1 + i,
                                            sibling->childAt(i).get());
@@ -1246,7 +1293,7 @@ class BPlusTree {
 				sibling->keyAt(i).~KeyType(); // call dtor manually
 			}
 
-			// memmove(&childAt(this->getCount() + 1), &sibling->childAt(0), sizeof(boost::interprocess::offset_ptr<NodeBase>) * (sibling->getCount() + 1));
+			// memmove(&childAt(this->getCount() + 1), &sibling->childAt(0), sizeof(RegionOffset) * (sibling->getCount() + 1));
                         for (int i = 0; i < sibling->getCount() + 1; i++) {
                                 setChildAt(this->getCount() + 1 + i,
                                            sibling->childAt(i).get());
@@ -1314,7 +1361,7 @@ class BPlusTree {
 				keyAt(this->getCount() + 1 + i).~KeyType(); // call dtor manually
 			}
 
-			// memcpy(&newInner->childAt(0), &childAt(this->getCount() + 1), sizeof(boost::interprocess::offset_ptr<NodeBase>) * (newInner->getCount() + 1));
+			// memcpy(&newInner->childAt(0), &childAt(this->getCount() + 1), sizeof(RegionOffset) * (newInner->getCount() + 1));
                         for (int i = 0; i < newInner->getCount() + 1; i++) {
                                 newInner->setChildAt(i, childAt(this->getCount() + 1 + i).get());
                         }
@@ -1342,7 +1389,7 @@ class BPlusTree {
 				setKeyAt(pos, k);
 			}
 
-			// memmove(&childAt(pos + 1), &childAt(pos), sizeof(boost::interprocess::offset_ptr<NodeBase>) * (this->getCount() - pos + 1));
+			// memmove(&childAt(pos + 1), &childAt(pos), sizeof(RegionOffset) * (this->getCount() - pos + 1));
                         for (int i = this->getCount() - pos; i >= 0; i--) {
                                 setChildAt(pos + 1 + i, childAt(pos + i).get());
                         }
@@ -1365,7 +1412,7 @@ class BPlusTree {
 		/** Enum that represents the state of the iterator */
 		enum IteratorState { VALID, END, REND, RETRY1, INVALID };
 
-		boost::interprocess::offset_ptr<BTreeLeaf> curNode_;
+		PersistentOffset<BTreeLeaf> curNode_;
 		int curPos_;
 		IteratorState state_;
 
@@ -1596,7 +1643,7 @@ class BPlusTree {
 		if (persisted_root == nullptr) {
 			throw std::invalid_argument("BPlusTree attach requires a persisted root");
 		}
-		root_.store(static_cast<NodeBase *>(persisted_root));
+		root_.store(allocation_.ToOffset(persisted_root), std::memory_order_release);
 	}
 
 	// Shared CXL trees: publish/load the live root via an HWCC atomic offset so
@@ -1607,20 +1654,23 @@ class BPlusTree {
 		TreeAccessScope access_scope(allocation_);
 		if (slot == nullptr)
 			throw std::invalid_argument("BPlusTree published root slot is null");
-		tigonkv::engine::mem_access::HwccAtomicLoad(slot);
+		RecordTreeAtomicLoad(slot);
 		const auto off = slot->load(std::memory_order_acquire);
 		if (off == tigonkv::engine::kNullOffset) {
 			// Creator: publish the process-local root allocated by the ctor.
-			NodeBase *local = root_.load();
+			const auto local_offset = root_.load(std::memory_order_acquire);
+			NodeBase *local = local_offset == tigonkv::engine::kNullOffset
+			    ? nullptr
+			    : static_cast<NodeBase *>(allocation_.FromOffset(local_offset));
 			if (local == nullptr)
 				throw std::runtime_error("BPlusTree has no local root to publish");
 			published_root_ = slot;
-			tigonkv::engine::mem_access::HwccAtomicStore(slot);
+			RecordTreeAtomicStore(slot);
 			slot->store(allocation_.ToOffset(local), std::memory_order_release);
 		} else {
 			// Attacher: adopt the HWCC live root.
 			published_root_ = slot;
-			root_.store(static_cast<NodeBase *>(allocation_.FromOffset(off)));
+			root_.store(off, std::memory_order_release);
 		}
 	}
 
@@ -1792,7 +1842,7 @@ class BPlusTree {
 				p->setKeyAt(pos, b->keyAt(0));
 
 				// adjust right node
-				// memmove(&b->childAt(0), &b->childAt(1), sizeof(boost::interprocess::offset_ptr<NodeBase>) * (b->getCount()));
+				// memmove(&b->childAt(0), &b->childAt(1), sizeof(RegionOffset) * (b->getCount()));
                                 for (int i = 0; i < b->getCount(); i++) {
                                         b->setChildAt(i, b->childAt(1 + i).get());
                                 }
@@ -1812,7 +1862,7 @@ class BPlusTree {
 				 *  a   b  c  d   e               a   b    c d   e
 				 */
 				// adjust right node
-				// memmove(&b->childAt(1), &b->childAt(0), sizeof(boost::interprocess::offset_ptr<NodeBase>) * (b->getCount() + 1));
+				// memmove(&b->childAt(1), &b->childAt(0), sizeof(RegionOffset) * (b->getCount() + 1));
                                 for (int i = b->getCount(); i >= 0; i--) {
                                         b->setChildAt(1 + i, b->childAt(i).get());
                                 }
@@ -2784,11 +2834,6 @@ restart:
 			return;
 
 		leaf->iteratorEnter(needRestart);
-		// Must restart if enter failed: constructing an iterator without a
-		// successful enter makes ~BPlusTreeIterator call iteratorLeave and
-		// corrupt the optimistic lock word (livelock under YCSB-E writers).
-		if (needRestart)
-			goto restart;
 		{
 			BPlusTreeIterator itr(leaf, pos, &allocation_);
 			if (itr == retryItr())
@@ -2907,6 +2952,16 @@ restart:
 		if (quit == false) {
 			goto restart;
 		}
+	}
+
+	// Keep the master TableBTreeOLC entrypoint available for offset-backed
+	// tables.  The CXL tree's update traversal already owns the required leaf
+	// latch and access accounting, so this compatibility entrypoint preserves
+	// that single traversal implementation.
+	void scanForUpdateNoContention(const KeyType &startKey,
+	                               std::function<bool(const KeyType &, ValueType &, bool)> processor)
+	{
+		scanForUpdate(startKey, std::move(processor));
 	}
 
 	/**
@@ -3253,19 +3308,24 @@ restart:
 	NodeBase *load_root() const
 	{
 		if (published_root_ != nullptr) {
-			tigonkv::engine::mem_access::HwccAtomicLoad(published_root_);
+			RecordTreeAtomicLoad(published_root_);
 			const auto off = published_root_->load(std::memory_order_acquire);
 			if (off == tigonkv::engine::kNullOffset) return nullptr;
 			return static_cast<NodeBase *>(allocation_.FromOffset(off));
 		}
-		return root_.load();
+		const auto off = root_.load(std::memory_order_acquire);
+		return off == tigonkv::engine::kNullOffset
+		           ? nullptr
+		           : static_cast<NodeBase *>(allocation_.FromOffset(off));
 	}
 
 	void store_root(NodeBase *node)
 	{
-		root_.store(node);
+		root_.store(node == nullptr ? tigonkv::engine::kNullOffset
+		                             : allocation_.ToOffset(node),
+		            std::memory_order_release);
 		if (published_root_ != nullptr) {
-			tigonkv::engine::mem_access::HwccAtomicStore(published_root_);
+			RecordTreeAtomicStore(published_root_);
 			published_root_->store(allocation_.ToOffset(node), std::memory_order_release);
 		}
 	}
@@ -3277,7 +3337,7 @@ restart:
 	const int keyUnique_;
 	const TreeNodeAllocation allocation_;
 
-        AtomicOffsetPtr<NodeBase> root_;
+	std::atomic<tigonkv::engine::RegionOffset> root_{tigonkv::engine::kNullOffset};
 	// When non-null (shared CXL trees), live root truth is this HWCC slot.
 	std::atomic<tigonkv::engine::RegionOffset> *published_root_{ nullptr };
 
@@ -3793,9 +3853,7 @@ restart:
 				return saved_success;
 		}
 		assert(result_saved);
-		// The adjacent callback is explicitly allowed to veto removal.  The
-		// original terminal assertion incorrectly turned that normal false
-		// result into an abort; preserve the callback's bool contract.
+		assert(saved_success);
 		return saved_success;
 	}
 

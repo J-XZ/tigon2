@@ -52,5 +52,3 @@ for ((round = 1; round <= rounds; ++round)); do
   TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" \
     "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$traces" "$round_logs" 1 a | tee -a "$round_log"
 done
-python3 "$root/scripts/summarize_ycsb_experiment.py" --log-root "$logs" \
-  --out-dir "$logs/summary"

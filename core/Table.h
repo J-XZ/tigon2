@@ -5,6 +5,7 @@
 #pragma once
 
 #include <thread>
+#include <memory>
 #include "benchmark/tpcc/Schema.h"
 #include "common/ClassOf.h"
 #include "common/Encoder.h"
@@ -365,7 +366,58 @@ template <std::size_t N, class KeyType, class ValueType, class KeyComparator, cl
 	std::size_t partitionID_;
 };
 
-template <class KeyType, class ValueType, class KeyComparator, class ValueComparator, class MetaInitFunc = MetaInitFuncNothing> class TableBTreeOLC : public ITable {
+template <class ValueType, class MetaInitFunc>
+struct RawPointerRowStorage {
+        using MetaDataType = std::atomic<uint64_t>;
+        struct ValueStruct {
+                MetaDataType meta;
+                ValueType data;
+        };
+        using StoredRow = ValueStruct *;
+        StoredRow Null() const { return nullptr; }
+        bool IsNull(StoredRow row) const { return row == nullptr; }
+        MetaDataType *Meta(StoredRow row) const { return row == nullptr ? nullptr : &row->meta; }
+        void *Data(StoredRow row) const { return row == nullptr ? nullptr : &row->data; }
+        void *AdjacentMeta(StoredRow row) const {
+                return row == nullptr ? nullptr
+                                       : reinterpret_cast<void *>(Meta(row)->load());
+        }
+        StoredRow AllocateAndConstruct(const void *value, bool is_placeholder) const {
+                auto *row = new ValueStruct;
+                row->meta.store(MetaInitFunc()(!is_placeholder), std::memory_order_relaxed);
+                row->data = *static_cast<const ValueType *>(value);
+                return row;
+        }
+        void DestroyUnpublished(StoredRow row) const { delete row; }
+        void Retire(StoredRow) const {}
+        void Update(StoredRow row, const void *value) const {
+                row->data = *static_cast<const ValueType *>(value);
+        }
+        std::size_t ValueSize() const { return sizeof(ValueType); }
+        std::size_t KeySize(std::size_t key_size) const { return key_size; }
+        std::size_t FieldSize() const { return ClassOf<ValueType>::size(); }
+        void Deserialize(StoredRow row, StringPiece bytes) const {
+                Decoder decoder(bytes);
+                decoder >> row->data;
+                DCHECK(bytes.size() - decoder.size() == FieldSize());
+        }
+        void Serialize(Encoder &encoder, const void *value) const {
+                encoder << *static_cast<const ValueType *>(value);
+        }
+        template <typename BTree>
+        std::unique_ptr<BTree> MakeTree() const { return std::make_unique<BTree>(); }
+        template <typename BTree>
+        void BindPublishedRoot(BTree &, std::atomic<uint64_t> *) const {}
+        template <typename BTree>
+        uint64_t RootOffset(const BTree &) const { return 0; }
+};
+
+template <class KeyType, class ValueType, class KeyComparator,
+          class ValueComparator, class MetaInitFunc = MetaInitFuncNothing,
+          template <class, class, class, class, std::size_t, uint64_t, uint64_t>
+          class BTreeTemplate = btreeolc::BPlusTree,
+          class RowStoragePolicy = RawPointerRowStorage<ValueType, MetaInitFunc>>
+class TableBTreeOLC : public ITable {
     public:
         using MetaDataType = std::atomic<uint64_t>;
 
@@ -373,10 +425,8 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
         static constexpr uint64_t leaf_page_size = 4096;
         static constexpr uint64_t inner_page_size = 4096;
 
-        struct ValueStruct {
-                MetaDataType meta;     // the value is the pointer to the local metadata
-                ValueType data;
-        };
+        using ValueStruct = typename RowStoragePolicy::ValueStruct;
+        using StoredRow = typename RowStoragePolicy::StoredRow;
 
         // std::atomic has implicitly deleted copy-constructor
         // so we need to define a ValueType that supports it
@@ -394,7 +444,7 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
                         return *this;
                 }
 
-                ValueStruct *row{ nullptr };
+                StoredRow row{};
         };
 
         struct BTreeOLCValueComparator {
@@ -407,14 +457,19 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
                 }
         };
 
-        using BTree = btreeolc::BPlusTree<KeyType, BTreeOLCValue, KeyComparator, BTreeOLCValueComparator, update_threshold, leaf_page_size, inner_page_size>;
+        using BTree = BTreeTemplate<KeyType, BTreeOLCValue, KeyComparator,
+                                    BTreeOLCValueComparator, update_threshold,
+                                    leaf_page_size, inner_page_size>;
 
 	virtual ~TableBTreeOLC() override = default;
 
-	TableBTreeOLC(std::size_t tableID, std::size_t partitionID)
+	TableBTreeOLC(std::size_t tableID, std::size_t partitionID,
+                      RowStoragePolicy storage = RowStoragePolicy{})
 		: tableID_(tableID)
 		, partitionID_(partitionID)
+		, storage_(std::move(storage))
 	{
+	        btree_ = storage_.template MakeTree<BTree>();
 	}
 
         uint64_t get_plain_key(const void *key) override
@@ -437,11 +492,10 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
 		const auto &k = *static_cast<const KeyType *>(key);
 
                 BTreeOLCValue value;
-                bool success = btree.lookup(k, value);
+                bool success = btree_->lookup(k, value);
 
                 if (success == true) {
-                        MetaDataType *meta_ptr = reinterpret_cast<MetaDataType *>(&value.row->meta);
-                        return std::make_tuple(meta_ptr, &value.row->data);
+                        return std::make_tuple(storage_.Meta(value.row), storage_.Data(value.row));
                 } else {
                         return std::make_tuple(nullptr, nullptr);
                 }
@@ -453,10 +507,10 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
 		const auto &k = *static_cast<const KeyType *>(key);
 
                 BTreeOLCValue value;
-                bool success = btree.lookup(k, value);
+                bool success = btree_->lookup(k, value);
 
                 if (success == true) {
-                        return &value.row->data;
+                        return storage_.Data(value.row);
                 } else {
                         return nullptr;
                 }
@@ -468,10 +522,10 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
 		const auto &k = *static_cast<const KeyType *>(key);
 
                 BTreeOLCValue value;
-                bool success = btree.lookup(k, value);
+                bool success = btree_->lookup(k, value);
 
                 if (success == true) {
-                        return &value.row->meta;
+                        return storage_.Meta(value.row);
                 } else {
                         return nullptr;
                 }
@@ -483,7 +537,7 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
 		const auto &k = *static_cast<const KeyType *>(key);
 
                 BTreeOLCValue value;
-                bool success = btree.lookup(k, value);
+                bool success = btree_->lookup(k, value);
 
                 if (success) {
                         return true;
@@ -498,8 +552,8 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
                 const auto &min_k = *static_cast<const KeyType *>(min_key);
 
                 auto processor = [&](const KeyType &key, BTreeOLCValue &value, bool is_last_tuple) -> bool {
-                        MetaDataType *meta_ptr = &value.row->meta;
-                        ValueType *data_ptr = &value.row->data;
+                        MetaDataType *meta_ptr = storage_.Meta(value.row);
+                        void *data_ptr = storage_.Data(value.row);
 
                         bool should_end = scan_processor(&key, meta_ptr, data_ptr, is_last_tuple);
 
@@ -511,7 +565,7 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
                         }
 		};
 
-                btree.scanForUpdate(min_k, processor);
+                btree_->scanForUpdate(min_k, processor);
         }
 
         // used by other baselines
@@ -519,22 +573,18 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
 	{
                 tid_check();
 		const auto &k = *static_cast<const KeyType *>(key);
-		const auto &v = *static_cast<const ValueType *>(value);
-
                 bool is_tuple_valid = !is_placeholder;
 
                 // create value that will not be moved around
-                ValueStruct *row = new ValueStruct;
-                CHECK(row != nullptr);
-                row->meta = MetaInitFunc()(is_tuple_valid);
-                row->data = v;
+		StoredRow row = storage_.AllocateAndConstruct(value, is_placeholder);
 
                 // BTreeOLCValue will be moved around and thus only stores pointers to the actual value
                 BTreeOLCValue btree_value;
                 btree_value.row = row;
 
                 // insert BTreeOLCValue to BTreeOLC
-		bool success = btree.insert(k, btree_value);
+		bool success = btree_->insert(k, btree_value);
+		if (!success) storage_.DestroyUnpublished(row);
 		return success;
 	}
 
@@ -543,13 +593,11 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
 	{
                 tid_check();
 		const auto &k = *static_cast<const KeyType *>(key);
-		const auto &v = *static_cast<const ValueType *>(value);
-
                 CHECK(is_placeholder == true);
 
                 auto processor = [&](const KeyType *key, BTreeOLCValue *value) -> bool {
-                        MetaDataType *meta_ptr = &value->row->meta;
-                        ValueType *data_ptr = &value->row->data;
+                        MetaDataType *meta_ptr = storage_.Meta(value->row);
+                        void *data_ptr = storage_.Data(value->row);
 
                         return next_key_processor(key, meta_ptr, data_ptr);
 		};
@@ -557,17 +605,15 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
                 bool is_tuple_valid = !is_placeholder;
 
                 // create value that will not be moved around
-                ValueStruct *row = new ValueStruct;
-                CHECK(row != nullptr);
-                row->meta = MetaInitFunc()(is_tuple_valid);
-                row->data = v;
+		StoredRow row = storage_.AllocateAndConstruct(value, is_placeholder);
 
                 // BTreeOLCValue will be moved around and thus only stores pointers to the actual value
                 BTreeOLCValue btree_value;
                 btree_value.row = row;
 
                 // insert BTreeOLCValue to BTreeOLC
-		bool success = btree.insert_lock_next_key(k, btree_value, processor);
+		bool success = btree_->insert_lock_next_key(k, btree_value, processor);
+		if (!success) storage_.DestroyUnpublished(row);
 		return success;
 	}
 
@@ -578,17 +624,12 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
 	{
                 tid_check();
 		const auto &k = *static_cast<const KeyType *>(key);
-		const auto &v = *static_cast<const ValueType *>(value);
-
                 CHECK(is_placeholder == true);
 
                 bool is_tuple_valid = !is_placeholder;
 
                 // create value that will not be moved around
-                ValueStruct *row = new ValueStruct;
-                CHECK(row != nullptr);
-                row->meta = MetaInitFunc()(is_tuple_valid);
-                row->data = v;
+		StoredRow row = storage_.AllocateAndConstruct(value, is_placeholder);
 
                 // BTreeOLCValue will be moved around and thus only stores pointers to the actual value
                 BTreeOLCValue btree_value;
@@ -599,19 +640,20 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
                         void *prev_data = nullptr, *next_data = nullptr;
 
                         if (prev_value != nullptr) {
-                                prev_meta_ptr = &prev_value->row->meta;
-                                prev_data = &prev_value->row->data;
+                                prev_meta_ptr = storage_.Meta(prev_value->row);
+                                prev_data = storage_.Data(prev_value->row);
                         }
                         if (next_value != nullptr) {
-                                next_meta_ptr = &next_value->row->meta;
-                                next_data = &next_value->row->data;
+                                next_meta_ptr = storage_.Meta(next_value->row);
+                                next_data = storage_.Data(next_value->row);
                         }
 
                         return processor(prev_key, prev_meta_ptr, prev_data, next_key, next_meta_ptr, next_data);
 		};
 
                 // insert BTreeOLCValue to BTreeOLC
-		bool success = btree.insert_and_process_adjacent_tuples(k, btree_value, adjacent_tuples_processor);
+		bool success = btree_->insert_and_process_adjacent_tuples(k, btree_value, adjacent_tuples_processor);
+		if (!success) storage_.DestroyUnpublished(row);
 		return success;
 	}
 
@@ -620,7 +662,7 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
                 tid_check();
 		const auto &k = *static_cast<const KeyType *>(key);
 
-                bool success = btree.remove(k);
+                bool success = btree_->remove(k);
                 CHECK(success == true);
 
                 return success;
@@ -631,30 +673,34 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
         {
                 tid_check();
 		const auto &k = *static_cast<const KeyType *>(key);
+                StoredRow removed_row = storage_.Null();
 
                 auto adjacent_tuples_processor = [&](const KeyType *prev_key, BTreeOLCValue *prev_value, const KeyType *cur_key, BTreeOLCValue *cur_value, const KeyType *next_key, BTreeOLCValue *next_value) -> bool {
                         void *prev_meta = nullptr, *cur_meta = nullptr, *next_meta = nullptr;
                         void *prev_data = nullptr, *cur_data = nullptr, *next_data = nullptr;
 
                         if (prev_value != nullptr) {
-                                prev_meta = reinterpret_cast<void *>(prev_value->row->meta.load());
-                                prev_data = &prev_value->row->data;
+				prev_meta = storage_.AdjacentMeta(prev_value->row);
+                                prev_data = storage_.Data(prev_value->row);
                         }
                         if (cur_value != nullptr) {
-                                cur_meta = reinterpret_cast<void *>(cur_value->row->meta.load());
-                                cur_data = &cur_value->row->data;
+                                removed_row = cur_value->row;
+                                cur_meta = storage_.AdjacentMeta(cur_value->row);
+                                cur_data = storage_.Data(cur_value->row);
                         }
                         if (next_value != nullptr) {
-                                next_meta = reinterpret_cast<void *>(next_value->row->meta.load());
-                                next_data = &next_value->row->data;
+				next_meta = storage_.AdjacentMeta(next_value->row);
+                                next_data = storage_.Data(next_value->row);
                         }
 
                         return processor(prev_key, prev_meta, prev_data, cur_key, cur_meta, cur_data, next_key, next_meta, next_data);
 		};
 
 
-                bool success = btree.remove_and_process_adjacent_keys(k, adjacent_tuples_processor);
+                bool success = btree_->remove_and_process_adjacent_keys(k, adjacent_tuples_processor);
                 CHECK(success == true);
+                if (success && !storage_.IsNull(removed_row))
+                        storage_.Retire(removed_row);
 
                 return success;
         }
@@ -663,14 +709,12 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
 	{
                 tid_check();
 		const auto &k = *static_cast<const KeyType *>(key);
-		const auto &v = *static_cast<const ValueType *>(value);
-
                 BTreeOLCValue btree_value;
-                bool success = btree.lookup(k, btree_value);
+                bool success = btree_->lookup(k, btree_value);
                 CHECK(success == true);
 
-		on_update(key, &btree_value.row->data);
-		btree_value.row->data = v;
+		on_update(key, storage_.Data(btree_value.row));
+		storage_.Update(btree_value.row, value);
 	}
 
         bool search_and_update_next_key_info(const void *key,
@@ -680,22 +724,22 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
                         void *prev_meta = nullptr, *cur_meta = nullptr, *next_meta = nullptr;
                         void *prev_data = nullptr, *cur_data = nullptr, *next_data = nullptr;
                         if (prev_value != nullptr) {
-                                prev_meta = reinterpret_cast<void *>(prev_value->row->meta.load());
-                                prev_data = &prev_value->row->data;
+				prev_meta = storage_.AdjacentMeta(prev_value->row);
+                                prev_data = storage_.Data(prev_value->row);
                         }
                         if (cur_value != nullptr) {
-                                cur_meta = reinterpret_cast<void *>(cur_value->row->meta.load());
-                                cur_data = &cur_value->row->data;
+				cur_meta = storage_.AdjacentMeta(cur_value->row);
+                                cur_data = storage_.Data(cur_value->row);
                         }
                         if (next_value != nullptr) {
-                                next_meta = reinterpret_cast<void *>(next_value->row->meta.load());
-                                next_data = &next_value->row->data;
+				next_meta = storage_.AdjacentMeta(next_value->row);
+                                next_data = storage_.Data(next_value->row);
                         }
                         update_processor(prev_key, prev_meta, prev_data, cur_key, cur_meta, cur_data, next_key, next_meta, next_data);
 		};
 
                 const auto &k = *static_cast<const KeyType *>(key);
-                return btree.lookupForNextKeyUpdate(k, processor);
+                return btree_->lookupForNextKeyUpdate(k, processor);
         }
 
 	void deserialize_value(const void *key, StringPiece stringPiece) override
@@ -705,44 +749,35 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
 		const auto &k = *static_cast<const KeyType *>(key);
 
 		BTreeOLCValue value;
-                bool success = btree.lookup(k, value);
+                bool success = btree_->lookup(k, value);
                 CHECK(success == true);
 
-		auto &v = value.row->data;
-
-		Decoder dec(stringPiece);
-		dec >> v;
-
-		DCHECK(size - dec.size() == ClassOf<ValueType>::size());
+		storage_.Deserialize(value.row, stringPiece);
 	}
 
 
 	void serialize_value(Encoder &enc, const void *value) override
 	{
 		tid_check();
-		std::size_t size = enc.size();
-		const auto &v = *static_cast<const ValueType *>(value);
-		enc << v;
-
-		DCHECK(enc.size() - size == ClassOf<ValueType>::size());
+		storage_.Serialize(enc, value);
 	}
 
 	std::size_t key_size() override
 	{
 		tid_check();
-		return sizeof(KeyType);
+		return storage_.KeySize(sizeof(KeyType));
 	}
 
 	std::size_t value_size() override
 	{
 		tid_check();
-		return sizeof(ValueType);
+		return storage_.ValueSize();
 	}
 
 	std::size_t field_size() override
 	{
 		tid_check();
-		return ClassOf<ValueType>::size();
+		return storage_.FieldSize();
 	}
 
 	std::size_t tableID() override
@@ -765,23 +800,42 @@ template <class KeyType, class ValueType, class KeyComparator, class ValueCompar
         void move_all_into_cxl(std::function<bool(ITable *, const void *, std::tuple<MetaDataType *, void *> &, bool)> move_in_func) override
         {
                 auto processor = [&](const KeyType &key, BTreeOLCValue &value, bool) -> bool {
-                        MetaDataType *meta_ptr = &value.row->meta;
-                        ValueType *data_ptr = &value.row->data;
+                        MetaDataType *meta_ptr = storage_.Meta(value.row);
+                        void *data_ptr = storage_.Data(value.row);
                         std::tuple<MetaDataType *, void *> row_tuple(meta_ptr, data_ptr);
 			bool ret = move_in_func(this, &key, row_tuple, false);
                         return false;
 		};
 
-                KeyType start_key;
+                KeyType start_key{};
                 memset(&start_key, 0, sizeof(KeyType));
-                CHECK(start_key.get_plain_key() == 0);
-                btree.scanForUpdateNoContention(start_key, processor);
+                btree_->scanForUpdateNoContention(start_key, processor);
+        }
+
+        bool lookup_stored_row(const KeyType &key, StoredRow *row) const {
+                if (row == nullptr) return false;
+                BTreeOLCValue value;
+                auto *tree = const_cast<BTree *>(btree_.get());
+                if (!tree->lookup(key, value)) return false;
+                *row = value.row;
+                return !storage_.IsNull(*row);
+        }
+
+        void bind_published_root(std::atomic<uint64_t> *slot) {
+                if (btree_ == nullptr) throw std::runtime_error("BTree is not initialized");
+                storage_.BindPublishedRoot(*btree_, slot);
+        }
+
+        uint64_t root_offset_for_persistence() const {
+                if (btree_ == nullptr) throw std::runtime_error("BTree is not initialized");
+                return storage_.RootOffset(*btree_);
         }
 
     private:
-	BTree btree;
-	std::size_t tableID_;
-	std::size_t partitionID_;
+        std::unique_ptr<BTree> btree_;
+        RowStoragePolicy storage_;
+        std::size_t tableID_;
+        std::size_t partitionID_;
 };
 
 template <class KeyType, class ValueType, class KeyComparator, class ValueComparator> class HStoreTable : public ITable {

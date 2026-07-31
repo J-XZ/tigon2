@@ -22,32 +22,20 @@ class LatencyScope {
   bool active_ = false;
 };
 
-class IsolatedLatencyScope {
- public:
-  explicit IsolatedLatencyScope(latency_sim::ScopeKind scope) {
-    active_ = latency_sim::InstrumentationEnabledFast();
-    if (active_)
-      latency_sim::GlobalLatencySimulator().BeginIsolatedScope(scope);
-  }
-  ~IsolatedLatencyScope() {
-    if (active_)
-      latency_sim::GlobalLatencySimulator().EndIsolatedScopeAndDelay();
-  }
-  IsolatedLatencyScope(const IsolatedLatencyScope &) = delete;
-  IsolatedLatencyScope &operator=(const IsolatedLatencyScope &) = delete;
-
- private:
-  bool active_ = false;
-};
-
-inline void DelayIsolatedScopeNow() {
-  if (latency_sim::InstrumentationEnabledFast())
-    latency_sim::GlobalLatencySimulator().DelayIsolatedScopeNow();
+inline bool HasActiveScope() {
+  return latency_sim::InstrumentationEnabledFast() &&
+         latency_sim::GlobalLatencySimulator().HasActiveScopeForCurrentThread();
 }
 
-inline void DelayActiveScopeNow() {
+inline void EndActiveScopeAndDelay() {
   if (latency_sim::InstrumentationEnabledFast())
-    latency_sim::GlobalLatencySimulator().DelayActiveScopeNow();
+    latency_sim::GlobalLatencySimulator().EndScopeAndDelay();
+}
+
+inline void BeginForegroundScope() {
+  if (latency_sim::InstrumentationEnabledFast())
+    latency_sim::GlobalLatencySimulator().BeginScope(
+        latency_sim::ScopeKind::kForeground);
 }
 
 inline void Record(latency_sim::PoolKind pool, latency_sim::AccessKind kind,
@@ -111,6 +99,20 @@ inline void SharedPayloadRead(const void *address, size_t bytes) {
 }
 inline void SharedPayloadWrite(const void *address, size_t bytes) {
   Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kWrite, address, bytes);
+}
+// Shared-payload freelist headers live in shared SWCC but are only touched by
+// the owner allocator before publish / after EBR; pool is still SWCC.
+inline void SharedPayloadAtomicLoad(const void *address) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kAtomicLoad,
+         address, 1);
+}
+inline void SharedPayloadAtomicStore(const void *address) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kAtomicStore,
+         address, 1);
+}
+inline void SharedPayloadAtomicRmw(const void *address) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kAtomicRmw,
+         address, 1);
 }
 
 }  // namespace tigonkv::engine::mem_access

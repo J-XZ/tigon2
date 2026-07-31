@@ -12,12 +12,14 @@ corresponding `CXLKV_*` compatibility variables.
 directories to exist; set the same variable explicitly when using a smaller generated
 set. The local workflow is a sequential, single-VM shared-backing smoke only. Multi-VM
 and multi-worker runs must use `run_guest_ycsb_workflows.sh`, which preserves one
-transport consumer and one collective-checkpoint participant per VM.
+transport consumer (demuxer) per VM.
 
 For a real multi-worker replay, set `TIGONKV_E2E_BARRIER_DIR`,
 `TIGONKV_E2E_WORKER_COUNT`, and unique `TIGONKV_E2E_WORKER_ID` values. The runner then
-waits for ready markers before timing and for done markers after an out-of-band
-checkpoint; the barrier directory must be fresh for each run.
+waits for ready markers before timing and a final barrier after host release; the
+barrier directory must be fresh for each run. Finished foreground workers continue to
+serve their own inbox until that barrier, so an unbound control thread never polls a
+worker-local queue.
 
 `run_guest_ycsb_workflows.sh` is the formal four-VM workflow. It assumes the cxlkv-style
 ivshmem server is already running, with `/dev/ivpci0` present in every guest, and uses

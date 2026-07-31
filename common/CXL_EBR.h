@@ -6,7 +6,7 @@
 
 #include "stdint.h"
 #include <glog/logging.h>
-#include <boost/interprocess/offset_ptr.hpp>
+#include <stdexcept>
 
 #include "common/CXLMemory.h"
 #include "kv/engine/mem_access.h"
@@ -68,6 +68,16 @@ class CXL_EBR {
         {
                 EBRMetaLocal &local_ebr_meta = get_local_ebr_meta();
 
+                initialize_ebr_meta(local_ebr_meta, coordinator_id, thread_id);
+        }
+
+        // KVEngine owns one persistent-in-process meta object per foreground
+        // worker.  Binding is only a TLS handle; it must never reset the
+        // worker's last-freed epoch when a different OS thread takes over.
+        void initialize_ebr_meta(EBRMetaLocal &local_ebr_meta,
+                                 uint64_t coordinator_id, uint64_t thread_id)
+        {
+
                 tigonkv::engine::mem_access::HwccRead(
                     &coordinator_num, sizeof(coordinator_num));
                 tigonkv::engine::mem_access::HwccRead(
@@ -87,6 +97,22 @@ class CXL_EBR {
                 local_ebr_meta.garbage_size.clear();
                 local_ebr_meta.max_garbage_size = 0;
 
+        }
+
+        void bind_external_ebr_meta(EBRMetaLocal *meta)
+        {
+                if (meta == nullptr)
+                        throw std::invalid_argument("null external EBR meta");
+                if (bound_ebr_meta_ != nullptr)
+                        throw std::runtime_error("EBR external meta already bound");
+                bound_ebr_meta_ = meta;
+        }
+
+        void unbind_external_ebr_meta()
+        {
+                if (bound_ebr_meta_ == nullptr)
+                        throw std::runtime_error("EBR external meta is not bound");
+                bound_ebr_meta_ = nullptr;
         }
 
         void add_retired_object(void *ptr, uint64_t size, uint64_t category,
@@ -178,6 +204,11 @@ class CXL_EBR {
                 if (cur_global_epoch >= 2) {
                         uint64_t epoch_to_reclaim = cur_global_epoch - 2;
                         if (epoch_to_reclaim > local_ebr_meta.last_freed_epoch) {
+                                // Preserve the original EBR progression invariant.
+                                // A gap would skip a retire epoch and hide allocator
+                                // queue corruption rather than reclaiming safely.
+                                CHECK(epoch_to_reclaim ==
+                                      local_ebr_meta.last_freed_epoch + 1);
                                 uint64_t gc_size = 0;
                                 auto *regions = bound_regions();
                                 CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
@@ -186,13 +217,21 @@ class CXL_EBR {
                                     epoch_to_reclaim % max_epoch);
                                 for (const auto &object : retired) {
                                         void *ptr = object.private_partition != UINT32_MAX
-                                            ? regions->swcc().FromOffset(object.object_offset)
-                                            : (object.domain == tigonkv::engine::AllocationDomain::kHwccIndex ||
-                                               object.domain == tigonkv::engine::AllocationDomain::kHwccMetadata ||
-                                               object.domain == tigonkv::engine::AllocationDomain::kHwccEbr ||
-                                               object.domain == tigonkv::engine::AllocationDomain::kTransport
-                                                   ? regions->hwcc().FromOffset(object.object_offset)
-                                                   : regions->swcc().FromOffset(object.object_offset));
+                                            ? regions->ResolveOwnerPrivate(
+                                                  object.object_offset, object.bytes,
+                                                  object.private_partition,
+                                                  coordinator_id)
+                                            : (object.domain == tigonkv::engine::AllocationDomain::kSharedPayloadSwcc
+                                                   ? regions->ResolveSharedPayload(
+                                                         object.object_offset,
+                                                         object.bytes)
+                                                   : ((object.domain == tigonkv::engine::AllocationDomain::kHwccIndex ||
+                                                       object.domain == tigonkv::engine::AllocationDomain::kHwccMetadata)
+                                                          ? regions->ResolveDynamicHwcc(object.object_offset,
+                                                                                         object.bytes,
+                                                                                         coordinator_id)
+                                                          : throw std::runtime_error(
+                                                                "EBR retire record has unsupported allocation domain")));
                                         if (object.private_partition != UINT32_MAX)
                                                 regions->FreeOwnerPrivate(ptr, object.bytes,
                                                                           object.private_partition,
@@ -226,9 +265,12 @@ class CXL_EBR {
     private:
         static EBRMetaLocal &get_local_ebr_meta()
 	{
+		if (bound_ebr_meta_ != nullptr)
+			return *bound_ebr_meta_;
 		static thread_local EBRMetaLocal local_ebr_meta;
 		return local_ebr_meta;
 	}
+		inline static thread_local EBRMetaLocal *bound_ebr_meta_ = nullptr;
 
         uint64_t coordinator_num{ 0 };
         uint64_t thread_num{ 0 };

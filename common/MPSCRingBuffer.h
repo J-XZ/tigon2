@@ -7,7 +7,6 @@
 #include "common/Message.h"
 #include "common/CXLMemory.h"
 #include "kv/engine/mem_access.h"
-#include <boost/interprocess/offset_ptr.hpp>
 #include <stddef.h>
 #include <atomic>
 #include <stdexcept>
@@ -34,9 +33,12 @@ class MPSCRingBuffer {
                 , tail(0)
                 , count(0)
         {
-                entries_buffer = reinterpret_cast<char *>(cxl_memory.cxlalloc_malloc_wrapper(entry_struct_size * entry_num, CXLMemory::TRANSPORT_ALLOCATION));
+                entries_buffer_offset = CXLMemory::transport_pointer_to_offset(
+                    cxl_memory.cxlalloc_malloc_wrapper(
+                        entry_struct_size * entry_num,
+                        CXLMemory::TRANSPORT_ALLOCATION));
                 for (int i = 0; i < entry_num; i++) {
-                        Entry *entry = reinterpret_cast<Entry *>(entries_buffer.get() + i * entry_struct_size);
+                        Entry *entry = reinterpret_cast<Entry *>(entries() + i * entry_struct_size);
                         entry->is_ready = 0;
                         entry->remaining_size = 0;
                         entry->dequeue_offset = 0;
@@ -46,17 +48,23 @@ class MPSCRingBuffer {
 
         uint64_t get_entry_num()
         {
+                tigonkv::engine::mem_access::TransportRead(
+                    &entry_num, sizeof(entry_num));
                 return entry_num;
         }
 
         uint64_t get_entry_size()
         {
+                tigonkv::engine::mem_access::TransportRead(
+                    &entry_data_size, sizeof(entry_data_size));
                 return entry_data_size;
         }
 
         uint64_t size()
         {
                 uint64_t cur_head = 0, cur_tail = 0;
+                tigonkv::engine::mem_access::TransportRead(
+                    &entry_num, sizeof(entry_num));
 
                 tigonkv::engine::mem_access::HwccAtomicLoad(&head);
                 cur_head = head.load(std::memory_order_acquire);
@@ -71,26 +79,36 @@ class MPSCRingBuffer {
                 uint64_t cur_count = 0, cur_tail = 0;
                 Entry *entry = nullptr;
 
+                tigonkv::engine::mem_access::TransportRead(
+                    &entry_struct_size,
+                    sizeof(entry_struct_size) + sizeof(entry_data_size) +
+                        sizeof(entry_num));
+                tigonkv::engine::mem_access::TransportRead(
+                    &entries_buffer_offset, sizeof(entries_buffer_offset));
+                const uint64_t local_entry_struct_size = entry_struct_size;
+                const uint64_t local_entry_data_size = entry_data_size;
+                const uint64_t local_entry_num = entry_num;
+
                 // Prefer throw over glog FATAL: aborting one guest made the
                 // remaining VMs look like a Forward/Await stall under YCSB-A.
-                if (entry_num == 0 || entry_struct_size < 9 ||
-                    entry_data_size != entry_struct_size - 9) {
+                if (local_entry_num == 0 || local_entry_struct_size < 9 ||
+                    local_entry_data_size != local_entry_struct_size - 9) {
                         LOG(ERROR) << "MPSCRingBuffer corrupt metadata: data_size="
-                                   << data_size << " entry_data_size=" << entry_data_size
-                                   << " entry_struct_size=" << entry_struct_size
-                                   << " entry_num=" << entry_num;
+                                   << data_size << " entry_data_size=" << local_entry_data_size
+                                   << " entry_struct_size=" << local_entry_struct_size
+                                   << " entry_num=" << local_entry_num;
                         throw std::runtime_error("corrupt MPSCRingBuffer metadata");
                 }
-                if (data_size > entry_data_size) {
+                if (data_size > local_entry_data_size) {
                         LOG(ERROR) << "MPSCRingBuffer enqueue too large: data_size="
-                                   << data_size << " entry_data_size=" << entry_data_size;
+                                   << data_size << " entry_data_size=" << local_entry_data_size;
                         throw std::runtime_error("KV message exceeds transport entry");
                 }
 
                 /* try to gain access to the queue */
                 tigonkv::engine::mem_access::HwccAtomicRmw(&count);
                 cur_count = std::atomic_fetch_add_explicit(&count, 1, std::memory_order_acquire);
-                if(cur_count >= entry_num) {
+                if(cur_count >= local_entry_num) {
                         /* back off since queue is full */
                         tigonkv::engine::mem_access::HwccAtomicRmw(&count);
                         std::atomic_fetch_sub_explicit(&count, 1, std::memory_order_release);
@@ -100,10 +118,10 @@ class MPSCRingBuffer {
                 /* gain exclusive access to the entry */
                 tigonkv::engine::mem_access::HwccAtomicRmw(&tail);
                 cur_tail = std::atomic_fetch_add_explicit(&tail, 1, std::memory_order_release);
-                cur_tail %= entry_num;
+                cur_tail %= local_entry_num;
 
                 /* get the entry */
-                entry = reinterpret_cast<Entry *>(entries_buffer.get() + cur_tail * entry_struct_size);
+                entry = reinterpret_cast<Entry *>(entries() + cur_tail * local_entry_struct_size);
 
                 /* memcpy the data to the target endpoint's receive queue */
                 tigonkv::engine::mem_access::TransportWrite(entry->data, data_size);
@@ -118,9 +136,6 @@ class MPSCRingBuffer {
 
                 /* mark the entry as ready */
                 tigonkv::engine::mem_access::HwccAtomicStore(&entry->is_ready);
-                // All prior ring/data access latency must be causal: settle it
-                // before the release store makes this frame visible.
-                tigonkv::engine::mem_access::DelayActiveScopeNow();
                 entry->is_ready.store(1, std::memory_order_release);
 
                 return true;
@@ -128,7 +143,7 @@ class MPSCRingBuffer {
 
         uint64_t dequeue(char *data_buffer, uint64_t buffer_size)
         {
-                uint64_t cur_head = 0, cur_tail = 0;
+                uint64_t cur_head = 0;
                 uint64_t entry_index = 0;
                 uint64_t dequeue_size = 0;
                 Entry *entry = nullptr;
@@ -136,25 +151,32 @@ class MPSCRingBuffer {
                 if (buffer_size == 0)
                         return 0;
 
+                tigonkv::engine::mem_access::TransportRead(
+                    &entry_struct_size,
+                    sizeof(entry_struct_size) + sizeof(entry_data_size) +
+                        sizeof(entry_num));
+                tigonkv::engine::mem_access::TransportRead(
+                    &entries_buffer_offset, sizeof(entries_buffer_offset));
+                const uint64_t local_entry_struct_size = entry_struct_size;
+                const uint64_t local_entry_data_size = entry_data_size;
+                const uint64_t local_entry_num = entry_num;
+
                 if (size() == 0)
                         return 0;
 
                 tigonkv::engine::mem_access::HwccAtomicLoad(&head);
                 cur_head = head.load(std::memory_order_acquire);
-                entry_index = cur_head % entry_num;
+                entry_index = cur_head % local_entry_num;
 
                 /* get the entry */
-                entry = reinterpret_cast<Entry *>(entries_buffer.get() + entry_index * entry_struct_size);
+                entry = reinterpret_cast<Entry *>(
+                    entries() + entry_index * local_entry_struct_size);
 
                 /* wait for the entry to be ready */
                 uint8_t ready = 0;
                 do {
                         tigonkv::engine::mem_access::HwccAtomicLoad(&entry->is_ready);
                         ready = entry->is_ready.load(std::memory_order_acquire);
-                        // Each poll is a real HWCC dependency. Settle it before
-                        // issuing another poll so host scheduling cannot create
-                        // an artificial burst of un-delayed loads.
-                        tigonkv::engine::mem_access::DelayActiveScopeNow();
                 } while (ready != 1);
 
                 /* Partial dequeue is not supported. Metadata or wire-size
@@ -165,12 +187,13 @@ class MPSCRingBuffer {
                     &entry->remaining_size,
                     sizeof(entry->remaining_size) + sizeof(entry->dequeue_offset));
                 if (entry->remaining_size == 0 ||
-                    entry->dequeue_offset > entry_data_size ||
-                    entry->remaining_size > entry_data_size - entry->dequeue_offset) {
+                    entry->dequeue_offset > local_entry_data_size ||
+                    entry->remaining_size >
+                        local_entry_data_size - entry->dequeue_offset) {
                         LOG(ERROR) << "MPSCRingBuffer corrupt dequeue metadata: remaining_size="
                                    << entry->remaining_size
                                    << " dequeue_offset=" << entry->dequeue_offset
-                                   << " entry_data_size=" << entry_data_size;
+                                   << " entry_data_size=" << local_entry_data_size;
                         throw std::runtime_error("corrupt MPSCRingBuffer dequeue metadata");
                 }
                 if (buffer_size < entry->remaining_size) {
@@ -201,9 +224,6 @@ class MPSCRingBuffer {
                         tigonkv::engine::mem_access::HwccAtomicStore(&head);
                         /* reduce count by 1 */
                         tigonkv::engine::mem_access::HwccAtomicRmw(&count);
-                        // Do not publish a reusable slot until all dequeue
-                        // payload/metadata/atomic latency has been paid.
-                        tigonkv::engine::mem_access::DelayActiveScopeNow();
                         entry->is_ready.store(0, std::memory_order_relaxed);
                         head.store(cur_head + 1, std::memory_order_release);
                         std::atomic_fetch_sub_explicit(&count, 1, std::memory_order_release);
@@ -262,6 +282,13 @@ class MPSCRingBuffer {
                 _mm_sfence();
         }
 
+        char *entries() const {
+                if (entries_buffer_offset == 0)
+                        throw std::runtime_error("MPSCRingBuffer has null entries offset");
+                return static_cast<char *>(CXLMemory::transport_offset_to_pointer(
+                    entries_buffer_offset, entry_struct_size * entry_num));
+        }
+
         uint64_t entry_struct_size;
         uint64_t entry_data_size;
         uint64_t entry_num;
@@ -269,7 +296,7 @@ class MPSCRingBuffer {
         std::atomic<uint64_t> head;
         std::atomic<uint64_t> tail;
         std::atomic<uint64_t> count;
-        boost::interprocess::offset_ptr<char> entries_buffer;
+        uint64_t entries_buffer_offset = 0;
 };
 
 }

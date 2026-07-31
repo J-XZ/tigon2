@@ -3,10 +3,200 @@
 #include "kv/engine/kv_migration.h"
 #include "kv/engine/kv_partition.h"
 
-#include <cstddef>
+#include <cstring>
+#include <stdexcept>
+#include <string_view>
 
 namespace star
 {
+
+// Position-independent storage adapter for the original ClockTracker API.
+// The list algorithm lives here; KVPartition only supplies owner-private
+// control/node allocation and offset resolvers.
+class PolicyClock::ClockTracker {
+ public:
+  struct ClockTrackerNode {
+    MigrationManager::migrated_row_entity row_entity;
+    tigonkv::engine::RegionOffset node_offset = tigonkv::engine::kNullOffset;
+  };
+
+  explicit ClockTracker(tigonkv::engine::KVPartition &partition)
+      : partition_(partition) {}
+
+  void lock() {
+    auto *control = partition_.ClockTrackerControl();
+    const volatile void *volatile_lock = &control->lock;
+    auto *lock = const_cast<const void *>(volatile_lock);
+    tigonkv::engine::mem_access::PrivateAtomicRmw(lock);
+    pthread_spin_lock(&control->lock);
+  }
+  bool try_lock() {
+    auto *control = partition_.ClockTrackerControl();
+    const volatile void *volatile_lock = &control->lock;
+    auto *lock = const_cast<const void *>(volatile_lock);
+    tigonkv::engine::mem_access::PrivateAtomicRmw(lock);
+    return pthread_spin_trylock(&control->lock) == 0;
+  }
+  void unlock() {
+    auto *control = partition_.ClockTrackerControl();
+    const volatile void *volatile_lock = &control->lock;
+    auto *lock = const_cast<const void *>(volatile_lock);
+    tigonkv::engine::mem_access::PrivateAtomicStore(lock);
+    pthread_spin_unlock(&control->lock);
+  }
+
+  tigonkv::engine::PrivateClockTrackerNode *allocate() {
+    return partition_.AllocateClockTrackerNode();
+  }
+  void discard(tigonkv::engine::PrivateClockTrackerNode *node) {
+    partition_.FreeClockTrackerNode(node);
+  }
+
+  void track(tigonkv::engine::PrivateClockTrackerNode *node, ITable *table,
+             const void *key,
+             const std::tuple<ITable::MetaDataType *, void *> &row,
+             void *migration_policy_meta) {
+    if (node == nullptr || table == nullptr || key == nullptr ||
+        migration_policy_meta == nullptr)
+      throw std::runtime_error("Clock move-in returned invalid tracker state");
+    const auto row_offset = partition_.ClockTrackerLocalRowOffset(row);
+    const auto smeta_offset = partition_.ClockTrackerSharedRowOffset(
+        migration_policy_meta);
+    node->value_off = row_offset;
+    node->smeta_off = smeta_offset;
+    node->prev_off = tigonkv::engine::kNullOffset;
+    node->next_off = tigonkv::engine::kNullOffset;
+    std::memcpy(&node->key, key, sizeof(node->key));
+    const auto node_offset = partition_.ClockTrackerNodeOffset(node);
+    auto *control = partition_.ClockTrackerControl();
+    tigonkv::engine::mem_access::PrivateRead(&control->head,
+                                             sizeof(control->head));
+    tigonkv::engine::mem_access::PrivateRead(&control->tail,
+                                             sizeof(control->tail));
+    if (control->head == tigonkv::engine::kNullOffset &&
+        control->tail == tigonkv::engine::kNullOffset) {
+      tigonkv::engine::mem_access::PrivateWrite(&control->head,
+                                                sizeof(control->head));
+      tigonkv::engine::mem_access::PrivateWrite(&control->tail,
+                                                sizeof(control->tail));
+      control->head = node_offset;
+      control->tail = node_offset;
+    } else {
+      auto *tail = partition_.ResolveClockTrackerNode(control->tail);
+      if (tail == nullptr) throw std::runtime_error("Clock tail offset is invalid");
+      tigonkv::engine::mem_access::PrivateRead(tail, sizeof(*tail));
+      tigonkv::engine::mem_access::PrivateWrite(tail, sizeof(*tail));
+      tail->next_off = node_offset;
+      tigonkv::engine::mem_access::PrivateWrite(node, sizeof(*node));
+      node->prev_off = control->tail;
+      tigonkv::engine::mem_access::PrivateWrite(&control->tail,
+                                                sizeof(control->tail));
+      control->tail = node_offset;
+    }
+    tigonkv::engine::mem_access::PrivateWrite(node, sizeof(*node));
+  }
+
+  ClockTrackerNode *move_forward_and_get_cursor(ITable *table) {
+    if (table == nullptr) throw std::invalid_argument("null Clock table");
+    auto *control = partition_.ClockTrackerControl();
+    tigonkv::engine::mem_access::PrivateRead(&control->cursor,
+                                             sizeof(control->cursor));
+    if (control->cursor == tigonkv::engine::kNullOffset) {
+      tigonkv::engine::mem_access::PrivateRead(&control->head,
+                                               sizeof(control->head));
+      control->cursor = control->head;
+    } else {
+      auto *current = partition_.ResolveClockTrackerNode(control->cursor);
+      if (current == nullptr) throw std::runtime_error("Clock cursor offset is invalid");
+      tigonkv::engine::mem_access::PrivateRead(current, sizeof(*current));
+      control->cursor = current->next_off;
+    }
+    tigonkv::engine::mem_access::PrivateWrite(&control->cursor,
+                                              sizeof(control->cursor));
+    if (control->cursor == tigonkv::engine::kNullOffset) return nullptr;
+    auto *node = partition_.ResolveClockTrackerNode(control->cursor);
+    if (node == nullptr) throw std::runtime_error("Clock candidate offset is invalid");
+    tigonkv::engine::mem_access::PrivateRead(node, sizeof(*node));
+    if (!partition_.ClockTrackerNodeMatches(*node))
+      throw std::runtime_error("Clock tracker node/local-row mismatch");
+    node_.node_offset = control->cursor;
+    node_.row_entity = MigrationManager::migrated_row_entity(
+        table, node->key.bytes, partition_.ClockTrackerLocalRow(node->value_off),
+        /*metadata_size=*/0);
+    node_.row_entity.migration_manager_meta =
+        partition_.ClockTrackerSharedRow(node->smeta_off);
+    return &node_;
+  }
+
+  void untrack(ClockTrackerNode *node) {
+    if (node == nullptr) throw std::invalid_argument("null Clock victim");
+    unlink_and_free(node->node_offset);
+  }
+
+  void untrack_key(const void *key) {
+    if (key == nullptr) throw std::invalid_argument("null Clock key");
+    tigonkv::engine::FixedKey fixed_key =
+        tigonkv::engine::FixedKey::From(
+            std::string_view(static_cast<const char *>(key), 32), 32);
+    auto *control = partition_.ClockTrackerControl();
+    tigonkv::engine::mem_access::PrivateRead(&control->head,
+                                             sizeof(control->head));
+    for (auto offset = control->head; offset != tigonkv::engine::kNullOffset;) {
+      auto *node = partition_.ResolveClockTrackerNode(offset);
+      if (node == nullptr) throw std::runtime_error("Clock node offset is invalid");
+      tigonkv::engine::mem_access::PrivateRead(node, sizeof(*node));
+      const auto next = node->next_off;
+      if (node->key.Compare(fixed_key) == 0) {
+        unlink_and_free(offset);
+        return;
+      }
+      offset = next;
+    }
+  }
+
+  void reset_cursor() {
+    auto *control = partition_.ClockTrackerControl();
+    tigonkv::engine::mem_access::PrivateWrite(&control->cursor,
+                                              sizeof(control->cursor));
+    control->cursor = tigonkv::engine::kNullOffset;
+  }
+
+ private:
+  void unlink_and_free(tigonkv::engine::RegionOffset node_offset) {
+    auto *control = partition_.ClockTrackerControl();
+    auto *node = partition_.ResolveClockTrackerNode(node_offset);
+    if (node == nullptr) throw std::runtime_error("Clock untrack offset is invalid");
+    tigonkv::engine::mem_access::PrivateRead(node, sizeof(*node));
+    tigonkv::engine::mem_access::PrivateRead(control, sizeof(*control));
+    if (control->cursor == node_offset) control->cursor = node->prev_off;
+    if (control->head == control->tail) {
+      if (control->head != node_offset)
+        throw std::runtime_error("Clock singleton unlink mismatch");
+      control->head = tigonkv::engine::kNullOffset;
+      control->tail = tigonkv::engine::kNullOffset;
+    } else {
+      if (node->prev_off != tigonkv::engine::kNullOffset) {
+        auto *prev = partition_.ResolveClockTrackerNode(node->prev_off);
+        if (prev == nullptr) throw std::runtime_error("Clock previous offset is invalid");
+        tigonkv::engine::mem_access::PrivateWrite(prev, sizeof(*prev));
+        prev->next_off = node->next_off;
+      }
+      if (node->next_off != tigonkv::engine::kNullOffset) {
+        auto *next = partition_.ResolveClockTrackerNode(node->next_off);
+        if (next == nullptr) throw std::runtime_error("Clock next offset is invalid");
+        tigonkv::engine::mem_access::PrivateWrite(next, sizeof(*next));
+        next->prev_off = node->prev_off;
+      }
+      if (control->head == node_offset) control->head = node->next_off;
+      if (control->tail == node_offset) control->tail = node->prev_off;
+    }
+    tigonkv::engine::mem_access::PrivateWrite(control, sizeof(*control));
+    partition_.FreeClockTrackerNode(node);
+  }
+
+  tigonkv::engine::KVPartition &partition_;
+  ClockTrackerNode node_;
+};
 
 PolicyClock::PolicyClock(
     std::function<migration_result(ITable *, const void *,
@@ -49,23 +239,101 @@ void PolicyClock::access_row(void *migration_policy_meta, uint64_t partition_id)
   (void)partition_id;
 }
 
+tigonkv::engine::KVPartition *&PolicyClock::HeldClockPartition() {
+  thread_local tigonkv::engine::KVPartition *held = nullptr;
+  return held;
+}
+
+void PolicyClock::run_under_partition_clock(
+    ITable *table, const std::function<void()> &fn) {
+  if (!try_run_under_partition_clock(table, fn)) {
+    // Blocking fallback for non-cooperative callers (matches spin_lock).
+    auto *partition = PartitionOf(table);
+    if (partition == nullptr) {
+      fn();
+      return;
+    }
+    if (HeldClockPartition() == partition) {
+      fn();
+      return;
+    }
+    if (HeldClockPartition() != nullptr)
+      throw std::logic_error("nested Clock critical section across partitions");
+    ClockTracker clock_tracker(*partition);
+    clock_tracker.lock();
+    HeldClockPartition() = partition;
+    try {
+      fn();
+    } catch (...) {
+      HeldClockPartition() = nullptr;
+      clock_tracker.unlock();
+      throw;
+    }
+    HeldClockPartition() = nullptr;
+    clock_tracker.unlock();
+  }
+}
+
+bool PolicyClock::try_run_under_partition_clock(
+    ITable *table, const std::function<void()> &fn) {
+  auto *partition = PartitionOf(table);
+  if (partition == nullptr) {
+    fn();
+    return true;
+  }
+  if (HeldClockPartition() == partition) {
+    fn();
+    return true;
+  }
+  // Cross-partition nesting under cooperative poll: treat as Busy rather than
+  // hard-failing the worker that still owes a peer response.
+  if (HeldClockPartition() != nullptr) return false;
+  ClockTracker clock_tracker(*partition);
+  if (!clock_tracker.try_lock()) return false;
+  HeldClockPartition() = partition;
+  try {
+    fn();
+  } catch (...) {
+    HeldClockPartition() = nullptr;
+    clock_tracker.unlock();
+    throw;
+  }
+  HeldClockPartition() = nullptr;
+  clock_tracker.unlock();
+  return true;
+}
+
 migration_result PolicyClock::move_row_in(
     ITable *table, const void *key,
     const std::tuple<MetaDataType *, void *> &row, bool inc_ref_cnt) {
   auto *partition = PartitionOf(table);
   if (partition == nullptr) return migration_result::FAIL_OOM;
+  ClockTracker clock_tracker(*partition);
+  const bool nested = HeldClockPartition() == partition;
   void *migration_policy_meta = nullptr;
-  partition->ClockLock();
+  if (!nested) clock_tracker.lock();
+  auto *tracker_node = static_cast<tigonkv::engine::PrivateClockTrackerNode *>(
+      nullptr);
   try {
+    try {
+      tracker_node = clock_tracker.allocate();
+    } catch (const std::bad_alloc &) {
+      if (!nested) clock_tracker.unlock();
+      return migration_result::FAIL_OOM;
+    }
     const migration_result ret = move_from_partition_to_shared_region(
         table, key, row, inc_ref_cnt, migration_policy_meta);
     if (ret == migration_result::SUCCESS) {
-      partition->ClockTrackMigratedKey(key);
+      clock_tracker.track(tracker_node, table, key, row,
+                          migration_policy_meta);
+    } else {
+      clock_tracker.discard(tracker_node);
     }
-    partition->ClockUnlock();
+    if (!nested) clock_tracker.unlock();
     return ret;
   } catch (...) {
-    partition->ClockUnlock();
+    if (tracker_node != nullptr) clock_tracker.discard(tracker_node);
+    if (!nested) clock_tracker.unlock();
     throw;
   }
 }
@@ -75,39 +343,55 @@ bool PolicyClock::move_row_out(uint64_t partition_id) {
   auto *kv_table = tigonkv::engine::KvMigrationRuntime::Instance().TableFor(
       static_cast<uint32_t>(partition_id));
   if (kv_table == nullptr || kv_table->partition() == nullptr) return false;
-  if (cxl_memory.get_stats(CXLMemory::TOTAL_HW_CC_USAGE) < hw_cc_budget)
-    return false;
   auto *partition = kv_table->partition();
+  ClockTracker clock_tracker(*partition);
+  const bool nested = HeldClockPartition() == partition;
   bool ret = false;
-  partition->ClockLock();
+  // Under AwaitResponse nesting, never spin on Clock held by a long
+  // move_in_scan_range: skip this OnDemand pass; a later call retries.
+  if (!nested && !clock_tracker.try_lock()) return false;
   try {
-    while (true) {
-      const auto victim_off = partition->ClockAdvanceCursor();
-      if (victim_off == tigonkv::engine::kNullOffset) break;
-      tigonkv::engine::FixedKey victim_key;
-      TwoPLPashaMetadataShared *smeta = nullptr;
-      if (!partition->ClockVictim(victim_off, &victim_key, &smeta)) continue;
+    if (cxl_memory.get_stats(CXLMemory::TOTAL_HW_CC_USAGE) < hw_cc_budget) {
+      if (!nested) clock_tracker.unlock();
+      return ret;
+    }
+    // Cap one OnDemand walk so a large tracker list cannot hold the partition
+    // Clock across a full ring under Scan storms (100k YCSB E).  Later
+    // OnDemand calls resume from the same cursor, matching master's repeated
+    // move_row_out invocations after further move-ins.
+    constexpr int kMaxCandidatesPerCall = 64;
+    int examined = 0;
+    while (examined < kMaxCandidatesPerCall) {
+      auto *victim = clock_tracker.move_forward_and_get_cursor(kv_table);
+      if (victim == nullptr) break;
+      ++examined;
+      auto *smeta = PolicySmeta(victim->row_entity.migration_manager_meta);
       smeta->lock();
       const bool second_chance = smeta->get_second_chance_bit();
       if (second_chance) smeta->clear_second_chance_bit();
       smeta->unlock();
       if (second_chance) continue;
       const bool moved = move_from_shared_region_to_partition(
-          kv_table, victim_key.bytes, empty_row_);
+          victim->row_entity.table, victim->row_entity.key,
+          victim->row_entity.local_row);
       if (moved) {
+        // The offset adapter materializes callback state in one scratch node.
+        // Keep the original victim stable across the master-prescribed cursor
+        // advance below; that advance overwrites the scratch view.
+        ClockTracker::ClockTrackerNode original_victim = *victim;
         // Preserve the original cursor advance before unlinking its victim.
-        (void)partition->ClockAdvanceCursor();
-        partition->ClockUntrackMigratedKey(victim_key.bytes);
+        (void)clock_tracker.move_forward_and_get_cursor(kv_table);
+        clock_tracker.untrack(&original_victim);
         if (cxl_memory.get_stats(CXLMemory::TOTAL_HW_CC_USAGE) < hw_cc_budget) {
           ret = true;
           break;
         }
       }
     }
-    partition->ClockUnlock();
+    if (!nested) clock_tracker.unlock();
     return ret;
   } catch (...) {
-    partition->ClockUnlock();
+    if (!nested) clock_tracker.unlock();
     throw;
   }
 }
@@ -116,17 +400,19 @@ bool PolicyClock::delete_specific_row_and_move_out(ITable *table, const void *ke
                                                    bool is_delete_local) {
   auto *partition = PartitionOf(table);
   if (partition == nullptr) return false;
+  ClockTracker clock_tracker(*partition);
+  const bool nested = HeldClockPartition() == partition;
   void *migration_policy_meta = nullptr;
   bool need_move_out = false;
-  partition->ClockLock();
+  if (!nested) clock_tracker.lock();
   try {
     const bool ret = delete_and_update_next_key_info(
         table, key, is_delete_local, need_move_out, migration_policy_meta);
-    if (ret && need_move_out) partition->ClockUntrackMigratedKey(key);
-    partition->ClockUnlock();
+    if (ret && need_move_out) clock_tracker.untrack_key(key);
+    if (!nested) clock_tracker.unlock();
     return ret;
   } catch (...) {
-    partition->ClockUnlock();
+    if (!nested) clock_tracker.unlock();
     throw;
   }
 }
@@ -141,9 +427,10 @@ TwoPLPashaMetadataShared *PolicyClock::PolicySmeta(
     void *migration_policy_meta) {
   if (migration_policy_meta == nullptr)
     throw std::invalid_argument("null Clock migration policy metadata");
-  auto *bytes = static_cast<char *>(migration_policy_meta);
-  return reinterpret_cast<TwoPLPashaMetadataShared *>(
-      bytes - offsetof(TwoPLPashaMetadataShared, migration_policy_meta));
+  // Clock uses the existing HWCC smeta bit 37 directly.  The opaque
+  // MigrationManager argument is the smeta itself, not a pointer into an
+  // SCC-resident policy blob.
+  return static_cast<TwoPLPashaMetadataShared *>(migration_policy_meta);
 }
 
 }  // namespace star

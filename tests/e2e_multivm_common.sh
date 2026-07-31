@@ -38,6 +38,8 @@ tigonkv_e2e_multivm_preflight() {
     exit 2
   fi
 
+  tigonkv_assert_host_test_isolated
+
   [[ -x "$TIGONKV_POOL_INITER" ]] || {
     echo "missing cxl_pool_initer: $TIGONKV_POOL_INITER" >&2
     exit 2

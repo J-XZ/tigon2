@@ -10,11 +10,6 @@
 namespace tigonkv::engine {
 namespace {
 
-const FixedKey &TableKey(const void *key) {
-  if (key == nullptr) throw std::invalid_argument("null table key");
-  return *static_cast<const FixedKey *>(key);
-}
-
 std::string_view TableValue(const void *value, uint32_t value_size) {
   if (value == nullptr) throw std::invalid_argument("null table value");
   return std::string_view(static_cast<const char *>(value), value_size);
@@ -22,224 +17,117 @@ std::string_view TableValue(const void *value, uint32_t value_size) {
 
 }  // namespace
 
-std::tuple<star::ITable::MetaDataType *, void *> KvPartitionTable::Row(
-    RegionOffset offset) const {
-  if (offset == kNullOffset) return std::make_tuple(nullptr, nullptr);
-  auto *value = partition_->ValueFromOffset(offset);
-  if (value == nullptr) return std::make_tuple(nullptr, nullptr);
-  return std::make_tuple(&value->meta, value->data);
-}
-
-void KvPartitionTable::FillAdjacent(RegionOffset *offset, void **meta,
-                                     void **data) const {
-  *meta = nullptr;
-  *data = nullptr;
-  if (offset == nullptr || *offset == kNullOffset) return;
-  auto *value = partition_->ValueFromOffset(*offset);
-  // Match TableBTreeOLC's adjacent callbacks: search() exposes the
-  // ValueStruct meta slot, while adjacent callbacks expose the resolved local
-  // metadata object stored in that slot.
-  *meta = partition_->MetadataFromValue(value);
-  *data = value->data;
-}
-
-uint64_t KvPartitionTable::get_plain_key(const void *key) {
-  const auto &fixed = TableKey(key);
-  uint64_t result = 0;
-  const size_t bytes = std::min<size_t>(sizeof(result), key_size_);
-  for (size_t i = 0; i < bytes; ++i)
-    result = (result << 8) | static_cast<unsigned char>(fixed.bytes[i]);
-  return result;
-}
-
-int KvPartitionTable::compare_key(const void *a, const void *b) {
-  return TableKey(a).Compare(TableKey(b));
-}
-
-std::tuple<star::ITable::MetaDataType *, void *> KvPartitionTable::search(
-    const void *key) {
-  RegionOffset offset = kNullOffset;
-  if (!partition_->LookupPrivateOffset(TableKey(key), &offset))
-    return std::make_tuple(nullptr, nullptr);
-  return Row(offset);
-}
-
-void *KvPartitionTable::search_value(const void *key) {
-  return std::get<1>(search(key));
-}
-
-star::ITable::MetaDataType *KvPartitionTable::search_metadata(const void *key) {
-  return std::get<0>(search(key));
-}
-
-void KvPartitionTable::scan(
-    const void *min_key,
-    std::function<bool(const void *, MetaDataType *, void *, bool)> processor) {
-  if (!processor) throw std::invalid_argument("empty table scan processor");
-  const FixedKey &start = TableKey(min_key);
-  partition_->private_tree_->scanForUpdate(
-      start, [&](const FixedKey &key, KVPartition::PrivateTreeValue &offset,
-                 bool is_last) {
-        auto [meta, data] = Row(offset.row);
-        return processor(&key, meta, data, is_last);
-      });
-}
-
-bool KvPartitionTable::insert(const void *key, const void *value,
-                              bool is_placeholder) {
-  auto *row = partition_->AllocateValue(TableValue(value, value_size_));
-  auto *metadata = partition_->MetadataFromValue(row);
+RegionOffsetRowStorage::StoredRow RegionOffsetRowStorage::AllocateAndConstruct(
+    const void *value, bool is_placeholder) const {
+  if (partition == nullptr) throw std::runtime_error("null owner partition");
+  const std::string_view fixed_value = TableValue(value, value_size);
+  auto *metadata = new (partition->regions_.AllocateOwnerPrivate(
+      sizeof(PrivateMetadataLocal), partition->partition_id_,
+      partition->owner_shard_)) PrivateMetadataLocal;
+  const uint64_t row_bytes = sizeof(PrivateValueStruct) + value_size;
+  PrivateValueStruct *row = nullptr;
+  try {
+    row = new (partition->regions_.AllocateOwnerPrivate(
+        row_bytes, partition->partition_id_, partition->owner_shard_))
+        PrivateValueStruct;
+  } catch (const std::bad_alloc &) {
+    partition->regions_.FreeOwnerPrivate(
+        metadata, sizeof(PrivateMetadataLocal), partition->partition_id_,
+        partition->owner_shard_);
+    throw;
+  }
+  mem_access::PrivateAtomicStore(&row->meta);
+  row->meta.store(
+      partition->regions_.ToOwnerPrivateOffset(metadata, partition->partition_id_),
+      std::memory_order_release);
+  std::memcpy(row->data, fixed_value.data(), value_size);
+  mem_access::PrivateWrite(row->data, value_size);
   metadata->is_valid = !is_placeholder;
-  const bool inserted = partition_->private_tree_->insert(
-      TableKey(key), KVPartition::PrivateTreeValue{
-                         partition_->regions_.swcc().ToOffset(row)});
-  if (!inserted) {
-    partition_->FreeUnpublishedPrivateValue(row);
-    return false;
-  }
-  partition_->PersistPrivateRootIfChanged();
-  return true;
+  metadata->tid = partition->NextCommitTid(metadata->tid);
+  mem_access::PrivateWrite(
+      reinterpret_cast<char *>(metadata) + offsetof(PrivateMetadataLocal, is_valid),
+      sizeof(PrivateMetadataLocal) - offsetof(PrivateMetadataLocal, is_valid));
+  return partition->regions_.ToOwnerPrivateOffset(row, partition->partition_id_);
 }
 
-bool KvPartitionTable::insert_lock_next_key(
-    const void *key, const void *value,
-    std::function<bool(const void *, MetaDataType *, void *)> processor,
-    bool is_placeholder) {
-  if (!processor) throw std::invalid_argument("empty next-key processor");
-  auto *row = partition_->AllocateValue(TableValue(value, value_size_));
-  partition_->MetadataFromValue(row)->is_valid = !is_placeholder;
-  const KVPartition::PrivateTreeValue row_offset{
-      partition_->regions_.swcc().ToOffset(row)};
-  const bool inserted = partition_->private_tree_->insert_lock_next_key(
-      TableKey(key), row_offset,
-      [&](const FixedKey *next_key, KVPartition::PrivateTreeValue *next_offset) {
-        auto [meta, data] = next_offset == nullptr ? std::make_tuple(nullptr, nullptr)
-                                                    : Row(next_offset->row);
-        return processor(next_key, meta, data);
-      });
-  if (!inserted) {
-    partition_->FreeUnpublishedPrivateValue(row);
-    return false;
-  }
-  partition_->PersistPrivateRootIfChanged();
-  return true;
+void RegionOffsetRowStorage::DestroyUnpublished(StoredRow row) const {
+  auto *value = partition->ValueFromOffset(row);
+  if (value == nullptr) throw std::runtime_error("invalid unpublished row offset");
+  partition->FreeUnpublishedPrivateValue(value);
 }
 
-bool KvPartitionTable::insert_and_process_adjacent_tuples(
-    const void *key, const void *value,
-    std::function<bool(const void *, MetaDataType *, void *, const void *,
-                       MetaDataType *, void *)> processor,
-    bool is_placeholder) {
-  if (!processor) throw std::invalid_argument("empty adjacent-insert processor");
-  auto *row = partition_->AllocateValue(TableValue(value, value_size_));
-  partition_->MetadataFromValue(row)->is_valid = !is_placeholder;
-  const KVPartition::PrivateTreeValue row_offset{
-      partition_->regions_.swcc().ToOffset(row)};
-  const bool inserted = partition_->private_tree_->insert_and_process_adjacent_tuples(
-      TableKey(key), row_offset,
-      [&](const FixedKey *prev_key, KVPartition::PrivateTreeValue *prev_offset,
-          const FixedKey *next_key, KVPartition::PrivateTreeValue *next_offset) {
-        auto [prev_meta, prev_data] = prev_offset == nullptr
-                                          ? std::make_tuple(nullptr, nullptr)
-                                          : Row(prev_offset->row);
-        auto [next_meta, next_data] = next_offset == nullptr
-                                          ? std::make_tuple(nullptr, nullptr)
-                                          : Row(next_offset->row);
-        return processor(prev_key, prev_meta, prev_data, next_key, next_meta,
-                         next_data);
-      });
-  if (!inserted) {
-    partition_->FreeUnpublishedPrivateValue(row);
-    return false;
-  }
-  partition_->PersistPrivateRootIfChanged();
-  return true;
+void RegionOffsetRowStorage::Retire(StoredRow row) const {
+  auto *value = partition->ValueFromOffset(row);
+  if (value == nullptr) throw std::runtime_error("invalid retired row offset");
+  auto *metadata = partition->MetadataFromValue(value);
+  partition->ebr_.add_retired_object(
+      value, sizeof(PrivateValueStruct) + value_size,
+      star::CXLMemory::MISC_FREE, partition->owner_shard_,
+      partition->partition_id_);
+  partition->ebr_.add_retired_object(
+      metadata, sizeof(PrivateMetadataLocal), star::CXLMemory::MISC_FREE,
+      partition->owner_shard_, partition->partition_id_);
 }
 
-bool KvPartitionTable::remove(const void *key) {
-  const bool removed = partition_->private_tree_->remove(TableKey(key));
-  if (removed) partition_->PersistPrivateRootIfChanged();
-  return removed;
+RegionOffsetRowStorage::MetaDataType *RegionOffsetRowStorage::Meta(
+    StoredRow row) const {
+  auto *value = partition->ValueFromOffset(row);
+  return value == nullptr ? nullptr : &value->meta;
 }
 
-bool KvPartitionTable::remove_and_process_adjacent_tuples(
-    const void *key,
-    std::function<bool(const void *, void *, void *, const void *, void *,
-                       void *, const void *, void *, void *)> processor) {
-  if (!processor) throw std::invalid_argument("empty adjacent-delete processor");
-  const bool removed = partition_->private_tree_->remove_and_process_adjacent_keys(
-      TableKey(key),
-      [&](const FixedKey *prev_key, KVPartition::PrivateTreeValue *prev_offset,
-          const FixedKey *cur_key, KVPartition::PrivateTreeValue *cur_offset,
-          const FixedKey *next_key, KVPartition::PrivateTreeValue *next_offset) {
-        void *prev_meta = nullptr;
-        void *prev_data = nullptr;
-        void *cur_meta = nullptr;
-        void *cur_data = nullptr;
-        void *next_meta = nullptr;
-        void *next_data = nullptr;
-        FillAdjacent(prev_offset == nullptr ? nullptr : &prev_offset->row,
-                     &prev_meta, &prev_data);
-        FillAdjacent(cur_offset == nullptr ? nullptr : &cur_offset->row,
-                     &cur_meta, &cur_data);
-        FillAdjacent(next_offset == nullptr ? nullptr : &next_offset->row,
-                     &next_meta, &next_data);
-        return processor(prev_key, prev_meta, prev_data, cur_key, cur_meta,
-                         cur_data, next_key, next_meta, next_data);
-      });
-  if (removed) partition_->PersistPrivateRootIfChanged();
-  return removed;
+void *RegionOffsetRowStorage::Data(StoredRow row) const {
+  auto *value = partition->ValueFromOffset(row);
+  return value == nullptr ? nullptr : value->data;
 }
 
-void KvPartitionTable::update(
-    const void *key, const void *value,
-    std::function<void(const void *, const void *)> on_update) {
-  RegionOffset offset = kNullOffset;
-  if (!partition_->LookupPrivateOffset(TableKey(key), &offset))
-    throw std::runtime_error("table update missing key");
-  auto *row = partition_->ValueFromOffset(offset);
-  if (on_update) on_update(key, row->data);
-  std::memcpy(row->data, TableValue(value, value_size_).data(), value_size_);
-  mem_access::PrivateWrite(row->data, value_size_);
+void *RegionOffsetRowStorage::AdjacentMeta(StoredRow row) const {
+  auto *value = partition->ValueFromOffset(row);
+  return value == nullptr ? nullptr : partition->MetadataFromValue(value);
 }
 
-bool KvPartitionTable::search_and_update_next_key_info(
-    const void *key,
-    std::function<void(const void *, void *, void *, const void *, void *,
-                       void *, const void *, void *, void *)> processor) {
-  if (!processor) throw std::invalid_argument("empty next-key update processor");
-  return partition_->private_tree_->lookupForNextKeyUpdate(
-      TableKey(key),
-      [&](const FixedKey *prev_key, KVPartition::PrivateTreeValue *prev_offset,
-          const FixedKey *cur_key, KVPartition::PrivateTreeValue *cur_offset,
-          const FixedKey *next_key, KVPartition::PrivateTreeValue *next_offset) {
-        void *prev_meta = nullptr;
-        void *prev_data = nullptr;
-        void *cur_meta = nullptr;
-        void *cur_data = nullptr;
-        void *next_meta = nullptr;
-        void *next_data = nullptr;
-        FillAdjacent(prev_offset == nullptr ? nullptr : &prev_offset->row,
-                     &prev_meta, &prev_data);
-        FillAdjacent(cur_offset == nullptr ? nullptr : &cur_offset->row,
-                     &cur_meta, &cur_data);
-        FillAdjacent(next_offset == nullptr ? nullptr : &next_offset->row,
-                     &next_meta, &next_data);
-        processor(prev_key, prev_meta, prev_data, cur_key, cur_meta, cur_data,
-                  next_key, next_meta, next_data);
-      });
+void RegionOffsetRowStorage::Update(StoredRow row, const void *value) const {
+  auto *target = partition->ValueFromOffset(row);
+  if (target == nullptr) throw std::runtime_error("invalid row offset");
+  std::memcpy(target->data, TableValue(value, value_size).data(), value_size);
+  mem_access::PrivateWrite(target->data, value_size);
 }
 
-void KvPartitionTable::deserialize_value(const void *key,
-                                         star::StringPiece bytes) {
-  if (bytes.size() != value_size_)
+void RegionOffsetRowStorage::Deserialize(StoredRow row,
+                                         star::StringPiece bytes) const {
+  if (bytes.size() != value_size)
     throw std::invalid_argument("fixed table value has unexpected size");
-  update(key, bytes.data());
+  Update(row, bytes.data());
 }
 
-void KvPartitionTable::serialize_value(star::Encoder &encoder,
-                                       const void *value) {
-  encoder.write_n_bytes(TableValue(value, value_size_).data(), value_size_);
+void RegionOffsetRowStorage::Serialize(star::Encoder &encoder,
+                                       const void *value) const {
+  encoder.write_n_bytes(TableValue(value, value_size).data(), value_size);
+}
+
+KvPartitionTable::KvPartitionTable(
+    KVPartition *partition, uint32_t key_size, uint32_t value_size,
+    const btreeolc_cxl::TreeNodeAllocation &binding, void *persisted_root,
+    bool create_max_sentinel)
+    : KvTableBase(
+          kSingleTableId, partition->partition_id(),
+          RegionOffsetRowStorage{partition, key_size, value_size, binding,
+                                 persisted_root}),
+      partition_(partition) {
+  if (partition_ == nullptr) throw std::invalid_argument("null owner partition");
+  if (!create_max_sentinel) return;
+  const FixedKey sentinel = FixedKey::InternalMax(key_size);
+  const std::string zero_value(value_size, '\0');
+  if (!insert(&sentinel, zero_value.data(), false))
+    throw std::runtime_error("private tree internal max sentinel duplicate");
+}
+
+bool KvPartitionTable::LookupOffset(const FixedKey &key,
+                                    RegionOffset *offset) const {
+  if (offset == nullptr) throw std::invalid_argument("null table offset output");
+  RegionOffset row = kNullOffset;
+  if (!lookup_stored_row(key, &row)) return false;
+  *offset = row;
+  return true;
 }
 
 KvMigrationRuntime &KvMigrationRuntime::Instance() {
@@ -249,7 +137,11 @@ KvMigrationRuntime &KvMigrationRuntime::Instance() {
 
 void KvMigrationRuntime::Reset() {
   if (star::migration_manager == clock_.get()) star::migration_manager = nullptr;
+  if (star::twopl_pasha_global_helper == helper_.get())
+    star::twopl_pasha_global_helper = nullptr;
   clock_.reset();
+  helper_.reset();
+  cxl_tbl_vecs_.clear();
   tables_.clear();
 }
 
@@ -260,15 +152,45 @@ void KvMigrationRuntime::Install(std::vector<KVPartition *> partitions,
                                  uint64_t hw_cc_budget_per_host) {
   Reset();
   if (partition_count == 0) throw std::invalid_argument("partition_count == 0");
-  tables_.clear();
-  tables_.resize(partition_count);
+  tables_.assign(partition_count, nullptr);
+  cxl_tbl_vecs_.assign(1, std::vector<star::CXLTableBase *>(partition_count,
+                                                               nullptr));
   for (KVPartition *partition : partitions) {
     if (partition == nullptr) continue;
     if (partition->partition_id() >= partition_count)
       throw std::invalid_argument("partition id exceeds partition_count");
-    tables_[partition->partition_id()] = std::make_unique<KvPartitionTable>(
-        partition, key_size, value_size);
+    auto *table = partition->private_table();
+    // Non-owner VMs deliberately have no owner-private SWCC handle.  Their
+    // shared CXL table is installed separately in the original helper's
+    // cxl_tbl_vecs; only the owner needs an ITable/OLC handle here.
+    if (table == nullptr) continue;
+    if (table->key_size() != key_size || table->value_size() != value_size)
+      throw std::runtime_error("partition table fixed KV size mismatch");
+    tables_[partition->partition_id()] = table;
+    // Fall through: owner entries also need their shared lookup wrapper.
   }
+  for (KVPartition *partition : partitions) {
+    if (partition == nullptr) continue;
+    const uint32_t partition_id = partition->partition_id();
+    if (partition_id >= partition_count)
+      throw std::invalid_argument("partition id exceeds partition_count");
+    auto *shared_table = partition->shared_cxl_table();
+    if (shared_table == nullptr || shared_table->tableID() != kSingleTableId ||
+        shared_table->partitionID() != partition_id)
+      throw std::runtime_error("invalid shared CXL table wrapper");
+    cxl_tbl_vecs_[kSingleTableId][partition_id] = shared_table;
+  }
+  star::Context helper_context;
+  helper_context.coordinator_id = coordinator_id;
+  helper_context.partition_num = partition_count;
+  helper_context.protocol = "TwoPLPasha";
+  helper_context.enable_phantom_detection = true;
+  helper_context.enable_scc = true;
+  helper_context.enable_migration_optimization = true;
+  helper_context.model_cxl_search_overhead = false;
+  helper_ = std::make_unique<star::TwoPLPashaHelper>(
+      coordinator_id, helper_context, cxl_tbl_vecs_);
+  star::twopl_pasha_global_helper = helper_.get();
   clock_ = std::make_unique<star::PolicyClock>(
       KvMoveFromPartitionToShared, KvMoveFromSharedToPartition,
       KvDeleteAndUpdateNextKeyInfo, coordinator_id, partition_count, "OnDemand",
@@ -278,11 +200,7 @@ void KvMigrationRuntime::Install(std::vector<KVPartition *> partitions,
 
 KvPartitionTable *KvMigrationRuntime::TableFor(uint32_t partition_id) const {
   if (partition_id >= tables_.size()) return nullptr;
-  return tables_[partition_id].get();
-}
-
-void KvMigrationRuntime::SyncHwCcUsage(const KVPartition &partition) {
-  star::cxl_memory.set_total_hw_cc_usage(partition.hwcc_used_bytes());
+  return tables_[partition_id];
 }
 
 star::migration_result KvMoveFromPartitionToShared(

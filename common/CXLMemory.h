@@ -68,18 +68,34 @@ class CXLMemory {
         static uint32_t bound_owner_shard() { return owner_shard_; }
         static bool dual_region_allocator_bound() { return dual_regions_ != nullptr; }
 
-        static uint64_t pointer_to_pool_offset(const void *pointer)
+        static tigonkv::engine::RegionOffset transport_pointer_to_offset(
+                const void *pointer)
         {
                 if (dual_regions_ == nullptr)
                         throw std::runtime_error("tigonkv: dual-region allocator is not bound");
-                return dual_regions_->ToPoolOffset(pointer);
+                return dual_regions_->ToTransportOffset(pointer);
         }
 
-        static void *pool_offset_to_pointer(uint64_t offset)
+        static void *transport_offset_to_pointer(
+                tigonkv::engine::RegionOffset offset, uint64_t bytes)
         {
                 if (dual_regions_ == nullptr)
                         throw std::runtime_error("tigonkv: dual-region allocator is not bound");
-                return dual_regions_->FromPoolOffset(offset);
+                return dual_regions_->ResolveTransport(offset, bytes);
+        }
+
+        static uint64_t shared_payload_pointer_to_offset(const void *pointer)
+        {
+                if (dual_regions_ == nullptr)
+                        throw std::runtime_error("tigonkv: dual-region allocator is not bound");
+                return dual_regions_->EncodeSharedPayloadOffset(pointer, owner_shard_);
+        }
+
+        static void *shared_payload_offset_to_pointer(uint64_t offset, uint64_t bytes)
+        {
+                if (dual_regions_ == nullptr)
+                        throw std::runtime_error("tigonkv: dual-region allocator is not bound");
+                return dual_regions_->ResolveSharedPayload(offset, bytes);
         }
 
         void init_cxlalloc_for_given_thread(uint64_t threads_num_per_host, uint64_t thread_id, uint64_t hosts_num, uint64_t host_id)
@@ -99,11 +115,9 @@ class CXLMemory {
                 // collect statistics
                 switch (category) {
                 case INDEX_ALLOCATION:
-                        size_total_hw_cc_usage.fetch_add(size);
                         size_index_usage.fetch_add(size);
                         break;
                 case DATA_ALLOCATION:
-                        size_total_hw_cc_usage.fetch_add(metadata_size);
                         size_metadata_usage.fetch_add(metadata_size);
                         size_data_usage.fetch_add(data_size);
                         break;
@@ -111,7 +125,6 @@ class CXLMemory {
                         size_transport_usage.fetch_add(size);
                         break;
                 case MISC_ALLOCATION:
-                        size_total_hw_cc_usage.fetch_add(size);
                         size_misc_usage.fetch_add(size);
                         break;
                 default:
@@ -123,23 +136,30 @@ class CXLMemory {
 
         void cxlalloc_free_wrapper(void *ptr, uint64_t size, int category, uint64_t metadata_size, uint64_t data_size)
         {
+                const auto checked_sub = [](std::atomic<uint64_t> &counter,
+                                            uint64_t bytes, const char *detail) {
+                        const uint64_t before = counter.load(std::memory_order_relaxed);
+                        if (before < bytes) LOG(FATAL) << detail;
+                        counter.fetch_sub(bytes, std::memory_order_relaxed);
+                };
                 // collect statistics
                 switch (category) {
                 case INDEX_FREE:
-                        size_total_hw_cc_usage.fetch_sub(size);
-                        size_index_usage.fetch_sub(size);
+                        checked_sub(size_index_usage, size, "CXL index accounting underflow");
                         break;
                 case DATA_FREE:
-                        size_total_hw_cc_usage.fetch_sub(metadata_size);
-                        size_metadata_usage.fetch_sub(metadata_size);
-                        size_data_usage.fetch_sub(data_size);
+                        checked_sub(size_metadata_usage, metadata_size,
+                                    "CXL metadata accounting underflow");
+                        checked_sub(size_data_usage, data_size,
+                                    "CXL data accounting underflow");
                         break;
                 case TRANSPORT_FREE:
-                        size_transport_usage.fetch_sub(size);
+                        checked_sub(size_transport_usage, size,
+                                    "CXL transport accounting underflow");
                         break;
                 case MISC_FREE:
-                        size_total_hw_cc_usage.fetch_sub(size);
-                        size_misc_usage.fetch_sub(size);
+                        checked_sub(size_misc_usage, size,
+                                    "CXL misc accounting underflow");
                         break;
                 default:
                         CHECK(0);
@@ -152,28 +172,18 @@ class CXLMemory {
                 // collect statistics
                 switch (category) {
                 case INDEX_ALLOCATION:
-                        size_total_hw_cc_usage.fetch_add(size);
                         size_index_usage.fetch_add(size);
                         break;
                 case METADATA_ALLOCATION:
-                        if (context.migration_policy == "LRU") {
-                                size_total_hw_cc_usage.fetch_add(size + 24);
-                        } else {
-                                size_total_hw_cc_usage.fetch_add(size);
-                        }
                         size_metadata_usage.fetch_add(size);
                         break;
                 case DATA_ALLOCATION:
-                        if (context.enable_scc == false) {
-                                size_total_hw_cc_usage.fetch_add(size);
-                        }
                         size_data_usage.fetch_add(size);
                         break;
                 case TRANSPORT_ALLOCATION:
                         size_transport_usage.fetch_add(size);
                         break;
                 case MISC_ALLOCATION:
-                        size_total_hw_cc_usage.fetch_add(size);
                         size_misc_usage.fetch_add(size);
                         break;
                 default:
@@ -185,32 +195,30 @@ class CXLMemory {
 
         void cxlalloc_free_wrapper(void *ptr, uint64_t size, int category)
         {
+                const auto checked_sub = [](std::atomic<uint64_t> &counter,
+                                            uint64_t bytes, const char *detail) {
+                        const uint64_t before = counter.load(std::memory_order_relaxed);
+                        if (before < bytes) LOG(FATAL) << detail;
+                        counter.fetch_sub(bytes, std::memory_order_relaxed);
+                };
                 // collect statistics
                 switch (category) {
                 case INDEX_FREE:
-                        size_total_hw_cc_usage.fetch_sub(size);
-                        size_index_usage.fetch_sub(size);
+                        checked_sub(size_index_usage, size, "CXL index accounting underflow");
                         break;
                 case METADATA_FREE:
-                        if (context.migration_policy == "LRU") {
-                                size_total_hw_cc_usage.fetch_sub(size + 24);
-                        } else {
-                                size_total_hw_cc_usage.fetch_sub(size);
-                        }
-                        size_metadata_usage.fetch_sub(size);
+                        checked_sub(size_metadata_usage, size,
+                                    "CXL metadata accounting underflow");
                         break;
                 case DATA_FREE:
-                        if (context.enable_scc == false) {
-                                size_total_hw_cc_usage.fetch_sub(size);
-                        }
-                        size_data_usage.fetch_sub(size);
+                        checked_sub(size_data_usage, size, "CXL data accounting underflow");
                         break;
                 case TRANSPORT_FREE:
-                        size_transport_usage.fetch_sub(size);
+                        checked_sub(size_transport_usage, size,
+                                    "CXL transport accounting underflow");
                         break;
                 case MISC_FREE:
-                        size_total_hw_cc_usage.fetch_sub(size);
-                        size_misc_usage.fetch_sub(size);
+                        checked_sub(size_misc_usage, size, "CXL misc accounting underflow");
                         break;
                 default:
                         CHECK(0);
@@ -246,7 +254,13 @@ class CXLMemory {
                                 std::memory_order_acquire);
                         if (offset == tigonkv::engine::kNullOffset) _mm_pause();
                 } while (offset == tigonkv::engine::kNullOffset);
-                *shared_data = dual_regions_->hwcc().FromOffset(offset);
+                if (root_index == cxl_transport_root_index)
+                        *shared_data = dual_regions_->ResolveTransport(offset, 1);
+                else if (root_index == cxl_global_ebr_meta_root_index)
+                        *shared_data = dual_regions_->ResolveEbr(offset, 1);
+                else
+                        throw std::runtime_error(
+                            "tigonkv: unknown static HWCC root index");
         }
 
         uint64_t get_stats(int category)
@@ -263,20 +277,14 @@ class CXLMemory {
                 case MISC_USAGE:
                         return size_misc_usage;
                 case TOTAL_HW_CC_USAGE:
-                        return size_total_hw_cc_usage;
+                        if (dual_regions_ == nullptr)
+                                throw std::runtime_error("Clock policy counter is unbound");
+                        return dual_regions_->PolicyHwccUsedBytes(owner_shard_);
                 case TOTAL_USAGE:
                         return size_index_usage + size_metadata_usage + size_data_usage + size_transport_usage + size_misc_usage;      // does not need to be consistent
                 default:
                         CHECK(0);
                 }
-        }
-
-        // tigonkv: PolicyClock budgets against this counter; dual-region KV
-        // allocations update domain used_bytes instead of the legacy wrappers,
-        // so the engine syncs the observed HWCC total before move_row_out.
-        void set_total_hw_cc_usage(uint64_t bytes)
-        {
-                size_total_hw_cc_usage.store(bytes, std::memory_order_relaxed);
         }
 
         void print_stats()
@@ -324,7 +332,6 @@ class CXLMemory {
         std::atomic<uint64_t> size_transport_usage{ 0 };
         std::atomic<uint64_t> size_misc_usage{ 0 };
 
-        std::atomic<uint64_t> size_total_hw_cc_usage{ 0 };
 };
 
 extern CXLMemory cxl_memory;

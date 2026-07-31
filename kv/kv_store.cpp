@@ -35,52 +35,24 @@ namespace {
 // the tree will reject later.
 constexpr size_t kMaxKey = 32;
 constexpr size_t kMaxValue = 4096;
-// Match e2e_trace_runner: Busy is contention, retry at the logical op boundary
-// so YCSB and API callers share one contract with the engine's inner budgets.
-constexpr int kStoreBusyRetryBudget = 64;
-thread_local KVStore *TlsRuntimeOwner = nullptr;
-thread_local RuntimeStats *TlsRuntimeStats = nullptr;
-
-bool IsInternalMaxKey(std::string_view key) {
-  return !key.empty() && std::all_of(key.begin(), key.end(),
-                                     [](char byte) {
-                                       return static_cast<unsigned char>(byte) == 0xff;
-                                     });
+// Busy is contention.  Retry only at the logical operation boundary so YCSB
+// and API callers share one contract with the engine's inner primitives.
+bool IsInternalMaxKey(std::string_view key, uint32_t fixed_key_size) {
+  if (key.size() != fixed_key_size) return false;
+  return engine::FixedKey::From(key, fixed_key_size).Compare(
+             engine::FixedKey::InternalMax(fixed_key_size)) == 0;
 }
 
 template <typename Op>
-Status RunWithBusyRetry(KVStore *store, Op &&op) {
+Status RunWithBusyRetry(KVStore *store, RuntimeStats *runtime, Op &&op) {
   Status status;
-  for (int attempt = 0; attempt < kStoreBusyRetryBudget; ++attempt) {
+  for (;;) {
     status = op();
     if (status.code != StatusCode::kBusy) return status;
+    if (runtime != nullptr) ++runtime->retries;
     if (store != nullptr) store->PollTransport();
     std::this_thread::yield();
   }
-  return status;
-}
-
-void AddRuntimeStats(RuntimeStats *total, const RuntimeStats &part) {
-  total->logical_ops += part.logical_ops;
-  total->commits += part.commits;
-  total->aborts += part.aborts;
-  total->retries += part.retries;
-  total->private_gets += part.private_gets;
-  total->private_puts += part.private_puts;
-  total->private_deletes += part.private_deletes;
-  total->private_swcc_flushes += part.private_swcc_flushes;
-  total->shared_gets += part.shared_gets;
-  total->shared_puts += part.shared_puts;
-  total->shared_deletes += part.shared_deletes;
-  total->shared_swcc_flushes += part.shared_swcc_flushes;
-  total->migration_in += part.migration_in;
-  total->migration_out += part.migration_out;
-  total->network_tx_bytes += part.network_tx_bytes;
-  total->network_rx_bytes += part.network_rx_bytes;
-  total->scan_rows_returned += part.scan_rows_returned;
-  total->scan_ops += part.scan_ops;
-  total->scan_partition_probes += part.scan_partition_probes;
-  total->scan_migrate_rpcs += part.scan_migrate_rpcs;
 }
 
 std::string StripComments(std::string text) {
@@ -624,9 +596,6 @@ void ParseStrictLatencyConfig(const std::string &text, Config *config) {
   config->latency_cache_hit_extra_ns =
       ParseStrictDouble(text, field("cache_hit_extra_ns"),
                         "tigon_kv.latency_inject.cache_hit_extra_ns");
-  config->hwcc_atomic_ns =
-      std::max({config->hwcc_atomic_load_ns, config->hwcc_atomic_store_ns,
-                config->hwcc_atomic_rmw_ns});
 }
 
 void ParsePartitioningConfig(const std::string &text, Config *config) {
@@ -791,13 +760,13 @@ Config Config::FromJsonc(const std::string &path) {
 }
 
 void Config::Validate() {
-  if (size_mb == 0 || hwcc_size_mb > 1024 || hwcc_size_mb > size_mb ||
+  if (size_mb == 0 || hwcc_size_mb > size_mb ||
       swcc_size_mb > size_mb || hwcc_offset_mb + hwcc_size_mb > size_mb ||
       swcc_offset_mb + swcc_size_mb > size_mb || fixed_value_size == 0 ||
       (hwcc_offset_mb < swcc_offset_mb + swcc_size_mb &&
        swcc_offset_mb < hwcc_offset_mb + hwcc_size_mb))
     throw std::invalid_argument("invalid shared-memory capacity or HWCC budget");
-  if (vm_count == 0 || partition_count < vm_count ||
+  if (vm_count == 0 || partition_count == 0 ||
       partition_count > engine::kMaxPartitions ||
       fixed_key_size == 0 || fixed_key_size > kMaxKey ||
       fixed_value_size > kMaxValue || shared_memory_numa_node < -1 || vm_numa_node < -1 ||
@@ -813,8 +782,7 @@ void Config::Validate() {
     if (boundary->empty()) return;
     if (boundary->size() > fixed_key_size)
       throw std::invalid_argument("partition range boundary exceeds fixed_key_size");
-    const engine::FixedKey key = engine::FixedKey::From(*boundary, fixed_key_size);
-    boundary->assign(key.bytes, fixed_key_size);
+    boundary->resize(fixed_key_size, '\0');
   };
   if (!partition_ranges.front().lower_key.empty())
     throw std::invalid_argument("first partition lower_key must be empty");
@@ -840,7 +808,8 @@ void Config::Validate() {
     auto &range = partition_ranges[partition];
     normalize_boundary(&range.lower_key);
     normalize_boundary(&range.upper_key);
-    if (IsInternalMaxKey(range.lower_key) || IsInternalMaxKey(range.upper_key))
+    if (IsInternalMaxKey(range.lower_key, fixed_key_size) ||
+        IsInternalMaxKey(range.upper_key, fixed_key_size))
       throw std::invalid_argument("partition range boundary reserves internal max sentinel");
     if (partition + 1 != partition_count && range.upper_key.empty())
       throw std::invalid_argument("only final partition may have empty upper_key");
@@ -942,8 +911,7 @@ std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
 }
 
 KVStore::KVStore(const Config &config)
-    : impl_(new Impl()), config_(config),
-      worker_runtime_(config.foreground_worker_count_per_vm) {
+    : impl_(new Impl()), config_(config) {
   config_.Validate();
   latency_sim::Config latency;
   latency.enabled = config_.latency_enabled;
@@ -969,10 +937,6 @@ KVStore::KVStore(const Config &config)
 }
 
 KVStore::~KVStore() {
-  if (TlsRuntimeOwner == this) {
-    TlsRuntimeOwner = nullptr;
-    TlsRuntimeStats = nullptr;
-  }
   Close();
 }
 
@@ -994,27 +958,30 @@ uint32_t KVStore::OwnerForKey(std::string_view key) const {
 }
 
 void KVStore::ValidateKeyValue(std::string_view key, std::string_view value) const {
-  if (key.size() != config_.fixed_key_size || IsInternalMaxKey(key) ||
+  if (key.size() != config_.fixed_key_size ||
+      IsInternalMaxKey(key, config_.fixed_key_size) ||
       value.size() != config_.fixed_value_size)
     throw std::invalid_argument("key/value must match configured fixed size");
 }
 
 RuntimeStats &KVStore::ThreadRuntime() {
-  if (TlsRuntimeOwner == this && TlsRuntimeStats != nullptr) return *TlsRuntimeStats;
-  // Single-threaded API users are not required to call BindWorker. Multi-worker
-  // harnesses bind every worker and therefore never share this fallback slot.
-  return unbound_runtime_.stats;
+  return CurrentWorkerRuntime();
+}
+
+RuntimeStats &KVStore::CurrentWorkerRuntime() {
+  if (impl_ == nullptr || impl_->engine == nullptr)
+    throw std::runtime_error("foreground KV operation requires an open engine");
+  return impl_->engine->CurrentWorkerRuntime();
 }
 
 Status KVStore::Put(std::string_view key, std::string_view value) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
-  impl_->engine->PollTransport();
   try { ValidateKeyValue(key, value); }
   catch (const std::exception &e) { return Status::Error(StatusCode::kInvalidArgument, e.what()); }
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
-  Status status = RunWithBusyRetry(this, [&] {
+  Status status = RunWithBusyRetry(this, &runtime, [&] {
     return impl_->engine->Put(key, value);
   });
   if (status.ok()) { ++runtime.commits; ++runtime.private_puts; }
@@ -1025,13 +992,13 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
 GetResult KVStore::Get(std::string_view key) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
-  impl_->engine->PollTransport();
-  if (key.size() != config_.fixed_key_size || IsInternalMaxKey(key))
+  if (key.size() != config_.fixed_key_size ||
+      IsInternalMaxKey(key, config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
   GetResult result;
-  Status status = RunWithBusyRetry(this, [&] {
+  Status status = RunWithBusyRetry(this, &runtime, [&] {
     result = impl_->engine->Get(key);
     return result.status;
   });
@@ -1044,12 +1011,12 @@ GetResult KVStore::Get(std::string_view key) {
 Status KVStore::Delete(std::string_view key) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
-  impl_->engine->PollTransport();
-  if (key.size() != config_.fixed_key_size || IsInternalMaxKey(key))
+  if (key.size() != config_.fixed_key_size ||
+      IsInternalMaxKey(key, config_.fixed_key_size))
     return Status::Error(StatusCode::kInvalidArgument, "invalid key");
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
-  Status status = RunWithBusyRetry(this, [&] {
+  Status status = RunWithBusyRetry(this, &runtime, [&] {
     return impl_->engine->Delete(key);
   });
   if (status.ok()) { ++runtime.commits; ++runtime.private_deletes; }
@@ -1061,18 +1028,23 @@ ScanResult KVStore::Scan(std::string_view start_key, std::string_view end_key,
                          uint64_t limit) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
-  impl_->engine->PollTransport();
-  if (start_key.size() != config_.fixed_key_size || IsInternalMaxKey(start_key) ||
+  if (start_key.size() != config_.fixed_key_size ||
+      IsInternalMaxKey(start_key, config_.fixed_key_size) ||
       (!end_key.empty() && end_key.size() != config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument, "invalid scan range"), {}};
-  if (!end_key.empty() && !IsInternalMaxKey(end_key) && start_key >= end_key)
-    return {Status::Error(StatusCode::kInvalidArgument,
-                          "scan range is empty or inverted"), {}};
+  // Routing and the tree both use FixedKey::Compare().  Preserve that exact
+  // bytewise ordering at the facade instead of introducing a second
+  // std::string comparison rule.  An empty/inverted half-open interval is a
+  // valid empty scan, matching the engine's lower-bound implementation.
+  if (!end_key.empty() &&
+      engine::FixedKey::From(start_key, config_.fixed_key_size)
+              .Compare(engine::FixedKey::From(end_key, config_.fixed_key_size)) >= 0)
+    return {Status::Ok(), {}};
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
   ++runtime.scan_ops;
   ScanResult result;
-  Status status = RunWithBusyRetry(this, [&] {
+  Status status = RunWithBusyRetry(this, &runtime, [&] {
     result = impl_->engine->Scan(start_key, end_key, limit);
     return result.status;
   });
@@ -1090,7 +1062,6 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
                                    std::string_view desired) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
-  impl_->engine->PollTransport();
   try { ValidateKeyValue(key, desired); }
   catch (const std::exception &e) { return {Status::Error(StatusCode::kInvalidArgument, e.what()), false}; }
   if (!expected.empty() && expected.size() != config_.fixed_value_size)
@@ -1099,7 +1070,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
   CasResult result;
-  Status status = RunWithBusyRetry(this, [&] {
+  Status status = RunWithBusyRetry(this, &runtime, [&] {
     result = impl_->engine->CompareExchange(key, expected, desired);
     return result.status;
   });
@@ -1113,13 +1084,13 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
 IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   engine::mem_access::LatencyScope latency_scope(
       latency_sim::ScopeKind::kForeground);
-  impl_->engine->PollTransport();
-  if (key.size() != config_.fixed_key_size || IsInternalMaxKey(key))
+  if (key.size() != config_.fixed_key_size ||
+      IsInternalMaxKey(key, config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), 0};
   RuntimeStats &runtime = ThreadRuntime();
   ++runtime.logical_ops;
   IncrementResult result;
-  Status status = RunWithBusyRetry(this, [&] {
+  Status status = RunWithBusyRetry(this, &runtime, [&] {
     result = impl_->engine->Increment(key, delta);
     return result.status;
   });
@@ -1130,8 +1101,6 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
 }
 
 Status KVStore::PollTransport() {
-  engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kForeground);
   if (impl_ == nullptr || impl_->engine == nullptr)
     return Status::Error(StatusCode::kCorruption, "KVStore is closed");
   impl_->engine->PollTransport();
@@ -1141,44 +1110,22 @@ Status KVStore::PollTransport() {
 void KVStore::BindWorker(uint32_t worker_id) {
   if (impl_ == nullptr || impl_->engine == nullptr)
     throw std::runtime_error("BindWorker requires an open KVStore");
-  if (worker_id >= worker_runtime_.size())
+  if (worker_id >= config_.foreground_worker_count_per_vm)
     throw std::invalid_argument("BindWorker worker_id exceeds foreground worker count");
   impl_->engine->BindWorker(worker_id);
-  TlsRuntimeOwner = this;
-  TlsRuntimeStats = &worker_runtime_[worker_id].stats;
 }
 
 void KVStore::ReleaseWorker() {
   if (impl_ == nullptr || impl_->engine == nullptr)
     throw std::runtime_error("ReleaseWorker requires an open KVStore");
   impl_->engine->ReleaseWorker();
-  if (TlsRuntimeOwner == this) {
-    TlsRuntimeOwner = nullptr;
-    TlsRuntimeStats = nullptr;
-  }
 }
 
 MemoryStats KVStore::Memory() const { return impl_->engine->Memory(); }
 
 RuntimeStats KVStore::Runtime() const {
-  RuntimeStats stats;
-  AddRuntimeStats(&stats, unbound_runtime_.stats);
-  for (const WorkerRuntime &worker : worker_runtime_)
-    AddRuntimeStats(&stats, worker.stats);
-  if (impl_ != nullptr && impl_->engine != nullptr) {
-    const RuntimeStats engine = impl_->engine->EngineRuntime();
-    stats.shared_gets += engine.shared_gets;
-    stats.shared_puts += engine.shared_puts;
-    stats.shared_deletes += engine.shared_deletes;
-    stats.shared_swcc_flushes += engine.shared_swcc_flushes;
-    stats.migration_in += engine.migration_in;
-    stats.migration_out += engine.migration_out;
-    stats.scan_partition_probes += engine.scan_partition_probes;
-    stats.scan_migrate_rpcs += engine.scan_migrate_rpcs;
-    stats.network_tx_bytes = engine.network_tx_bytes;
-    stats.network_rx_bytes = engine.network_rx_bytes;
-  }
-  return stats;
+  if (impl_ == nullptr || impl_->engine == nullptr) return {};
+  return impl_->engine->EngineRuntime();
 }
 
 std::string KVStore::DumpStats() const {
@@ -1200,8 +1147,6 @@ std::string KVStore::DumpStats() const {
   out += "allocator_shared_overhead_bytes=" + std::to_string(memory.allocator_shared_overhead_bytes) + "\n";
   out += "allocator_local_dram_bytes=" + std::to_string(memory.allocator_local_dram_bytes) + "\n";
   out += "unclassified_shared_bytes=" + std::to_string(memory.unclassified_shared_bytes) + "\n";
-  out += "retired_pending_bytes=" + std::to_string(memory.retired_pending_bytes) + "\n";
-  out += "reclaimed_total_bytes=" + std::to_string(memory.reclaimed_total_bytes) + "\n";
   out += "physical_hwcc_capacity_bytes=" +
          std::to_string(memory.physical_hwcc_capacity_bytes) + "\n";
   out += "owner_migration_dynamic_budget_bytes=" +

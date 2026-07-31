@@ -390,6 +390,8 @@ command -v guestfish >/dev/null || { echo "guestfish required to prepare guest d
 tigonkv_check_or_apply_host_tuning
 
 "$root/tigonkv_kill_vms.sh" --config "$config" --allow-state-change
+tigonkv_assert_host_test_isolated
+tigonkv_assert_qemu_group empty
 
 mkdir -p "$TIGONKV_VM_STORAGE"
 tigonkv_setup_shared_memory
@@ -406,8 +408,11 @@ for ((i = 0; i < TIGONKV_VM_COUNT; i++)); do
   tigonkv_prepare_qemu_cmd "$i"
   "${TIGONKV_QEMU_CMD[@]}"
   pid=$(<"$vm_dir/qemu.pid")
-  echo "[init_vm] pin vm_$i pid=$pid threads to host CPUs $TIGONKV_QEMU_CPU_LIST"
-  taskset -apc "$TIGONKV_QEMU_CPU_LIST" "$pid" >/dev/null
+  # Reconstruct the per-VM slice at the pin point.  Keep this independent of
+  # the shell's IFS state: taskset requires one comma-separated CPU argument.
+  vm_cpu_list=$(printf '%s\n' "${TIGONKV_VM_CORES// /,}" | cut -d, -f$((i * TIGONKV_VM_CORES_PER_VM + 1))-$(((i + 1) * TIGONKV_VM_CORES_PER_VM)))
+  echo "[init_vm] pin vm_$i pid=$pid threads to host CPUs $vm_cpu_list"
+  taskset -apc "$vm_cpu_list" "$pid" >/dev/null
 done
 
 for ((i = 0; i < TIGONKV_VM_COUNT; i++)); do

@@ -30,25 +30,29 @@ uint64_t ParseUnsigned(const std::string &text, const std::string &label) {
 }
 [[noreturn]] void Fail(const std::string &message) { throw std::runtime_error(message); }
 
-// §10.1/§10.2: Busy is contention, not corruption. Retry the full logical op
-// (original transaction abort/retry) with PollTransport so peers make progress.
-constexpr int kBusyRetryBudget = 64;
-
-template <typename Op>
-Status RunWithBusyRetry(KVStore &store, Op &&op) {
-  Status status;
-  for (int attempt = 0; attempt < kBusyRetryBudget; ++attempt) {
-    status = op();
-    if (status.code != StatusCode::kBusy) return status;
-    (void)store.PollTransport();
-    std::this_thread::yield();
-  }
-  return status;
+std::string TestValueOverride(uint32_t fixed_value_size) {
+  const std::string hex = Env("TIGONKV_E2E_TEST_VALUE_HEX",
+                              "CXLKV_E2E_TEST_VALUE_HEX");
+  if (hex.empty()) return {};
+  if (hex.size() != static_cast<size_t>(fixed_value_size) * 2)
+    Fail("TIGONKV_E2E_TEST_VALUE_HEX has wrong fixed-value length");
+  std::string value(fixed_value_size, '\0');
+  const auto nibble = [](char ch) -> unsigned char {
+    if (ch >= '0' && ch <= '9') return static_cast<unsigned char>(ch - '0');
+    if (ch >= 'a' && ch <= 'f') return static_cast<unsigned char>(ch - 'a' + 10);
+    if (ch >= 'A' && ch <= 'F') return static_cast<unsigned char>(ch - 'A' + 10);
+    Fail("TIGONKV_E2E_TEST_VALUE_HEX is not hexadecimal");
+  };
+  for (uint32_t i = 0; i < fixed_value_size; ++i)
+    value[i] = static_cast<char>((nibble(hex[2 * i]) << 4) | nibble(hex[2 * i + 1]));
+  return value;
 }
 
 // Align with cxlkv FixedTraceValue: printable '!'..'~', length=fixed_value_size
 // (trace PUT LEN is ignored for the payload, as in cxlkv).
 std::string FixedTraceValue(std::mt19937_64 *rng, uint32_t fixed_value_size) {
+  const std::string test_value = TestValueOverride(fixed_value_size);
+  if (!test_value.empty()) return test_value;
   std::string value;
   value.resize(static_cast<size_t>(fixed_value_size));
   for (uint32_t i = 0; i < fixed_value_size; ++i)
@@ -98,7 +102,8 @@ void DrainTransport(KVStore &store) {
 // Guest VMs do not share a filesystem, so the host orchestrator cannot use the
 // file-marker Barrier directly across them.  Keep a VM's transport alive after
 // its timed replay until the host observes that every peer has also finished.
-void WaitForHostRelease(const std::string &phase, KVStore &store) {
+void WaitForHostRelease(const std::string &phase, KVStore &store,
+                        bool service_transport = true) {
   const std::string release_file =
       Env("TIGONKV_E2E_RELEASE_FILE", "CXLKV_E2E_RELEASE_FILE");
   if (release_file.empty()) return;
@@ -113,9 +118,11 @@ void WaitForHostRelease(const std::string &phase, KVStore &store) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
   while (!std::filesystem::exists(release_file)) {
-    const Status status = store.PollTransport();
-    if (!status.ok())
-      Fail("transport poll failed while waiting for host release: " + status.message);
+    if (service_transport) {
+      const Status status = store.PollTransport();
+      if (!status.ok())
+        Fail("transport poll failed while waiting for host release: " + status.message);
+    }
     if (std::chrono::steady_clock::now() >= deadline)
       Fail("host release timeout for phase " + phase);
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -164,6 +171,16 @@ bool ScanExpectNonemptyEnabled(int argc, char **argv) {
              "CXLKV_E2E_SCAN_EXPECT_NONEMPTY", "0") == "1";
 }
 
+bool RequireGetFoundEnabled(int argc, char **argv) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--require-get-found") return true;
+    if (arg == "--allow-get-not-found") return false;
+  }
+  return Env("TIGONKV_E2E_REQUIRE_GET_FOUND",
+             "CXLKV_E2E_REQUIRE_GET_FOUND", "0") == "1";
+}
+
 void SeedScanMaxKey(ScanExpectState *state) {
   const std::string configured =
       Env("TIGONKV_E2E_SCAN_MAX_KEY", "CXLKV_E2E_SCAN_MAX_KEY");
@@ -182,7 +199,8 @@ void PrintScanRows(uint32_t node, uint64_t scan_ops, uint64_t rows) {
 ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_64 *rng,
                          uint32_t fixed_key_size, uint32_t fixed_value_size,
                          ScanExpectState *scan_expect = nullptr,
-                         std::atomic<uint64_t> *progress_ops = nullptr) {
+                         std::atomic<uint64_t> *progress_ops = nullptr,
+                         bool require_get_found = false) {
   constexpr uint64_t kProgressPublishBatch = 256;
   std::ifstream input(trace);
   if (!input) Fail("cannot open trace: " + trace);
@@ -203,28 +221,25 @@ ReplayResult ReplayTrace(KVStore &store, const std::string &trace, std::mt19937_
     if (op == "PUT") {
       const std::string value = FixedTraceValue(rng, fixed_value_size);
       (void)len;  // cxlkv ignores PUT LEN when synthesizing FixedTraceValue
-      status = RunWithBusyRetry(store, [&] { return store.Put(key, value); });
+      status = store.Put(key, value);
       if (status.ok() && scan_expect != nullptr) scan_expect->NotePut(key);
     } else if (op == "GET") {
       if (len != 0) Fail("GET LEN must be zero");
-      status = RunWithBusyRetry(store, [&] {
-        Status s = store.Get(key).status;
-        if (s.code == StatusCode::kNotFound) s = Status::Ok();
-        return s;
-      });
+      const GetResult get = store.Get(key);
+      status = get.status;
+      const std::string test_value = TestValueOverride(fixed_value_size);
+      if (!test_value.empty() && status.ok() && get.value != test_value)
+        Fail("GET value mismatch at line " + std::to_string(line_no));
+      if (!require_get_found && status.code == StatusCode::kNotFound)
+        status = Status::Ok();
     } else if (op == "DELETE") {
       if (len != 0) Fail("DELETE LEN must be zero");
-      status = RunWithBusyRetry(store, [&] {
-        Status s = store.Delete(key);
-        if (s.code == StatusCode::kNotFound) s = Status::Ok();
-        return s;
-      });
+      status = store.Delete(key);
+      if (status.code == StatusCode::kNotFound) status = Status::Ok();
     } else if (op == "SCAN") {
       ScanResult scan;
-      status = RunWithBusyRetry(store, [&] {
-        scan = store.Scan(key, {}, len);
-        return scan.status;
-      });
+      scan = store.Scan(key, {}, len);
+      status = scan.status;
       if (status.ok()) {
         ++result.scan_ops;
         result.scan_rows_returned += scan.items.size();
@@ -276,7 +291,8 @@ void PrintThreadTopology(uint32_t node, uint64_t foreground,
 
 int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
                   const std::string &trace_dir, uint64_t workers, uint32_t batch_ops,
-                  uint64_t value_seed, ScanExpectState *scan_expect) {
+                  uint64_t value_seed, ScanExpectState *scan_expect,
+                  bool require_get_found) {
   const bool stage_markers =
       Env("TIGONKV_E2E_STAGE_MARKERS", "CXLKV_E2E_STAGE_MARKERS", "0") == "1";
   const bool legacy_progress =
@@ -316,6 +332,7 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   std::atomic<uint64_t> completed_workers{0};
   std::atomic<bool> replay_start{false};
   std::atomic<bool> replay_done{false};
+  std::atomic<bool> workers_release{false};
   std::vector<std::chrono::steady_clock::time_point> worker_end(workers);
   for (uint64_t worker = 0; worker < workers; ++worker) {
     threads.emplace_back([&, worker] {
@@ -330,22 +347,45 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
           std::this_thread::yield();
         results[worker] = ReplayTrace(*store, traces[worker], &rng, config.fixed_key_size,
                                       config.fixed_value_size, scan_expect,
-                                      heartbeat ? &progress_ops : nullptr);
+                                      heartbeat ? &progress_ops : nullptr,
+                                      require_get_found);
         worker_end[worker] = std::chrono::steady_clock::now();
+        if (completed_workers.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+            workers)
+          replay_done.store(true, std::memory_order_release);
+        // Match the original Executor lifetime: a finished foreground worker
+        // still serves only its own Message queue until every VM has replayed.
+        // The orchestration thread must not poll worker 0 concurrently.
+        while (!workers_release.load(std::memory_order_acquire)) {
+          const Status status = store->PollTransport();
+          if (!status.ok())
+            Fail("transport poll failed while serving peer: " + status.message);
+          std::this_thread::yield();
+        }
         store->ReleaseWorker();
       } catch (...) {
         if (!ready_published)
           ready_workers.fetch_add(1, std::memory_order_release);
-        try {
-          store->ReleaseWorker();
-        } catch (...) {
+        {
+          std::lock_guard<std::mutex> lock(error_mutex);
+          if (!error) error = std::current_exception();
+          if (completed_workers.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+              workers)
+            replay_done.store(true, std::memory_order_release);
         }
-        std::lock_guard<std::mutex> lock(error_mutex);
-        if (!error) error = std::current_exception();
+        // A replay error must not make this worker abandon its original SPSC
+        // inbox while peers are still awaiting replies.  The orchestrator
+        // observes replay_done, releases every worker, and then rethrows the
+        // recorded error on its control thread.
+        if (ready_published) {
+          while (!workers_release.load(std::memory_order_acquire)) {
+            const Status status = store->PollTransport();
+            if (!status.ok()) break;
+            std::this_thread::yield();
+          }
+          store->ReleaseWorker();
+        }
       }
-      if (completed_workers.fetch_add(1, std::memory_order_acq_rel) + 1 ==
-          workers)
-        replay_done.store(true, std::memory_order_release);
     });
   }
   while (ready_workers.load(std::memory_order_acquire) != workers)
@@ -374,18 +414,29 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
               << std::flush;
     last_progress = current;
   }
-  for (auto &thread : threads) thread.join();
-  if (error) std::rethrow_exception(error);
+  {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    if (error) {
+      workers_release.store(true, std::memory_order_release);
+      for (auto &thread : threads) thread.join();
+      std::rethrow_exception(error);
+    }
+  }
   log_stage("replay_done");
   const auto end = *std::max_element(worker_end.begin(), worker_end.end());
   const auto duration_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
       end - start).count());
-  WaitForHostRelease(phase, *store);
+  WaitForHostRelease(phase, *store, /*service_transport=*/false);
   log_stage("release_done");
-  DrainTransport(*store);
-  log_stage("drain_done");
-  Barrier(phase, config.node_id, true, store.get());
+  // The original foreground workers remain the only transport consumers.  Do
+  // not release them and then make this unbound orchestration thread poll a
+  // worker-local inbox: KVStore deliberately hard-fails that misuse.  While
+  // this final barrier waits, the still-bound workers continue serving their
+  // own queues exactly as they did through host release.
+  Barrier(phase, config.node_id, true);
   log_stage("barrier_done");
+  workers_release.store(true, std::memory_order_release);
+  for (auto &thread : threads) thread.join();
   uint64_t ops = 0;
   uint64_t scan_ops = 0;
   uint64_t scan_rows = 0;
@@ -454,12 +505,13 @@ int main(int argc, char **argv) {
     ScanExpectState scan_expect;
     scan_expect.expect_nonempty = ScanExpectNonemptyEnabled(argc, argv);
     SeedScanMaxKey(&scan_expect);
+    const bool require_get_found = RequireGetFoundEnabled(argc, argv);
     // Guest YCSB uses TRACE_DIR even for 1 worker/VM; only fall back to a
     // single TRACE_FILE when no directory is provided.
     if (!trace_dir.empty()) {
       if (trace_workers == 0) Fail("TIGONKV_E2E_TRACE_WORKERS must be >= 1");
       return RunMultiTrace(config, reset, phase, trace_dir, trace_workers, batch_ops,
-                           value_seed, &scan_expect);
+                           value_seed, &scan_expect, require_get_found);
     }
     if (trace_workers > 1)
       Fail("TIGONKV_E2E_TRACE_DIR is required for multi-worker replay");
@@ -492,28 +544,25 @@ int main(int argc, char **argv) {
       if (op == "PUT") {
         const std::string value = FixedTraceValue(&rng, config.fixed_value_size);
         (void)len;
-        status = RunWithBusyRetry(*store, [&] { return store->Put(key, value); });
+        status = store->Put(key, value);
         if (status.ok()) scan_expect.NotePut(key);
       } else if (op == "GET") {
         if (len != 0) Fail("GET LEN must be zero");
-        status = RunWithBusyRetry(*store, [&] {
-          Status s = store->Get(key).status;
-          if (s.code == StatusCode::kNotFound) s = Status::Ok();
-          return s;
-        });
+        const GetResult get = store->Get(key);
+        status = get.status;
+        const std::string test_value = TestValueOverride(config.fixed_value_size);
+        if (!test_value.empty() && status.ok() && get.value != test_value)
+          Fail("GET value mismatch at line " + std::to_string(line_no));
+        if (!require_get_found && status.code == StatusCode::kNotFound)
+          status = Status::Ok();
       } else if (op == "DELETE") {
         if (len != 0) Fail("DELETE LEN must be zero");
-        status = RunWithBusyRetry(*store, [&] {
-          Status s = store->Delete(key);
-          if (s.code == StatusCode::kNotFound) s = Status::Ok();
-          return s;
-        });
+        status = store->Delete(key);
+        if (status.code == StatusCode::kNotFound) status = Status::Ok();
       } else if (op == "SCAN") {
         ScanResult result;
-        status = RunWithBusyRetry(*store, [&] {
-          result = store->Scan(key, {}, len);
-          return result.status;
-        });
+        result = store->Scan(key, {}, len);
+        status = result.status;
         if (status.ok()) {
           ++scan_ops;
           scan_rows += result.items.size();

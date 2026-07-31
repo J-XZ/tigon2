@@ -32,7 +32,12 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 //      checkpoint coordination are process-local, never shared layout state.
 // v21: removes the current-only Clock migrated-key hot counter and records
 //      the HWCC smeta offset in each owner-private Clock tracker node.
-constexpr uint32_t kSharedLayoutVersion = 21;
+// v22: Clock tracker membership is represented only by independent
+// owner-private tracker nodes; local row metadata no longer persists a reverse
+// node link.
+// v23: owner allocator controls are fixed slots before partition arenas and
+// private roots are atomic RegionOffsets.
+constexpr uint32_t kSharedLayoutVersion = 23;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -44,6 +49,42 @@ constexpr uint32_t kMaxAllocatorShards = 64;
 // linearizable; Scan is not a global cross-partition snapshot.
 constexpr uint32_t kSingleTableId = 0;
 static_assert(kSingleTableId == 0, "TigonKV exposes exactly one logical table");
+
+// The original TwoPLPasha local metadata is one storage body. Only the two
+// references vary between the legacy DRAM representation and the persistent
+// KV representation; all latch/state fields and their order stay identical.
+template <typename MigratedRowRef, typename SccDataRef>
+struct TwoPLPashaMetadataLocalStorage {
+  TwoPLPashaMetadataLocalStorage()
+      : tid(0),
+        is_valid(false),
+        is_migrated(false),
+        is_data_modified_since_moved_out(true),
+        migrated_row{},
+        scc_data{} {
+    pthread_spin_init(&latch, PTHREAD_PROCESS_PRIVATE);
+  }
+
+  void lock() { pthread_spin_lock(&latch); }
+  void unlock() { pthread_spin_unlock(&latch); }
+
+  pthread_spinlock_t latch;
+  uint64_t tid{0};
+  bool is_valid{false};
+  bool is_migrated{false};
+  bool is_data_modified_since_moved_out{true};
+  // The second spelling is retained as a source-level adapter for the
+  // offset-backed KV call sites. Both names are the same one storage slot;
+  // there is no second locator or state field.
+  union {
+    MigratedRowRef migrated_row;
+    MigratedRowRef migrated_smeta_off;
+  };
+  union {
+    SccDataRef scc_data;
+    SccDataRef scc_data_off;
+  };
+};
 
 enum class AllocationDomain : uint32_t {
   kHwccIndex = 0,
@@ -80,15 +121,31 @@ struct FixedKey {
   char bytes[kMaxFixedKeyBytes];
 
   static FixedKey From(std::string_view key, uint32_t fixed_size) {
-    if (fixed_size == 0 || fixed_size > kMaxFixedKeyBytes || key.size() > fixed_size)
+    if (fixed_size == 0 || fixed_size > kMaxFixedKeyBytes ||
+        key.size() != fixed_size)
       throw std::invalid_argument("invalid fixed key size");
     FixedKey result{};
     std::memcpy(result.bytes, key.data(), key.size());
     return result;
   }
 
+  static FixedKey InternalMax(uint32_t fixed_size) {
+    if (fixed_size == 0 || fixed_size > kMaxFixedKeyBytes)
+      throw std::invalid_argument("invalid internal max key size");
+    FixedKey result{};
+    std::memset(result.bytes, 0xff, fixed_size);
+    return result;
+  }
+
   int Compare(const FixedKey &other) const {
     return std::memcmp(bytes, other.bytes, kMaxFixedKeyBytes);
+  }
+
+  uint64_t get_plain_key() const {
+    uint64_t result = 0;
+    for (size_t i = 0; i < sizeof(result); ++i)
+      result = (result << 8) | static_cast<unsigned char>(bytes[i]);
+    return result;
   }
 };
 
@@ -104,34 +161,16 @@ struct FixedKeyComparator {
   }
 };
 
-// Offset-adapted forms of the original TableBTreeOLC::ValueStruct and
-// TwoPLPashaMetadataLocal.  They are separate owner-private allocations: the
-// leaf carries the ValueStruct offset, its atomic meta carries this metadata
-// offset, and no process virtual address survives an attach.
+// Offset-adapted form of the original TableBTreeOLC::ValueStruct. The lmeta
+// storage itself is defined once in the TwoPLPasha helper and is specialized
+// there for RegionOffset references.
 struct PrivateValueStruct {
   std::atomic<RegionOffset> meta{kNullOffset};
   char data[];
 };
 
-struct alignas(64) PrivateMetadataLocal {
-  PrivateMetadataLocal() {
-    pthread_spin_init(&latch, PTHREAD_PROCESS_PRIVATE);
-  }
-
-  void lock() { pthread_spin_lock(&latch); }
-  void unlock() { pthread_spin_unlock(&latch); }
-
-  pthread_spinlock_t latch;
-  uint64_t tid{0};
-  bool is_valid{false};
-  bool is_migrated{false};
-  bool is_data_modified_since_moved_out{true};
-  uint8_t reserved{0};
-  RegionOffset migrated_smeta_off{kNullOffset};
-  RegionOffset scc_data_off{kNullOffset};
-  RegionOffset clock_node_off{kNullOffset};
-};
-static_assert(alignof(PrivateMetadataLocal) == 64);
+using PrivateMetadataLocal =
+    TwoPLPashaMetadataLocalStorage<RegionOffset, RegionOffset>;
 
 // Mechanical owner-private adaptation of PolicyClock::ClockTrackerNode.  The
 // original node owns a key copy independently of ValueStruct; keeping it
@@ -142,6 +181,13 @@ struct PrivateClockTrackerNode {
   RegionOffset prev_off{kNullOffset};
   RegionOffset next_off{kNullOffset};
   FixedKey key{};
+};
+
+struct OwnerPrivateClockTrackerControl {
+  pthread_spinlock_t lock{};
+  RegionOffset head{kNullOffset};
+  RegionOffset tail{kNullOffset};
+  RegionOffset cursor{kNullOffset};
 };
 
 struct alignas(64) PartitionDirectoryEntry {
@@ -182,16 +228,6 @@ struct alignas(64) SharedLayoutHeader {
       owner_dynamic_arenas{};
   std::array<PartitionDirectoryEntry, kMaxPartitions> partitions{};
   std::array<DomainCounter, kAllocationDomainCount> domains{};
-
-  bool IsCompatible(uint64_t expected_hash, uint64_t expected_pool_bytes,
-                    uint32_t expected_vms, uint32_t expected_partitions) const {
-    return magic.load(std::memory_order_acquire) == kSharedLayoutMagic &&
-           layout_version == kSharedLayoutVersion &&
-           config_hash == expected_hash && total_pool_bytes == expected_pool_bytes &&
-           vm_count == expected_vms && partition_count == expected_partitions &&
-           state.load(std::memory_order_acquire) ==
-               static_cast<uint32_t>(LayoutState::kReady);
-  }
 };
 
 static_assert(alignof(SharedLayoutHeader) == 64);

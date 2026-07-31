@@ -96,8 +96,6 @@ struct MemoryStats {
   uint64_t allocator_shared_overhead_bytes = 0;
   uint64_t allocator_local_dram_bytes = 0;
   uint64_t unclassified_shared_bytes = 0;
-  uint64_t retired_pending_bytes = 0;
-  uint64_t reclaimed_total_bytes = 0;
   // Physical HWCC region size vs per-owner Clock dynamic limit (§11.10).
   uint64_t physical_hwcc_capacity_bytes = 0;
   uint64_t owner_migration_dynamic_budget_bytes = 0;
@@ -144,7 +142,6 @@ struct Config {
   std::string when_to_move_out = "OnDemand";
   std::string scc_mechanism = "WriteThrough";
   uint64_t transport_ring_total_mb = 16;
-  bool strict_swcc_access = false;
   bool verbose = false;
   bool extra_check = false;
   // Pin foreground workers and the inbound demuxer to distinct CPUs from the
@@ -160,7 +157,6 @@ struct Config {
   double swcc_flush_ns = 0;
   double hwcc_read_ns = 0;
   double hwcc_write_ns = 0;
-  double hwcc_atomic_ns = 0;
   double hwcc_atomic_load_ns = 0;
   double hwcc_atomic_store_ns = 0;
   double hwcc_atomic_rmw_ns = 0;
@@ -209,6 +205,9 @@ class KVStore {
 
   MemoryStats Memory() const;
   RuntimeStats Runtime() const;
+  // The engine owns the sole worker runtime slot.  KVStore only forwards its
+  // facade counters to the currently bound foreground worker.
+  RuntimeStats &CurrentWorkerRuntime();
   uint32_t StablePartitionForKey(std::string_view key) const;
   uint32_t OwnerForKey(std::string_view key) const;
   std::string DumpStats() const;
@@ -220,16 +219,8 @@ class KVStore {
   void ValidateKeyValue(std::string_view key, std::string_view value) const;
   RuntimeStats &ThreadRuntime();
   struct Impl;
-  struct alignas(64) WorkerRuntime {
-    RuntimeStats stats;
-  };
   std::unique_ptr<Impl> impl_;
   Config config_;
-  // PLAN §1.8: one cache-line-isolated counter set per foreground worker.
-  // BindWorker selects the calling thread's slot, so hot operations never
-  // update a shared counter or execute an atomic RMW.
-  std::vector<WorkerRuntime> worker_runtime_;
-  WorkerRuntime unbound_runtime_;
 };
 
 }  // namespace tigonkv

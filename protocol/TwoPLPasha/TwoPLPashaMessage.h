@@ -3,6 +3,8 @@
 //
 
 #pragma once
+#include <cstdint>
+#include <functional>
 #include <unordered_set>
 #include "common/Encoder.h"
 #include "common/Message.h"
@@ -13,6 +15,7 @@
 #include "protocol/TwoPLPasha/TwoPLPashaHelper.h"
 #include "protocol/TwoPLPasha/TwoPLPashaRWKey.h"
 #include "protocol/TwoPLPasha/TwoPLPashaTransaction.h"
+
 
 namespace star
 {
@@ -35,25 +38,89 @@ enum class TwoPLPashaMessage {
 	NFIELDS
 };
 
+enum class RemoteInsertOutcome : uint8_t {
+        Inserted = 0,
+        AlreadyExists = 1,
+        Busy = 2,
+        NoMemory = 3,
+};
+
+enum class MigrationResponseOutcome : uint8_t {
+        Migrated = 0,
+        Missing = 1,
+        Busy = 2,
+        NoMemory = 3,
+};
+
 class TwoPLPashaMessageFactory {
     public:
-        static std::size_t new_data_migration_message(Message &message, ITable &table, const void *key, uint64_t transaction_id, uint32_t key_offset)
+        static std::size_t data_migration_request_size(std::size_t key_size) {
+                return MessagePiece::get_header_size() + key_size +
+                       sizeof(uint64_t) + sizeof(uint32_t);
+        }
+        static std::size_t scan_migration_request_size(std::size_t key_size) {
+                return MessagePiece::get_header_size() + 2 * key_size +
+                       sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
+        }
+        static std::size_t remote_insert_request_size(
+                std::size_t key_size, std::size_t value_size) {
+                return MessagePiece::get_header_size() + key_size + value_size +
+                       sizeof(uint64_t) + sizeof(uint32_t);
+        }
+        static std::size_t remote_delete_request_size(std::size_t key_size) {
+                return MessagePiece::get_header_size() + key_size;
+        }
+        static std::size_t bool_key_offset_response_size() {
+                return MessagePiece::get_header_size() + sizeof(bool) +
+                       sizeof(uint32_t);
+        }
+        static std::size_t status_key_offset_response_size() {
+                return MessagePiece::get_header_size() + sizeof(uint8_t) +
+                       sizeof(uint32_t);
+        }
+        static std::size_t empty_response_size() {
+                return MessagePiece::get_header_size();
+        }
+
+        static std::size_t new_data_migration_message(
+                Message &message, std::size_t table_id, std::size_t partition_id,
+                const void *key, std::size_t key_size, uint64_t transaction_id,
+                uint32_t key_offset)
 	{
-		/*
-		 * The structure of a data migration request: (primary key, transaction_id, key_offset)
-		 */
-
-		auto key_size = table.key_size();
-
-		auto message_size = MessagePiece::get_header_size() + key_size + sizeof(transaction_id) + sizeof(key_offset);
-		auto message_piece_header = MessagePiece::construct_message_piece_header(static_cast<uint32_t>(TwoPLPashaMessage::DATA_MIGRATION_REQUEST),
-                                                                                         message_size, table.tableID(), table.partitionID());
-
+		auto message_size = data_migration_request_size(key_size);
+		auto message_piece_header = MessagePiece::construct_message_piece_header(
+		    static_cast<uint32_t>(TwoPLPashaMessage::DATA_MIGRATION_REQUEST),
+		    message_size, table_id, partition_id);
 		Encoder encoder(message.data);
 		encoder << message_piece_header;
 		encoder.write_n_bytes(key, key_size);
-		encoder << transaction_id;
-		encoder << key_offset;
+		encoder << transaction_id << key_offset;
+		message.flush();
+		message.set_gen_time(Time::now());
+		return message_size;
+	}
+
+        static std::size_t new_data_migration_message(Message &message, ITable &table, const void *key, uint64_t transaction_id, uint32_t key_offset)
+	{
+		return new_data_migration_message(message, table.tableID(),
+		    table.partitionID(), key, table.key_size(), transaction_id,
+		    key_offset);
+	}
+
+        static std::size_t new_data_migration_message_for_scan(
+                Message &message, std::size_t table_id, std::size_t partition_id,
+                const void *min_key, const void *max_key, std::size_t key_size,
+                uint64_t limit, uint64_t transaction_id, uint32_t key_offset)
+	{
+		auto message_size = scan_migration_request_size(key_size);
+		auto message_piece_header = MessagePiece::construct_message_piece_header(
+		    static_cast<uint32_t>(TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN),
+		    message_size, table_id, partition_id);
+		Encoder encoder(message.data);
+		encoder << message_piece_header;
+		encoder.write_n_bytes(min_key, key_size);
+		encoder.write_n_bytes(max_key, key_size);
+		encoder << limit << transaction_id << key_offset;
 		message.flush();
 		message.set_gen_time(Time::now());
 		return message_size;
@@ -61,26 +128,9 @@ class TwoPLPashaMessageFactory {
 
         static std::size_t new_data_migration_message_for_scan(Message &message, ITable &table, const void *min_key, const void *max_key, uint64_t limit, uint64_t transaction_id, uint32_t key_offset)
 	{
-		/*
-		 * The structure of a data migration request: (min_key, max_key, limit, transaction_id, key_offset)
-		 */
-
-		auto key_size = table.key_size();
-
-		auto message_size = MessagePiece::get_header_size() + key_size + key_size + sizeof(limit) + sizeof(transaction_id) + sizeof(key_offset);
-		auto message_piece_header = MessagePiece::construct_message_piece_header(static_cast<uint32_t>(TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN),
-                                                                                         message_size, table.tableID(), table.partitionID());
-
-		Encoder encoder(message.data);
-		encoder << message_piece_header;
-		encoder.write_n_bytes(min_key, key_size);
-                encoder.write_n_bytes(max_key, key_size);
-                encoder << limit;
-		encoder << transaction_id;
-		encoder << key_offset;
-		message.flush();
-		message.set_gen_time(Time::now());
-		return message_size;
+		return new_data_migration_message_for_scan(
+		    message, table.tableID(), table.partitionID(), min_key, max_key,
+		    table.key_size(), limit, transaction_id, key_offset);
 	}
 
         static std::size_t new_data_move_out_hint_message(Message &message)
@@ -104,25 +154,44 @@ class TwoPLPashaMessageFactory {
 		CHECK(0);
 	}
 
-        static std::size_t new_remote_insert_message(Message &message, ITable &table, const void *key, void *value, uint64_t transaction_id, uint32_t key_offset)
+        static std::size_t new_remote_insert_message(
+                Message &message, std::size_t table_id, std::size_t partition_id,
+                const void *key, std::size_t key_size, const void *value,
+                std::size_t value_size, uint64_t transaction_id,
+                uint32_t key_offset)
 	{
-		/*
-		 * The structure of a remote delete request: (primary key, value)
-		 */
-
-		auto key_size = table.key_size();
-                auto value_size = table.value_size();
-
-		auto message_size = MessagePiece::get_header_size() + key_size + value_size + sizeof(transaction_id) + sizeof(key_offset);
-		auto message_piece_header = MessagePiece::construct_message_piece_header(static_cast<uint32_t>(TwoPLPashaMessage::REMOTE_INSERT_REQUEST),
-                                                                                         message_size, table.tableID(), table.partitionID());
-
+		auto message_size = remote_insert_request_size(key_size, value_size);
+		auto message_piece_header = MessagePiece::construct_message_piece_header(
+		    static_cast<uint32_t>(TwoPLPashaMessage::REMOTE_INSERT_REQUEST),
+		    message_size, table_id, partition_id);
 		Encoder encoder(message.data);
 		encoder << message_piece_header;
 		encoder.write_n_bytes(key, key_size);
-                encoder.write_n_bytes(value, value_size);
-                encoder << transaction_id;
-		encoder << key_offset;
+		encoder.write_n_bytes(value, value_size);
+		encoder << transaction_id << key_offset;
+		message.flush();
+		message.set_gen_time(Time::now());
+		return message_size;
+	}
+
+        static std::size_t new_remote_insert_message(Message &message, ITable &table, const void *key, void *value, uint64_t transaction_id, uint32_t key_offset)
+	{
+		return new_remote_insert_message(
+		    message, table.tableID(), table.partitionID(), key, table.key_size(),
+		    value, table.value_size(), transaction_id, key_offset);
+	}
+
+        static std::size_t new_remote_delete_message(
+                Message &message, std::size_t table_id, std::size_t partition_id,
+                const void *key, std::size_t key_size)
+	{
+		auto message_size = remote_delete_request_size(key_size);
+		auto message_piece_header = MessagePiece::construct_message_piece_header(
+		    static_cast<uint32_t>(TwoPLPashaMessage::REMOTE_DELETE_REQUEST),
+		    message_size, table_id, partition_id);
+		Encoder encoder(message.data);
+		encoder << message_piece_header;
+		encoder.write_n_bytes(key, key_size);
 		message.flush();
 		message.set_gen_time(Time::now());
 		return message_size;
@@ -130,22 +199,8 @@ class TwoPLPashaMessageFactory {
 
         static std::size_t new_remote_delete_message(Message &message, ITable &table, const void *key)
 	{
-		/*
-		 * The structure of a remote delete request: (primary key)
-		 */
-
-		auto key_size = table.key_size();
-
-		auto message_size = MessagePiece::get_header_size() + key_size;
-		auto message_piece_header = MessagePiece::construct_message_piece_header(static_cast<uint32_t>(TwoPLPashaMessage::REMOTE_DELETE_REQUEST),
-                                                                                         message_size, table.tableID(), table.partitionID());
-
-		Encoder encoder(message.data);
-		encoder << message_piece_header;
-		encoder.write_n_bytes(key, key_size);
-		message.flush();
-		message.set_gen_time(Time::now());
-		return message_size;
+		return new_remote_delete_message(message, table.tableID(),
+		    table.partitionID(), key, table.key_size());
 	}
 };
 
@@ -153,58 +208,336 @@ class TwoPLPashaMessageHandler {
 	using Transaction = TwoPLPashaTransaction;
 
     public:
+        // Transaction-free request overloads keep the original decode,
+        // row-action, response, and post-response ordering in this handler.
+        // The facade supplies only its existing owner binding and operation
+        // callback; it does not own another wire state machine.
+        static bool data_migration_request_handler(
+                MessagePiece inputPiece, Message &responseMessage, ITable &table,
+                std::size_t key_size,
+                const std::function<MigrationResponseOutcome(const void *)> &move_row_in,
+                const std::function<void()> &after_response = {})
+        {
+                const char *key = nullptr;
+                uint64_t transaction_id = 0;
+                uint32_t key_offset = 0;
+                if (!decode_data_migration_request(
+                        inputPiece, key_size, key, transaction_id, key_offset) ||
+                    key_offset != 0)
+                        return false;
+                (void)transaction_id;
+                const MigrationResponseOutcome outcome = move_row_in(key);
+                append_data_migration_response(responseMessage, table.tableID(),
+                    table.partitionID(), outcome, key_offset);
+                if (outcome == MigrationResponseOutcome::Migrated && after_response)
+                        after_response();
+                return true;
+        }
+
+        static bool remote_insert_request_handler(
+                MessagePiece inputPiece, Message &responseMessage, ITable &table,
+                std::size_t key_size, std::size_t value_size,
+                const std::function<RemoteInsertOutcome(const void *, const void *)> &insert_row)
+        {
+                const char *key = nullptr;
+                const char *value = nullptr;
+                uint64_t transaction_id = 0;
+                uint32_t key_offset = 0;
+                if (!decode_remote_insert_request(inputPiece, key_size, value_size,
+                                                   key, value, transaction_id,
+                                                   key_offset) || key_offset != 0)
+                        return false;
+                (void)transaction_id;
+                const RemoteInsertOutcome outcome = insert_row(key, value);
+                append_remote_insert_response(responseMessage, table.tableID(),
+                    table.partitionID(), outcome, key_offset);
+                return true;
+        }
+
+        static bool remote_delete_request_handler(
+                MessagePiece inputPiece, Message &responseMessage, ITable &table,
+                std::size_t key_size,
+                const std::function<bool(const void *)> &delete_row)
+        {
+                const char *key = nullptr;
+                if (!decode_remote_delete_request(inputPiece, key_size, key) ||
+                    !delete_row(key))
+                        return false;
+                append_remote_delete_response(responseMessage, table.tableID(),
+                    table.partitionID());
+                return true;
+        }
+
+        static bool data_migration_request_for_scan_handler(
+                MessagePiece inputPiece, Message &responseMessage, ITable &table,
+                std::size_t key_size,
+                const std::function<bool(const void *, const void *, uint64_t)> &
+                    move_range,
+                const std::function<void()> &after_response = {})
+        {
+                const char *min_key = nullptr;
+                const char *max_key = nullptr;
+                uint64_t limit = 0;
+                uint64_t transaction_id = 0;
+                uint32_t key_offset = 0;
+                if (!decode_scan_migration_request(
+                        inputPiece, key_size, min_key, max_key, limit,
+                        transaction_id, key_offset) || key_offset != 0)
+                        return false;
+                (void)transaction_id;
+                const bool success = move_range(min_key, max_key, limit);
+                append_scan_migration_response(responseMessage, table.tableID(),
+                    table.partitionID(), success, key_offset);
+                if (success && after_response) after_response();
+                return true;
+        }
+
+
+        static bool decode_data_migration_request(
+                MessagePiece piece, std::size_t key_size, const char *&key,
+                uint64_t &transaction_id, uint32_t &key_offset)
+        {
+                if (piece.get_message_type() != static_cast<uint32_t>(
+                            TwoPLPashaMessage::DATA_MIGRATION_REQUEST) ||
+                    piece.get_message_length() !=
+                        TwoPLPashaMessageFactory::data_migration_request_size(key_size))
+                        return false;
+                auto input = piece.toStringPiece();
+                key = input.data();
+                input.remove_prefix(key_size);
+                Decoder decoder(input);
+                decoder >> transaction_id >> key_offset;
+                return decoder.size() == 0;
+        }
+
+        static bool decode_remote_insert_request(
+                MessagePiece piece, std::size_t key_size, std::size_t value_size,
+                const char *&key, const char *&value,
+                uint64_t &transaction_id, uint32_t &key_offset)
+        {
+                if (piece.get_message_type() != static_cast<uint32_t>(
+                            TwoPLPashaMessage::REMOTE_INSERT_REQUEST) ||
+                    piece.get_message_length() !=
+                        TwoPLPashaMessageFactory::remote_insert_request_size(
+                            key_size, value_size))
+                        return false;
+                auto input = piece.toStringPiece();
+                key = input.data();
+                input.remove_prefix(key_size);
+                value = input.data();
+                input.remove_prefix(value_size);
+                Decoder decoder(input);
+                decoder >> transaction_id >> key_offset;
+                return decoder.size() == 0;
+        }
+
+        static bool decode_remote_delete_request(
+                MessagePiece piece, std::size_t key_size, const char *&key)
+        {
+                if (piece.get_message_type() != static_cast<uint32_t>(
+                            TwoPLPashaMessage::REMOTE_DELETE_REQUEST) ||
+                    piece.get_message_length() !=
+                        TwoPLPashaMessageFactory::remote_delete_request_size(key_size))
+                        return false;
+                key = piece.toStringPiece().data();
+                return true;
+        }
+
+        static bool decode_scan_migration_request(
+                MessagePiece piece, std::size_t key_size, const char *&min_key,
+                const char *&max_key, uint64_t &limit, uint64_t &transaction_id,
+                uint32_t &key_offset)
+        {
+                if (piece.get_message_type() != static_cast<uint32_t>(
+                            TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN) ||
+                    piece.get_message_length() !=
+                        TwoPLPashaMessageFactory::scan_migration_request_size(key_size))
+                        return false;
+                auto input = piece.toStringPiece();
+                min_key = input.data();
+                input.remove_prefix(key_size);
+                max_key = input.data();
+                input.remove_prefix(key_size);
+                Decoder decoder(input);
+                decoder >> limit >> transaction_id >> key_offset;
+                return decoder.size() == 0;
+        }
+
+        static bool decode_data_migration_response(
+                MessagePiece piece, MigrationResponseOutcome &outcome,
+                uint32_t &key_offset)
+        {
+                if (piece.get_message_type() != static_cast<uint32_t>(
+                            TwoPLPashaMessage::DATA_MIGRATION_RESPONSE) ||
+                    piece.get_message_length() !=
+                        TwoPLPashaMessageFactory::status_key_offset_response_size())
+                        return false;
+                Decoder decoder(piece.toStringPiece());
+                uint8_t raw = 0;
+                decoder >> raw >> key_offset;
+                if (decoder.size() != 0 || raw > 3) return false;
+                switch (raw) {
+                        case 0: outcome = MigrationResponseOutcome::Migrated; break;
+                        case 1: outcome = MigrationResponseOutcome::Missing; break;
+                        case 2: outcome = MigrationResponseOutcome::Busy; break;
+                        case 3: outcome = MigrationResponseOutcome::NoMemory; break;
+                }
+                return true;
+        }
+
+        static bool decode_remote_insert_response(
+                MessagePiece piece, RemoteInsertOutcome &outcome,
+                uint32_t &key_offset)
+        {
+                if (piece.get_message_type() != static_cast<uint32_t>(
+                            TwoPLPashaMessage::REMOTE_INSERT_RESPONSE) ||
+                    piece.get_message_length() !=
+                        TwoPLPashaMessageFactory::status_key_offset_response_size())
+                        return false;
+                Decoder decoder(piece.toStringPiece());
+                uint8_t raw = 0;
+                decoder >> raw >> key_offset;
+                if (decoder.size() != 0 || raw > 3) return false;
+                switch (raw) {
+                        case 0: outcome = RemoteInsertOutcome::Inserted; break;
+                        case 1: outcome = RemoteInsertOutcome::AlreadyExists; break;
+                        case 2: outcome = RemoteInsertOutcome::Busy; break;
+                        case 3: outcome = RemoteInsertOutcome::NoMemory; break;
+                }
+                return true;
+        }
+
+        static bool decode_scan_migration_response(
+                MessagePiece piece, bool &success, uint32_t &key_offset)
+        {
+                if (piece.get_message_type() != static_cast<uint32_t>(
+                            TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN) ||
+                    piece.get_message_length() !=
+                        TwoPLPashaMessageFactory::bool_key_offset_response_size())
+                        return false;
+                Decoder decoder(piece.toStringPiece());
+                decoder >> success >> key_offset;
+                return decoder.size() == 0;
+        }
+
+        static bool decode_remote_delete_response(MessagePiece piece)
+        {
+                return piece.get_message_type() == static_cast<uint32_t>(
+                           TwoPLPashaMessage::REMOTE_DELETE_RESPONSE) &&
+                       piece.get_message_length() ==
+                           TwoPLPashaMessageFactory::empty_response_size() &&
+                       piece.toStringPiece().size() == 0;
+        }
+
+        static void append_data_migration_response(
+                Message &message, std::size_t table_id, std::size_t partition_id,
+                MigrationResponseOutcome outcome, uint32_t key_offset)
+        {
+                const auto size =
+                    TwoPLPashaMessageFactory::status_key_offset_response_size();
+                Encoder encoder(message.data);
+                encoder << MessagePiece::construct_message_piece_header(
+                    static_cast<uint32_t>(TwoPLPashaMessage::DATA_MIGRATION_RESPONSE),
+                    size, table_id, partition_id);
+                switch (outcome) {
+                        case MigrationResponseOutcome::Migrated:
+                                encoder << uint8_t{0} << key_offset; message.flush(); return;
+                        case MigrationResponseOutcome::Missing:
+                                encoder << uint8_t{1} << key_offset; message.flush(); return;
+                        case MigrationResponseOutcome::Busy:
+                                encoder << uint8_t{2} << key_offset; message.flush(); return;
+                        case MigrationResponseOutcome::NoMemory:
+                                encoder << uint8_t{3} << key_offset; message.flush(); return;
+                }
+                LOG(FATAL) << "unknown migration response outcome";
+        }
+
+        static void append_remote_insert_response(
+                Message &message, std::size_t table_id, std::size_t partition_id,
+                RemoteInsertOutcome outcome, uint32_t key_offset)
+        {
+                const auto size =
+                    TwoPLPashaMessageFactory::status_key_offset_response_size();
+                Encoder encoder(message.data);
+                encoder << MessagePiece::construct_message_piece_header(
+                    static_cast<uint32_t>(TwoPLPashaMessage::REMOTE_INSERT_RESPONSE),
+                    size, table_id, partition_id);
+                switch (outcome) {
+                        case RemoteInsertOutcome::Inserted:
+                                encoder << uint8_t{0} << key_offset; message.flush(); return;
+                        case RemoteInsertOutcome::AlreadyExists:
+                                encoder << uint8_t{1} << key_offset; message.flush(); return;
+                        case RemoteInsertOutcome::Busy:
+                                encoder << uint8_t{2} << key_offset; message.flush(); return;
+                        case RemoteInsertOutcome::NoMemory:
+                                encoder << uint8_t{3} << key_offset; message.flush(); return;
+                }
+                LOG(FATAL) << "unknown remote insert outcome";
+        }
+
+        static void append_scan_migration_response(
+                Message &message, std::size_t table_id, std::size_t partition_id,
+                bool success, uint32_t key_offset)
+        {
+                const auto size =
+                    TwoPLPashaMessageFactory::bool_key_offset_response_size();
+                Encoder encoder(message.data);
+                encoder << MessagePiece::construct_message_piece_header(
+                    static_cast<uint32_t>(
+                        TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN),
+                    size, table_id, partition_id);
+                encoder << success << key_offset;
+                message.flush();
+        }
+
+        static void append_remote_delete_response(
+                Message &message, std::size_t table_id, std::size_t partition_id)
+        {
+                Encoder encoder(message.data);
+                encoder << MessagePiece::construct_message_piece_header(
+                    static_cast<uint32_t>(TwoPLPashaMessage::REMOTE_DELETE_RESPONSE),
+                    TwoPLPashaMessageFactory::empty_response_size(), table_id,
+                    partition_id);
+                message.flush();
+        }
+
         // The owner half of the original scan migration request.  Keeping it
         // here lets the transaction handler and the transaction-free KV
         // facade share the exact ITable scan / move_row_in sequence instead
         // of growing a second range-paging protocol in KVPartition.
+        //
+        // The owner half of the original scan migration request.  Keeping it
+        // here lets the transaction handler and the transaction-free KV
+        // facade share the exact ITable scan / move_row_in sequence instead
+        // of growing a second range-paging protocol in KVPartition.
+        // Master deliberately scans then move_row_in without one outer Clock
+        // section (acknowledged race if a row is deleted between the two).
         static void move_in_scan_range(ITable &table, const void *min_key,
                                        const void *max_key, uint64_t limit)
         {
                 std::vector<ITable::row_entity> scan_results;
-                auto scan_processor = [&](const void *key,
-                                          std::atomic<uint64_t> *meta_ptr,
-                                          void *data_ptr,
-                                          bool is_last_tuple) -> bool {
-                        (void)is_last_tuple;
+                table.scan(min_key, [&](const void *key,
+                                        ITable::MetaDataType *meta,
+                                        void *data, bool) -> bool {
                         DCHECK(key != nullptr);
-                        DCHECK(meta_ptr != nullptr);
-                        DCHECK(data_ptr != nullptr);
-
-                        bool migrating_next_key = false;
-                        if (limit != 0 && scan_results.size() == limit) {
-                                migrating_next_key = true;
-                        } else if (table.compare_key(key, max_key) > 0) {
-                                migrating_next_key = true;
-                        }
-
-                        if (table.compare_key(key, min_key) >= 0) {
-                                if (scan_results.size() > 0 &&
-                                    table.compare_key(
-                                        key,
-                                        scan_results[scan_results.size() - 1].key) <= 0) {
-                                        return false;
-                                }
-                        } else {
+                        DCHECK(meta != nullptr);
+                        DCHECK(data != nullptr);
+                        const bool migrating_next_key =
+                            (limit != 0 && scan_results.size() == limit) ||
+                            table.compare_key(key, max_key) > 0;
+                        if (table.compare_key(key, min_key) < 0) return false;
+                        if (!scan_results.empty() &&
+                            table.compare_key(key, scan_results.back().key) <= 0)
                                 return false;
-                        }
-
-                        // The original handler deliberately ignores a race
-                        // between this scan and move_row_in.  The requester
-                        // re-runs the same CXL scan after the bool response.
-                        scan_results.emplace_back(key, table.key_size(), meta_ptr,
-                                                  data_ptr, table.value_size());
+                        scan_results.emplace_back(key, table.key_size(), meta, data,
+                                                  table.value_size());
                         return migrating_next_key;
-                };
-                table.scan(min_key, scan_processor);
-
+                });
                 for (auto &row : scan_results) {
-                        std::tuple<std::atomic<uint64_t> *, void *> row_tuple(
+                        std::tuple<ITable::MetaDataType *, void *> row_tuple(
                             row.meta, row.data);
-                        // Same original semantics: a missing/deleted row or
-                        // allocation failure is handled by the re-probe, and
-                        // this range migration never obtains requester refs.
-                        migration_manager->move_row_in(&table, row.key, row_tuple,
-                                                       false);
+                        (void)migration_manager->move_row_in(
+                            &table, row.key, row_tuple, false);
                 }
         }
 
@@ -426,95 +759,54 @@ class TwoPLPashaMessageHandler {
                 int type = scanKey.get_request_type();
                 std::vector<ITable::row_entity> &scan_results = *reinterpret_cast<std::vector<ITable::row_entity> *>(scanKey.get_scan_res_vec());
 
-                // we do the next-key locking logic inside this function
-                bool scan_success = false;       // it is possible that the range is empty - we return fail and abort in this case
-                bool migration_required = false;
-                auto remote_scan_processor = [&](const void *key, void *cxl_row, bool is_last_tuple) -> bool {
-                        DCHECK(key != nullptr);
-                        DCHECK(cxl_row != nullptr);
-                        DCHECK(scan_results.size() <= limit);
-
-                        bool locking_next_tuple = false;
-
-                        if (is_last_tuple == true) {
-                                locking_next_tuple = true;
-                        } else if (limit != 0 && scan_results.size() == limit) {
-                                locking_next_tuple = true;
-                        } else if (table.compare_key(key, max_key) > 0) {
-                                locking_next_tuple = true;
-                        }
-
-                        if (table.compare_key(key, min_key) >= 0) {
-                                if (scan_results.size() > 0) {
-                                        if (table.compare_key(key, scan_results[scan_results.size() - 1].key) <= 0) {
-                                                return false;
-                                        }
-                                }
-                        } else {
-                                return false;
-                        }
-
-                        // check if the previous key and the next key are real
-                        TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(cxl_row);
-                        TwoPLPashaSharedDataSCC *scc_data = smeta->get_scc_data();
-
+                CXLTableBase *target_cxl_table = twopl_pasha_global_helper->get_cxl_table(table_id, partition_id);
+                auto adjacency_ok = [&](const void *key, void *cxl_row, bool,
+                                        size_t result_count, bool) -> bool {
+                        auto *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(cxl_row);
                         smeta->lock();
-                        if (!TwoPLPashaHelper::scan_row_adjacency_ok(
-                                table.compare_key(key, min_key) == 0,
-                                scan_results.size() == limit,
-                                smeta->get_prev_key_real_bit(),
-                                smeta->get_next_key_real_bit())) {
-                                migration_required = true;
-                        }
+                        const bool ok = TwoPLPashaHelper::scan_row_adjacency_ok(
+                            table.compare_key(key, min_key) == 0,
+                            result_count == limit,
+                            smeta->get_prev_key_real_bit(),
+                            smeta->get_next_key_real_bit());
                         smeta->unlock();
-
-                        // stop immediately if data migration is needed
-                        if (migration_required == true) {
-                                scan_success = false;
-                                return true;
-                        }
-
-                        // TODO: Theoretically, we need to check if the current tuple is already locked by previous queries.
-                        // But we can ignore it for now because we never generate
-                        // transactions with duplicated or overlapped queries.
-
-                        // try to acquire the lock and increase the reference count if locking succeeds
+                        return ok;
+                };
+                auto acquire_remote = [&](const void *key, void *cxl_row, bool,
+                                          ITable::row_entity *row) -> bool {
                         bool lock_success = false;
                         if (type == TwoPLPashaRWKey::SCAN_FOR_READ) {
                                 twopl_pasha_global_helper->remote_read_lock_and_inc_ref_cnt(reinterpret_cast<char *>(cxl_row), table.value_size(), lock_success);
-                        } else if (type == TwoPLPashaRWKey::SCAN_FOR_UPDATE) {
-                                twopl_pasha_global_helper->remote_write_lock_and_inc_ref_cnt(reinterpret_cast<char *>(cxl_row), table.value_size(), lock_success);
-                        } else if (type == TwoPLPashaRWKey::SCAN_FOR_INSERT) {
-                                twopl_pasha_global_helper->remote_write_lock_and_inc_ref_cnt(reinterpret_cast<char *>(cxl_row), table.value_size(), lock_success);
-                        } else if (type == TwoPLPashaRWKey::SCAN_FOR_DELETE) {
+                        } else if (type == TwoPLPashaRWKey::SCAN_FOR_UPDATE ||
+                                   type == TwoPLPashaRWKey::SCAN_FOR_INSERT ||
+                                   type == TwoPLPashaRWKey::SCAN_FOR_DELETE) {
                                 twopl_pasha_global_helper->remote_write_lock_and_inc_ref_cnt(reinterpret_cast<char *>(cxl_row), table.value_size(), lock_success);
                         } else {
                                 DCHECK(0);
                         }
-
-                        if (lock_success == true) {
-                                // acquiring lock succeeds
-                                ITable::row_entity cur_row(key, table.key_size(), reinterpret_cast<std::atomic<uint64_t> *>(cxl_row), scc_data->data, table.value_size());
-                                if (locking_next_tuple == false) {
-                                        scan_results.push_back(cur_row);
-                                        // continue scan
-                                        return false;
-                                } else {
-                                        // scan succeeds - store the next-tuple and quit
-                                        scanKey.set_next_row_entity(cur_row);
-                                        scanKey.set_next_row_locked();
-                                        scan_success = true;
-                                        return true;
-                                }
-                        } else {
-                                // stop and fail immediately if we fail to acquire a lock
-                                scan_success = false;
-                                return true;
-                        }
+                        if (!lock_success) return false;
+                        auto *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(cxl_row);
+                        *row = ITable::row_entity(key, table.key_size(),
+                            reinterpret_cast<ITable::MetaDataType *>(cxl_row),
+                            smeta->get_scc_data()->data, table.value_size());
+                        return true;
                 };
-
-                CXLTableBase *target_cxl_table = twopl_pasha_global_helper->get_cxl_table(table_id, partition_id);
-                target_cxl_table->scan(min_key, remote_scan_processor);
+                ITable::row_entity next_row;
+                bool has_next_row = false;
+                bool scan_success = false;
+                bool migration_required = false;
+                bool scan_busy = false;
+                TwoPLPashaHelper::scan_remote_fragment(
+                    [&table](const void *left, const void *right) {
+                        return table.compare_key(left, right);
+                    }, *target_cxl_table, min_key, max_key, limit, scan_results,
+                    &next_row, has_next_row, scan_success, migration_required,
+                    scan_busy, adjacency_ok, acquire_remote,
+                    [](const ITable::row_entity &row) -> const void * { return row.key; });
+                if (has_next_row) {
+                        scanKey.set_next_row_entity(next_row);
+                        scanKey.set_next_row_locked();
+                }
 
                 if (migration_required == true) {
                         // if race condition happens, we abort and try again later
@@ -597,7 +889,7 @@ class TwoPLPashaMessageHandler {
 
         static void remote_insert_response_handler(MessagePiece inputPiece, Message &responseMessage, ITable &table, Transaction *txn)
 	{
-		DCHECK(inputPiece.get_message_type() == static_cast<uint32_t>(TwoPLPashaMessage::REMOTE_DELETE_REQUEST));
+		DCHECK(inputPiece.get_message_type() == static_cast<uint32_t>(TwoPLPashaMessage::REMOTE_INSERT_RESPONSE));
 		auto table_id = inputPiece.get_table_id();
 		auto partition_id = inputPiece.get_partition_id();
 		DCHECK(table_id == table.tableID());
@@ -680,14 +972,14 @@ class TwoPLPashaMessageHandler {
 	{
 		std::vector<std::function<void(MessagePiece, Message &, ITable &, Transaction *)> > v;
 		v.resize(static_cast<int>(ControlMessage::NFIELDS));
-		v.push_back(data_migration_request_handler);
+		v.push_back(static_cast<void (*)(MessagePiece, Message &, ITable &, Transaction *)>(data_migration_request_handler));
 		v.push_back(data_migration_response_handler);
-		v.push_back(data_migration_request_for_scan_handler);
+		v.push_back(static_cast<void (*)(MessagePiece, Message &, ITable &, Transaction *)>(data_migration_request_for_scan_handler));
 		v.push_back(data_migration_response_for_scan_handler);
                 v.push_back(data_move_out_hint_handler);
-                v.push_back(remote_insert_request_handler);
+                v.push_back(static_cast<void (*)(MessagePiece, Message &, ITable &, Transaction *)>(remote_insert_request_handler));
                 v.push_back(remote_insert_response_handler);
-                v.push_back(remote_delete_request_handler);
+                v.push_back(static_cast<void (*)(MessagePiece, Message &, ITable &, Transaction *)>(remote_delete_request_handler));
                 // replication is not supported
                 // v.push_back(replication_request_handler);
 		// v.push_back(replication_response_handler);

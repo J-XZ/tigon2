@@ -3,6 +3,7 @@
 #include "kv/engine/kv_types_layout.h"
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -55,15 +56,21 @@ class RegionAllocator {
   static RegionAllocator Initialize(void *region, uint64_t region_bytes,
                                     uint32_t shard_count,
                                     uint64_t reserved_prefix_bytes = 0,
-                                    bool metadata_is_hwcc = false);
+                                    bool control_is_hwcc = false,
+                                    bool block_is_hwcc = false,
+                                    bool block_is_shared_payload = false);
   static RegionAllocator Attach(void *region, uint64_t region_bytes,
-                                bool metadata_is_hwcc = false);
+                                bool control_is_hwcc = false,
+                                bool block_is_hwcc = false,
+                                bool block_is_shared_payload = false);
   static RegionAllocator InitializeWithExternalHeader(
       void *region, uint64_t region_bytes, RegionAllocatorHeader *header,
-      bool metadata_is_hwcc = false);
+      bool control_is_hwcc = false, bool block_is_hwcc = false,
+      bool block_is_shared_payload = false);
   static RegionAllocator AttachWithExternalHeader(
       void *region, uint64_t region_bytes, RegionAllocatorHeader *header,
-      bool metadata_is_hwcc = false);
+      bool control_is_hwcc = false, bool block_is_hwcc = false,
+      bool block_is_shared_payload = false);
 
   // Hot path: owner shard size-class freelist / bump under a short spin lock.
   // Every allocation is reclaimed by its owner. Cross-owner free is a protocol
@@ -90,9 +97,11 @@ class RegionAllocator {
 
  private:
   RegionAllocator(void *base, uint64_t bytes, RegionAllocatorHeader *header,
-                  bool metadata_is_hwcc)
+                  bool control_is_hwcc, bool block_is_hwcc,
+                  bool block_is_shared_payload)
       : base_(static_cast<std::byte *>(base)), bytes_(bytes), header_(header),
-        metadata_is_hwcc_(metadata_is_hwcc) {}
+        control_is_hwcc_(control_is_hwcc), block_is_hwcc_(block_is_hwcc),
+        block_is_shared_payload_(block_is_shared_payload) {}
   static uint64_t Align(uint64_t bytes) {
     if (bytes > UINT64_MAX - (kAlignment - 1)) throw std::bad_alloc();
     return (bytes + kAlignment - 1) & ~(kAlignment - 1);
@@ -112,11 +121,18 @@ class RegionAllocator {
   void RecordAtomicLoad(const void *address) const;
   void RecordAtomicStore(const void *address) const;
   void RecordAtomicRmw(const void *address) const;
+  void RecordBlockAtomicLoad(const void *address) const;
+  void RecordBlockAtomicStore(const void *address) const;
+  void RecordBlockAtomicRmw(const void *address) const;
+  void RecordBlockMetadataRead(const void *address, uint64_t bytes) const;
+  void RecordBlockMetadataWrite(const void *address, uint64_t bytes) const;
 
   std::byte *base_;
   uint64_t bytes_;
   RegionAllocatorHeader *header_;
-  bool metadata_is_hwcc_;
+  bool control_is_hwcc_;
+  bool block_is_hwcc_;
+  bool block_is_shared_payload_;
 };
 
 // The pool is mapped once, but allocations are physically constrained to one
@@ -155,12 +171,20 @@ struct alignas(64) OwnerPrivateArenaHeader {
   // Original-compute-node state: the private B+tree root and Clock control
   // words belong with this owner's non-coherent SWCC arena, never in the
   // globally coherent partition directory.
-  RegionOffset private_root = kNullOffset;
+  std::atomic<RegionOffset> private_root{kNullOffset};
+  OwnerPrivateClockTrackerControl clock{};
+};
+
+// One fixed owner slot precedes the partition arenas.  It is the only
+// persistent home for an owner's dynamic allocator headers, accounting, and
+// EBR queues; partition arenas contain partition-local roots/Clock state only.
+struct alignas(64) OwnerAllocatorControl {
+  uint64_t magic = 0x5449474f4e4f574eULL;  // TIGONOWN
+  uint32_t version = 1;
+  uint32_t owner_shard = 0;
   RegionOffset dynamic_hwcc_allocator = kNullOffset;
   RegionOffset dynamic_shared_swcc_allocator = kNullOffset;
-  RegionOffset clock_head = kNullOffset;
-  RegionOffset clock_tail = kNullOffset;
-  RegionOffset clock_cursor = kNullOffset;
+  std::atomic<uint64_t> total_hw_cc_usage{0};
   // Original EBR keeps one retire list per worker/epoch.  The lists are
   // owner-private SWCC offsets so their allocator metadata never becomes a
   // cross-VM synchronization object.
@@ -177,6 +201,7 @@ struct OwnerPrivateRetireRecord {
   uint64_t bytes = 0;
   AllocationDomain domain = AllocationDomain::kHwccIndex;
   uint32_t private_partition = UINT32_MAX;
+  uint32_t record_partition = UINT32_MAX;
   RegionOffset next = kNullOffset;
 };
 
@@ -189,6 +214,13 @@ struct alignas(64) DualRegionPersistentHeader {
   uint64_t owner_private_arenas_offset = 0;
   uint64_t owner_private_arenas_bytes = 0;
   uint64_t owner_private_arena_stride = 0;
+  uint64_t owner_controls_offset = 0;
+  uint64_t owner_controls_bytes = 0;
+  uint64_t owner_control_stride = 0;
+  uint64_t transport_offset = kNullOffset;
+  uint64_t transport_bytes = 0;
+  uint64_t ebr_offset = kNullOffset;
+  uint64_t ebr_bytes = 0;
 };
 
 class DualRegionAllocator {
@@ -203,6 +235,7 @@ class DualRegionAllocator {
   // its owner-private controls were already initialized and published.
   void BindOwnerPrivateAllocators(uint32_t node_id);
   void FinalizeStaticHwccLayout();
+  void PublishStaticHwccLayout();
   // Startup has exactly one cross-VM state machine.  Each VM initializes only
   // its own SWCC arena and roots, publishes its bit, then VM0 releases Ready.
   // These are startup-only operations, never a checkpoint/recovery protocol.
@@ -229,39 +262,64 @@ class DualRegionAllocator {
       uint32_t owner_shard, uint32_t worker_id, uint32_t epoch);
   bool IsHwccAddress(const void *pointer) const;
   bool IsSwccAddress(const void *pointer) const;
-  uint64_t ToPoolOffset(const void *pointer) const;
-  void *FromPoolOffset(uint64_t offset) const;
+  RegionOffset ToOwnerPrivateOffset(const void *pointer,
+                                    uint32_t partition_id) const;
+  uint64_t EncodeSharedPayloadOffset(const void *pointer,
+                                     uint32_t owner_shard) const;
+  RegionOffset ToTransportOffset(const void *pointer) const;
+  RegionOffset ToDynamicHwccOffset(const void *pointer,
+                                   uint32_t owner_shard) const;
   bool IsInOwnerPrivateArena(const void *pointer, uint32_t partition_id) const;
+  void *ResolveOwnerPrivate(RegionOffset offset, uint64_t bytes,
+                            uint32_t partition_id,
+                            uint32_t expected_owner) const;
+  void *ResolveDynamicHwcc(RegionOffset offset, uint64_t bytes,
+                           uint32_t expected_owner) const;
+  void *ResolveSharedPayload(uint64_t whole_pool_offset,
+                             uint64_t bytes) const;
+  void *ResolveTransport(RegionOffset offset, uint64_t bytes) const;
+  void *ResolveEbr(RegionOffset offset, uint64_t bytes) const;
   RegionOffset OwnerPrivateArenaOffset(uint32_t partition_id) const;
   uint64_t SharedPayloadCapacityBytes(uint32_t owner_shard) const;
   uint64_t OwnerPrivateUsedBytes(uint32_t owner_shard) const;
   uint64_t DynamicHwccUsedBytes(uint32_t owner_shard) const;
+  uint64_t PolicyHwccUsedBytes(uint32_t owner_shard) const;
   uint64_t SharedPayloadUsedBytes(uint32_t owner_shard) const;
+  // Static HWCC/SWCC domain counters live in the layout header. Reporting and
+  // Open() clamp must record each load; do not return the atomic pointer.
+  uint64_t ReadStaticDomainUsedBytes(AllocationDomain domain) const;
   // Explicit test/teardown flush only. It is not a distributed checkpoint or
   // a substitute for SCC publication.
   void FlushOwnedRanges(uint32_t node_id);
   const SharedLayoutHeader &layout() const { return header_->layout; }
   SharedLayoutHeader &layout() { return header_->layout; }
   const RegionAllocator &hwcc() const { return hwcc_; }
-  const RegionAllocator &swcc() const { return swcc_; }
 
  private:
   DualRegionAllocator(std::byte *pool, const DualRegionConfig &config,
-                      DualRegionPersistentHeader *header, RegionAllocator hwcc,
-                      RegionAllocator swcc)
-      : pool_(pool), config_(config), header_(header), hwcc_(hwcc), swcc_(swcc) {}
+                      DualRegionPersistentHeader *header, RegionAllocator hwcc)
+      : pool_(pool), config_(config), header_(header), hwcc_(hwcc) {}
   static bool IsHwccDomain(AllocationDomain domain);
+  void BindOwnerPrivateArenaHandles(uint32_t node_id);
+  OwnerAllocatorControl *OwnerControl(uint32_t owner_shard) const;
   OwnerPrivateArenaHeader *Arena(uint32_t partition_id) const;
+  void *SwccFromOffset(RegionOffset offset, uint64_t bytes = 1) const;
+  RegionOffset SwccToOffset(const void *pointer, uint64_t bytes = 1) const;
   std::byte *pool_;
   DualRegionConfig config_;
   DualRegionPersistentHeader *header_;
   RegionAllocator hwcc_;
-  RegionAllocator swcc_;
+  // Process-local, non-owning handles rebuilt only for this VM's private
+  // arenas.  They never enter the mapped layout and keep Allocate/Free off
+  // the HWCC descriptor path.
+  std::array<OwnerPrivateArenaHeader *, kMaxPartitions>
+      owner_private_arenas_{};
   std::array<std::unique_ptr<RegionAllocator>, kMaxAllocatorShards>
       dynamic_hwcc_{};
   std::array<std::unique_ptr<RegionAllocator>, kMaxAllocatorShards>
       dynamic_shared_swcc_{};
   bool static_hwcc_finalized_ = false;
+  uint32_t bound_owner_shard_ = UINT32_MAX;
 };
 
 // Owns one MAP_SHARED backing-file mapping. Initialization is serialized with

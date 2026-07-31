@@ -2,6 +2,7 @@
 
 #include "kv/engine/region_allocator.h"
 #include "kv/kv_store.h"
+#include "common/CXL_EBR.h"
 
 #include "common/LockfreeQueue.h"
 #include "common/Message.h"
@@ -16,11 +17,10 @@
 namespace star {
 class CXL_EBR;
 class SCCManager;
+enum class TwoPLPashaMessage;
 }
 
 namespace tigonkv::engine {
-
-enum class RpcKind : uint8_t { kMigrate, kInsert, kDelete, kScanMigrate };
 
 class KVPartition;
 }
@@ -40,7 +40,6 @@ class KVEngine {
   Status Put(std::string_view key, std::string_view value);
   GetResult Get(std::string_view key);
   Status Delete(std::string_view key);
-  Status MoveOut(std::string_view key);
   ScanResult Scan(std::string_view start_key, std::string_view end_key,
                   uint64_t limit);
   CasResult CompareExchange(std::string_view key, std::string_view expected,
@@ -59,9 +58,10 @@ class KVEngine {
   void ReleaseWorker();
   uint32_t PartitionForKey(std::string_view key) const;
   uint32_t OwnerForKey(std::string_view key) const;
-  uint64_t NetworkTxBytes() const { return network_tx_bytes_.load(std::memory_order_relaxed); }
-  uint64_t NetworkRxBytes() const { return network_rx_bytes_.load(std::memory_order_relaxed); }
+  uint64_t NetworkTxBytes() const;
+  uint64_t NetworkRxBytes() const;
   RuntimeStats EngineRuntime() const;
+  RuntimeStats &CurrentWorkerRuntime();
   // Single-partition owner range move-in (§5.2). Does not return values.
   Status PreparePartitionSharedScan(uint32_t partition_id,
                                     std::string_view start_key,
@@ -81,15 +81,20 @@ class KVEngine {
   KVPartition *OwnedPartition(std::string_view key) const;
   KVPartition *VisiblePartition(std::string_view key) const;
   uint32_t OwnerForPartition(uint32_t partition) const;
-  Status Forward(RpcKind type, std::string_view key, std::string_view value,
+  // Every foreground entry must have selected one original EBR/mailbox
+  // worker.  This is TLS-only on the hot path; ownership conflicts remain a
+  // BindWorker/ReleaseWorker concern.
+  void RequireBoundWorker() const;
+  Status Forward(star::TwoPLPashaMessage type, std::string_view key,
+                 std::string_view value,
                  uint32_t partition_id, uint32_t owner,
                  std::string_view scan_max = {}, uint64_t scan_limit = 0);
   // TwoPLPasha DATA_MIGRATION: ask owner to move_row_in, then requester CXL-accesses.
   Status RequestMigrate(std::string_view key);
   struct OperationContext {
     uint32_t expected_response_type = 0;
+    uint32_t expected_source_owner = 0;
     uint32_t partition_id = 0;
-    uint64_t operation_sequence = 0;
     bool done = false;
     Status result = Status::Error(StatusCode::kCorruption, "unset RPC result");
   };
@@ -102,18 +107,28 @@ class KVEngine {
     OperationContext operation;
     uint64_t next_operation_sequence = 1;
   };
+  // A foreground worker is the sole writer to its slot. Keep protocol-path
+  // diagnostics out of the shared/global RMW path just like facade counters.
+  struct alignas(64) WorkerRuntime {
+    RuntimeStats stats;
+    uint64_t max_tid = 0;
+    star::CXL_EBR::EBRMetaLocal ebr_meta{};
+  };
   WorkerMailbox &CurrentMailbox();
   Status AwaitResponse(WorkerMailbox &mailbox);
   void DispatchMessage(star::Message &message, WorkerMailbox &mailbox);
   void ServeTransportRequest(star::Message &message,
                              star::MessagePiece piece,
                              WorkerMailbox &mailbox);
-  void ConsumeTransportResponse(star::MessagePiece piece,
+  void ConsumeTransportResponse(star::Message &message,
+                                star::MessagePiece piece,
                                 WorkerMailbox &mailbox);
-  star::Message &OutboundMessage(WorkerMailbox &mailbox, uint32_t destination,
-                                 uint64_t operation_sequence);
+  star::Message &OutboundMessage(WorkerMailbox &mailbox, uint32_t destination);
+  // The direct-CXL counterpart of Executor::flush_messages().  A foreground
+  // worker finishes every handler before publishing that handler's one-piece
+  // response, preserving the original OnDemand move-out ordering.
+  void FlushOutboundMessages(WorkerMailbox &mailbox);
   void SendTransportMessage(star::Message &message);
-  void EnforceMigrationBudget(KVPartition &partition);
   void StartInboundDemuxer();
   void StopInboundDemuxer();
   void InboundDemuxerLoop();
@@ -121,7 +136,7 @@ class KVEngine {
   Config config_;
   // Per-owner Clock dynamic HWCC limit after Open clamps configured budget to
   // capacity remaining once static HWCC domains are accounted (§11.10).
-  // Install / Memory / EnforceMigrationBudget all use this value — not the raw
+  // Install and Memory use this value — not the raw
   // (config.hw_cc_budget_mb − EBR) / vm_count formula alone.
   uint64_t owner_migration_dynamic_budget_bytes_ = 0;
   std::unique_ptr<DualRegionMappedPool> pool_;
@@ -137,23 +152,16 @@ class KVEngine {
   std::mutex worker_owner_mutex_;
   std::vector<std::thread::id> worker_owners_;
   std::vector<std::unique_ptr<WorkerMailbox>> worker_mailboxes_;
+  std::vector<WorkerRuntime> worker_runtime_;
   star::MPSCRingBuffer *rings_ = nullptr;
   // Sole MPSC consumer — mirrors Tigon IncomingDispatcher.  Never serves
   // Put/Get/Scan and never SendTransportMessage (avoids full-ring circular wait).
   std::thread inbound_demuxer_;
   std::atomic<bool> inbound_demuxer_stop_{false};
   uint32_t inbound_demuxer_worker_id_ = 0;
-  std::atomic<uint64_t> network_tx_bytes_{0};
-  std::atomic<uint64_t> network_rx_bytes_{0};
-  std::atomic<uint64_t> shared_gets_{0};
-  std::atomic<uint64_t> shared_puts_{0};
-  std::atomic<uint64_t> shared_deletes_{0};
-  std::atomic<uint64_t> shared_swcc_flushes_{0};
-  std::atomic<uint64_t> migration_in_{0};
-  std::atomic<uint64_t> migration_out_{0};
-  // §13 Scan diagnostics: flushed from TLS at Scan boundaries / once per RPC.
-  std::atomic<uint64_t> scan_partition_probes_{0};
-  std::atomic<uint64_t> scan_migrate_rpcs_{0};
+  // The demuxer has no foreground worker identity. Its receive byte counter is
+  // isolated from foreground statistics; only EngineRuntime reads it.
+  std::atomic<uint64_t> demux_network_rx_bytes_{0};
 };
 
 }  // namespace tigonkv::engine

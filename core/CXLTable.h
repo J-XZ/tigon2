@@ -7,10 +7,20 @@
 #include "common/CCHashTable.h"
 #include "common/btree_olc_cxl/BTreeOLC_CXL.h"
 
-#include <boost/interprocess/offset_ptr.hpp>
 
 namespace star
 {
+
+struct LegacyOffsetPtrRowReference {
+        using StoredRow = btreeolc_cxl::PersistentOffset<void>;
+        StoredRow Null() const { return StoredRow(nullptr); }
+        bool IsNull(const StoredRow &row) const { return row.get() == nullptr; }
+        StoredRow Encode(void *row) const { return StoredRow(row); }
+        void *Resolve(const StoredRow &row) const { return row.get(); }
+        bool Equal(const StoredRow &left, const StoredRow &right) const {
+                return left.get() == right.get();
+        }
+};
 
 class CXLTableBase {
     public:
@@ -80,7 +90,9 @@ template <class KeyType> class CXLTableHashMap : public CXLTableBase {
 	std::size_t partitionID_;
 };
 
-template <class KeyType, class KeyComparator> class CXLTableBTreeOLC : public CXLTableBase {
+template <class KeyType, class KeyComparator,
+          class SharedRowReferencePolicy = LegacyOffsetPtrRowReference>
+class CXLTableBTreeOLC : public CXLTableBase {
     public:
         static constexpr uint64_t update_threshold = 1024;
         static constexpr uint64_t leaf_page_size = 4096;
@@ -93,25 +105,27 @@ template <class KeyType, class KeyComparator> class CXLTableBTreeOLC : public CX
 
                 BTreeOLCValue(const BTreeOLCValue &value)
                 {
-                        this->row = value.row.get();
-                        this->is_valid.store(value.is_valid.load());
+                        this->row = value.row;
+                        tigonkv::engine::mem_access::HwccAtomicLoad(&value.is_valid);
+                        this->is_valid.store(value.is_valid.load(std::memory_order_relaxed));
                 }
 
                 BTreeOLCValue &operator=(const BTreeOLCValue &value)
                 {
-                        this->row = value.row.get();
-                        this->is_valid.store(value.is_valid.load());
+                        this->row = value.row;
+                        tigonkv::engine::mem_access::HwccAtomicLoad(&value.is_valid);
+                        this->is_valid.store(value.is_valid.load(std::memory_order_relaxed));
                         return *this;
                 }
 
-                boost::interprocess::offset_ptr<void> row{ nullptr };
+                typename SharedRowReferencePolicy::StoredRow row{};
                 std::atomic<bool> is_valid{ false };
         };
 
         struct BTreeOLCValueComparator {
                 int operator()(const BTreeOLCValue &a, const BTreeOLCValue &b) const
                 {
-                        if (a.row.get() == b.row.get())
+                        if (a.row == b.row)
                                 return 0;
                         else
                                 return 1;
@@ -119,29 +133,36 @@ template <class KeyType, class KeyComparator> class CXLTableBTreeOLC : public CX
         };
 
         using CXLBTree = btreeolc_cxl::BPlusTree<KeyType, BTreeOLCValue, KeyComparator, BTreeOLCValueComparator, update_threshold, leaf_page_size, inner_page_size>;
+        using StoredRow = typename SharedRowReferencePolicy::StoredRow;
 
 	virtual ~CXLTableBTreeOLC() override = default;
 
-        CXLTableBTreeOLC(CXLBTree *cxl_btree, std::size_t tableID, std::size_t partitionID)
+        CXLTableBTreeOLC(CXLBTree *cxl_btree, std::size_t tableID, std::size_t partitionID,
+                         SharedRowReferencePolicy row_policy = SharedRowReferencePolicy{})
                 : cxl_btree_(cxl_btree)
                 , tableID_(tableID)
 		, partitionID_(partitionID)
+		, row_policy_(std::move(row_policy))
 	{
 	}
 
 	virtual void *search(const void *key) override
         {
+                StoredRow row = row_policy_.Null();
+                return lookup_reference(key, &row) ? row_policy_.Resolve(row)
+                                                   : nullptr;
+        }
+
+        bool lookup_reference(const void *key, StoredRow *row)
+        {
+                if (row == nullptr) throw std::invalid_argument("null shared row output");
                 const auto &k = *static_cast<const KeyType *>(key);
-
                 BTreeOLCValue value;
-                bool success = cxl_btree_->lookup(k, value);
-
-                if (success == true) {
-                        CHECK(value.is_valid == true);
-                        return value.row.get();
-                } else {
-                        return nullptr;
-                }
+                if (!cxl_btree_->lookup(k, value)) return false;
+                tigonkv::engine::mem_access::HwccAtomicLoad(&value.is_valid);
+                if (!value.is_valid.load(std::memory_order_relaxed)) return false;
+                *row = value.row;
+                return !row_policy_.IsNull(*row);
         }
 
         virtual void scan(const void *min_key, std::function<bool(const void *, void *, bool)> scan_processor) override
@@ -149,7 +170,7 @@ template <class KeyType, class KeyComparator> class CXLTableBTreeOLC : public CX
                 const auto &min_k = *static_cast<const KeyType *>(min_key);
 
                 auto processor = [&](const KeyType &key, BTreeOLCValue &value, bool is_last_tuple) -> bool {
-                        bool should_end = scan_processor(&key, value.row.get(), is_last_tuple);
+                        bool should_end = scan_processor(&key, row_policy_.Resolve(value.row), is_last_tuple);
 
                         if (should_end == false) {
                                 return false;
@@ -166,11 +187,9 @@ template <class KeyType, class KeyComparator> class CXLTableBTreeOLC : public CX
                 const auto &k = *static_cast<const KeyType *>(key);
 
                 BTreeOLCValue value;
-                value.row = row;
-                if (is_placeholder == true)
-                        value.is_valid.store(false);
-                else
-                        value.is_valid.store(true);
+                value.row = row_policy_.Encode(row);
+                tigonkv::engine::mem_access::HwccAtomicStore(&value.is_valid);
+                value.is_valid.store(is_placeholder == false, std::memory_order_relaxed);
 
 		bool success = cxl_btree_->insert(k, value);
 		return success;
@@ -200,6 +219,7 @@ template <class KeyType, class KeyComparator> class CXLTableBTreeOLC : public CX
 	CXLBTree *cxl_btree_;
 	std::size_t tableID_;
 	std::size_t partitionID_;
+        SharedRowReferencePolicy row_policy_;
 };
 
 } // namespace star

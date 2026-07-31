@@ -1,10 +1,10 @@
 {
   "shared_memory": {
-    "size_mb": 32,
+    "size_mb": 64,
     "path": "/tmp/tigonkv-trace-backing",
     "device_path": "/dev/ivpci0",
-    "hwcc": { "offset_mb": 0, "size_mb": 16 },
-    "swcc": { "offset_mb": 16, "size_mb": 16 }
+    "hwcc": { "offset_mb": 0, "size_mb": 32 },
+    "swcc": { "offset_mb": 32, "size_mb": 32 }
   },
   "vm": { "count": 1 },
   "tigon_kv": {
@@ -20,7 +20,7 @@
     },
     "fixed_key_size": 32,
     "fixed_value_size": 128,
-    "hw_cc_budget_mb": 4,
+    "hw_cc_budget_mb": 32,
     "owner_private_swcc_fraction": 0.35,
     "migration_policy": "Clock",
     "when_to_move_out": "OnDemand",

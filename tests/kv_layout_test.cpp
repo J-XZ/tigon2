@@ -3,6 +3,7 @@
 #include "common/Encoder.h"
 #include "common/Message.h"
 #include "common/MessagePiece.h"
+#include "protocol/TwoPLPasha/TwoPLPashaHelper.h"
 
 #include <cassert>
 #include <cstring>
@@ -15,10 +16,12 @@ int main() {
   assert(kSingleTableId == 0);
   assert(kMaxFixedKeyBytes == 32);
   assert(kMaxPartitions >= 16);
-  assert(kSharedLayoutVersion == 21);
+  assert(kSharedLayoutVersion == 23);
   assert(sizeof(PartitionDirectoryEntry) == 64);
   assert(sizeof(PrivateValueStruct) == sizeof(RegionOffset));
-  assert(alignof(PrivateMetadataLocal) == 64);
+  assert(alignof(PrivateMetadataLocal) == alignof(uint64_t));
+  assert(sizeof(PrivateMetadataLocal) ==
+         sizeof(star::TwoPLPashaMetadataLocal));
   // Transport uses the original Message/MessagePiece framing. The largest KV
   // request is a 32B key + 1024B fixed value + original transaction/key slot.
   {
@@ -42,8 +45,8 @@ int main() {
     assert(message.get_message_length() == star::Message::get_prefix_size() + piece_bytes);
     assert(message.get_message_length() <= 2048 - 9);
   }
-  const FixedKey alpha = FixedKey::From("alpha", 8);
-  const FixedKey beta = FixedKey::From("beta", 8);
+  const FixedKey alpha = FixedKey::From(std::string("alpha\0\0\0", 8), 8);
+  const FixedKey beta = FixedKey::From(std::string("beta\0\0\0\0", 8), 8);
   assert(alpha.Compare(alpha) == 0);
   assert(FixedKeyLess{}(alpha, beta));
   assert(kNullOffset == 0);
@@ -54,16 +57,24 @@ int main() {
   header.total_pool_bytes = 4096;
   header.vm_count = 2;
   header.partition_count = 16;
-  assert(!header.IsCompatible(7, 4096, 2, 16));
+  // Attach validates layout via C1's unique path; assert the same Ready/
+  // hash/pool invariants inline without a parallel compatibility helper.
+  assert(header.magic.load(std::memory_order_acquire) == kSharedLayoutMagic);
+  assert(header.state.load(std::memory_order_acquire) !=
+         static_cast<uint32_t>(LayoutState::kReady));
   header.state.store(static_cast<uint32_t>(LayoutState::kReady),
                      std::memory_order_release);
-  assert(header.IsCompatible(7, 4096, 2, 16));
-  assert(!header.IsCompatible(8, 4096, 2, 16));
+  assert(header.state.load(std::memory_order_acquire) ==
+         static_cast<uint32_t>(LayoutState::kReady));
+  assert(header.config_hash == 7);
+  assert(header.total_pool_bytes == 4096);
+  assert(header.vm_count == 2 && header.partition_count == 16);
+  assert(header.config_hash != 8);
   OwnerPrivateArenaHeader arena;
-  assert(arena.private_root == kNullOffset);
-  arena.private_root = 64;
+  assert(arena.private_root.load(std::memory_order_acquire) == kNullOffset);
+  arena.private_root.store(64, std::memory_order_release);
   header.partitions[3].shared_root.store(128, std::memory_order_release);
-  assert(arena.private_root == 64);
+  assert(arena.private_root.load(std::memory_order_acquire) == 64);
   assert(header.partitions[3].shared_root.load(std::memory_order_acquire) == 128);
 
   alignas(PrivateValueStruct) std::byte value_storage[

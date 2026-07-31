@@ -1020,8 +1020,25 @@ migration 开销，也不得用更差的新策略人为拖慢 Tigon。SWCC/HWCC 
    shared tree中存在精确start。shared范围不完整时，owner继续复用原
    `ITable::scan(min, callback)`，迁入`[min,max]`内的行以及原本的第一个
    `> max`右边界；没有符合范围的真实行时，§3.2内部哨兵仍会作为右边界迁入。
-   requester收到响应后以完全相同的min/max/limit重跑原remote scan，锁定并释放
-   该右边界后才可推进下一partition。
+   master remote callback的`key == min / size == limit / otherwise`三分支在
+   `min`不存在时与上述 forward-only move-in 不可同时成立：首个`key > min`没有
+   已迁入 predecessor，因而其`prev_real=false`会使完全相同的重跑永久再次请求
+   move-in。对此唯一允许的 lower-bound 薄适配是：每个独立 remote fragment 的
+   第一条`key >= min`行也作为左边界，只要求`next_real`；此判定直接由既有结果
+   vector为空得出，不解析/传输 resolved-min，不保存跨调用状态。该首行之后仍严格
+   使用 master 的三分支，`key > max`不能伪装成 limit boundary，sentinel也不放宽
+   adjacency；作为唯一终端行，sentinel 在迁入 shared 时必须以既有 `next_real` 位
+   表示右边界已闭合，随后仍按同一 predicate 校验，不能在 callback 中另加豁免。
+   **首次** CXL probe 必须保持 master 原三分支（不启用该 lower-bound 豁免），以免
+   在 `[min, island)` 仍为 private-only 时接受远处已迁入 island，导致
+   `move_in(min, limit)` 只填满 min 起的前 `limit+1` 私有键、永远修不到 island
+   尾缘 `next_real=0`（Busy 活锁）。仅在 owner 完成既有 range move-in 并返回后的
+   **同参重跑**上启用该豁免。requester以完全相同的min/max/limit重跑，锁定并释放
+   右边界后才可推进下一partition。
+   另：insert 的 `clear_adjacent` 可在后继仍已迁入时清掉当前行 `next_real`；
+   owner already-migrated 再 move-in 时，除 master 既有的邻居懒更新外，必须按观测到
+   的 private 邻居迁移状态重建 **当前行** prev/next bit（与 fresh move-in 同一观测），
+   否则同参重跑会永久再次 Busy。不得借此新增 Scan 状态机或第二套邻接协议。
    Scan migration response严格保留原`bool success + uint32_t key_offset`
    framing；只按§2.15修正原request长度断言并在owner完成原move-in循环后设置
    `success=true`。不得新增resolved-min key、Ready/Exhausted枚举、bound mode
@@ -1065,17 +1082,17 @@ migration 开销，也不得用更差的新策略人为拖慢 Tigon。SWCC/HWCC 
 
 问题：
 
-1. facade有64次 Busy retry。
+1. facade把高争用的 Busy 过早地当作逻辑操作失败；固定次数不能证明竞争已经稳定。
 2. `PutPrivate`另有最多1024次create-race循环。
 3. `LockNeighborhood`存在无界yield；当前 Scan/Engine也包含自己的操作级重试
    语义。
 
 解决方案：
 
-1. 只在单表facade逻辑操作边界保留当前唯一
-   `kStoreBusyRetryBudget=64`，语义固定为“含首次在内最多64次完整操作尝试”。
-   每次Busy后只协作drain本worker inbox并`std::this_thread::yield()`，不sleep；
-   第64次仍Busy就返回Busy。不得由agent改成另一个数字、无限重试或按操作分预算。
+1. 只在单表facade逻辑操作边界保留唯一 Busy retry。每次 Busy 后只协作
+   drain本worker inbox并`std::this_thread::yield()`，不 sleep；只要仍是正常竞争
+   就持续重做完整操作，直到成功或得到非 Busy 状态。不得在 helper、partition、
+   engine、transport handler 或 runner 增加第二套固定/操作级 retry budget。
 2. 原 B+Tree OLC restart、单次 CAS、自旋锁取得等完成一个 primitive所需的短
    循环继续保留。
 3. helper、partition、engine和transport handler遇到整次操作竞争时立即返回
@@ -1087,7 +1104,8 @@ migration 开销，也不得用更差的新策略人为拖慢 Tigon。SWCC/HWCC 
 测试方法：
 
 1. 注入确定性行锁冲突，断言一次内部失败只增加一次 facade retry。
-2. 高竞争 create/Put/Delete不能无限stall；超出 facade预算返回Busy并有统计。
+2. 高竞争 create/Put/Delete在竞争释放后必须继续完成，并有 retry 统计；真实
+   stall仍用 Debug/GDB 定位，不能用 timeout、sleep 或降低并发掩盖。
 3. 检查 helper/engine/runner不存在第二个固定操作级retry预算。
 4. 运行 `unit_tests`、`kv_partition_test`、`kv_engine_test`。
 
@@ -1550,10 +1568,16 @@ enable_scan运行时分叉（正式路径固定phantom/BTree Scan）
    handoff、`drain_quiescent`和空
    `leave_critical_section`；KV删除伪配对调用，而不是留下空hook。
 5. `CXLMemory`只保留类别→HWCC/shared-SWCC/owner-private-SWCC allocator的薄
-   binding与会计，不增加fallback。所有权和free域由对象类型决定，不做远端free。
-   shared-SWCC SCC allocation的释放遵守§3.3：普通move-out保留原缓存，
-   永久Delete才由owner退休；不能因实现通用allocator而把move-out改成无条件
-   free。
+   binding与会计，不增加按当前VM owner、裸VA或未验证全池范围的fallback。原
+   `TwoPLPashaMetadataShared::get_scc_data()` 的 atomic word 只保存 whole-pool
+   SCC payload offset、没有 allocation-owner 字段，且 master 的同一函数也没有
+   owner 参数；因此 shared-SWCC resolver 必须只在已发布且互不重叠的
+   shared-payload descriptor 集合中验证该 offset 恰好命中一个 arena，再瞬时解析
+   VA。它不能由当前VM owner选择 arena，不能缓存/发布解析结果，也不能把
+   owner-private、dynamic-HWCC或静态区误解为 payload。所有权和free域仍由对象
+   类型决定，不做远端free。shared-SWCC SCC allocation的释放遵守§3.3：普通
+   move-out保留原缓存，永久Delete才由owner退休；不能因实现通用allocator而把
+   move-out改成无条件free。
 6. `KvPartitionTable`按 §3.4完整delegate；删掉生产adapter中的所有空壳。对
    `master` 未链接legacy代码中的原有 `CHECK(0)` 不做全仓清理。
 
