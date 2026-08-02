@@ -89,9 +89,24 @@ SCC、Clock/MigrationManager 和 EBR；不要把它重写成另一套 KV。
 
 - 所有访问只通过现有 `mem_access` 记录；延迟只能在释放 B+Tree leaf latch、
   row/smeta lock、Clock lock和 EBR 关键等待后结算。
-- `latency_inject.enabled=true` 只允许 RelWithDebInfo、verbose/extra_check off、
-  foreground enabled且 TSC 校准成功；不得加入 `sleep_for` 回退。
-- disabled 路径应只有近零成本的可预测分支，不读 TSC、不维护 cache filter。
+- `tigon_kv.latency_inject` 必须同时包含且严格解析
+  `fixed_latency`、`hwcc_access_count`、`atomic_count` 和
+  `remote_cache_invalidation` 四个独立模块；未知、重复、缺失、旧 cache-hit
+  字段和非法范围都必须 hard-fail。
+- `fixed_latency.enabled=true` 只允许 RelWithDebInfo、verbose/extra_check off、
+  foreground enabled 且 TSC 校准成功；固定延迟只按内存域和覆盖 cache line
+  累计，在安全 scope 末端用 `rdtsc + _mm_pause` 结算，不读取远程模型状态，
+  也没有 clock/sleep fallback。
+- disabled 路径应只有一次 process-local relaxed feature-mask 分支，不读 TSC、
+  不建立 TLS、地址映射、cache 状态或统计原子；编译期
+  `TIGONKV_DISABLE_HARDWARE_SIMULATION=ON` 还必须移除 wrapper slow path。
+- HWCC ordinary 统计只由实际执行的 HWCC read/write wrapper 产生；原子通过执行型
+  load/store/CAS/exchange/fetch wrapper 统计，不能再使用 detached record。普通
+  SWCC write 不自动产生远程失效；只有真实 WriteThrough flush/explicit handoff
+  才进入远程可见性交接事件。
+- 远程模块使用稳定 pool id/offset、共享全局 sequence 和可重放事件日志；日志
+  溢出、缺口、重复或非法状态必须 hard-fail。事件日志容量属于 HWCC
+  instrumentation 保留区，不能被业务 allocator 使用。
 - 任何修改 shared/private/transport/migration 路径后，都要重新核对访问域、
   cacheline 范围、flush 与安全结算点，并同步更新 `延迟插入审计报告.md`。
 

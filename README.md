@@ -28,6 +28,15 @@ ivshmem; HWCC/SWCC are logical protocol and accounting categories. Results must 
 described as NUMA-based CXL shared-memory emulation and software latency-injected
 results, never as real CXL hardware performance.
 
+The current `tigonkv` hardware-simulation path has four independent modules under
+`tigon_kv.latency_inject`: fixed latency, HWCC ordinary-access counts, executed atomic
+counts, and ordered remote-cache invalidation. It has no fixed-delay cache-hit/miss
+filter. All four can be disabled independently; the all-disabled path is a single
+relaxed feature-mask gate, and `TIGONKV_DISABLE_HARDWARE_SIMULATION=ON` provides the
+compile-off comparison. See [硬件模拟当前实现.md](硬件模拟当前实现.md) and
+[延迟插入审计报告.md](延迟插入审计报告.md) for the current domain and validation
+contract.
+
 The default experiment paths come from `experiment_config.jsonc`
 (`shared_memory.path` / `device_path`, `vm.storage_path`). `scripts/vm/*` only
 inspects or reuses an existing topology and deliberately refuses to start/reboot

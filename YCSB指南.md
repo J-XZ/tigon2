@@ -10,6 +10,11 @@
 | KV | key 32 B / value 32 B（YCSB 脚本写死） |
 | Workloads | load + a/b/c/d/e |
 
+硬件模拟四模块默认全部关闭；YCSB 正式功能结果使用 `--no-latency`，不要把
+硬件模拟统计或固定延迟混入尾延迟比较。需要做模块 smoke 时，只切换生成配置中的
+一个模块并保持固定延迟数值为零；模块激活证据读取每个 VM 的
+`TIGONKV_HARDWARE_SIM_STATS`，不能用 wall time 推断覆盖。
+
 说明：编排上 **每个 workload 都会先 load 再 run**（每轮对 a…e：`pool_reset → load → run`）。trace 只生成一份共享 load；不是「全局只 load 一次再连跑 a–e」。
 
 ---
@@ -111,7 +116,7 @@ build-relwithdebinfo/ycsb_partition_splits \
 `logs/partition_splits.log` 记录 trace/split digest、sample stride、每 partition 的
 load 行数、owner 与代表 key。正式运行前必须保留该文件，确认四个 partition 均有行且
 没有全 `0xff` 内部哨兵；不能按 A--E 访问热度重新分割。若完整 load 核对不满足
-1.25 均衡要求，只能显式将 `--sample-stride` 设为更小的固定值以提高采样密度（例如 16）并重新生成
+1.25 均衡要求，只能显式将 `--sample-stride` 设为更小的固定值以提高采样密度（小规模 smoke 可用 1）并重新生成
 整套配置和 trace 元数据；这不是运行时自适应，实际使用的 stride 必须记录在
 `run_meta.json` 与 `partition_splits.log`。
 

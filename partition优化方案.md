@@ -63,7 +63,7 @@ migration 开销，也不得用更差的新策略人为拖慢 Tigon。SWCC/HWCC 
 
 ## 2. 固定施工规则
 
-1. 所有功能修改先在 `latency_inject.enabled=false` 下完成。
+1. 所有功能修改先在四个硬件模拟模块均 `enabled=false` 下完成。
 2. 每完成一项，先运行该项的 focused Debug 测试；发现 stall 时使用 Debug
    构建和 GDB 定位，不增加 sleep、无界等待或降低 worker 数量。
 3. 功能路径仍有 bug 时，不修改软件延迟埋点。
@@ -533,8 +533,9 @@ migration 开销，也不得用更差的新策略人为拖慢 Tigon。SWCC/HWCC 
    `prepare_read`覆盖完整SCC allocation，再检查valid并在成功时增加HWCC ref；
    不能沿用master中对shared-SWCC valid的裸读。后续
    `remote_take_*_lock_and_read`仍走原SCC primitive；SCC bitmap已表明本host
-   cache有效时由原manager判为cache hit，不为消除这次必要校验合并两段原调用链
-   或新增HWCC valid镜像。
+   cache有效时由原 SCC manager 的协议 bitmap 判为 cache hit（这是 SCC 协议状态，
+   不是 fixed-latency 模拟器的 hit/miss 过滤），不为消除这次必要校验合并两段
+   原调用链或新增HWCC valid镜像。
 8. 原 Tigon点查询假定key存在，公共KV接口不能沿用该假定。只对原
    `DATA_MIGRATION_RESPONSE` 的bool结果做一个必要薄扩展，固定为小枚举：
 
@@ -1196,21 +1197,22 @@ range 互斥表。
    发布先于该scope的最终busy-wait，沿用本节统一的软件模型口径。
 5. 给 B+Tree latch/access wrapper传递稳定的 tree allocation binding，不依赖
    “最近一次访问了哪棵树”的可变TLS状态。
-6. disabled模式保持一次可预测fast gate，不读TSC、不建TLS map、不更新filter；
+6. disabled模式保持一次可预测fast gate，不读TSC、不建TLS map、不更新cache状态；
    enabled校准失败hard-fail，禁止sleep fallback。
 7. 更新 `延迟插入审计报告.md`，删除旧路径结论。
 
 测试方法：
 
-1. `latency_modes_test`覆盖 disabled、TSC门禁、cache_model=none、统计恒等式和
-   settlement。
-2. focused点路径分别断言 SWCC/HWCC raw变化符合实际访问域。
+1. `latency_modes_test`覆盖 disabled、TSC门禁、四模块独立性、执行型 atomic、
+   remote sequence/replay、访问域和 settlement。
+2. focused点路径分别断言 SWCC/HWCC operation/line/byte 统计符合实际访问域。
 3. 构造private Scan callback内进入shared tree的嵌套访问，检查返回后的private
    leaf unlock仍计SWCC。
 4. RelWithDebInfo、`verbose=false`、`extra_check=false`、小延迟值运行
    `kv_shared_protocol_test`、`kv_partition_test`、`kv_engine_test`。
-5. 与CXLKV只在两边完全相同的 `cache_model=none`、容量、NUMA和延迟参数下
-   对比；raw次数无需相等，但不能错分池或重复收费。
+5. 与CXLKV只在两边完全关闭硬件软件延迟、容量、NUMA和构建参数相同的条件下
+   对比；模块统计不要求两仓数值相等，但不能错分池、重复收费或把 SWCC 当成
+   自动硬件 coherence。
 
 ### 3.12 删除死代码和 current-only 双路径
 
