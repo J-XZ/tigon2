@@ -8,7 +8,6 @@
 #include <mutex>
 #include <iterator>
 #include <stdexcept>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -46,7 +45,7 @@ void CpuRelax() {
 #if defined(__x86_64__) || defined(__i386__)
   _mm_pause();
 #else
-  std::this_thread::yield();
+  std::atomic_signal_fence(std::memory_order_seq_cst);
 #endif
 }
 
@@ -83,30 +82,32 @@ void CalibrateTscOnce() {
   });
 }
 
+bool HasCalibratedTsc() {
+#if defined(__x86_64__) || defined(__i386__)
+  return std::isfinite(g_ticks_per_ns) && g_ticks_per_ns > 0.0;
+#else
+  return false;
+#endif
+}
+
 void DelaySpinNs(uint64_t ns) {
   if (ns == 0) {
     return;
   }
   CalibrateTscOnce();
 #if defined(__x86_64__) || defined(__i386__)
-  if (g_ticks_per_ns > 0.0) {
-    const uint64_t start = ReadTsc();
-    const uint64_t ticks = std::max<uint64_t>(
-        1, static_cast<uint64_t>(g_ticks_per_ns * static_cast<double>(ns)));
-    while (ReadTsc() - start < ticks) {
-      CpuRelax();
-    }
-    return;
+  if (!HasCalibratedTsc()) {
+    std::abort();
   }
-#endif
-  // A clock-based spin is intentionally used instead of sleep_for: sleeping
-  // has scheduler-dependent overshoot and is not a valid fixed-delay model.
-  const auto start = std::chrono::steady_clock::now();
-  while (static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now() - start)
-             .count()) < ns) {
+  const uint64_t start = ReadTsc();
+  const uint64_t ticks = std::max<uint64_t>(
+      1, static_cast<uint64_t>(g_ticks_per_ns * static_cast<double>(ns)));
+  while (ReadTsc() - start < ticks) {
     CpuRelax();
   }
+#else
+  std::abort();
+#endif
 }
 
 uint64_t RoundNs(double ns) {
@@ -771,6 +772,10 @@ void LatencySimulator::Configure(Config config) {
   g_features.store(feature_mask_, std::memory_order_relaxed);
   if (feature_mask_ & kFixedLatency) {
     CalibrateTscOnce();
+    if (!HasCalibratedTsc()) {
+      throw std::runtime_error(
+          "fixed latency requires a calibrated x86 TSC; no clock fallback is permitted");
+    }
   }
 }
 
