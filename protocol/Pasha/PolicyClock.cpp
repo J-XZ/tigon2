@@ -25,16 +25,10 @@ class PolicyClock::ClockTracker {
 
   void lock() {
     auto *control = partition_.ClockTrackerControl();
-    const volatile void *volatile_lock = &control->lock;
-    auto *lock = const_cast<const void *>(volatile_lock);
-    tigonkv::engine::mem_access::PrivateAtomicRmw(lock);
     pthread_spin_lock(&control->lock);
   }
   void unlock() {
     auto *control = partition_.ClockTrackerControl();
-    const volatile void *volatile_lock = &control->lock;
-    auto *lock = const_cast<const void *>(volatile_lock);
-    tigonkv::engine::mem_access::PrivateAtomicStore(lock);
     pthread_spin_unlock(&control->lock);
   }
 

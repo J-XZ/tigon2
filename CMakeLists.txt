@@ -9,6 +9,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include(CTest)
 enable_testing()
 
+option(TIGONKV_DISABLE_HARDWARE_SIMULATION
+       "Compile out all hardware-simulation wrapper slow paths" OFF)
+
 # Keep the single-config default identical to the documented production
 # build before any build-type-specific flags are selected.  An explicit
 # caller value, and multi-config generators, remain untouched.
@@ -48,6 +51,9 @@ add_library(tigonkv STATIC kv/kv_store.cpp kv/engine/latency_inject.cpp
 target_link_libraries(tigonkv PUBLIC pthread glog)
 target_compile_definitions(tigonkv PUBLIC
   TIGONKV_CMAKE_BUILD_TYPE="$<CONFIG>")
+if(TIGONKV_DISABLE_HARDWARE_SIMULATION)
+  target_compile_definitions(tigonkv PUBLIC TIGONKV_DISABLE_HARDWARE_SIMULATION=1)
+endif()
 
 # tigonkv: legacy transaction benchmarks retain source-only reference status.
 # The redesigned KV target must not link the obsolete cxlalloc implementation.
@@ -84,6 +90,9 @@ add_executable(cxl_ebr_test tests/cxl_ebr_test.cpp)
 target_link_libraries(cxl_ebr_test PRIVATE tigonkv)
 add_executable(numa_placement_probe tools/numa_placement_probe.cpp)
 add_executable(cxl_pool_initer tools/cxl_pool_initer.cpp)
+add_executable(hardware_sim_disabled_benchmark
+               tests/hardware_sim_disabled_benchmark.cpp)
+target_link_libraries(hardware_sim_disabled_benchmark PRIVATE tigonkv)
 
 add_custom_target(tigonkv_target ALL DEPENDS tigonkv)
 add_custom_target(e2e_trace_target DEPENDS e2e_trace_runner)

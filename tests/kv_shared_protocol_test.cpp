@@ -155,17 +155,11 @@ int main() {
   regions.InitializeOwnerPrivateArenas(0);
   star::CXLMemory::bind_dual_region_allocator(&regions, 0);
   latency_sim::Config latency;
-  latency.enabled = true;
-  latency.foreground_enabled = true;
-  latency.stats_enabled = true;
-  latency.swcc_read_ns_per_line = 10;
-  latency.swcc_write_ns_per_line = 10;
-  latency.swcc_flush_ns_per_line = 10;
-  latency.hwcc_read_ns_per_line = 10;
-  latency.hwcc_write_ns_per_line = 10;
-  latency.hwcc_atomic_load_ns = 10;
-  latency.hwcc_atomic_store_ns = 10;
-  latency.hwcc_atomic_rmw_ns = 10;
+  latency.fixed_latency.enabled = true;
+  latency.fixed_latency.foreground_enabled = true;
+  latency.fixed_latency.delayed_time_stats_enabled = true;
+  latency.fixed_latency.swcc_fixed_ns_per_line = 10;
+  latency.fixed_latency.hwcc_fixed_ns_per_line = 10;
   auto &simulator = latency_sim::GlobalLatencySimulator();
   simulator.Configure(latency);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
@@ -331,9 +325,7 @@ int main() {
 
   simulator.EndScopeAndDelay();
   const auto latency_stats = simulator.TakeStatsAndReset();
-  assert(latency_stats.hwcc_raw_line_accesses > 0);
-  assert(latency_stats.hwcc_cache_misses ==
-         latency_stats.hwcc_raw_line_accesses);
+  assert(latency_stats.hwcc_read_ops > 0 || latency_stats.hwcc_delayed_ns > 0);
   pthread_spin_destroy(&legacy_local.latch);
   pthread_spin_destroy(&offset_local.latch);
   star::scc_manager = nullptr;

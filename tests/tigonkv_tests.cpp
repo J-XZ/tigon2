@@ -192,27 +192,37 @@ int main(int argc, char **argv) {
     assert(source.good());
     base_config_text.assign(std::istreambuf_iterator<char>(source),
                             std::istreambuf_iterator<char>());
-    const std::string needle = "\"swcc_read_ns_per_line\": 0";
+    const std::string needle = "\"swcc_fixed_ns_per_line\": 0";
     const size_t position = base_config_text.find(needle);
     assert(position != std::string::npos);
     std::string text = base_config_text;
-    text.replace(position, needle.size(), "\"swcc_read_ns_per_line\": 1.25e0");
+    text.replace(position, needle.size(), "\"swcc_fixed_ns_per_line\": 1.25e0");
     std::ofstream output(latency_config_path);
     output << text;
   }
   const Config fractional = Config::FromJsonc(latency_config_path);
-  assert(fractional.swcc_read_ns == 1.25);
+  assert(fractional.hardware_simulation.fixed_latency.swcc_fixed_ns_per_line == 1.25);
   assert(fractional.cpu_affinity);
 
   static constexpr std::string_view kLatencyFields[] = {
-      "enabled", "foreground_enabled", "merge_enabled", "stats_enabled",
-      "cache_line_bytes", "swcc_read_ns_per_line",
-      "swcc_write_ns_per_line", "swcc_flush_ns_per_line",
-      "hwcc_read_ns_per_line", "hwcc_write_ns_per_line",
-      "hwcc_atomic_load_ns", "hwcc_atomic_store_ns",
-      "hwcc_atomic_rmw_ns", "cache_model", "cache_hits_enabled",
-      "cache_capacity_lines", "cache_associativity",
-      "cache_fixed_hit_rate", "cache_hit_extra_ns"};
+      "fixed_latency", "hwcc_access_count", "atomic_count",
+      "remote_cache_invalidation", "swcc_fixed_ns_per_line",
+      "hwcc_fixed_ns_per_line", "background_enabled",
+      "delayed_time_stats_enabled", "read_enabled", "write_enabled",
+      "operation_count_enabled", "line_count_enabled", "byte_count_enabled",
+      "max_tags", "hwcc_enabled", "owner_private_swcc_enabled",
+      "local_dram_enabled", "cas_enabled", "exchange_enabled",
+      "fetch_arithmetic_enabled", "fetch_bitwise_enabled",
+      "result_breakdown_enabled", "fence_enabled", "wait_notify_enabled",
+      "memory_order_breakdown_enabled", "scope_breakdown_enabled",
+      "tag_breakdown_enabled", "dirty_handoff_enabled",
+      "clean_copy_invalidation_enabled", "dirty_eviction_writeback_enabled",
+      "swcc_explicit_visibility_handoff_enabled", "node_count",
+      "cache_size_bytes_per_node", "total_cpu_cache_size_bytes",
+      "cache_size_bytes_by_node", "cache_instances_per_node", "associativity",
+      "capacity_mode", "replacement_policy", "lfu_counter_bits",
+      "lfu_aging_interval_accesses", "lfu_tie_breaker",
+      "shared_sequencer_offset", "event_log_capacity"};
   for (const std::string_view field : kLatencyFields) {
     assert(ParseTextThrows(latency_config_path,
                            RemoveJsonFieldLine(base_config_text, field)));
@@ -227,8 +237,8 @@ int main(int argc, char **argv) {
                   "\"cache_line_bytes\": 64.0")));
   assert(ParseTextThrows(
       latency_config_path,
-      ReplaceOnce(base_config_text, "\"cache_model\": \"none\"",
-                  "\"cache_model\": false")));
+      ReplaceOnce(base_config_text, "\"fixed_latency\": {",
+                  "\"fixed_latency\": {\"cache_model\": false,")));
   assert(ParseTextThrows(
       latency_config_path,
       ReplaceOnce(base_config_text, "\"latency_inject\": {",
@@ -251,13 +261,11 @@ int main(int argc, char **argv) {
                          ReplaceLatencyObjectWithFalse(base_config_text)));
   assert(ParseTextThrows(
       latency_config_path,
-      ReplaceOnce(base_config_text, "\"cache_capacity_lines\": 4096",
-                  "\"cache_capacity_lines\": 0")));
+      ReplaceOnce(base_config_text, "\"max_tags\": 32",
+                  "\"max_tags\": 0")));
 
   std::string enabled = ReplaceOnce(
       base_config_text, "\"enabled\": false", "\"enabled\": true");
-  enabled = ReplaceOnce(enabled, "\"foreground_enabled\": false",
-                        "\"foreground_enabled\": true");
   if (RelWithDebInfoBuild()) {
     const Config parsed_enabled = [&] {
       std::ofstream output(latency_config_path);
@@ -265,8 +273,8 @@ int main(int argc, char **argv) {
       output.close();
       return Config::FromJsonc(latency_config_path);
     }();
-    assert(parsed_enabled.latency_enabled);
-    assert(parsed_enabled.latency_foreground_enabled);
+    assert(parsed_enabled.hardware_simulation.fixed_latency.enabled);
+    assert(parsed_enabled.hardware_simulation.fixed_latency.foreground_enabled);
   } else {
     assert(ParseTextThrows(latency_config_path, enabled));
   }
@@ -351,7 +359,7 @@ int main(int argc, char **argv) {
   insufficient_cpu.vm_core_count_per_vm = 4;
   assert(ValidateThrows(insufficient_cpu));
   Config gated = config;
-  gated.latency_enabled = true;
+  gated.hardware_simulation.fixed_latency.enabled = true;
   if (RelWithDebInfoBuild()) {
     gated.verbose = true;
     assert(ValidateThrows(gated));
@@ -359,17 +367,17 @@ int main(int argc, char **argv) {
     gated.extra_check = true;
     assert(ValidateThrows(gated));
     gated.extra_check = false;
-    gated.latency_foreground_enabled = false;
-    gated.latency_merge_enabled = true;
+    gated.hardware_simulation.fixed_latency.foreground_enabled = false;
+    gated.hardware_simulation.fixed_latency.background_enabled = true;
     assert(ValidateThrows(gated));
   } else {
     assert(ValidateThrows(gated));
   }
-  config.latency_enabled = RelWithDebInfoBuild();
-  config.latency_foreground_enabled = true;
-  config.latency_stats_enabled = true;
-  config.swcc_read_ns = 1;
-  config.swcc_write_ns = 1;
+  config.hardware_simulation.fixed_latency.enabled = RelWithDebInfoBuild();
+  config.hardware_simulation.fixed_latency.foreground_enabled = true;
+  config.hardware_simulation.fixed_latency.delayed_time_stats_enabled = true;
+  config.hardware_simulation.fixed_latency.swcc_fixed_ns_per_line = 1;
+  config.hardware_simulation.fixed_latency.hwcc_fixed_ns_per_line = 1;
   // HWCC is bounded by the configured physical shared region, not by an
   // arbitrary 1GiB validation ceiling.  Larger verified configurations are
   // permitted when a smaller policy budget cannot satisfy a focused test.
@@ -448,13 +456,14 @@ int main(int argc, char **argv) {
   const std::string stats = store->DumpStats();
   assert(stats.find("allocator_shared_overhead_bytes=") != std::string::npos);
   assert(stats.find("network_tx_bytes=") != std::string::npos);
-  if (RelWithDebInfoBuild()) {
-    assert(stats.find("\nswcc_raw=0\n") == std::string::npos);
-    assert(stats.find("\nswcc_misses=0\n") == std::string::npos);
-  } else {
-    assert(stats.find("\nswcc_raw=0\n") != std::string::npos);
-    assert(stats.find("\nhwcc_raw=0\n") != std::string::npos);
-  }
+  assert(stats.find("TIGONKV_HARDWARE_SIM_STATS\n") != std::string::npos);
+  assert(stats.find("\nswcc_raw=") == std::string::npos);
+  assert(stats.find("\nhwcc_raw=") == std::string::npos);
+  assert(stats.find("\nswcc_misses=") == std::string::npos);
+  assert(stats.find("\nfixed_latency_enabled=") != std::string::npos);
+  assert(stats.find("\nhwcc_access_count_enabled=") != std::string::npos);
+  assert(stats.find("\natomic_count_enabled=") != std::string::npos);
+  assert(stats.find("\nremote_cache_invalidation_enabled=") != std::string::npos);
   store->BindWorker(0);
   store->ReleaseWorker();
   store.reset();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kv/engine/kv_types_layout.h"
+#include "kv/engine/mem_access.h"
 
 #include <atomic>
 #include <array>
@@ -87,7 +88,11 @@ class RegionAllocator {
   uint64_t capacity() const { return bytes_; }
   uint64_t metadata_bytes() const { return header_->metadata_bytes; }
   uint64_t allocated() const {
-    return header_->allocated_bytes.load(std::memory_order_acquire);
+    const auto domain = control_is_hwcc_
+                            ? latency_sim::AtomicDomain::kHwcc
+                            : latency_sim::AtomicDomain::kOwnerPrivateSwcc;
+    return latency_sim::CountedAtomicLoad(header_->allocated_bytes,
+                                          std::memory_order_acquire, domain);
   }
   uint32_t shard_count() const { return header_->shard_count; }
   // Flush allocator metadata plus each shard's allocated high-water range.
@@ -118,12 +123,6 @@ class RegionAllocator {
   void AccountFree(uint64_t bytes, DomainCounter *counter);
   void RecordMetadataRead(const void *address, uint64_t bytes) const;
   void RecordMetadataWrite(const void *address, uint64_t bytes) const;
-  void RecordAtomicLoad(const void *address) const;
-  void RecordAtomicStore(const void *address) const;
-  void RecordAtomicRmw(const void *address) const;
-  void RecordBlockAtomicLoad(const void *address) const;
-  void RecordBlockAtomicStore(const void *address) const;
-  void RecordBlockAtomicRmw(const void *address) const;
   void RecordBlockMetadataRead(const void *address, uint64_t bytes) const;
   void RecordBlockMetadataWrite(const void *address, uint64_t bytes) const;
 
@@ -151,6 +150,12 @@ struct DualRegionConfig {
   uint32_t fixed_key_size = 0;
   uint32_t fixed_value_size = 0;
   double owner_private_swcc_fraction = 0.35;
+  // The remote-invalidation sequencer/log live in a reserved HWCC prefix,
+  // immediately after the allocator metadata.  Their addresses are offsets
+  // in the mapped region, never process virtual addresses.
+  bool remote_invalidation_enabled = false;
+  uint64_t remote_shared_sequencer_offset = 0;
+  uint64_t remote_event_log_capacity = 0;
 };
 
 // A fixed SWCC subrange assigned to one partition.  It is persistent and
@@ -221,6 +226,13 @@ struct alignas(64) DualRegionPersistentHeader {
   uint64_t transport_bytes = 0;
   uint64_t ebr_offset = kNullOffset;
   uint64_t ebr_bytes = 0;
+  // Offsets below are relative to hwcc_allocator_offset.  The entire
+  // instrumentation prefix is excluded from the business allocator.
+  uint64_t remote_instrumentation_offset = kNullOffset;
+  uint64_t remote_instrumentation_bytes = 0;
+  uint64_t remote_sequence_offset = kNullOffset;
+  uint64_t remote_event_log_offset = kNullOffset;
+  uint64_t remote_event_log_capacity = 0;
 };
 
 class DualRegionAllocator {
@@ -288,6 +300,14 @@ class DualRegionAllocator {
   // Static HWCC/SWCC domain counters live in the layout header. Reporting and
   // Open() clamp must record each load; do not return the atomic pointer.
   uint64_t ReadStaticDomainUsedBytes(AllocationDomain domain) const;
+  bool HasRemoteInstrumentation() const {
+    return header_->remote_instrumentation_bytes != 0;
+  }
+  void *RemoteSequenceWord() const;
+  void *RemoteEventLog() const;
+  uint64_t RemoteEventLogCapacity() const {
+    return header_->remote_event_log_capacity;
+  }
   // Explicit test/teardown flush only. It is not a distributed checkpoint or
   // a substitute for SCC publication.
   void FlushOwnedRanges(uint32_t node_id);

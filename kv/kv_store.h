@@ -1,5 +1,7 @@
 #pragma once
 
+#include "kv/engine/latency_inject.h"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -147,25 +149,9 @@ struct Config {
   // Pin foreground workers and the inbound demuxer to distinct CPUs from the
   // process's allowed affinity mask. Performance configurations enable this.
   bool cpu_affinity = false;
-  bool latency_enabled = false;
-  bool latency_foreground_enabled = false;
-  bool latency_merge_enabled = false;
-  bool latency_stats_enabled = false;
-  uint64_t latency_cache_line_bytes = 64;
-  double swcc_read_ns = 0;
-  double swcc_write_ns = 0;
-  double swcc_flush_ns = 0;
-  double hwcc_read_ns = 0;
-  double hwcc_write_ns = 0;
-  double hwcc_atomic_load_ns = 0;
-  double hwcc_atomic_store_ns = 0;
-  double hwcc_atomic_rmw_ns = 0;
-  std::string latency_cache_model = "none";
-  bool latency_cache_hits_enabled = false;
-  double latency_cache_fixed_hit_rate = 0.0;
-  uint64_t latency_cache_capacity_lines = 4096;
-  uint64_t latency_cache_associativity = 8;
-  double latency_cache_hit_extra_ns = 0;
+  // Canonical four-module hardware simulation configuration. JSONC is the
+  // only configuration surface; the former flat/cache-model schema is gone.
+  latency_sim::Config hardware_simulation{};
 
   static Config FromJsonc(const std::string &path);
   // Normalizes non-infinite range boundaries into their persisted FixedKey

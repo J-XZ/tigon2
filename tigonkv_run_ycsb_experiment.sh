@@ -53,8 +53,12 @@ shared=d['shared_memory']; shared['size_mb']=size; shared['hwcc']['offset_mb']=0
 shared['swcc']['offset_mb']=1024; shared['swcc']['size_mb']=size-1024
 if shared['swcc']['size_mb'] <= 0: raise SystemExit('shared size must exceed fixed 1024MB HWCC')
 if numa: shared['numa_node']=[int(x) for x in numa.split(',')]
-lat=d['tigon_kv']['latency_inject']; lat['cache_model']='none'; lat['cache_hits_enabled']=False
-if no_latency == 'true': lat['enabled']=lat['foreground_enabled']=lat['merge_enabled']=False
+lat=d['tigon_kv']['latency_inject']
+if no_latency == 'true':
+    for section in ('fixed_latency', 'hwcc_access_count', 'atomic_count', 'remote_cache_invalidation'):
+        lat[section]['enabled'] = False
+else:
+    lat['fixed_latency']['enabled'] = True
 # Formal YCSB / e2e_trace alignment with cxlkv: fixed 32/32.
 d['tigon_kv']['fixed_key_size']=32
 d['tigon_kv']['fixed_value_size']=32

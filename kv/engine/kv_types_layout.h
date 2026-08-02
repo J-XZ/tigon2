@@ -39,7 +39,9 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // private roots are atomic RegionOffsets.
 // v24: partition-wide scan-range migrate single-flight flag.
 // v26: same single-flight semantics (v25 multi-slot experiment dropped).
-constexpr uint32_t kSharedLayoutVersion = 26;
+// v27: reserve the HWCC remote-invalidation sequence/log prefix outside the
+// business allocator when that independent module is enabled.
+constexpr uint32_t kSharedLayoutVersion = 27;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;

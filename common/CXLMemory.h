@@ -232,9 +232,9 @@ class CXLMemory {
                 if (!dual_regions_->IsHwccAddress(shared_data))
                         throw std::invalid_argument("tigonkv: root must be in HWCC");
                 tigonkv::engine::mem_access::HwccAtomicStore(
-                        &dual_regions_->layout().roots[root_index]);
-                dual_regions_->layout().roots[root_index].store(
-                        dual_regions_->hwcc().ToOffset(shared_data), std::memory_order_release);
+                        dual_regions_->layout().roots[root_index],
+                        dual_regions_->hwcc().ToOffset(shared_data),
+                        std::memory_order_release);
         }
 
         static void wait_and_retrieve_cxl_shared_data(uint64_t root_index, void **shared_data)
@@ -248,9 +248,8 @@ class CXLMemory {
                 // the higher-level Ready barrier still gates request service.
                 tigonkv::engine::RegionOffset offset = tigonkv::engine::kNullOffset;
                 do {
-                        tigonkv::engine::mem_access::HwccAtomicLoad(
-                                &dual_regions_->layout().roots[root_index]);
-                        offset = dual_regions_->layout().roots[root_index].load(
+                        offset = tigonkv::engine::mem_access::HwccAtomicLoad(
+                                dual_regions_->layout().roots[root_index],
                                 std::memory_order_acquire);
                         if (offset == tigonkv::engine::kNullOffset) _mm_pause();
                 } while (offset == tigonkv::engine::kNullOffset);

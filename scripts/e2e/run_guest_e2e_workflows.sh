@@ -96,8 +96,8 @@ run_phase() {
   local suite=$1 phase=$2 round=$3
   local phase_dir="$log_root/round${round}/e2e_${suite}/${phase}"
   local release_file="$remote_root/e2e-guest-release/round${round}-e2e_${suite}-${phase}"
+  local -a pids=()
   mkdir -p "$phase_dir"
-  pids=()
   for ((vm = 0; vm < vm_count; vm++)); do
     remote "$vm" "mkdir -p '$remote_root/e2e-guest-release'; rm -f '$release_file' '$release_file.waiting'"
     run_remote "$suite" "$phase" "$vm" 0 "$phase_dir/vm${vm}.log" "$release_file" &
@@ -119,9 +119,35 @@ run_phase() {
       done
       break
     fi
+    # A guest can fail before publishing replay_done (for example after a
+    # hard-fail from instrumentation).  Do not wait until the outer timeout
+    # in that case: the background timeout/ssh process is already complete,
+    # so report its log and reap the remaining children immediately.
+    local dead_vm=-1
+    for ((vm = 0; vm < vm_count; vm++)); do
+      if ! kill -0 "${pids[$vm]}" 2>/dev/null; then
+        dead_vm=$vm
+        break
+      fi
+    done
+    if (( dead_vm >= 0 )); then
+      echo "phase command exited before replay completion: suite=$suite round=$round phase=$phase vm=$dead_vm" >&2
+      for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+      done
+      for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+      done
+      for ((vm = 0; vm < vm_count; vm++)); do
+        echo "--- vm${vm} ---" >&2
+        tail -n 60 "$phase_dir/vm${vm}.log" >&2 || true
+      done
+      return 1
+    fi
     if (( SECONDS >= deadline )); then
       echo "timeout waiting for replay completion: suite=$suite round=$round phase=$phase" >&2
       for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+      for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
       return 1
     fi
     sleep 0.05

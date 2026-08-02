@@ -171,25 +171,73 @@ inline void RecordTreeDataWrite(const void *address, uint64_t bytes) {
 		tigonkv::engine::mem_access::PrivateWrite(address, bytes);
 }
 
-inline void RecordTreeAtomicLoad(const void *address) {
-	if (TreeAccessIsHwcc)
-		tigonkv::engine::mem_access::HwccAtomicLoad(address);
-	else
-		tigonkv::engine::mem_access::PrivateAtomicLoad(address);
+template <typename T>
+inline T TreeAtomicLoad(const std::atomic<T> &value, std::memory_order order) {
+	return TreeAccessIsHwcc
+	           ? latency_sim::CountedAtomicLoad(
+	                 value, order, latency_sim::AtomicDomain::kHwcc)
+	           : latency_sim::CountedAtomicLoad(
+	                 value, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
 
-inline void RecordTreeAtomicStore(const void *address) {
+template <typename T>
+inline void TreeAtomicStore(std::atomic<T> &value, T desired,
+                            std::memory_order order) {
 	if (TreeAccessIsHwcc)
-		tigonkv::engine::mem_access::HwccAtomicStore(address);
+		latency_sim::CountedAtomicStore(
+		    value, desired, order, latency_sim::AtomicDomain::kHwcc);
 	else
-		tigonkv::engine::mem_access::PrivateAtomicStore(address);
+		latency_sim::CountedAtomicStore(
+		    value, desired, order,
+		    latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
 
-inline void RecordTreeAtomicRmw(const void *address) {
-	if (TreeAccessIsHwcc)
-		tigonkv::engine::mem_access::HwccAtomicRmw(address);
-	else
-		tigonkv::engine::mem_access::PrivateAtomicRmw(address);
+template <typename T>
+inline bool TreeAtomicCompareExchangeStrong(
+    std::atomic<T> &value, T &expected, T desired,
+    std::memory_order success, std::memory_order failure) {
+	return TreeAccessIsHwcc
+	           ? latency_sim::CountedCompareExchangeStrong(
+	                 value, expected, desired, success, failure,
+	                 latency_sim::AtomicDomain::kHwcc)
+	           : latency_sim::CountedCompareExchangeStrong(
+	                 value, expected, desired, success, failure,
+	                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+}
+
+template <typename T>
+inline bool TreeAtomicCompareExchangeWeak(
+    std::atomic<T> &value, T &expected, T desired,
+    std::memory_order success, std::memory_order failure) {
+	return TreeAccessIsHwcc
+	           ? latency_sim::CountedCompareExchangeWeak(
+	                 value, expected, desired, success, failure,
+	                 latency_sim::AtomicDomain::kHwcc)
+	           : latency_sim::CountedCompareExchangeWeak(
+	                 value, expected, desired, success, failure,
+	                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+}
+
+template <typename T>
+inline T TreeAtomicFetchAdd(std::atomic<T> &value, T operand,
+                            std::memory_order order) {
+	return TreeAccessIsHwcc
+	           ? latency_sim::CountedAtomicFetchAdd(
+	                 value, operand, order, latency_sim::AtomicDomain::kHwcc)
+	           : latency_sim::CountedAtomicFetchAdd(
+	                 value, operand, order,
+	                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+}
+
+template <typename T>
+inline T TreeAtomicFetchSub(std::atomic<T> &value, T operand,
+                            std::memory_order order) {
+	return TreeAccessIsHwcc
+	           ? latency_sim::CountedAtomicFetchSub(
+	                 value, operand, order, latency_sim::AtomicDomain::kHwcc)
+	           : latency_sim::CountedAtomicFetchSub(
+	                 value, operand, order,
+                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
 
 // Record the cache line containing the node latch and metadata at each node
@@ -212,31 +260,28 @@ struct LatchBase {
 	std::atomic<uint64_t> word{ 0 };
 
 	uint64_t load(std::memory_order order = std::memory_order_seq_cst) {
-		RecordTreeAtomicLoad(&word);
-		return word.load(order);
+		return TreeAtomicLoad(word, order);
 	}
 	void store(uint64_t value,
 	           std::memory_order order = std::memory_order_seq_cst) {
-		RecordTreeAtomicStore(&word);
-		word.store(value, order);
+		TreeAtomicStore(word, value, order);
 	}
 	bool compareExchangeStrong(uint64_t &expected, uint64_t desired) {
-		RecordTreeAtomicRmw(&word);
-		return word.compare_exchange_strong(expected, desired);
+		return TreeAtomicCompareExchangeStrong(
+		    word, expected, desired, std::memory_order_seq_cst,
+		    std::memory_order_seq_cst);
 	}
 	bool compareExchangeWeak(uint64_t &expected, uint64_t desired,
 	                         std::memory_order success,
 	                         std::memory_order failure) {
-		RecordTreeAtomicRmw(&word);
-		return word.compare_exchange_weak(expected, desired, success, failure);
+		return TreeAtomicCompareExchangeWeak(word, expected, desired, success,
+		                                     failure);
 	}
 	uint64_t fetchAdd(uint64_t value) {
-		RecordTreeAtomicRmw(&word);
-		return word.fetch_add(value);
+		return TreeAtomicFetchAdd(word, value, std::memory_order_seq_cst);
 	}
 	uint64_t fetchSub(uint64_t value) {
-		RecordTreeAtomicRmw(&word);
-		return word.fetch_sub(value);
+		return TreeAtomicFetchSub(word, value, std::memory_order_seq_cst);
 	}
 };
 
@@ -1652,7 +1697,8 @@ class BPlusTree {
 		if (persisted_root == nullptr) {
 			throw std::invalid_argument("BPlusTree attach requires a persisted root");
 		}
-		root_.store(allocation_.ToOffset(persisted_root), std::memory_order_release);
+		TreeAtomicStore(root_, allocation_.ToOffset(persisted_root),
+		                std::memory_order_release);
 	}
 
 	// Shared CXL trees: publish/load the live root via an HWCC atomic offset so
@@ -1663,23 +1709,27 @@ class BPlusTree {
 		TreeAccessScope access_scope(allocation_);
 		if (slot == nullptr)
 			throw std::invalid_argument("BPlusTree published root slot is null");
-		RecordTreeAtomicLoad(slot);
-		const auto off = slot->load(std::memory_order_acquire);
+			const auto off = latency_sim::CountedAtomicLoad(
+			    *slot, std::memory_order_acquire,
+			    latency_sim::AtomicDomain::kHwcc);
 		if (off == tigonkv::engine::kNullOffset) {
 			// Creator: publish the process-local root allocated by the ctor.
-			const auto local_offset = root_.load(std::memory_order_acquire);
+			const auto local_offset = TreeAtomicLoad(
+			    root_, std::memory_order_acquire);
 			NodeBase *local = local_offset == tigonkv::engine::kNullOffset
 			    ? nullptr
 			    : static_cast<NodeBase *>(allocation_.FromOffset(local_offset));
 			if (local == nullptr)
 				throw std::runtime_error("BPlusTree has no local root to publish");
 			published_root_ = slot;
-			RecordTreeAtomicStore(slot);
-			slot->store(allocation_.ToOffset(local), std::memory_order_release);
+				latency_sim::CountedAtomicStore(
+				    *slot, allocation_.ToOffset(local),
+				    std::memory_order_release,
+				    latency_sim::AtomicDomain::kHwcc);
 		} else {
 			// Attacher: adopt the HWCC live root.
 			published_root_ = slot;
-			root_.store(off, std::memory_order_release);
+			TreeAtomicStore(root_, off, std::memory_order_release);
 		}
 	}
 
@@ -3317,12 +3367,13 @@ restart:
 	NodeBase *load_root() const
 	{
 		if (published_root_ != nullptr) {
-			RecordTreeAtomicLoad(published_root_);
-			const auto off = published_root_->load(std::memory_order_acquire);
+			const auto off = latency_sim::CountedAtomicLoad(
+			    *published_root_, std::memory_order_acquire,
+			    latency_sim::AtomicDomain::kHwcc);
 			if (off == tigonkv::engine::kNullOffset) return nullptr;
 			return static_cast<NodeBase *>(allocation_.FromOffset(off));
 		}
-		const auto off = root_.load(std::memory_order_acquire);
+		const auto off = TreeAtomicLoad(root_, std::memory_order_acquire);
 		return off == tigonkv::engine::kNullOffset
 		           ? nullptr
 		           : static_cast<NodeBase *>(allocation_.FromOffset(off));
@@ -3330,12 +3381,13 @@ restart:
 
 	void store_root(NodeBase *node)
 	{
-		root_.store(node == nullptr ? tigonkv::engine::kNullOffset
-		                             : allocation_.ToOffset(node),
-		            std::memory_order_release);
+		TreeAtomicStore(root_, node == nullptr ? tigonkv::engine::kNullOffset
+		                                        : allocation_.ToOffset(node),
+		                std::memory_order_release);
 		if (published_root_ != nullptr) {
-			RecordTreeAtomicStore(published_root_);
-			published_root_->store(allocation_.ToOffset(node), std::memory_order_release);
+			latency_sim::CountedAtomicStore(
+			    *published_root_, allocation_.ToOffset(node),
+			    std::memory_order_release, latency_sim::AtomicDomain::kHwcc);
 		}
 	}
 

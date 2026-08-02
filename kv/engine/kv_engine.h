@@ -169,6 +169,10 @@ class KVEngine {
   // The demuxer has no foreground worker identity. Its receive byte counter is
   // isolated from foreground statistics; only EngineRuntime reads it.
   std::atomic<uint64_t> demux_network_rx_bytes_{0};
+  // The process-global simulator owns a mapping into this pool while the
+  // engine is alive. Teardown validates the complete shared sequence before
+  // removing it, so a lost/duplicate event is a hard failure.
+  bool remote_simulation_attached_ = false;
 };
 
 }  // namespace tigonkv::engine

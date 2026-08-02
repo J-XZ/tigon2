@@ -110,14 +110,13 @@ struct LocalMetadataAccess<TwoPLPashaMetadataLocalOffset> {
             sizeof(TwoPLPashaMetadataLocalOffset) - kStateOffset;
 
         static void Lock(TwoPLPashaMetadataLocalOffset &lmeta) {
-                tigonkv::engine::mem_access::PrivateAtomicRmw(
-                    reinterpret_cast<const void *>(
-                        reinterpret_cast<uintptr_t>(&lmeta.latch)));
+                // pthread_spinlock_t is an opaque lock object, not a
+                // std::atomic operation that this wrapper can execute.  The
+                // real lock operation remains pthread_spin_lock below.
+                (void)lmeta;
         }
         static void Unlock(TwoPLPashaMetadataLocalOffset &lmeta) {
-                tigonkv::engine::mem_access::PrivateAtomicStore(
-                    reinterpret_cast<const void *>(
-                        reinterpret_cast<uintptr_t>(&lmeta.latch)));
+                (void)lmeta;
         }
         static void Read(const TwoPLPashaMetadataLocalOffset &lmeta) {
                 tigonkv::engine::mem_access::PrivateRead(
@@ -134,15 +133,15 @@ struct LocalMetadataAccess<TwoPLPashaMetadataLocalOffset> {
 struct TwoPLPashaMetadataShared {
         uint64_t load_atomic_word(std::memory_order order = std::memory_order_seq_cst)
         {
-                tigonkv::engine::mem_access::HwccAtomicLoad(&atomic_word);
-                return atomic_word.load(order);
+                return tigonkv::engine::mem_access::HwccAtomicLoad(
+                    atomic_word, order);
         }
 
         void store_atomic_word(uint64_t value,
                                std::memory_order order = std::memory_order_seq_cst)
         {
-                tigonkv::engine::mem_access::HwccAtomicStore(&atomic_word);
-                atomic_word.store(value, order);
+                tigonkv::engine::mem_access::HwccAtomicStore(
+                    atomic_word, value, order);
         }
 
         bool compare_exchange_word_strong(
@@ -150,9 +149,8 @@ struct TwoPLPashaMetadataShared {
             std::memory_order success = std::memory_order_seq_cst,
             std::memory_order failure = std::memory_order_seq_cst)
         {
-                tigonkv::engine::mem_access::HwccAtomicRmw(&atomic_word);
-                return atomic_word.compare_exchange_strong(
-                    expected, desired, success, failure);
+                return tigonkv::engine::mem_access::HwccAtomicCompareExchangeStrong(
+                    atomic_word, expected, desired, success, failure);
         }
 
         TwoPLPashaMetadataShared(TwoPLPashaSharedDataSCC *scc_data)

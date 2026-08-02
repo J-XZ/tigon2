@@ -36,9 +36,10 @@ RegionOffsetRowStorage::StoredRow RegionOffsetRowStorage::AllocateAndConstruct(
         partition->owner_shard_);
     throw;
   }
-  mem_access::PrivateAtomicStore(&row->meta);
-  row->meta.store(
-      partition->regions_.ToOwnerPrivateOffset(metadata, partition->partition_id_),
+  mem_access::PrivateAtomicStore(
+      row->meta,
+      partition->regions_.ToOwnerPrivateOffset(metadata,
+                                               partition->partition_id_),
       std::memory_order_release);
   std::memcpy(row->data, fixed_value.data(), value_size);
   mem_access::PrivateWrite(row->data, value_size);

@@ -74,6 +74,8 @@ class TwoPLPashaSCCWriteThroughNoSharedRead : public SCCManager {
                 smeta->set_scc_bit(cur_host_id);
 
                 clwb(scc_data, size);
+                tigonkv::engine::mem_access::SwccExplicitHandoffToRemotes(
+                    scc_data, size, static_cast<uint32_t>(cur_host_id));
         }
 };
 

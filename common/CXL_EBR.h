@@ -125,8 +125,9 @@ class CXL_EBR {
                 uint64_t thread_id = local_ebr_meta.thread_id;
 
                 EBRMetaCXL &cxl_ebr_meta = cxl_ebr_meta_vec[coordinator_id][thread_id];
-                tigonkv::engine::mem_access::HwccAtomicLoad(&cxl_ebr_meta.local_epoch);
-                uint64_t cur_local_epoch = cxl_ebr_meta.local_epoch.load(std::memory_order_acquire);
+                uint64_t cur_local_epoch =
+                    tigonkv::engine::mem_access::HwccAtomicLoad(
+                        cxl_ebr_meta.local_epoch, std::memory_order_acquire);
 
                 auto *regions = bound_regions();
                 CHECK(regions != nullptr) << "tigonkv: EBR requires dual-region allocator";
@@ -145,12 +146,14 @@ class CXL_EBR {
                 uint64_t thread_id = local_ebr_meta.thread_id;
 
                 EBRMetaCXL &cxl_ebr_meta = cxl_ebr_meta_vec[coordinator_id][thread_id];
-                tigonkv::engine::mem_access::HwccAtomicLoad(&cxl_ebr_meta.local_epoch);
-                uint64_t cur_local_epoch = cxl_ebr_meta.local_epoch.load(std::memory_order_acquire);
+                uint64_t cur_local_epoch =
+                    tigonkv::engine::mem_access::HwccAtomicLoad(
+                        cxl_ebr_meta.local_epoch, std::memory_order_acquire);
 
                 // load global epoch
-                tigonkv::engine::mem_access::HwccAtomicLoad(&global_epoch);
-                uint64_t cur_global_epoch = global_epoch.load(std::memory_order_acquire);
+                uint64_t cur_global_epoch =
+                    tigonkv::engine::mem_access::HwccAtomicLoad(
+                        global_epoch, std::memory_order_acquire);
 
                 if (cur_global_epoch == cur_local_epoch) {
                         auto *regions = bound_regions();
@@ -167,9 +170,10 @@ class CXL_EBR {
                                      i < local_ebr_meta.coordinator_count; i++) {
                                         for (uint64_t j = 0;
                                              j < local_ebr_meta.thread_count; j++) {
-                                                tigonkv::engine::mem_access::HwccAtomicLoad(
-                                                    &cxl_ebr_meta_vec[i][j].local_epoch);
-                                                uint64_t local_epoch = cxl_ebr_meta_vec[i][j].local_epoch.load(std::memory_order_acquire);
+                                                uint64_t local_epoch =
+                                                    tigonkv::engine::mem_access::HwccAtomicLoad(
+                                                        cxl_ebr_meta_vec[i][j].local_epoch,
+                                                        std::memory_order_acquire);
                                                 if (local_epoch < cur_global_epoch) {   // local epoch might be larger than 'cur_global_epoch' because of race conditions
                                                         advance_global_ebr = false;
                                                         break;
@@ -180,8 +184,11 @@ class CXL_EBR {
                                 // advance the global epoch
                                 if (advance_global_ebr == true) {
                                         uint64_t new_global_epoch = cur_global_epoch + 1;
-                                        tigonkv::engine::mem_access::HwccAtomicRmw(&global_epoch);
-                                        global_epoch.compare_exchange_strong(cur_global_epoch, new_global_epoch, std::memory_order_acq_rel);
+                                        tigonkv::engine::mem_access::HwccAtomicCompareExchangeStrong(
+                                            global_epoch, cur_global_epoch,
+                                            new_global_epoch,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire);
                                 }
                         }
                 } else {
@@ -189,15 +196,16 @@ class CXL_EBR {
                 }
 
                 // reload global epoch
-                tigonkv::engine::mem_access::HwccAtomicLoad(&global_epoch);
-                cur_global_epoch = global_epoch.load(std::memory_order_acquire);
+                cur_global_epoch =
+                    tigonkv::engine::mem_access::HwccAtomicLoad(
+                        global_epoch, std::memory_order_acquire);
 
                 // update local epoch if necessary
                 if (cur_local_epoch < cur_global_epoch) {
                         CHECK(cur_local_epoch == cur_global_epoch - 1);
                         tigonkv::engine::mem_access::HwccAtomicStore(
-                            &cxl_ebr_meta.local_epoch);
-                        cxl_ebr_meta.local_epoch.store(cur_global_epoch, std::memory_order_release);
+                            cxl_ebr_meta.local_epoch, cur_global_epoch,
+                            std::memory_order_release);
                 }
 
                 // now it is time to reclaim garbage in local_epoch - 2

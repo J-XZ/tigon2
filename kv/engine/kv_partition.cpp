@@ -68,11 +68,12 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
     if (materialize_private) {
       mem_access::PrivateRead(&private_arena_->private_root,
                               sizeof(private_arena_->private_root));
-      private_root = private_arena_->private_root.load(std::memory_order_acquire);
+      private_root = mem_access::PrivateAtomicLoad(
+          private_arena_->private_root, std::memory_order_acquire);
     }
-    mem_access::HwccAtomicLoad(&directory_.shared_root);
     if ((materialize_private && private_root == kNullOffset) ||
-        directory_.shared_root.load(std::memory_order_acquire) == kNullOffset)
+        mem_access::HwccAtomicLoad(directory_.shared_root,
+                                   std::memory_order_acquire) == kNullOffset)
       throw std::runtime_error("partition attach missing tree root");
     if (materialize_private) {
       private_table_ = std::make_unique<KvPartitionTable>(
@@ -83,11 +84,11 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
           /*create_max_sentinel=*/false);
       private_table_->BindPublishedRoot(&private_arena_->private_root);
     }
-    mem_access::HwccAtomicLoad(&directory_.shared_root);
     shared_tree_ = new SharedTree(
         shared_binding_,
         regions_.ResolveDynamicHwcc(
-            directory_.shared_root.load(std::memory_order_acquire),
+            mem_access::HwccAtomicLoad(directory_.shared_root,
+                                       std::memory_order_acquire),
             btreeolc_cxl::kPageSize, owner_shard_));
     shared_tree_->bind_published_root(&directory_.shared_root);
     shared_table_ = new SharedTable(
@@ -117,20 +118,19 @@ KVPartition::~KVPartition() {
 
 bool KVPartition::TryBeginScanRangeMigrate() {
   uint32_t expected = 0;
-  mem_access::HwccAtomicRmw(&directory_.scan_range_migrate_inflight);
-  return directory_.scan_range_migrate_inflight.compare_exchange_strong(
-      expected, 1, std::memory_order_acq_rel, std::memory_order_acquire);
+  return mem_access::HwccAtomicCompareExchangeStrong(
+      directory_.scan_range_migrate_inflight, expected, uint32_t{1},
+      std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 void KVPartition::EndScanRangeMigrate() {
-  mem_access::HwccAtomicStore(&directory_.scan_range_migrate_inflight);
-  directory_.scan_range_migrate_inflight.store(0, std::memory_order_release);
+  mem_access::HwccAtomicStore(directory_.scan_range_migrate_inflight,
+                              uint32_t{0}, std::memory_order_release);
 }
 
 bool KVPartition::ScanRangeMigrateInFlight() const {
-  mem_access::HwccAtomicLoad(&directory_.scan_range_migrate_inflight);
-  return directory_.scan_range_migrate_inflight.load(std::memory_order_acquire) !=
-         0;
+  return mem_access::HwccAtomicLoad(directory_.scan_range_migrate_inflight,
+                                    std::memory_order_acquire) != 0;
 }
 
 FixedKey KVPartition::MakeKey(std::string_view key) const {
@@ -163,8 +163,8 @@ PrivateValueStruct *KVPartition::ValueFromOffset(RegionOffset offset) const {
 PrivateMetadataLocal *KVPartition::MetadataFromValue(
     PrivateValueStruct *value) const {
   if (value == nullptr) return nullptr;
-  mem_access::PrivateAtomicLoad(&value->meta);
-  const RegionOffset offset = value->meta.load(std::memory_order_acquire);
+  const RegionOffset offset = mem_access::PrivateAtomicLoad(
+      value->meta, std::memory_order_acquire);
   if (offset == kNullOffset)
     throw std::runtime_error("private ValueStruct has no local metadata");
   return static_cast<PrivateMetadataLocal *>(regions_.ResolveOwnerPrivate(

@@ -133,25 +133,70 @@ uint64_t SharedLayoutConfigDigest(const Config &config) {
     text("range_lower", config.partition_ranges[partition].lower_key);
     text("range_upper", config.partition_ranges[partition].upper_key);
   }
-  boolean("latency_enabled", config.latency_enabled);
-  boolean("latency_foreground_enabled", config.latency_foreground_enabled);
-  boolean("latency_merge_enabled", config.latency_merge_enabled);
-  boolean("latency_stats_enabled", config.latency_stats_enabled);
-  u64("latency_cache_line_bytes", config.latency_cache_line_bytes);
-  decimal("swcc_read_ns", config.swcc_read_ns);
-  decimal("swcc_write_ns", config.swcc_write_ns);
-  decimal("swcc_flush_ns", config.swcc_flush_ns);
-  decimal("hwcc_read_ns", config.hwcc_read_ns);
-  decimal("hwcc_write_ns", config.hwcc_write_ns);
-  decimal("hwcc_atomic_load_ns", config.hwcc_atomic_load_ns);
-  decimal("hwcc_atomic_store_ns", config.hwcc_atomic_store_ns);
-  decimal("hwcc_atomic_rmw_ns", config.hwcc_atomic_rmw_ns);
-  text("latency_cache_model", config.latency_cache_model);
-  boolean("latency_cache_hits_enabled", config.latency_cache_hits_enabled);
-  decimal("latency_cache_fixed_hit_rate", config.latency_cache_fixed_hit_rate);
-  u64("latency_cache_capacity_lines", config.latency_cache_capacity_lines);
-  u64("latency_cache_associativity", config.latency_cache_associativity);
-  decimal("latency_cache_hit_extra_ns", config.latency_cache_hit_extra_ns);
+  const auto &simulation = config.hardware_simulation;
+  const auto &fixed = simulation.fixed_latency;
+  const auto &access = simulation.hwcc_access_count;
+  const auto &atomic = simulation.atomic_count;
+  const auto &remote = simulation.remote_cache_invalidation;
+  boolean("fixed_latency.enabled", fixed.enabled);
+  u64("fixed_latency.cache_line_bytes", fixed.cache_line_bytes);
+  decimal("fixed_latency.swcc_fixed_ns_per_line", fixed.swcc_fixed_ns_per_line);
+  decimal("fixed_latency.hwcc_fixed_ns_per_line", fixed.hwcc_fixed_ns_per_line);
+  boolean("fixed_latency.foreground_enabled", fixed.foreground_enabled);
+  boolean("fixed_latency.background_enabled", fixed.background_enabled);
+  boolean("fixed_latency.delayed_time_stats_enabled", fixed.delayed_time_stats_enabled);
+  boolean("hwcc_access_count.enabled", access.enabled);
+  u64("hwcc_access_count.cache_line_bytes", access.cache_line_bytes);
+  boolean("hwcc_access_count.read_enabled", access.read_enabled);
+  boolean("hwcc_access_count.write_enabled", access.write_enabled);
+  boolean("hwcc_access_count.operation_count_enabled", access.operation_count_enabled);
+  boolean("hwcc_access_count.line_count_enabled", access.line_count_enabled);
+  boolean("hwcc_access_count.byte_count_enabled", access.byte_count_enabled);
+  boolean("hwcc_access_count.breakdown_by_scope_enabled", access.breakdown_by_scope_enabled);
+  boolean("hwcc_access_count.breakdown_by_tag_enabled", access.breakdown_by_tag_enabled);
+  u64("hwcc_access_count.max_tags", access.max_tags);
+  boolean("atomic_count.enabled", atomic.enabled);
+  boolean("atomic_count.hwcc_enabled", atomic.hwcc_enabled);
+  boolean("atomic_count.owner_private_swcc_enabled", atomic.owner_private_swcc_enabled);
+  boolean("atomic_count.local_dram_enabled", atomic.local_dram_enabled);
+  boolean("atomic_count.load_enabled", atomic.load_enabled);
+  boolean("atomic_count.store_enabled", atomic.store_enabled);
+  boolean("atomic_count.cas_enabled", atomic.cas_enabled);
+  boolean("atomic_count.exchange_enabled", atomic.exchange_enabled);
+  boolean("atomic_count.fetch_arithmetic_enabled", atomic.fetch_arithmetic_enabled);
+  boolean("atomic_count.fetch_bitwise_enabled", atomic.fetch_bitwise_enabled);
+  boolean("atomic_count.result_breakdown_enabled", atomic.result_breakdown_enabled);
+  boolean("atomic_count.fence_enabled", atomic.fence_enabled);
+  boolean("atomic_count.wait_notify_enabled", atomic.wait_notify_enabled);
+  boolean("atomic_count.memory_order_breakdown_enabled", atomic.memory_order_breakdown_enabled);
+  boolean("atomic_count.scope_breakdown_enabled", atomic.scope_breakdown_enabled);
+  boolean("atomic_count.tag_breakdown_enabled", atomic.tag_breakdown_enabled);
+  u64("atomic_count.max_tags", atomic.max_tags);
+  boolean("remote_cache_invalidation.enabled", remote.enabled);
+  boolean("remote_cache_invalidation.dirty_handoff_enabled", remote.dirty_handoff_enabled);
+  boolean("remote_cache_invalidation.clean_copy_invalidation_enabled", remote.clean_copy_invalidation_enabled);
+  boolean("remote_cache_invalidation.dirty_eviction_writeback_enabled", remote.dirty_eviction_writeback_enabled);
+  boolean("remote_cache_invalidation.swcc_explicit_visibility_handoff_enabled", remote.swcc_explicit_visibility_handoff_enabled);
+  u64("remote_cache_invalidation.cache_line_bytes", remote.cache_line_bytes);
+  u64("remote_cache_invalidation.node_count", remote.node_count);
+  u64("remote_cache_invalidation.cache_size_bytes_per_node", remote.cache_size_bytes_per_node);
+  u64("remote_cache_invalidation.total_cpu_cache_size_bytes", remote.total_cpu_cache_size_bytes);
+  u64("remote_cache_invalidation.cache_instances_per_node", remote.cache_instances_per_node);
+  u64("remote_cache_invalidation.associativity", remote.associativity);
+  text("remote_cache_invalidation.capacity_mode", remote.capacity_mode);
+  text("remote_cache_invalidation.replacement_policy", remote.replacement_policy);
+  u64("remote_cache_invalidation.lfu_counter_bits", remote.lfu_counter_bits);
+  u64("remote_cache_invalidation.lfu_aging_interval_accesses", remote.lfu_aging_interval_accesses);
+  text("remote_cache_invalidation.lfu_tie_breaker", remote.lfu_tie_breaker);
+  boolean("remote_cache_invalidation.scope_breakdown_enabled", remote.scope_breakdown_enabled);
+  boolean("remote_cache_invalidation.tag_breakdown_enabled", remote.tag_breakdown_enabled);
+  u64("remote_cache_invalidation.max_tags", remote.max_tags);
+  u64("remote_cache_invalidation.shared_sequencer_offset", remote.shared_sequencer_offset);
+  u64("remote_cache_invalidation.event_log_capacity", remote.event_log_capacity);
+  for (size_t index = 0; index < remote.cache_size_bytes_by_node.size(); ++index)
+    u64("remote_cache_invalidation.cache_size_bytes_by_node." +
+            std::to_string(index),
+        remote.cache_size_bytes_by_node[index]);
   return digest.value();
 }
 
@@ -318,8 +363,88 @@ DualRegionConfig RegionConfig(const Config &config) {
   region.fixed_key_size = config.fixed_key_size;
   region.fixed_value_size = config.fixed_value_size;
   region.owner_private_swcc_fraction = config.owner_private_swcc_fraction;
+  region.remote_invalidation_enabled =
+      config.hardware_simulation.remote_cache_invalidation.enabled;
+  region.remote_shared_sequencer_offset =
+      config.hardware_simulation.remote_cache_invalidation.shared_sequencer_offset;
+  region.remote_event_log_capacity =
+      config.hardware_simulation.remote_cache_invalidation.event_log_capacity;
   return region;
 }
+
+// These identifiers are part of Tigon2's instrumentation format, not
+// virtual-address identities. They remain stable when the same backing pool
+// is mapped at a different VA in another VM.
+constexpr uint64_t kTigonHwccPoolId = 0x5449474f4e485743ULL;  // TIGONHWC
+constexpr uint64_t kTigonSwccPoolId = 0x5449474f4e535743ULL;  // TIGONSWC
+
+class RemoteSimulationBinding {
+ public:
+  RemoteSimulationBinding() = default;
+  RemoteSimulationBinding(const RemoteSimulationBinding &) = delete;
+  RemoteSimulationBinding &operator=(const RemoteSimulationBinding &) = delete;
+
+  void Attach(DualRegionMappedPool *pool, const Config &config) {
+    if (pool == nullptr ||
+        !config.hardware_simulation.remote_cache_invalidation.enabled)
+      return;
+    auto &simulator = latency_sim::GlobalLatencySimulator();
+    auto &allocator = pool->allocator();
+    if (!allocator.HasRemoteInstrumentation())
+      throw std::runtime_error(
+          "remote invalidation is enabled without a shared event log area");
+    sequence_ = allocator.RemoteSequenceWord();
+    event_log_ = allocator.RemoteEventLog();
+    event_capacity_ = allocator.RemoteEventLogCapacity();
+    simulator.AttachSharedRemoteLog(sequence_, event_log_, event_capacity_);
+    try {
+      simulator.RegisterMemoryRange(
+          static_cast<std::byte *>(pool->base()) + config.hwcc_offset_mb *
+              1024ULL * 1024ULL,
+          config.hwcc_size_mb * 1024ULL * 1024ULL,
+          latency_sim::MemoryDomain::kHwcc, kTigonHwccPoolId, 0);
+      simulator.RegisterMemoryRange(
+          static_cast<std::byte *>(pool->base()) + config.swcc_offset_mb *
+              1024ULL * 1024ULL,
+          config.swcc_size_mb * 1024ULL * 1024ULL,
+          latency_sim::MemoryDomain::kSwcc, kTigonSwccPoolId, 0);
+    } catch (...) {
+      simulator.DetachSharedRemoteLog(sequence_, event_log_);
+      sequence_ = nullptr;
+      event_log_ = nullptr;
+      event_capacity_ = 0;
+      throw;
+    }
+    hwcc_base_ = static_cast<std::byte *>(pool->base()) +
+                 config.hwcc_offset_mb * 1024ULL * 1024ULL;
+    hwcc_bytes_ = config.hwcc_size_mb * 1024ULL * 1024ULL;
+    swcc_base_ = static_cast<std::byte *>(pool->base()) +
+                 config.swcc_offset_mb * 1024ULL * 1024ULL;
+    swcc_bytes_ = config.swcc_size_mb * 1024ULL * 1024ULL;
+    active_ = true;
+  }
+
+  void Release() { active_ = false; }
+
+  ~RemoteSimulationBinding() {
+    if (!active_) return;
+    auto &simulator = latency_sim::GlobalLatencySimulator();
+    simulator.ValidateSharedRemoteLog();
+    simulator.UnregisterMemoryRange(hwcc_base_, hwcc_bytes_);
+    simulator.UnregisterMemoryRange(swcc_base_, swcc_bytes_);
+    simulator.DetachSharedRemoteLog(sequence_, event_log_);
+  }
+
+ private:
+  bool active_ = false;
+  void *sequence_ = nullptr;
+  void *event_log_ = nullptr;
+  uint64_t event_capacity_ = 0;
+  const void *hwcc_base_ = nullptr;
+  uint64_t hwcc_bytes_ = 0;
+  const void *swcc_base_ = nullptr;
+  uint64_t swcc_bytes_ = 0;
+};
 
 }  // namespace
 
@@ -364,6 +489,21 @@ KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> p
 
 KVEngine::~KVEngine() {
   StopInboundDemuxer();
+  if (remote_simulation_attached_) {
+    auto &simulator = latency_sim::GlobalLatencySimulator();
+    simulator.ValidateSharedRemoteLog();
+    auto *base = static_cast<std::byte *>(pool_->base());
+    simulator.UnregisterMemoryRange(
+        base + config_.hwcc_offset_mb * 1024ULL * 1024ULL,
+        config_.hwcc_size_mb * 1024ULL * 1024ULL);
+    simulator.UnregisterMemoryRange(
+        base + config_.swcc_offset_mb * 1024ULL * 1024ULL,
+        config_.swcc_size_mb * 1024ULL * 1024ULL);
+    simulator.DetachSharedRemoteLog(
+        pool_->allocator().RemoteSequenceWord(),
+        pool_->allocator().RemoteEventLog());
+    remote_simulation_attached_ = false;
+  }
   if (star::scc_manager == scc_.get()) star::scc_manager = nullptr;
   if (star::global_ebr_meta == ebr_) star::global_ebr_meta = nullptr;
   KvMigrationRuntime::Instance().Reset();
@@ -374,6 +514,11 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   auto affinity_cpus = ResolveAffinityCpus(config);
   auto pool = std::make_unique<DualRegionMappedPool>(
       DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
+  // Attach before transport/EBR/root construction so startup traffic is part
+  // of the same ordered remote log. If any later startup phase throws, the
+  // local binding destructor detaches the mapping and validates the prefix.
+  RemoteSimulationBinding remote_binding;
+  remote_binding.Attach(pool.get(), config);
   star::CXLMemory::bind_dual_region_allocator(&pool->allocator(), config.node_id);
   star::MPSCRingBuffer *rings = nullptr;
   star::CXL_EBR *ebr = nullptr;
@@ -419,6 +564,9 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   star::scc_manager = scc.get();
   auto engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool), ebr,
                                                         std::move(scc)));
+  engine->remote_simulation_attached_ =
+      config.hardware_simulation.remote_cache_invalidation.enabled;
+  remote_binding.Release();
   // Root/sentinel construction is not a foreground operation, but it must
   // advance a concrete worker-owned TID slot rather than an unbounded TLS
   // high-water mark.  Worker 0 owns this bootstrap slot after BindWorker.
@@ -461,8 +609,8 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   bool initialize_owner = reset;
   if (!reset) {
     const auto &layout = engine->pool_->allocator().layout();
-    mem_access::HwccAtomicLoad(&layout.state);
-    initialize_owner = layout.state.load(std::memory_order_acquire) ==
+    initialize_owner = mem_access::HwccAtomicLoad(
+        layout.state, std::memory_order_acquire) ==
         static_cast<uint32_t>(LayoutState::kInitializing);
   }
   if (initialize_owner) {
@@ -474,8 +622,8 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
     for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
       if (engine->OwnerForPartition(partition) != config.node_id) continue;
       const auto &directory = engine->pool_->allocator().layout().partitions[partition];
-      mem_access::HwccAtomicLoad(&directory.shared_root);
-      if (directory.shared_root.load(std::memory_order_acquire) != kNullOffset)
+      if (mem_access::HwccAtomicLoad(directory.shared_root,
+                                     std::memory_order_acquire) != kNullOffset)
         throw std::runtime_error(
             "tigonkv: owner initialization found an already-published shared root");
       initializer_partitions.emplace_back(std::make_unique<KVPartition>(
@@ -502,8 +650,8 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   // root visible, for both reset and attach.
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
     const auto &directory = engine->pool_->allocator().layout().partitions[partition];
-    mem_access::HwccAtomicLoad(&directory.shared_root);
-    if (directory.shared_root.load(std::memory_order_acquire) == kNullOffset)
+    if (mem_access::HwccAtomicLoad(directory.shared_root,
+                                   std::memory_order_acquire) == kNullOffset)
       throw std::runtime_error("tigonkv: layout ready with missing shared root");
     const bool materialize_private =
         engine->OwnerForPartition(partition) == config.node_id;

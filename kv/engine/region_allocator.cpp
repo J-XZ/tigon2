@@ -21,16 +21,107 @@ namespace {
 bool RangeContains(uint64_t begin, uint64_t length, uint64_t offset,
                    uint64_t bytes);
 
+struct RemoteInstrumentationGeometry {
+  uint64_t instrumentation_offset = kNullOffset;
+  uint64_t instrumentation_bytes = 0;
+  uint64_t sequence_offset = kNullOffset;
+  uint64_t event_log_offset = kNullOffset;
+  uint64_t event_log_capacity = 0;
+};
+
+uint64_t AlignChecked(uint64_t value, uint64_t alignment) {
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+      value > UINT64_MAX - (alignment - 1))
+    throw std::invalid_argument("alignment arithmetic overflow");
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+RemoteInstrumentationGeometry RemoteGeometry(const DualRegionConfig &config,
+                                             uint64_t allocator_bytes) {
+  RemoteInstrumentationGeometry geometry;
+  if (!config.remote_invalidation_enabled) return geometry;
+  constexpr uint64_t metadata_bytes =
+      (sizeof(RegionAllocatorHeader) + RegionAllocator::kAlignment - 1) &
+      ~(RegionAllocator::kAlignment - 1);
+  if (allocator_bytes <= metadata_bytes ||
+      config.remote_event_log_capacity == 0 ||
+      config.remote_shared_sequencer_offset > UINT64_MAX - metadata_bytes)
+    throw std::invalid_argument("invalid remote instrumentation geometry");
+  const uint64_t sequence_hint =
+      metadata_bytes + config.remote_shared_sequencer_offset;
+  geometry.instrumentation_offset = metadata_bytes;
+  geometry.sequence_offset = AlignChecked(sequence_hint, alignof(uint64_t));
+  const uint64_t sequence_end =
+      geometry.sequence_offset + sizeof(uint64_t);
+  if (sequence_end < geometry.sequence_offset)
+    throw std::invalid_argument("remote sequence geometry overflows");
+  geometry.event_log_offset =
+      AlignChecked(sequence_end, alignof(latency_sim::RemoteEventRecord));
+  if (config.remote_event_log_capacity >
+      UINT64_MAX / latency_sim::kRemoteEventRecordBytes)
+    throw std::invalid_argument("remote event log geometry overflows");
+  const uint64_t event_log_bytes =
+      config.remote_event_log_capacity * latency_sim::kRemoteEventRecordBytes;
+  if (geometry.event_log_offset > UINT64_MAX - event_log_bytes)
+    throw std::invalid_argument("remote event log geometry overflows");
+  const uint64_t end = geometry.event_log_offset + event_log_bytes;
+  if (end > allocator_bytes || end < geometry.instrumentation_offset)
+    throw std::invalid_argument("remote event log exceeds HWCC allocator");
+  geometry.instrumentation_bytes = end - geometry.instrumentation_offset;
+  geometry.event_log_capacity = config.remote_event_log_capacity;
+  return geometry;
+}
+
 uint64_t CheckedAtomicSubtract(std::atomic<uint64_t> *counter, uint64_t bytes,
-                               const char *detail) {
-  uint64_t before = counter->load(std::memory_order_relaxed);
+                               const char *detail,
+                               latency_sim::AtomicDomain domain) {
+  uint64_t before = latency_sim::CountedAtomicLoad(
+      *counter, std::memory_order_relaxed, domain);
   for (;;) {
     if (before < bytes) LOG(FATAL) << detail;
-    if (counter->compare_exchange_weak(before, before - bytes,
-                                       std::memory_order_relaxed,
-                                       std::memory_order_relaxed))
+    if (latency_sim::CountedCompareExchangeWeak(
+            *counter, before, before - bytes, std::memory_order_relaxed,
+            std::memory_order_relaxed, domain))
       return before;
   }
+}
+
+latency_sim::AtomicDomain AtomicDomainFor(bool hwcc, bool /*shared_payload*/) {
+  // Shared-payload allocator control is still owner-local metadata.  Mapping
+  // it to the owner-private bucket records the executed operation without
+  // pretending that SWCC has hardware coherence.
+  return hwcc ? latency_sim::AtomicDomain::kHwcc
+              : latency_sim::AtomicDomain::kOwnerPrivateSwcc;
+}
+
+template <typename T>
+T CountedLoadFor(const std::atomic<T> &value, bool hwcc, bool shared_payload,
+                 std::memory_order order) {
+  return latency_sim::CountedAtomicLoad(
+      value, order, AtomicDomainFor(hwcc, shared_payload));
+}
+
+template <typename T>
+void CountedStoreFor(std::atomic<T> &value, T desired, bool hwcc,
+                     bool shared_payload, std::memory_order order) {
+  latency_sim::CountedAtomicStore(
+      value, desired, order, AtomicDomainFor(hwcc, shared_payload));
+}
+
+template <typename T>
+T CountedFetchAddFor(std::atomic<T> &value, T operand, bool hwcc,
+                     bool shared_payload, std::memory_order order) {
+  return latency_sim::CountedAtomicFetchAdd(
+      value, operand, order, AtomicDomainFor(hwcc, shared_payload));
+}
+
+template <typename T>
+bool CountedCasWeakFor(std::atomic<T> &value, T &expected, T desired,
+                       bool hwcc, bool shared_payload,
+                       std::memory_order success, std::memory_order failure) {
+  return latency_sim::CountedCompareExchangeWeak(
+      value, expected, desired, success, failure,
+      AtomicDomainFor(hwcc, shared_payload));
 }
 
 #ifndef NDEBUG
@@ -173,27 +264,6 @@ RegionAllocator RegionAllocator::AttachWithExternalHeader(
                          block_is_shared_payload);
 }
 
-void RegionAllocator::RecordAtomicLoad(const void *address) const {
-  if (control_is_hwcc_)
-    mem_access::HwccAtomicLoad(address);
-  else
-    mem_access::PrivateAtomicLoad(address);
-}
-
-void RegionAllocator::RecordAtomicStore(const void *address) const {
-  if (control_is_hwcc_)
-    mem_access::HwccAtomicStore(address);
-  else
-    mem_access::PrivateAtomicStore(address);
-}
-
-void RegionAllocator::RecordAtomicRmw(const void *address) const {
-  if (control_is_hwcc_)
-    mem_access::HwccAtomicRmw(address);
-  else
-    mem_access::PrivateAtomicRmw(address);
-}
-
 void RegionAllocator::RecordMetadataRead(const void *address,
                                          uint64_t bytes) const {
   if (control_is_hwcc_)
@@ -208,33 +278,6 @@ void RegionAllocator::RecordMetadataWrite(const void *address,
     mem_access::HwccWrite(address, bytes);
   else
     mem_access::PrivateWrite(address, bytes);
-}
-
-void RegionAllocator::RecordBlockAtomicLoad(const void *address) const {
-  if (block_is_hwcc_)
-    mem_access::HwccAtomicLoad(address);
-  else if (block_is_shared_payload_)
-    mem_access::SharedPayloadAtomicLoad(address);
-  else
-    mem_access::PrivateAtomicLoad(address);
-}
-
-void RegionAllocator::RecordBlockAtomicStore(const void *address) const {
-  if (block_is_hwcc_)
-    mem_access::HwccAtomicStore(address);
-  else if (block_is_shared_payload_)
-    mem_access::SharedPayloadAtomicStore(address);
-  else
-    mem_access::PrivateAtomicStore(address);
-}
-
-void RegionAllocator::RecordBlockAtomicRmw(const void *address) const {
-  if (block_is_hwcc_)
-    mem_access::HwccAtomicRmw(address);
-  else if (block_is_shared_payload_)
-    mem_access::SharedPayloadAtomicRmw(address);
-  else
-    mem_access::PrivateAtomicRmw(address);
 }
 
 void RegionAllocator::RecordBlockMetadataRead(const void *address,
@@ -259,49 +302,63 @@ void RegionAllocator::RecordBlockMetadataWrite(const void *address,
 
 void RegionAllocator::Lock(RegionAllocatorShard &shard) const {
   uint32_t expected = 0;
-  RecordAtomicRmw(&shard.lock);
-  while (!shard.lock.compare_exchange_weak(expected, 1, std::memory_order_acquire,
-                                            std::memory_order_relaxed)) {
+  auto cas = [&] {
+    if (control_is_hwcc_)
+      return mem_access::HwccAtomicCompareExchangeWeak(
+          shard.lock, expected, 1u, std::memory_order_acquire,
+          std::memory_order_relaxed);
+    return mem_access::PrivateAtomicCompareExchangeWeak(
+        shard.lock, expected, 1u, std::memory_order_acquire,
+        std::memory_order_relaxed);
+  };
+  while (!cas()) {
     expected = 0;
-    RecordAtomicRmw(&shard.lock);
     _mm_pause();
   }
 }
 
 void RegionAllocator::Unlock(RegionAllocatorShard &shard) const {
-  RecordAtomicStore(&shard.lock);
-  shard.lock.store(0, std::memory_order_release);
+  if (control_is_hwcc_)
+    mem_access::HwccAtomicStore(shard.lock, 0u, std::memory_order_release);
+  else
+    mem_access::PrivateAtomicStore(shard.lock, 0u, std::memory_order_release);
 }
 
 void RegionAllocator::AccountAllocate(uint64_t bytes, DomainCounter *counter) {
   if (control_is_hwcc_) {
-    RecordAtomicRmw(&header_->allocated_bytes);
-    header_->allocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
-    RecordAtomicRmw(&header_->allocation_count);
-    header_->allocation_count.fetch_add(1, std::memory_order_relaxed);
+    mem_access::HwccAtomicFetchAdd(header_->allocated_bytes, bytes,
+                                   std::memory_order_relaxed);
+    mem_access::HwccAtomicFetchAdd(header_->allocation_count, uint64_t{1},
+                                   std::memory_order_relaxed);
   }
-  RecordAtomicRmw(&counter->used_bytes);
-  const uint64_t used = counter->used_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
-  RecordAtomicLoad(&counter->peak_bytes);
-  uint64_t peak = counter->peak_bytes.load(std::memory_order_relaxed);
+  const auto domain = control_is_hwcc_
+                          ? latency_sim::AtomicDomain::kHwcc
+                          : latency_sim::AtomicDomain::kOwnerPrivateSwcc;
+  const uint64_t used = latency_sim::CountedAtomicFetchAdd(
+                            counter->used_bytes, bytes,
+                            std::memory_order_relaxed, domain) + bytes;
+  uint64_t peak = latency_sim::CountedAtomicLoad(
+      counter->peak_bytes, std::memory_order_relaxed, domain);
   while (peak < used) {
-    RecordAtomicRmw(&counter->peak_bytes);
-    if (counter->peak_bytes.compare_exchange_weak(
-            peak, used, std::memory_order_relaxed))
+    if (latency_sim::CountedCompareExchangeWeak(
+            counter->peak_bytes, peak, used, std::memory_order_relaxed,
+            std::memory_order_relaxed, domain))
       break;
   }
 }
 
 void RegionAllocator::AccountFree(uint64_t bytes, DomainCounter *counter) {
-  RecordAtomicRmw(&counter->used_bytes);
+  const auto domain = control_is_hwcc_
+                          ? latency_sim::AtomicDomain::kHwcc
+                          : latency_sim::AtomicDomain::kOwnerPrivateSwcc;
   CheckedAtomicSubtract(&counter->used_bytes, bytes,
-                        "allocator domain accounting underflow");
+                        "allocator domain accounting underflow", domain);
   if (control_is_hwcc_) {
-    RecordAtomicRmw(&header_->allocated_bytes);
     CheckedAtomicSubtract(&header_->allocated_bytes, bytes,
-                          "allocator total accounting underflow");
-    RecordAtomicRmw(&header_->free_count);
-    header_->free_count.fetch_add(1, std::memory_order_relaxed);
+                          "allocator total accounting underflow",
+                          latency_sim::AtomicDomain::kHwcc);
+    mem_access::HwccAtomicFetchAdd(header_->free_count, uint64_t{1},
+                                   std::memory_order_relaxed);
   }
 }
 
@@ -342,14 +399,16 @@ void *RegionAllocator::AllocateFromShard(uint64_t bytes, uint32_t size_class,
   auto &shard = header_->shards[owner_shard];
   Lock(shard);
   if (size_class < kAllocatorSizeClasses) {
-    RecordAtomicLoad(&shard.free_heads[size_class]);
-    const RegionOffset head = shard.free_heads[size_class].load(std::memory_order_relaxed);
+    const RegionOffset head = CountedLoadFor(
+        shard.free_heads[size_class], block_is_hwcc_,
+        block_is_shared_payload_, std::memory_order_relaxed);
     if (head != kNullOffset) {
       auto *block = static_cast<RegionFreeBlock *>(FromOffset(head));
-      RecordBlockAtomicLoad(&block->next);
-      RecordAtomicStore(&shard.free_heads[size_class]);
-      shard.free_heads[size_class].store(block->next.load(std::memory_order_relaxed),
-                                         std::memory_order_relaxed);
+      const RegionOffset next = CountedLoadFor(
+          block->next, block_is_hwcc_, block_is_shared_payload_,
+          std::memory_order_relaxed);
+      CountedStoreFor(shard.free_heads[size_class], next, block_is_hwcc_,
+                      block_is_shared_payload_, std::memory_order_relaxed);
       Unlock(shard);
       return block;
     }
@@ -378,7 +437,8 @@ void *RegionAllocator::Allocate(uint64_t bytes, AllocationDomain, DomainCounter 
   void *result = AllocateFromShard(requested, size_class, owner_shard);
   if (size_class < kAllocatorSizeClasses) {
     auto *fresh_block = new (result) RegionFreeBlock;
-    RecordBlockAtomicStore(&fresh_block->next);
+    CountedStoreFor(fresh_block->next, kNullOffset, block_is_hwcc_,
+                    block_is_shared_payload_, std::memory_order_relaxed);
     RecordBlockMetadataWrite(&fresh_block->size_class,
                         sizeof(fresh_block->size_class) +
                             sizeof(fresh_block->owner_shard));
@@ -393,12 +453,13 @@ void RegionAllocator::FreeLocal(RegionOffset offset, uint32_t size_class, uint32
   auto &shard = header_->shards[owner_shard];
   Lock(shard);
   auto *block = static_cast<RegionFreeBlock *>(FromOffset(offset));
-  RecordAtomicLoad(&shard.free_heads[size_class]);
-  RecordBlockAtomicStore(&block->next);
-  block->next.store(shard.free_heads[size_class].load(std::memory_order_relaxed),
-                    std::memory_order_relaxed);
-  RecordAtomicStore(&shard.free_heads[size_class]);
-  shard.free_heads[size_class].store(offset, std::memory_order_release);
+  const RegionOffset head = CountedLoadFor(
+      shard.free_heads[size_class], block_is_hwcc_, block_is_shared_payload_,
+      std::memory_order_relaxed);
+  CountedStoreFor(block->next, head, block_is_hwcc_, block_is_shared_payload_,
+                  std::memory_order_relaxed);
+  CountedStoreFor(shard.free_heads[size_class], offset, block_is_hwcc_,
+                  block_is_shared_payload_, std::memory_order_release);
   Unlock(shard);
 }
 
@@ -505,9 +566,18 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   const uint64_t dual_header_bytes =
       (sizeof(*header) + RegionAllocator::kAlignment - 1) &
       ~(RegionAllocator::kAlignment - 1);
+  if (config.hwcc_size_bytes < dual_header_bytes)
+    throw std::invalid_argument("HWCC region is smaller than dual header");
   header->hwcc_allocator_offset = config.hwcc_offset_bytes + dual_header_bytes;
   header->hwcc_allocator_bytes = config.hwcc_size_bytes -
                                   (header->hwcc_allocator_offset - config.hwcc_offset_bytes);
+  const RemoteInstrumentationGeometry remote_geometry =
+      RemoteGeometry(config, header->hwcc_allocator_bytes);
+  header->remote_instrumentation_offset = remote_geometry.instrumentation_offset;
+  header->remote_instrumentation_bytes = remote_geometry.instrumentation_bytes;
+  header->remote_sequence_offset = remote_geometry.sequence_offset;
+  header->remote_event_log_offset = remote_geometry.event_log_offset;
+  header->remote_event_log_capacity = remote_geometry.event_log_capacity;
   header->swcc_allocator_offset = config.swcc_offset_bytes;
   header->swcc_allocator_bytes = config.swcc_size_bytes;
   const uint64_t swcc_metadata_bytes =
@@ -553,7 +623,17 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   // dynamic objects use owner-private control headers created in phase two.
   auto hwcc = RegionAllocator::Initialize(base + header->hwcc_allocator_offset,
                                           header->hwcc_allocator_bytes, 1,
-                                          0, true, true);
+                                          remote_geometry.instrumentation_bytes,
+                                          true, true);
+  if (remote_geometry.instrumentation_bytes != 0) {
+    auto *instrumentation = base + header->hwcc_allocator_offset +
+                            remote_geometry.instrumentation_offset;
+    std::memset(instrumentation, 0, remote_geometry.instrumentation_bytes);
+    auto *sequence = reinterpret_cast<std::atomic<uint64_t> *>(
+        base + header->hwcc_allocator_offset +
+        remote_geometry.sequence_offset);
+    new (sequence) std::atomic<uint64_t>(0);
+  }
   // The global SWCC header is initialized only in this VM's reset path.  It
   // is not retained as a process-wide resolver: owner controls and dynamic
   // arenas are reached through the immutable SWCC integer geometry below.
@@ -569,12 +649,15 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   }
   auto set_fixed_domain = [&](AllocationDomain domain, uint64_t bytes) {
     auto &counter = header->layout.domains[static_cast<size_t>(domain)];
-    mem_access::HwccAtomicStore(&counter.used_bytes);
-    counter.used_bytes.store(bytes, std::memory_order_relaxed);
-    mem_access::HwccAtomicStore(&counter.peak_bytes);
-    counter.peak_bytes.store(bytes, std::memory_order_relaxed);
+    mem_access::HwccAtomicStore(counter.used_bytes, bytes,
+                                std::memory_order_relaxed);
+    mem_access::HwccAtomicStore(counter.peak_bytes, bytes,
+                                std::memory_order_relaxed);
   };
-  set_fixed_domain(AllocationDomain::kHwccLayout, dual_header_bytes);
+  if (remote_geometry.instrumentation_bytes > UINT64_MAX - dual_header_bytes)
+    throw std::invalid_argument("HWCC layout accounting overflows");
+  set_fixed_domain(AllocationDomain::kHwccLayout,
+                   dual_header_bytes + remote_geometry.instrumentation_bytes);
   set_fixed_domain(AllocationDomain::kHwccAllocatorMetadata,
                    hwcc.metadata_bytes());
   set_fixed_domain(AllocationDomain::kSwccAllocatorMetadata,
@@ -744,7 +827,8 @@ void DualRegionAllocator::FinalizeStaticHwccLayout() {
 void DualRegionAllocator::PublishStaticHwccLayout() {
   if (!static_hwcc_finalized_)
     throw std::logic_error("static HWCC layout must be finalized before publication");
-  if (header_->layout.magic.load(std::memory_order_acquire) != 0)
+  if (mem_access::HwccAtomicLoad(header_->layout.magic,
+                                 std::memory_order_acquire) != 0)
     throw std::logic_error("static HWCC layout published more than once");
   for (uint32_t owner = 0; owner < header_->layout.vm_count; ++owner) {
     const auto &descriptor = header_->layout.owner_dynamic_arenas[owner];
@@ -770,8 +854,8 @@ void DualRegionAllocator::PublishStaticHwccLayout() {
   // This is the sole immutable-layout publication point.  Every field above,
   // including transport/EBR allocations made by KVEngine, is visible before
   // the release-store of magic.
-  mem_access::HwccAtomicStore(&header_->layout.magic);
-  header_->layout.magic.store(kSharedLayoutMagic, std::memory_order_release);
+  mem_access::HwccAtomicStore(header_->layout.magic, kSharedLayoutMagic,
+                              std::memory_order_release);
   FlushForRemoteVisibility(&header_->layout, sizeof(header_->layout), false);
 }
 
@@ -793,8 +877,8 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
   // Retrying Attach from the KV facade races the same phase and can expire
   // while VM0 is still constructing the static transport/EBR prefix.
   for (;;) {
-    mem_access::HwccAtomicLoad(&header->layout.magic);
-    if (header->layout.magic.load(std::memory_order_acquire) ==
+    if (mem_access::HwccAtomicLoad(header->layout.magic,
+                                   std::memory_order_acquire) ==
         kSharedLayoutMagic)
       break;
     _mm_pause();
@@ -802,8 +886,21 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
   // A joining VM must attach while the layout is still Initializing so it can
   // construct its own private arena/root.  Ready is intentionally checked by
   // KVEngine only after all owner bits are published.
+  const uint64_t dual_header_bytes =
+      (sizeof(*header) + RegionAllocator::kAlignment - 1) &
+      ~(RegionAllocator::kAlignment - 1);
+  if (config.hwcc_size_bytes < dual_header_bytes)
+    throw std::runtime_error("dual-region HWCC size is smaller than dual header");
+  if (header->hwcc_allocator_offset !=
+          config.hwcc_offset_bytes + dual_header_bytes ||
+      header->hwcc_allocator_bytes !=
+          config.hwcc_size_bytes - dual_header_bytes)
+    throw std::runtime_error("dual-region HWCC allocator bounds are invalid");
+  const RemoteInstrumentationGeometry remote_geometry =
+      RemoteGeometry(config, header->hwcc_allocator_bytes);
   const bool compatible =
-      header->layout.magic.load(std::memory_order_acquire) ==
+      mem_access::HwccAtomicLoad(header->layout.magic,
+                                 std::memory_order_acquire) ==
           kSharedLayoutMagic &&
       header->layout.layout_version == kSharedLayoutVersion &&
       header->layout.config_hash == config.config_hash &&
@@ -816,6 +913,13 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
       header->layout.swcc_size_bytes == config.swcc_size_bytes &&
       header->layout.fixed_key_size == config.fixed_key_size &&
       header->layout.fixed_value_size == config.fixed_value_size &&
+      header->remote_instrumentation_offset ==
+          remote_geometry.instrumentation_offset &&
+      header->remote_instrumentation_bytes ==
+          remote_geometry.instrumentation_bytes &&
+      header->remote_sequence_offset == remote_geometry.sequence_offset &&
+      header->remote_event_log_offset == remote_geometry.event_log_offset &&
+      header->remote_event_log_capacity == remote_geometry.event_log_capacity &&
       header->owner_private_arena_stride != 0;
   if (!compatible) {
     std::ostringstream detail;
@@ -841,17 +945,17 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
 void DualRegionAllocator::PublishOwnerInitialized(uint32_t node_id) {
   if (node_id >= header_->layout.vm_count || node_id >= 64)
     throw std::invalid_argument("owner-ready node outside layout");
-  mem_access::HwccAtomicLoad(&header_->layout.state);
-  if (header_->layout.state.load(std::memory_order_acquire) !=
+  if (mem_access::HwccAtomicLoad(header_->layout.state,
+                                 std::memory_order_acquire) !=
       static_cast<uint32_t>(LayoutState::kInitializing))
     throw std::logic_error("owner initialized after layout became ready");
   // The owner, and only the owner, makes its private SWCC initialization
   // visible before advertising the corresponding startup bit.
   FlushOwnedRanges(node_id);
   const uint64_t bit = 1ULL << node_id;
-  mem_access::HwccAtomicRmw(&header_->layout.owner_init_ready_bitmap);
-  const uint64_t previous = header_->layout.owner_init_ready_bitmap.fetch_or(
-      bit, std::memory_order_release);
+  const uint64_t previous = mem_access::HwccAtomicFetchOr(
+      header_->layout.owner_init_ready_bitmap, bit,
+      std::memory_order_release);
   if ((previous & bit) != 0)
     throw std::logic_error("owner initialization published more than once");
   FlushForRemoteVisibility(&header_->layout.owner_init_ready_bitmap,
@@ -865,9 +969,8 @@ void DualRegionAllocator::WaitForOwnersAndPublishReady() {
                                 ? ~uint64_t{0}
                                 : ((uint64_t{1} << header_->layout.vm_count) - 1);
   for (;;) {
-    mem_access::HwccAtomicLoad(&header_->layout.owner_init_ready_bitmap);
-    if (header_->layout.owner_init_ready_bitmap.load(std::memory_order_acquire) ==
-        expected)
+    if (mem_access::HwccAtomicLoad(header_->layout.owner_init_ready_bitmap,
+                                   std::memory_order_acquire) == expected)
       break;
     _mm_pause();
   }
@@ -876,8 +979,8 @@ void DualRegionAllocator::WaitForOwnersAndPublishReady() {
 
 void DualRegionAllocator::WaitUntilReady() const {
   for (;;) {
-    mem_access::HwccAtomicLoad(&header_->layout.state);
-    if (header_->layout.state.load(std::memory_order_acquire) ==
+    if (mem_access::HwccAtomicLoad(header_->layout.state,
+                                   std::memory_order_acquire) ==
         static_cast<uint32_t>(LayoutState::kReady))
       return;
     _mm_pause();
@@ -885,8 +988,8 @@ void DualRegionAllocator::WaitUntilReady() const {
 }
 
 void DualRegionAllocator::PublishReady() {
-  mem_access::HwccAtomicLoad(&header_->layout.state);
-  const uint32_t state = header_->layout.state.load(std::memory_order_acquire);
+  const uint32_t state = mem_access::HwccAtomicLoad(
+      header_->layout.state, std::memory_order_acquire);
   if (state != static_cast<uint32_t>(LayoutState::kInitializing)) {
     throw std::logic_error(
         "dual-region layout ready published with state=" +
@@ -895,15 +998,14 @@ void DualRegionAllocator::PublishReady() {
   const uint64_t expected = header_->layout.vm_count == 64
                                 ? ~uint64_t{0}
                                 : ((uint64_t{1} << header_->layout.vm_count) - 1);
-  mem_access::HwccAtomicLoad(&header_->layout.owner_init_ready_bitmap);
-  if (header_->layout.owner_init_ready_bitmap.load(std::memory_order_acquire) !=
-      expected)
+  if (mem_access::HwccAtomicLoad(header_->layout.owner_init_ready_bitmap,
+                                 std::memory_order_acquire) != expected)
     throw std::logic_error("layout ready before every owner initialized");
   // Each owner flushed its own private arena before setting its bit. VM0 only
   // performs the HWCC release; it must not walk another VM's private SWCC.
-  mem_access::HwccAtomicStore(&header_->layout.state);
-  header_->layout.state.store(static_cast<uint32_t>(LayoutState::kReady),
-                              std::memory_order_release);
+  mem_access::HwccAtomicStore(
+      header_->layout.state, static_cast<uint32_t>(LayoutState::kReady),
+      std::memory_order_release);
   FlushForRemoteVisibility(&header_->layout.state, sizeof(header_->layout.state),
                            false);
 }
@@ -922,8 +1024,8 @@ void *DualRegionAllocator::Allocate(uint64_t bytes, AllocationDomain domain,
       throw std::runtime_error("dynamic HWCC allocator is not initialized by owner");
     auto *control = OwnerControl(owner_shard);
     void *result = allocator->Allocate(bytes, domain, &control->dynamic_hwcc, 0);
-    mem_access::PrivateAtomicRmw(&control->total_hw_cc_usage);
-    control->total_hw_cc_usage.fetch_add(bytes, std::memory_order_relaxed);
+    mem_access::PrivateAtomicFetchAdd(control->total_hw_cc_usage, bytes,
+                                      std::memory_order_relaxed);
     return result;
   }
   if (domain == AllocationDomain::kSharedPayloadSwcc) {
@@ -987,77 +1089,78 @@ void *DualRegionAllocator::AllocateOwnerPrivate(uint64_t bytes, uint32_t partiti
   if (arena->owner_shard != owner_shard)
     throw std::runtime_error("private arena allocation from non-owner shard");
   uint32_t expected = 0;
-  mem_access::PrivateAtomicRmw(&arena->lock);
-  while (!arena->lock.compare_exchange_weak(expected, 1, std::memory_order_acquire,
-                                             std::memory_order_relaxed)) {
+  while (!mem_access::PrivateAtomicCompareExchangeWeak(
+      arena->lock, expected, uint32_t{1}, std::memory_order_acquire,
+      std::memory_order_relaxed)) {
     expected = 0;
-    mem_access::PrivateAtomicRmw(&arena->lock);
     _mm_pause();
   }
   const uint64_t aligned = (bytes + RegionAllocator::kAlignment - 1) &
                            ~(RegionAllocator::kAlignment - 1);
   const uint64_t requested = aligned + RegionAllocator::kAlignment;
   if (requested > UINT32_MAX) {
-    mem_access::PrivateAtomicStore(&arena->lock);
-    arena->lock.store(0, std::memory_order_release);
+    mem_access::PrivateAtomicStore(arena->lock, uint32_t{0},
+                                   std::memory_order_release);
     throw std::bad_alloc();
   }
   RegionOffset previous = kNullOffset;
-  mem_access::PrivateAtomicLoad(&arena->free_head);
-  RegionOffset current = arena->free_head.load(std::memory_order_relaxed);
+  RegionOffset current = mem_access::PrivateAtomicLoad(
+      arena->free_head, std::memory_order_relaxed);
   while (current != kNullOffset) {
     auto *block = static_cast<RegionFreeBlock *>(SwccFromOffset(current));
     mem_access::PrivateRead(&block->size_class, sizeof(block->size_class));
     const uint32_t block_bytes = block->size_class;
     if (block_bytes >= requested) {
-      mem_access::PrivateAtomicLoad(&block->next);
-      const RegionOffset next = block->next.load(std::memory_order_relaxed);
+      const RegionOffset next = mem_access::PrivateAtomicLoad(
+          block->next, std::memory_order_relaxed);
       if (previous == kNullOffset) {
-        mem_access::PrivateAtomicStore(&arena->free_head);
-        arena->free_head.store(next, std::memory_order_relaxed);
+        mem_access::PrivateAtomicStore(arena->free_head, next,
+                                       std::memory_order_relaxed);
       } else {
         auto *previous_block =
             static_cast<RegionFreeBlock *>(SwccFromOffset(previous));
-        mem_access::PrivateAtomicStore(&previous_block->next);
-        previous_block->next.store(next, std::memory_order_relaxed);
+        mem_access::PrivateAtomicStore(previous_block->next, next,
+                                       std::memory_order_relaxed);
       }
       mem_access::PrivateWrite(&block->owner_shard,
                                sizeof(block->owner_shard));
       block->owner_shard = owner_shard;
-      mem_access::PrivateAtomicStore(&arena->lock);
-      arena->lock.store(0, std::memory_order_release);
-      mem_access::PrivateAtomicRmw(&arena->allocated_bytes);
-      arena->allocated_bytes.fetch_add(block_bytes, std::memory_order_relaxed);
+      mem_access::PrivateAtomicStore(arena->lock, uint32_t{0},
+                                     std::memory_order_release);
+      mem_access::PrivateAtomicFetchAdd(
+          arena->allocated_bytes, static_cast<uint64_t>(block_bytes),
+          std::memory_order_relaxed);
       return static_cast<std::byte *>(static_cast<void *>(block)) + RegionAllocator::kAlignment;
     }
     previous = current;
-    mem_access::PrivateAtomicLoad(&block->next);
-    current = block->next.load(std::memory_order_relaxed);
+    current = mem_access::PrivateAtomicLoad(block->next,
+                                            std::memory_order_relaxed);
   }
   mem_access::PrivateRead(&arena->bump, sizeof(arena->bump));
   mem_access::PrivateRead(&arena->end, sizeof(arena->end));
   const uint64_t begin = (arena->bump + RegionAllocator::kAlignment - 1) &
                          ~(RegionAllocator::kAlignment - 1);
   if (begin > arena->end || requested > arena->end - begin) {
-    mem_access::PrivateAtomicStore(&arena->lock);
-    arena->lock.store(0, std::memory_order_release);
+    mem_access::PrivateAtomicStore(arena->lock, uint32_t{0},
+                                   std::memory_order_release);
     throw std::bad_alloc();
   }
   mem_access::PrivateWrite(&arena->bump, sizeof(arena->bump));
   arena->bump = begin + requested;
   void *block_address = SwccFromOffset(begin);
   auto *fresh_block = new (block_address) RegionFreeBlock;
-  mem_access::PrivateAtomicStore(&fresh_block->next);
+  mem_access::PrivateAtomicStore(fresh_block->next, kNullOffset,
+                                 std::memory_order_relaxed);
   mem_access::PrivateWrite(&fresh_block->size_class,
                            sizeof(fresh_block->size_class) +
                                sizeof(fresh_block->owner_shard));
   auto *block = fresh_block;
   block->size_class = static_cast<uint32_t>(requested);
   block->owner_shard = owner_shard;
-  mem_access::PrivateAtomicRmw(&arena->allocated_bytes);
-  arena->allocated_bytes.fetch_add(requested, std::memory_order_relaxed);
-  mem_access::PrivateAtomicStore(&arena->lock);
-  arena->lock.store(0, std::memory_order_release);
+  mem_access::PrivateAtomicFetchAdd(arena->allocated_bytes, requested,
+                                    std::memory_order_relaxed);
+  mem_access::PrivateAtomicStore(arena->lock, uint32_t{0},
+                                 std::memory_order_release);
   return static_cast<std::byte *>(SwccFromOffset(begin)) + RegionAllocator::kAlignment;
 }
 
@@ -1080,23 +1183,22 @@ void DualRegionAllocator::FreeOwnerPrivate(void *pointer, uint64_t bytes,
   if (block->owner_shard != owner_shard || block_bytes < requested)
     throw std::runtime_error("private arena free size or owner mismatch");
   uint32_t expected = 0;
-  mem_access::PrivateAtomicRmw(&arena->lock);
-  while (!arena->lock.compare_exchange_weak(expected, 1, std::memory_order_acquire,
-                                             std::memory_order_relaxed)) {
+  while (!mem_access::PrivateAtomicCompareExchangeWeak(
+      arena->lock, expected, uint32_t{1}, std::memory_order_acquire,
+      std::memory_order_relaxed)) {
     expected = 0;
-    mem_access::PrivateAtomicRmw(&arena->lock);
   }
-  mem_access::PrivateAtomicLoad(&arena->free_head);
-  mem_access::PrivateAtomicStore(&block->next);
-  block->next.store(arena->free_head.load(std::memory_order_relaxed),
-                    std::memory_order_relaxed);
-  mem_access::PrivateAtomicStore(&arena->free_head);
-  arena->free_head.store(SwccToOffset(block), std::memory_order_release);
-  mem_access::PrivateAtomicStore(&arena->lock);
-  arena->lock.store(0, std::memory_order_release);
-  mem_access::PrivateAtomicRmw(&arena->allocated_bytes);
+  const RegionOffset head = mem_access::PrivateAtomicLoad(
+      arena->free_head, std::memory_order_relaxed);
+  mem_access::PrivateAtomicStore(block->next, head,
+                                 std::memory_order_relaxed);
+  mem_access::PrivateAtomicStore(arena->free_head, SwccToOffset(block),
+                                 std::memory_order_release);
+  mem_access::PrivateAtomicStore(arena->lock, uint32_t{0},
+                                 std::memory_order_release);
   CheckedAtomicSubtract(&arena->allocated_bytes, block_bytes,
-                        "owner-private allocator accounting underflow");
+                        "owner-private allocator accounting underflow",
+                        latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
 
 void DualRegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain domain,
@@ -1110,9 +1212,9 @@ void DualRegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain d
       throw std::runtime_error("dynamic HWCC free outside owner arena");
     auto *control = OwnerControl(owner_shard);
     allocator->Free(pointer, bytes, domain, &control->dynamic_hwcc, 0, 0);
-    mem_access::PrivateAtomicRmw(&control->total_hw_cc_usage);
     CheckedAtomicSubtract(&control->total_hw_cc_usage, bytes,
-                          "owner Clock policy counter underflow");
+                          "owner Clock policy counter underflow",
+                          latency_sim::AtomicDomain::kOwnerPrivateSwcc);
     return;
   }
   if (domain == AllocationDomain::kSharedPayloadSwcc) {
@@ -1158,17 +1260,16 @@ void DualRegionAllocator::Retire(uint32_t owner_shard, uint32_t queue_partition,
                  : (IsHwccDomain(domain) ? hwcc_.ToOffset(pointer)
                                           : SwccToOffset(pointer)));
   auto &head = control->retire_heads[worker_id][epoch];
-  mem_access::PrivateAtomicLoad(&head);
-  RegionOffset previous = head.load(std::memory_order_relaxed);
+  RegionOffset previous = mem_access::PrivateAtomicLoad(
+      head, std::memory_order_relaxed);
   do {
     record->next = previous;
     mem_access::PrivateWrite(&record->next, sizeof(record->next));
-    mem_access::PrivateAtomicRmw(&head);
-  } while (!head.compare_exchange_weak(previous, SwccToOffset(record),
-                                        std::memory_order_release,
-                                        std::memory_order_relaxed));
-  mem_access::PrivateAtomicRmw(&control->retire_counts[worker_id][epoch]);
-  control->retire_counts[worker_id][epoch].fetch_add(1, std::memory_order_relaxed);
+  } while (!mem_access::PrivateAtomicCompareExchangeWeak(
+      head, previous, SwccToOffset(record), std::memory_order_release,
+      std::memory_order_relaxed));
+  mem_access::PrivateAtomicFetchAdd(control->retire_counts[worker_id][epoch],
+                                    uint64_t{1}, std::memory_order_relaxed);
 }
 
 uint64_t DualRegionAllocator::RetireCount(uint32_t owner_shard,
@@ -1177,8 +1278,8 @@ uint64_t DualRegionAllocator::RetireCount(uint32_t owner_shard,
   if (worker_id >= kOwnerPrivateEbrWorkers || epoch >= kOwnerPrivateEbrEpochs)
     throw std::invalid_argument("EBR retire count outside worker/epoch range");
   auto *control = OwnerControl(owner_shard);
-  mem_access::PrivateAtomicLoad(&control->retire_counts[worker_id][epoch]);
-  return control->retire_counts[worker_id][epoch].load(std::memory_order_acquire);
+  return mem_access::PrivateAtomicLoad(
+      control->retire_counts[worker_id][epoch], std::memory_order_acquire);
 }
 
 std::vector<OwnerPrivateRetireRecord> DualRegionAllocator::TakeRetired(
@@ -1187,9 +1288,9 @@ std::vector<OwnerPrivateRetireRecord> DualRegionAllocator::TakeRetired(
     throw std::invalid_argument("EBR reclaim outside worker/epoch range");
   std::vector<OwnerPrivateRetireRecord> retired;
   auto *control = OwnerControl(owner_shard);
-  mem_access::PrivateAtomicRmw(&control->retire_heads[worker_id][epoch]);
-  RegionOffset offset = control->retire_heads[worker_id][epoch].exchange(
-      kNullOffset, std::memory_order_acq_rel);
+  RegionOffset offset = mem_access::PrivateAtomicExchange(
+      control->retire_heads[worker_id][epoch], kNullOffset,
+      std::memory_order_acq_rel);
   while (offset != kNullOffset) {
     auto *record = static_cast<OwnerPrivateRetireRecord *>(SwccFromOffset(offset));
     mem_access::PrivateRead(record, sizeof(OwnerPrivateRetireRecord));
@@ -1204,9 +1305,9 @@ std::vector<OwnerPrivateRetireRecord> DualRegionAllocator::TakeRetired(
   }
   const uint64_t removed = retired.size();
   if (removed != 0) {
-    mem_access::PrivateAtomicRmw(&control->retire_counts[worker_id][epoch]);
     CheckedAtomicSubtract(&control->retire_counts[worker_id][epoch], removed,
-                          "owner-private EBR retire accounting underflow");
+                          "owner-private EBR retire accounting underflow",
+                          latency_sim::AtomicDomain::kOwnerPrivateSwcc);
   }
   return retired;
 }
@@ -1405,28 +1506,28 @@ uint64_t DualRegionAllocator::OwnerPrivateUsedBytes(uint32_t owner_shard) const 
        ++partition) {
     if (partition % header_->layout.vm_count != owner_shard) continue;
     auto *arena = Arena(partition);
-    mem_access::PrivateAtomicLoad(&arena->allocated_bytes);
-    used += arena->allocated_bytes.load(std::memory_order_relaxed);
+    used += mem_access::PrivateAtomicLoad(arena->allocated_bytes,
+                                          std::memory_order_relaxed);
   }
   return used;
 }
 
 uint64_t DualRegionAllocator::DynamicHwccUsedBytes(uint32_t owner_shard) const {
   auto *control = OwnerControl(owner_shard);
-  mem_access::PrivateAtomicLoad(&control->dynamic_hwcc.used_bytes);
-  return control->dynamic_hwcc.used_bytes.load(std::memory_order_relaxed);
+  return mem_access::PrivateAtomicLoad(control->dynamic_hwcc.used_bytes,
+                                      std::memory_order_relaxed);
 }
 
 uint64_t DualRegionAllocator::PolicyHwccUsedBytes(uint32_t owner_shard) const {
   auto *control = OwnerControl(owner_shard);
-  mem_access::PrivateAtomicLoad(&control->total_hw_cc_usage);
-  return control->total_hw_cc_usage.load(std::memory_order_relaxed);
+  return mem_access::PrivateAtomicLoad(control->total_hw_cc_usage,
+                                      std::memory_order_relaxed);
 }
 
 uint64_t DualRegionAllocator::SharedPayloadUsedBytes(uint32_t owner_shard) const {
   auto *control = OwnerControl(owner_shard);
-  mem_access::PrivateAtomicLoad(&control->shared_payload.used_bytes);
-  return control->shared_payload.used_bytes.load(std::memory_order_relaxed);
+  return mem_access::PrivateAtomicLoad(control->shared_payload.used_bytes,
+                                      std::memory_order_relaxed);
 }
 
 uint64_t DualRegionAllocator::ReadStaticDomainUsedBytes(
@@ -1443,8 +1544,19 @@ uint64_t DualRegionAllocator::ReadStaticDomainUsedBytes(
           "ReadStaticDomainUsedBytes rejects dynamic allocation domains");
   }
   auto *counter = &header_->layout.domains[static_cast<size_t>(domain)].used_bytes;
-  mem_access::HwccAtomicLoad(counter);
-  return counter->load(std::memory_order_relaxed);
+  return mem_access::HwccAtomicLoad(*counter, std::memory_order_relaxed);
+}
+
+void *DualRegionAllocator::RemoteSequenceWord() const {
+  if (!HasRemoteInstrumentation()) return nullptr;
+  return pool_ + header_->hwcc_allocator_offset +
+         header_->remote_sequence_offset;
+}
+
+void *DualRegionAllocator::RemoteEventLog() const {
+  if (!HasRemoteInstrumentation()) return nullptr;
+  return pool_ + header_->hwcc_allocator_offset +
+         header_->remote_event_log_offset;
 }
 
 void DualRegionAllocator::FlushOwnedRanges(uint32_t node_id) {
