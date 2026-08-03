@@ -227,7 +227,6 @@ int main() {
   latency_sim::Config latency;
   latency.fixed_latency.enabled = true;
   latency.fixed_latency.foreground_enabled = true;
-  latency.fixed_latency.delayed_time_stats_enabled = true;
   latency.fixed_latency.swcc_fixed_ns_per_line = 1;
   latency.fixed_latency.hwcc_fixed_ns_per_line = 1;
   auto &simulator = latency_sim::GlobalLatencySimulator();
@@ -236,14 +235,12 @@ int main() {
   regions.BindOwnerPrivateAllocators(0);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   assert(private_tree->lookup(Key(250), value) && value == 250);
+  assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-  const auto private_stats = simulator.TakeStatsAndReset();
-  assert(private_stats.swcc_delayed_ns > 0);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   assert(shared_tree->lookup(Key(250), value) && value == 1250);
+  assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-  const auto shared_stats = simulator.TakeStatsAndReset();
-  assert(shared_stats.hwcc_delayed_ns > 0);
   simulator.Configure(latency_sim::Config{});
 
   // Collapse the private root after a split.  The only persistent authority

@@ -4,289 +4,277 @@
 
 #include <atomic>
 #include <cstddef>
-#include <cstdlib>
 
 namespace tigonkv::engine::mem_access {
 
 class LatencyScope {
  public:
   explicit LatencyScope(latency_sim::ScopeKind scope) {
-    active_ = latency_sim::InstrumentationEnabledFast();
+    active_ = latency_sim::FixedLatencyEnabledFast();
     if (active_) latency_sim::GlobalLatencySimulator().BeginScope(scope);
   }
   ~LatencyScope() {
     if (active_) latency_sim::GlobalLatencySimulator().EndScopeAndDelay();
   }
-  LatencyScope(const LatencyScope &) = delete;
-  LatencyScope &operator=(const LatencyScope &) = delete;
+  LatencyScope(const LatencyScope&) = delete;
+  LatencyScope& operator=(const LatencyScope&) = delete;
 
  private:
   bool active_ = false;
 };
 
 inline bool HasActiveScope() {
-  return latency_sim::InstrumentationEnabledFast() &&
+  return latency_sim::FixedLatencyEnabledFast() &&
          latency_sim::GlobalLatencySimulator().HasActiveScopeForCurrentThread();
 }
 
 inline void EndActiveScopeAndDelay() {
-  if (latency_sim::InstrumentationEnabledFast())
+  if (latency_sim::FixedLatencyEnabledFast())
     latency_sim::GlobalLatencySimulator().EndScopeAndDelay();
 }
 
 inline void BeginForegroundScope() {
-  if (latency_sim::InstrumentationEnabledFast())
+  if (latency_sim::FixedLatencyEnabledFast())
     latency_sim::GlobalLatencySimulator().BeginScope(
         latency_sim::ScopeKind::kForeground);
 }
 
 inline void Record(latency_sim::PoolKind pool, latency_sim::AccessKind kind,
-                   const void *address, size_t bytes) {
-  if (latency_sim::InstrumentationEnabledFast())
-    latency_sim::GlobalLatencySimulator().RecordRange(pool, kind, address, bytes);
+                   const void* address, size_t bytes) {
+  if (latency_sim::FixedLatencyEnabledFast())
+    latency_sim::GlobalLatencySimulator().RecordRange(pool, kind, address,
+                                                      bytes);
 }
 
-inline void PrivateRead(const void *address, size_t bytes) {
+inline void PrivateRead(const void* address, size_t bytes) {
   Record(latency_sim::PoolKind::kOwnerPrivateSwcc,
          latency_sim::AccessKind::kRead, address, bytes);
 }
-inline void PrivateWrite(const void *address, size_t bytes) {
+inline void PrivateWrite(const void* address, size_t bytes) {
   Record(latency_sim::PoolKind::kOwnerPrivateSwcc,
          latency_sim::AccessKind::kWrite, address, bytes);
 }
+
 template <typename T>
-inline T PrivateAtomicLoad(const std::atomic<T> &value,
+inline T PrivateAtomicLoad(const std::atomic<T>& value,
                            std::memory_order order = std::memory_order_seq_cst,
                            uint32_t tag = 0) {
-  return latency_sim::CountedAtomicLoad(
+  return latency_sim::FixedLatencyAtomicLoad(
       value, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc, tag);
 }
 template <typename T>
-inline void PrivateAtomicStore(std::atomic<T> &value, T desired,
+inline void PrivateAtomicStore(std::atomic<T>& value, T desired,
                                std::memory_order order = std::memory_order_seq_cst,
                                uint32_t tag = 0) {
-  latency_sim::CountedAtomicStore(
+  latency_sim::FixedLatencyAtomicStore(
       value, desired, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc,
       tag);
 }
 template <typename T>
-inline T PrivateAtomicExchange(std::atomic<T> &value, T desired,
+inline T PrivateAtomicExchange(std::atomic<T>& value, T desired,
                                std::memory_order order = std::memory_order_seq_cst,
                                uint32_t tag = 0) {
-  return latency_sim::CountedAtomicExchange(
+  return latency_sim::FixedLatencyAtomicExchange(
       value, desired, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc,
       tag);
 }
 template <typename T>
-inline T PrivateAtomicFetchAdd(std::atomic<T> &value, T operand,
+inline T PrivateAtomicFetchAdd(std::atomic<T>& value, T operand,
                                std::memory_order order = std::memory_order_seq_cst,
                                uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchAdd(
+  return latency_sim::FixedLatencyAtomicFetchAdd(
       value, operand, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc,
       tag);
 }
 template <typename T>
-inline T PrivateAtomicFetchSub(std::atomic<T> &value, T operand,
+inline T PrivateAtomicFetchSub(std::atomic<T>& value, T operand,
                                std::memory_order order = std::memory_order_seq_cst,
                                uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchSub(
+  return latency_sim::FixedLatencyAtomicFetchSub(
       value, operand, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc,
       tag);
 }
 template <typename T>
-inline T PrivateAtomicFetchOr(std::atomic<T> &value, T operand,
+inline T PrivateAtomicFetchOr(std::atomic<T>& value, T operand,
                               std::memory_order order = std::memory_order_seq_cst,
                               uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchOr(
+  return latency_sim::FixedLatencyAtomicFetchOr(
       value, operand, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc,
       tag);
 }
 template <typename T>
-inline T PrivateAtomicFetchAnd(std::atomic<T> &value, T operand,
+inline T PrivateAtomicFetchAnd(std::atomic<T>& value, T operand,
                                std::memory_order order = std::memory_order_seq_cst,
                                uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchAnd(
+  return latency_sim::FixedLatencyAtomicFetchAnd(
       value, operand, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc,
       tag);
 }
 template <typename T>
-inline T PrivateAtomicFetchXor(std::atomic<T> &value, T operand,
+inline T PrivateAtomicFetchXor(std::atomic<T>& value, T operand,
                                std::memory_order order = std::memory_order_seq_cst,
                                uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchXor(
+  return latency_sim::FixedLatencyAtomicFetchXor(
       value, operand, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc,
       tag);
 }
 template <typename T>
 inline bool PrivateAtomicCompareExchangeWeak(
-    std::atomic<T> &value, T &expected, T desired,
-    std::memory_order success, std::memory_order failure, uint32_t tag = 0) {
-  return latency_sim::CountedCompareExchangeWeak(
+    std::atomic<T>& value, T& expected, T desired, std::memory_order success,
+    std::memory_order failure, uint32_t tag = 0) {
+  return latency_sim::FixedLatencyAtomicCompareExchangeWeak(
       value, expected, desired, success, failure,
       latency_sim::AtomicDomain::kOwnerPrivateSwcc, tag);
 }
 template <typename T>
 inline bool PrivateAtomicCompareExchangeStrong(
-    std::atomic<T> &value, T &expected, T desired,
-    std::memory_order success, std::memory_order failure, uint32_t tag = 0) {
-  return latency_sim::CountedCompareExchangeStrong(
+    std::atomic<T>& value, T& expected, T desired, std::memory_order success,
+    std::memory_order failure, uint32_t tag = 0) {
+  return latency_sim::FixedLatencyAtomicCompareExchangeStrong(
       value, expected, desired, success, failure,
       latency_sim::AtomicDomain::kOwnerPrivateSwcc, tag);
 }
-inline void HwccRead(const void *address, size_t bytes) {
-  Record(latency_sim::PoolKind::kHwcc, latency_sim::AccessKind::kRead, address, bytes);
+
+inline void HwccRead(const void* address, size_t bytes) {
+  Record(latency_sim::PoolKind::kHwcc, latency_sim::AccessKind::kRead, address,
+         bytes);
 }
-inline void HwccWrite(const void *address, size_t bytes) {
-  Record(latency_sim::PoolKind::kHwcc, latency_sim::AccessKind::kWrite, address, bytes);
+inline void HwccWrite(const void* address, size_t bytes) {
+  Record(latency_sim::PoolKind::kHwcc, latency_sim::AccessKind::kWrite, address,
+         bytes);
 }
 template <typename T>
-inline T HwccAtomicLoad(const std::atomic<T> &value,
+inline T HwccAtomicLoad(const std::atomic<T>& value,
                         std::memory_order order = std::memory_order_seq_cst,
                         uint32_t tag = 0) {
-  return latency_sim::CountedAtomicLoad(
+  return latency_sim::FixedLatencyAtomicLoad(
       value, order, latency_sim::AtomicDomain::kHwcc, tag);
 }
 template <typename T>
-inline void HwccAtomicStore(std::atomic<T> &value, T desired,
+inline void HwccAtomicStore(std::atomic<T>& value, T desired,
                             std::memory_order order = std::memory_order_seq_cst,
                             uint32_t tag = 0) {
-  latency_sim::CountedAtomicStore(value, desired, order,
-                                  latency_sim::AtomicDomain::kHwcc, tag);
+  latency_sim::FixedLatencyAtomicStore(value, desired, order,
+                                       latency_sim::AtomicDomain::kHwcc, tag);
 }
 template <typename T>
-inline T HwccAtomicExchange(std::atomic<T> &value, T desired,
+inline T HwccAtomicExchange(std::atomic<T>& value, T desired,
                             std::memory_order order = std::memory_order_seq_cst,
                             uint32_t tag = 0) {
-  return latency_sim::CountedAtomicExchange(value, desired, order,
-                                            latency_sim::AtomicDomain::kHwcc,
-                                            tag);
+  return latency_sim::FixedLatencyAtomicExchange(
+      value, desired, order, latency_sim::AtomicDomain::kHwcc, tag);
 }
 template <typename T>
-inline T HwccAtomicFetchAdd(std::atomic<T> &value, T operand,
+inline T HwccAtomicFetchAdd(std::atomic<T>& value, T operand,
                             std::memory_order order = std::memory_order_seq_cst,
                             uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchAdd(value, operand, order,
-                                            latency_sim::AtomicDomain::kHwcc,
-                                            tag);
+  return latency_sim::FixedLatencyAtomicFetchAdd(
+      value, operand, order, latency_sim::AtomicDomain::kHwcc, tag);
 }
 template <typename T>
-inline T HwccAtomicFetchSub(std::atomic<T> &value, T operand,
+inline T HwccAtomicFetchSub(std::atomic<T>& value, T operand,
                             std::memory_order order = std::memory_order_seq_cst,
                             uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchSub(value, operand, order,
-                                            latency_sim::AtomicDomain::kHwcc,
-                                            tag);
+  return latency_sim::FixedLatencyAtomicFetchSub(
+      value, operand, order, latency_sim::AtomicDomain::kHwcc, tag);
 }
 template <typename T>
-inline T HwccAtomicFetchOr(std::atomic<T> &value, T operand,
+inline T HwccAtomicFetchOr(std::atomic<T>& value, T operand,
                            std::memory_order order = std::memory_order_seq_cst,
                            uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchOr(value, operand, order,
-                                           latency_sim::AtomicDomain::kHwcc,
-                                           tag);
+  return latency_sim::FixedLatencyAtomicFetchOr(
+      value, operand, order, latency_sim::AtomicDomain::kHwcc, tag);
 }
 template <typename T>
-inline T HwccAtomicFetchAnd(std::atomic<T> &value, T operand,
+inline T HwccAtomicFetchAnd(std::atomic<T>& value, T operand,
                             std::memory_order order = std::memory_order_seq_cst,
                             uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchAnd(value, operand, order,
-                                            latency_sim::AtomicDomain::kHwcc,
-                                            tag);
+  return latency_sim::FixedLatencyAtomicFetchAnd(
+      value, operand, order, latency_sim::AtomicDomain::kHwcc, tag);
 }
 template <typename T>
-inline T HwccAtomicFetchXor(std::atomic<T> &value, T operand,
+inline T HwccAtomicFetchXor(std::atomic<T>& value, T operand,
                             std::memory_order order = std::memory_order_seq_cst,
                             uint32_t tag = 0) {
-  return latency_sim::CountedAtomicFetchXor(value, operand, order,
-                                            latency_sim::AtomicDomain::kHwcc,
-                                            tag);
+  return latency_sim::FixedLatencyAtomicFetchXor(
+      value, operand, order, latency_sim::AtomicDomain::kHwcc, tag);
 }
 template <typename T>
 inline bool HwccAtomicCompareExchangeWeak(
-    std::atomic<T> &value, T &expected, T desired,
-    std::memory_order success, std::memory_order failure, uint32_t tag = 0) {
-  return latency_sim::CountedCompareExchangeWeak(
+    std::atomic<T>& value, T& expected, T desired, std::memory_order success,
+    std::memory_order failure, uint32_t tag = 0) {
+  return latency_sim::FixedLatencyAtomicCompareExchangeWeak(
       value, expected, desired, success, failure,
       latency_sim::AtomicDomain::kHwcc, tag);
 }
 template <typename T>
 inline bool HwccAtomicCompareExchangeStrong(
-    std::atomic<T> &value, T &expected, T desired,
-    std::memory_order success, std::memory_order failure, uint32_t tag = 0) {
-  return latency_sim::CountedCompareExchangeStrong(
+    std::atomic<T>& value, T& expected, T desired, std::memory_order success,
+    std::memory_order failure, uint32_t tag = 0) {
+  return latency_sim::FixedLatencyAtomicCompareExchangeStrong(
       value, expected, desired, success, failure,
       latency_sim::AtomicDomain::kHwcc, tag);
 }
-inline void TransportRead(const void *address, size_t bytes) {
+
+inline void TransportRead(const void* address, size_t bytes) {
   HwccRead(address, bytes);
 }
-inline void TransportWrite(const void *address, size_t bytes) {
+inline void TransportWrite(const void* address, size_t bytes) {
   HwccWrite(address, bytes);
 }
-inline void SwccWriteback(const void *address, size_t bytes) {
-  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kFlush,
-         address, bytes);
+inline void SwccWriteback(const void* address, size_t bytes) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kFlush, address,
+         bytes);
 }
-inline void SwccInvalidate(const void *address, size_t bytes) {
-  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kInvalidate,
-         address, bytes);
+inline void SwccInvalidate(const void* address, size_t bytes) {
+  Record(latency_sim::PoolKind::kSwcc,
+         latency_sim::AccessKind::kInvalidate, address, bytes);
 }
-// A writeback is a real SWCC publication point in Tigon2's WriteThrough SCC:
-// it makes the line eligible for a remote owner to consume. Ordinary SWCC
-// writes do not call this helper, so the simulator never invents coherence
-// from a local store alone.
-inline void SwccExplicitHandoffToRemotes(const void *address, size_t bytes,
-                                         uint32_t from_node) {
-  if (!(latency_sim::HardwareSimulationFeaturesFast() &
-        latency_sim::kRemoteInvalidation))
-    return;
-  const auto &remote =
-      latency_sim::GlobalLatencySimulator().config().remote_cache_invalidation;
-  if (from_node >= remote.node_count) std::abort();
-  for (uint32_t to_node = 0; to_node < remote.node_count; ++to_node) {
-    if (to_node == from_node) continue;
-    latency_sim::GlobalLatencySimulator().RecordSwccExplicitHandoff(
-        latency_sim::PoolKind::kSwcc, address, bytes, from_node, to_node);
-  }
+inline void SharedPayloadRead(const void* address, size_t bytes) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kRead, address,
+         bytes);
 }
-inline void SharedPayloadRead(const void *address, size_t bytes) {
-  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kRead, address, bytes);
+inline void SharedPayloadWrite(const void* address, size_t bytes) {
+  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kWrite, address,
+         bytes);
 }
-inline void SharedPayloadWrite(const void *address, size_t bytes) {
-  Record(latency_sim::PoolKind::kSwcc, latency_sim::AccessKind::kWrite, address, bytes);
-}
-// Shared-payload freelist headers live in shared SWCC but are only touched by
-// the owner allocator before publish / after EBR; pool is still SWCC.
+
 template <typename T>
 inline T SharedPayloadAtomicLoad(
-    const std::atomic<T> &value,
+    const std::atomic<T>& value,
     std::memory_order order = std::memory_order_seq_cst, uint32_t tag = 0) {
-  return latency_sim::CountedAtomicLoad(
-      value, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc, tag);
+  return latency_sim::FixedLatencyAtomicLoad(
+      value, order, latency_sim::AtomicDomain::kSwcc, tag);
 }
 template <typename T>
 inline void SharedPayloadAtomicStore(
-    std::atomic<T> &value, T desired,
+    std::atomic<T>& value, T desired,
     std::memory_order order = std::memory_order_seq_cst, uint32_t tag = 0) {
-  latency_sim::CountedAtomicStore(
-      value, desired, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc,
-      tag);
+  latency_sim::FixedLatencyAtomicStore(value, desired, order,
+                                       latency_sim::AtomicDomain::kSwcc, tag);
 }
 template <typename T>
 inline T SharedPayloadAtomicExchange(
-    std::atomic<T> &value, T desired,
+    std::atomic<T>& value, T desired,
     std::memory_order order = std::memory_order_seq_cst, uint32_t tag = 0) {
-  return latency_sim::CountedAtomicExchange(
-      value, desired, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc,
-      tag);
+  return latency_sim::FixedLatencyAtomicExchange(
+      value, desired, order, latency_sim::AtomicDomain::kSwcc, tag);
 }
 template <typename T>
 inline bool SharedPayloadAtomicCompareExchangeWeak(
-    std::atomic<T> &value, T &expected, T desired,
+    std::atomic<T>& value, T& expected, T desired,
     std::memory_order success, std::memory_order failure, uint32_t tag = 0) {
-  return latency_sim::CountedCompareExchangeWeak(
+  return latency_sim::FixedLatencyAtomicCompareExchangeWeak(
       value, expected, desired, success, failure,
-      latency_sim::AtomicDomain::kOwnerPrivateSwcc, tag);
+      latency_sim::AtomicDomain::kSwcc, tag);
+}
+template <typename T>
+inline bool SharedPayloadAtomicCompareExchangeStrong(
+    std::atomic<T>& value, T& expected, T desired,
+    std::memory_order success, std::memory_order failure, uint32_t tag = 0) {
+  return latency_sim::FixedLatencyAtomicCompareExchangeStrong(
+      value, expected, desired, success, failure,
+      latency_sim::AtomicDomain::kSwcc, tag);
 }
 
 }  // namespace tigonkv::engine::mem_access

@@ -1,41 +1,16 @@
-# 双区域分配器审计
+# TigonKV allocator 审计结论
 
-## 决策
+- HWCC/SWCC 是配置指定的两个不重叠物理区域；layout metadata 的计算只使用真实业务
+  header、directory、tree、smeta、EBR 和 transport 对象。
+- HWCC 不再保留访问统计、事件日志、sequencer 或第二设备的隐藏 reserve；删除这些
+  模块后释放的空间回到业务 allocator。layout version 为 28，旧 backing 必须拒绝。
+- owner-private arena、Clock tracker 和 EBR retire record 通过 RegionOffset 保存在
+  owner-private SWCC；shared payload 通过 SCC 位于 shared SWCC；shared tree/root/smeta/
+  epoch/transport 位于 HWCC。
+- allocator 的普通 memory/runtime stats 仍可报告，但不能输出为硬件模拟统计，也不能
+  用作访问/原子计数。
+- allocator lock、EBR guard 和 SCC 发布期间只执行真实协议动作；固定延迟 pending
+  在安全 scope 出口结算。
 
-TigonKV 不使用 `dependencies/cxlalloc/libcxlalloc_static.a` 作为最终共享内存
-分配器。该二进制库没有可审计的区域路由、跨进程 free 所有权或按域统计接口，
-不能证明 HWCC 与 SWCC 的物理隔离及 `unclassified_shared_bytes == 0`。
-
-最终实现以 `kv/engine/region_allocator.*` 替换它。一个 backing mapping 切分
-为固定的 HWCC 与 SWCC 区；每一分配都带域标签，且持久引用只保存区域内 offset。
-私有 arena 固定属于 partition owner；shared payload 与 HWCC 元数据不得复用同一
-地址或通过状态位转换伪装迁移。
-
-## 当前审计
-
-- `common/CXLMemory.h` 经 dual-region allocator 路由；默认 TigonKV 构建不再链接
-  `dependencies/cxlalloc/libcxlalloc_static.a`。
-- `kv/kv_store.cpp` 是只持有 `KVEngine` 的薄门面；旧 slot、全局锁和 msync 伪协议
-  已删除。
-- 原始 Tigon 的 CXL B+Tree、EBR、传输与 TwoPL/Pasha 实现保留为就地改造对象；
-  原始源码不删除。
-
-## 验收证据
-
-| 能力 | 验证目标 |
-|---|---|
-| attach | 同一 mmap 文件在独立进程重新映射后 offset 可恢复 |
-| 分域 | HWCC 动态域、owner-private/shared-payload SWCC 及两池 allocator metadata 均独立记账 |
-| 回收 | 仅 owner 对本 arena 的本地 free 可复用；跨 owner free 是协议错误并 hard-fail |
-| 可见性 | SWCC 链发布在 flush/fence 后对远端可见 |
-| 有界性 | freelist/bump 在 owner-private control 下按 size-class 工作，无每线程 TLS cache/batch refill；进程 DRAM 不随 KV 数线性增长 |
-
-`region_allocator_test` 覆盖 attach、域记账、跨 owner free 拒绝、reuse、并发及跨域
-拒绝；这些场景由同一测试程序一次执行，不再用多个别名重复计入测试数量。用户
-已授权真实 VM/NUMA 操作；已有历史证据不替代当前 HEAD 的 fresh validation，
-最终结论以本轮 preflight 与连续测试记录为准。
-
-固定会计不与动态 block 重复：HWCC allocator header 归
-`kHwccAllocatorMetadata`；SWCC allocator header 加实际 arena header 总和归
-`kSwccAllocatorMetadata`。物理池 used 分别是该池固定域与动态域之和，组合
-allocator overhead 仅为二者相加，`unclassified_shared_bytes` 保持为零。
+验证入口：`tests/region_allocator_test.cpp`、`tests/kv_layout_test.cpp`、
+`tests/cxl_ebr_test.cpp`，以及 Debug/RelWithDebInfo clean build。

@@ -25,7 +25,7 @@ void RunCxlIncomingLoop(MPSCRingBuffer &ring, uint32_t coord_id,
       // One non-nested receive scope per iteration: dequeue attempt plus a
       // successful worker handoff. Empty polls settle before yield.
       tigonkv::engine::mem_access::LatencyScope receive_scope(
-          latency_sim::ScopeKind::kForeground);
+          latency_sim::ScopeKind::kOther);
       std::unique_ptr<Message> message;
       try {
         message = reader.next_message();

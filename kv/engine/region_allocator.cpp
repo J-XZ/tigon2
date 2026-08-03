@@ -21,65 +21,15 @@ namespace {
 bool RangeContains(uint64_t begin, uint64_t length, uint64_t offset,
                    uint64_t bytes);
 
-struct RemoteInstrumentationGeometry {
-  uint64_t instrumentation_offset = kNullOffset;
-  uint64_t instrumentation_bytes = 0;
-  uint64_t sequence_offset = kNullOffset;
-  uint64_t event_log_offset = kNullOffset;
-  uint64_t event_log_capacity = 0;
-};
-
-uint64_t AlignChecked(uint64_t value, uint64_t alignment) {
-  if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
-      value > UINT64_MAX - (alignment - 1))
-    throw std::invalid_argument("alignment arithmetic overflow");
-  return (value + alignment - 1) & ~(alignment - 1);
-}
-
-RemoteInstrumentationGeometry RemoteGeometry(const DualRegionConfig &config,
-                                             uint64_t allocator_bytes) {
-  RemoteInstrumentationGeometry geometry;
-  if (!config.remote_invalidation_enabled) return geometry;
-  constexpr uint64_t metadata_bytes =
-      (sizeof(RegionAllocatorHeader) + RegionAllocator::kAlignment - 1) &
-      ~(RegionAllocator::kAlignment - 1);
-  if (allocator_bytes <= metadata_bytes ||
-      config.remote_event_log_capacity == 0 ||
-      config.remote_shared_sequencer_offset > UINT64_MAX - metadata_bytes)
-    throw std::invalid_argument("invalid remote instrumentation geometry");
-  const uint64_t sequence_hint =
-      metadata_bytes + config.remote_shared_sequencer_offset;
-  geometry.instrumentation_offset = metadata_bytes;
-  geometry.sequence_offset = AlignChecked(sequence_hint, alignof(uint64_t));
-  const uint64_t sequence_end =
-      geometry.sequence_offset + sizeof(uint64_t);
-  if (sequence_end < geometry.sequence_offset)
-    throw std::invalid_argument("remote sequence geometry overflows");
-  geometry.event_log_offset =
-      AlignChecked(sequence_end, alignof(latency_sim::RemoteEventRecord));
-  if (config.remote_event_log_capacity >
-      UINT64_MAX / latency_sim::kRemoteEventRecordBytes)
-    throw std::invalid_argument("remote event log geometry overflows");
-  const uint64_t event_log_bytes =
-      config.remote_event_log_capacity * latency_sim::kRemoteEventRecordBytes;
-  if (geometry.event_log_offset > UINT64_MAX - event_log_bytes)
-    throw std::invalid_argument("remote event log geometry overflows");
-  const uint64_t end = geometry.event_log_offset + event_log_bytes;
-  if (end > allocator_bytes || end < geometry.instrumentation_offset)
-    throw std::invalid_argument("remote event log exceeds HWCC allocator");
-  geometry.instrumentation_bytes = end - geometry.instrumentation_offset;
-  geometry.event_log_capacity = config.remote_event_log_capacity;
-  return geometry;
-}
 
 uint64_t CheckedAtomicSubtract(std::atomic<uint64_t> *counter, uint64_t bytes,
                                const char *detail,
                                latency_sim::AtomicDomain domain) {
-  uint64_t before = latency_sim::CountedAtomicLoad(
+  uint64_t before = latency_sim::FixedLatencyAtomicLoad(
       *counter, std::memory_order_relaxed, domain);
   for (;;) {
     if (before < bytes) LOG(FATAL) << detail;
-    if (latency_sim::CountedCompareExchangeWeak(
+    if (latency_sim::FixedLatencyAtomicCompareExchangeWeak(
             *counter, before, before - bytes, std::memory_order_relaxed,
             std::memory_order_relaxed, domain))
       return before;
@@ -95,31 +45,31 @@ latency_sim::AtomicDomain AtomicDomainFor(bool hwcc, bool /*shared_payload*/) {
 }
 
 template <typename T>
-T CountedLoadFor(const std::atomic<T> &value, bool hwcc, bool shared_payload,
+T FixedLatencyLoadFor(const std::atomic<T> &value, bool hwcc, bool shared_payload,
                  std::memory_order order) {
-  return latency_sim::CountedAtomicLoad(
+  return latency_sim::FixedLatencyAtomicLoad(
       value, order, AtomicDomainFor(hwcc, shared_payload));
 }
 
 template <typename T>
-void CountedStoreFor(std::atomic<T> &value, T desired, bool hwcc,
+void FixedLatencyStoreFor(std::atomic<T> &value, T desired, bool hwcc,
                      bool shared_payload, std::memory_order order) {
-  latency_sim::CountedAtomicStore(
+  latency_sim::FixedLatencyAtomicStore(
       value, desired, order, AtomicDomainFor(hwcc, shared_payload));
 }
 
 template <typename T>
-T CountedFetchAddFor(std::atomic<T> &value, T operand, bool hwcc,
+T FixedLatencyFetchAddFor(std::atomic<T> &value, T operand, bool hwcc,
                      bool shared_payload, std::memory_order order) {
-  return latency_sim::CountedAtomicFetchAdd(
+  return latency_sim::FixedLatencyAtomicFetchAdd(
       value, operand, order, AtomicDomainFor(hwcc, shared_payload));
 }
 
 template <typename T>
-bool CountedCasWeakFor(std::atomic<T> &value, T &expected, T desired,
+bool FixedLatencyCasWeakFor(std::atomic<T> &value, T &expected, T desired,
                        bool hwcc, bool shared_payload,
                        std::memory_order success, std::memory_order failure) {
-  return latency_sim::CountedCompareExchangeWeak(
+  return latency_sim::FixedLatencyAtomicCompareExchangeWeak(
       value, expected, desired, success, failure,
       AtomicDomainFor(hwcc, shared_payload));
 }
@@ -334,13 +284,13 @@ void RegionAllocator::AccountAllocate(uint64_t bytes, DomainCounter *counter) {
   const auto domain = control_is_hwcc_
                           ? latency_sim::AtomicDomain::kHwcc
                           : latency_sim::AtomicDomain::kOwnerPrivateSwcc;
-  const uint64_t used = latency_sim::CountedAtomicFetchAdd(
+  const uint64_t used = latency_sim::FixedLatencyAtomicFetchAdd(
                             counter->used_bytes, bytes,
                             std::memory_order_relaxed, domain) + bytes;
-  uint64_t peak = latency_sim::CountedAtomicLoad(
+  uint64_t peak = latency_sim::FixedLatencyAtomicLoad(
       counter->peak_bytes, std::memory_order_relaxed, domain);
   while (peak < used) {
-    if (latency_sim::CountedCompareExchangeWeak(
+    if (latency_sim::FixedLatencyAtomicCompareExchangeWeak(
             counter->peak_bytes, peak, used, std::memory_order_relaxed,
             std::memory_order_relaxed, domain))
       break;
@@ -399,15 +349,15 @@ void *RegionAllocator::AllocateFromShard(uint64_t bytes, uint32_t size_class,
   auto &shard = header_->shards[owner_shard];
   Lock(shard);
   if (size_class < kAllocatorSizeClasses) {
-    const RegionOffset head = CountedLoadFor(
+    const RegionOffset head = FixedLatencyLoadFor(
         shard.free_heads[size_class], block_is_hwcc_,
         block_is_shared_payload_, std::memory_order_relaxed);
     if (head != kNullOffset) {
       auto *block = static_cast<RegionFreeBlock *>(FromOffset(head));
-      const RegionOffset next = CountedLoadFor(
+      const RegionOffset next = FixedLatencyLoadFor(
           block->next, block_is_hwcc_, block_is_shared_payload_,
           std::memory_order_relaxed);
-      CountedStoreFor(shard.free_heads[size_class], next, block_is_hwcc_,
+      FixedLatencyStoreFor(shard.free_heads[size_class], next, block_is_hwcc_,
                       block_is_shared_payload_, std::memory_order_relaxed);
       Unlock(shard);
       return block;
@@ -437,7 +387,7 @@ void *RegionAllocator::Allocate(uint64_t bytes, AllocationDomain, DomainCounter 
   void *result = AllocateFromShard(requested, size_class, owner_shard);
   if (size_class < kAllocatorSizeClasses) {
     auto *fresh_block = new (result) RegionFreeBlock;
-    CountedStoreFor(fresh_block->next, kNullOffset, block_is_hwcc_,
+    FixedLatencyStoreFor(fresh_block->next, kNullOffset, block_is_hwcc_,
                     block_is_shared_payload_, std::memory_order_relaxed);
     RecordBlockMetadataWrite(&fresh_block->size_class,
                         sizeof(fresh_block->size_class) +
@@ -453,12 +403,12 @@ void RegionAllocator::FreeLocal(RegionOffset offset, uint32_t size_class, uint32
   auto &shard = header_->shards[owner_shard];
   Lock(shard);
   auto *block = static_cast<RegionFreeBlock *>(FromOffset(offset));
-  const RegionOffset head = CountedLoadFor(
+  const RegionOffset head = FixedLatencyLoadFor(
       shard.free_heads[size_class], block_is_hwcc_, block_is_shared_payload_,
       std::memory_order_relaxed);
-  CountedStoreFor(block->next, head, block_is_hwcc_, block_is_shared_payload_,
+  FixedLatencyStoreFor(block->next, head, block_is_hwcc_, block_is_shared_payload_,
                   std::memory_order_relaxed);
-  CountedStoreFor(shard.free_heads[size_class], offset, block_is_hwcc_,
+  FixedLatencyStoreFor(shard.free_heads[size_class], offset, block_is_hwcc_,
                   block_is_shared_payload_, std::memory_order_release);
   Unlock(shard);
 }
@@ -571,13 +521,6 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   header->hwcc_allocator_offset = config.hwcc_offset_bytes + dual_header_bytes;
   header->hwcc_allocator_bytes = config.hwcc_size_bytes -
                                   (header->hwcc_allocator_offset - config.hwcc_offset_bytes);
-  const RemoteInstrumentationGeometry remote_geometry =
-      RemoteGeometry(config, header->hwcc_allocator_bytes);
-  header->remote_instrumentation_offset = remote_geometry.instrumentation_offset;
-  header->remote_instrumentation_bytes = remote_geometry.instrumentation_bytes;
-  header->remote_sequence_offset = remote_geometry.sequence_offset;
-  header->remote_event_log_offset = remote_geometry.event_log_offset;
-  header->remote_event_log_capacity = remote_geometry.event_log_capacity;
   header->swcc_allocator_offset = config.swcc_offset_bytes;
   header->swcc_allocator_bytes = config.swcc_size_bytes;
   const uint64_t swcc_metadata_bytes =
@@ -623,17 +566,8 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   // dynamic objects use owner-private control headers created in phase two.
   auto hwcc = RegionAllocator::Initialize(base + header->hwcc_allocator_offset,
                                           header->hwcc_allocator_bytes, 1,
-                                          remote_geometry.instrumentation_bytes,
+                                          0,
                                           true, true);
-  if (remote_geometry.instrumentation_bytes != 0) {
-    auto *instrumentation = base + header->hwcc_allocator_offset +
-                            remote_geometry.instrumentation_offset;
-    std::memset(instrumentation, 0, remote_geometry.instrumentation_bytes);
-    auto *sequence = reinterpret_cast<std::atomic<uint64_t> *>(
-        base + header->hwcc_allocator_offset +
-        remote_geometry.sequence_offset);
-    new (sequence) std::atomic<uint64_t>(0);
-  }
   // The global SWCC header is initialized only in this VM's reset path.  It
   // is not retained as a process-wide resolver: owner controls and dynamic
   // arenas are reached through the immutable SWCC integer geometry below.
@@ -654,10 +588,7 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
     mem_access::HwccAtomicStore(counter.peak_bytes, bytes,
                                 std::memory_order_relaxed);
   };
-  if (remote_geometry.instrumentation_bytes > UINT64_MAX - dual_header_bytes)
-    throw std::invalid_argument("HWCC layout accounting overflows");
-  set_fixed_domain(AllocationDomain::kHwccLayout,
-                   dual_header_bytes + remote_geometry.instrumentation_bytes);
+  set_fixed_domain(AllocationDomain::kHwccLayout, dual_header_bytes);
   set_fixed_domain(AllocationDomain::kHwccAllocatorMetadata,
                    hwcc.metadata_bytes());
   set_fixed_domain(AllocationDomain::kSwccAllocatorMetadata,
@@ -896,8 +827,6 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
       header->hwcc_allocator_bytes !=
           config.hwcc_size_bytes - dual_header_bytes)
     throw std::runtime_error("dual-region HWCC allocator bounds are invalid");
-  const RemoteInstrumentationGeometry remote_geometry =
-      RemoteGeometry(config, header->hwcc_allocator_bytes);
   const bool compatible =
       mem_access::HwccAtomicLoad(header->layout.magic,
                                  std::memory_order_acquire) ==
@@ -913,13 +842,6 @@ DualRegionAllocator DualRegionAllocator::Attach(void *pool,
       header->layout.swcc_size_bytes == config.swcc_size_bytes &&
       header->layout.fixed_key_size == config.fixed_key_size &&
       header->layout.fixed_value_size == config.fixed_value_size &&
-      header->remote_instrumentation_offset ==
-          remote_geometry.instrumentation_offset &&
-      header->remote_instrumentation_bytes ==
-          remote_geometry.instrumentation_bytes &&
-      header->remote_sequence_offset == remote_geometry.sequence_offset &&
-      header->remote_event_log_offset == remote_geometry.event_log_offset &&
-      header->remote_event_log_capacity == remote_geometry.event_log_capacity &&
       header->owner_private_arena_stride != 0;
   if (!compatible) {
     std::ostringstream detail;
@@ -1545,18 +1467,6 @@ uint64_t DualRegionAllocator::ReadStaticDomainUsedBytes(
   }
   auto *counter = &header_->layout.domains[static_cast<size_t>(domain)].used_bytes;
   return mem_access::HwccAtomicLoad(*counter, std::memory_order_relaxed);
-}
-
-void *DualRegionAllocator::RemoteSequenceWord() const {
-  if (!HasRemoteInstrumentation()) return nullptr;
-  return pool_ + header_->hwcc_allocator_offset +
-         header_->remote_sequence_offset;
-}
-
-void *DualRegionAllocator::RemoteEventLog() const {
-  if (!HasRemoteInstrumentation()) return nullptr;
-  return pool_ + header_->hwcc_allocator_offset +
-         header_->remote_event_log_offset;
 }
 
 void DualRegionAllocator::FlushOwnedRanges(uint32_t node_id) {

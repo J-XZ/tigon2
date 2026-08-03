@@ -1,310 +1,92 @@
-# Tigon
-Tigon[^1] is a research distributed transactional in-memory database that synchronizes
-cross-host concurrent data accesses over shared memory. Tigon adopts the Pasha
-architecture[^2]. The independent `tigonkv` path in this repository models CXL-style
-sharing with NUMA-based host DRAM, ivshmem mappings, explicit software cache-coherence
-protocols, and optional software latency injection; it is not a claim of real CXL
-hardware performance.
-This repository is implemented based on the [lotus](https://github.com/DBOS-project/lotus) codebase from Xinjing Zhou.
-The in-memory B+Tree implementation is adapted from [btreeolc](https://github.com/zxjcarrot/2-Tree/tree/master/backend/btreeolc).
-The lock-free MPSC ringbuffer used for implementing CXL transport is adapted from [waitfree-mpsc-queue](https://github.com/dbittman/waitfree-mpsc-queue).
+# TigonKV
 
-This repository contains the following:
-* An implementation of Tigon
-* Sundial[^3] optimized for a CXL pod: Sundial-CXL and Sundial+
-* DS2PL[^4] optimized for a CXL pod: DS2PL-CXL and DS2PL+
-* A benchmarking framework that supports full TPC-C, YCSB, and SmallBank
-* Scripts for emulating a CXL pod on a single physical machine
-* Scripts for building and running Tigon/baselines
-* Scripts for reproducing the results reported in the paper
+TigonKV 是一个独立的单表、定长 key/value、范围分区 KV，用于在单机上以 NUMA
+host DRAM、ivshmem 和多 VM 模拟 CXL 共享内存。结果只能称为共享内存模拟结果，不能
+表述为真实 CXL 硬件性能。
 
-## TigonKV shared-memory emulation path
+正式路径保留原 Tigon 的 B+Tree/OLC、TwoPLPasha WriteThrough SCC、owner-private
+规则、PolicyClock migration、EBR 和 CXL transport 的一致性骨架。外部 API 提供
+`Put`、`Get`、`Delete`、`Scan`、`CompareExchange` 和 `Increment`；逻辑表固定为
+`kSingleTableId=0`，共享布局只保存 `RegionOffset`。
 
-The independent KV path is built as `tigonkv` and exposes one namespace through
-`KVStore::Put`, `Get`, `Delete`, `Scan`, `CompareExchange`, and `Increment`. It keeps
-Tigon's partition/owner model internally and promotes a row to a shared payload only
-when a non-owner VM accesses it. The backing file is ordinary host DRAM mapped through
-ivshmem; HWCC/SWCC are logical protocol and accounting categories. Results must be
-described as NUMA-based CXL shared-memory emulation and software latency-injected
-results, never as real CXL hardware performance.
+## 当前硬件模拟
 
-The current `tigonkv` hardware-simulation path has four independent modules under
-`tigon_kv.latency_inject`: fixed latency, HWCC ordinary-access counts, executed atomic
-counts, and ordered remote-cache invalidation. It has no fixed-delay cache-hit/miss
-filter. All four can be disabled independently; the all-disabled path is a single
-relaxed feature-mask gate, and `TIGONKV_DISABLE_HARDWARE_SIMULATION=ON` provides the
-compile-off comparison. See [硬件模拟当前实现.md](硬件模拟当前实现.md) and
-[延迟插入审计报告.md](延迟插入审计报告.md) for the current domain and validation
-contract.
+`tigon_kv.latency_inject` 只接受一个 `fixed_latency` 对象：
 
-The default experiment paths come from `experiment_config.jsonc`
-(`shared_memory.path` / `device_path`, `vm.storage_path`). `scripts/vm/*` only
-inspects or reuses an existing topology and deliberately refuses to start/reboot
-VMs, configure networking, or change host tuning. The authoritative construction
-contract and final-verification procedure are
-[partition优化方案.md](partition优化方案.md). The current operational data path is
-recorded in [当前对比口径.md](当前对比口径.md); do not treat older slot-layout notes
-(if found in git history) as current architecture.
+```jsonc
+"fixed_latency": {
+  "enabled": false,
+  "cache_line_bytes": 64,
+  "swcc_fixed_ns_per_line": 0,
+  "hwcc_fixed_ns_per_line": 0,
+  "foreground_enabled": true,
+  "background_enabled": true
+}
+```
 
-Build and local verification (the laboratory correctness gate is the isolated 4VM
-end-to-end workflow; do not run the full CTest suite merely as routine coverage):
+它按真实 HWCC/SWCC 访问覆盖的 cache line 累加固定延迟，在前台或后台 scope 的安全
+出口用校准 TSC busy-wait 结算。访问统计、原子计数、远程 cache 模型、共享事件日志、
+replay 和 instrumentation ivshmem 均已删除；旧配置字段会 hard-fail。SCC 位图、真实
+flush/invalidate/writeback 和业务 runtime/memory accounting 仍保留，因为它们属于一致性
+协议或数据库运行时，而不是延迟模拟器。
+
+禁用时路径只有进程本地 fixed-latency fast gate；不会读 TSC、建立 TLS、维护统计或
+创建额外共享状态。`TIGONKV_DISABLE_HARDWARE_SIMULATION=ON` 提供编译期关闭对照。
+详细规则见 [硬件模拟当前实现.md](硬件模拟当前实现.md) 和
+[延迟插入审计报告.md](延迟插入审计报告.md)。
+
+## 内存与 VM
+
+业务 backing 只有一个 ivshmem 设备，并划分为不重叠的 HWCC 与 SWCC。默认根配置使用
+32GiB backing、HWCC 1024MiB、SWCC 31744MiB；`hw_cc_budget_mb` 是 PolicyClock 的
+动态预算，不是物理 HWCC 容量。VM 在 NUMA0，shared backing 与 ivshmem 服务在 NUMA1。
+布局和可见性规则见 [内存布局.md](内存布局.md) 与
+[缓存一致性设计.md](缓存一致性设计.md)。
+
+四 VM 测试使用本仓库的：
 
 ```bash
-cmake -S . -B build-relwithdebinfo -DCMAKE_BUILD_TYPE=RelWithDebInfo
+./tigonkv_kill_vms.sh --config ./experiment_config.jsonc --allow-state-change
+./tigonkv_init_vms.sh --config ./experiment_config.jsonc --allow-state-change
+./tigonkv_check_vms.sh --config ./experiment_config.jsonc
+```
+
+实际测试前必须确认其它项目的 QEMU、ivshmem 服务和 PID 文件已停止，并使用当前
+`image/root.img`、当前二进制和新建 backing。不要复用其它项目的镜像、trace、运行目录
+或测试结果。
+
+## 构建和测试
+
+```bash
+cmake -S . -B build-debug \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DTIGONKV_DISABLE_HARDWARE_SIMULATION=OFF
+cmake --build build-debug -j2
+ctest --test-dir build-debug -E '^e2e_' --output-on-failure -j1
+
+cmake -S . -B build-relwithdebinfo \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DTIGONKV_DISABLE_HARDWARE_SIMULATION=OFF
 cmake --build build-relwithdebinfo -j2
-# Run only the focused target relevant to a local change when needed.
+ctest --test-dir build-relwithdebinfo -E '^e2e_' --output-on-failure -j1
 ```
 
-The maintained comparison targets are `tigonkv`, `e2e_trace_runner`, the focused
-unit-test binaries, and the guest E2E scripts. The legacy transaction benchmark
-sources remain as upstream reference material but are intentionally not linked
-into the TigonKV comparison build. Distributed Scan follows an owner range move-in
-then CXL-read path for remote owners rather than merging partial CXL and owner-RPC
-rows. Every reported VM uses `foreground=N + demuxer=1` KV threads. See
-[当前对比口径.md](当前对比口径.md).
+固定延迟定向测试是 `latency_modes_test`；禁用热路径对照是
+`hardware_sim_disabled_benchmark`。启用 fixed latency 的正式构建要求
+`RelWithDebInfo`、`verbose=false`、`extra_check=false` 和成功 TSC 校准。
 
-## Claims
+4VM trace 入口和 YCSB 约定见 [YCSB指南.md](YCSB指南.md)。正式报告应披露
+`foreground=4 + demuxer=1`、NUMA/容量、固定延迟参数、trace、计时窗口以及本地
+范围 Scan 与其它实现的结构差异。
 
-> **Legacy/upstream boundary:** The paper claims and workflows below describe the
-> retained upstream Tigon benchmark system. They are reference material, not the
-> maintained TigonKV-vs-cxlkv comparison path, and some scripts may change host/VM
-> state. Current comparison entry points are the root `tigonkv_*` scripts,
-> `e2e_trace_runner`, the guest workflows, and
-> [当前对比口径.md](当前对比口径.md).
+## 文档地图
 
-By running the experiments, you should be able to reproduce the numbers shown in:
-* **Figure 4(a)**: TPC-C throughput of Sundial, Sundial-CXL, and Sundial+, varying percentages of multi-partition transactions
-* **Figure 4(b)**: TPC-C throughput of DS2PL, DS2PL-CXL, and DS2PL+, varying percentages of multi-partition transactions
-* **Figure 4(c)**: TPC-C throughput of Tigon, Sundial+, DS2PL+, and Motor, varying percentages of multi-partition transactions
-* **Figure 5**: YCSB throughput of Tigon, Sundial+, DS2PL+, and Motor, varying both read/write ratios and percentages of multi-partition transactions
-* **Figure 7**: Tigon's sensitivity to the size of hardware cache-coherent region
-* **Figure 8**: Comparison of different software cache-coherence protocols
+- [当前对比口径.md](当前对比口径.md)：当前数据面和比较边界。
+- [硬件模拟当前实现.md](硬件模拟当前实现.md)：fixed-latency-only 接口和路径。
+- [延迟插入审计报告.md](延迟插入审计报告.md)：访问域、scope 和安全点审计。
+- [partition优化方案.md](partition优化方案.md)：当前架构合同和验收清单。
+- [验证证据.md](验证证据.md)：当前构建、单元测试和 VM canary 摘要。
+- [修改日志.md](修改日志.md)：短的当前迁移摘要；历史施工细节由 Git 保存。
 
-## Emulate a CXL Pod using VMs
-The safe `tigonkv` emulation path runs multiple virtual machines (VMs) on one host and
-maps the same host-DRAM backing file through ivshmem. The shared pages should be placed
-on a NUMA node different from VM compute/local-RAM placement. HWCC and SWCC are logical
-database accounting/protocol categories; cross-VM visibility is tested with explicit
-software coherence, while the latency simulator adds configurable software delay. Host
-physical coherence can mask protocol bugs, so non-coherent correctness tests are also
-provided. Results from this path are NUMA-based CXL shared-memory emulation results,
-not real CXL hardware measurements.
-
-![](emulation.png)
-
-## Important Notes
-* Since Motor[^5] (one of our baselines) requires special hardware (4 machines connected via RDMA), the pre-measured raw numbers formerly shipped in ``results/motor`` were removed from the working tree (historical experiment outputs; the directory is gitignored). See git history for the original CSVs. If you would like to run Motor, please refer to https://github.com/minghust/motor
-* Please run all commands under project root directory
-
-## Testbed Setup
-
-### Legacy/original Tigon path requirements
-
-The following are retained for the original benchmark scripts. They are not required
-for the independent `tigonkv` file-backed emulation path, and those scripts may change
-host/VM state; inspect and explicitly authorize them before use.
-
-**Option A**
-* A machine with at least 40 cores in one socket
-* CXL memory connected to the first socket of the machine
-* Ubuntu 22.04
-
-**Option B** (if CXL memory is not available)
-* A two-socket machine with at least 40 cores in each socket
-* Ubuntu 22.04
-
-### Setup VM-based CXL Pod Emulation from Scratch
-
-1. Clone the repository
-```bash
-git clone https://github.com/yibo-huang/tigon.git
-```
-
-2. Host setup
-```bash
-./scripts/setup.sh HOST
-```
-
-3. Build VM image
-```bash
-./emulation/image/make_vm_img.sh
-```
-
-4. Launch VMs
-```bash
-# if you are using real CXL memory (Option A), run the following:
-sudo daxctl reconfigure-device --mode=system-ram dax0.0 --force # manage CXL memory as a CPU-less NUMA node
-sudo ./emulation/start_vms.sh --using-old-img --cxl 0 5 8 0 2 # replace the last argument with the NUMA node number of CXL memory (e.g., 2)
-
-# if you emulate CXL memory using remote NUMA node (Option B), run the following:
-sudo ./emulation/start_vms.sh --using-old-img --cxl 0 5 8 1 1 # launch 8 VMs each with 5 cores
-```
-
-5. Setup VMs
-```bash
-./scripts/setup.sh VMS 8 # 8 is the number of VMs
-```
-
-## Compile Tigon and Send the Binary to VMs
-```bash
-./scripts/run.sh COMPILE_SYNC 8 # 8 is the number of VMs
-```
-
-## Hello-World Example
-The command below runs Tigon with TPC-C as the workload.
-```bash
-./scripts/run.sh TPCC TwoPLPasha 8 3 mixed 10 15 1 0 1 Clock OnDemand 200000000 1 WriteThrough None 15 5 GROUP_WAL 20000 0 0
-```
-
-You can expect the last few lines of output to look something like this (numbers may differ):
-```bash
-I0426 06:22:58.143128 204381 Coordinator.h:610] Global Stats: total_commit: 360162 total_size_index_usage: 11890568 total_size_metadata_usage: 2463208 total_size_data_usage: 168300112 total_size_transport_usage: 134218176 total_size_misc_usage: 352 total_hw_cc_usage: 14354128 total_usage: 316872416
-I0426 06:22:59.143204 204415 Dispatcher.h:154] Incoming Dispatcher exits, network size: 5967050. socket_message_recv_latency(50th) 1 socket_message_recv_latency(75th) 2 socket_message_recv_latency(95th) 2 socket_message_recv_latency(99th) 4 internal_message_recv_latency(50th) 0 socket_message_recv_cnt 4141 socket_read_syscall 47768196 internal_message_recv_cnt 0
-I0426 06:22:59.143455 204381 WALLogger.h:539] Group Commit Stats: 45391 us (50%) 62229 us (75%) 91695 us (95%) 111490 us (99%) 47239 us (avg) committed_txn_cnt 620218
-I0426 06:22:59.146075 204381 WALLogger.h:545] Queuing Stats: 22565 us (50%) 39183 us (75%) 57647 us (95%) 72655 us (99%) 25590 us (avg)
-I0426 06:22:59.146092 204381 WALLogger.h:550] Disk Sync Stats: 1717 us (50%) 2071 us (75%) 4620 us (95%) 7078 us (99%) 2040 us (avg) disk_sync_cnt 5098 disk_sync_size 1543621646 current global epoch 2226
-I0426 06:22:59.206394 204381 Coordinator.h:155] round_trip_latency 58 (50th) 60 (75th) 71 (95th) 71 (99th) 
-I0426 06:22:59.206580 204381 Coordinator.h:407] Coordinator exits.
-I0426 06:22:59.981012 204381 Database.h:736] TPC-C consistency check passed!
-killing previous experiments...
-```
-
-## Reproduce the Results with an All-in-one Script (~7.5h)
-
-We provide an all-in-one script for your convenience, which runs all the experiments and generates all the figures. The figures are stored in ``results/test1``. If you would like to run it multiple times, please use different directory names under ``results`` to avoid overwriting old results (e.g., ``results/test2``).
-
-We recommend running it overnight using tmux.
-```bash
-./scripts/push_button.sh results/test1
-```
-
-To inteprete the results:
-* Figure 4 (a): ``results/test1/tpcc/tpcc-sundial.pdf``
-* Figure 4 (b): ``results/test1/tpcc/tpcc-twopl.pdf``
-* Figure 4 (c): ``results/test1/tpcc/tpcc.pdf``
-* Figure 5: ``results/test1/ycsb/ycsb.pdf``
-* Figure 7: ``results/test1/hwcc_budget/hwcc_budget.pdf``
-* Figure 8: ``results/test1/swcc/swcc.pdf``
-
-## Reproduce the Results One by One
-### Reproduce Figure 4 (~1h)
-
-```bash
-./scripts/run_tpcc.sh ./results/test1 # run experiments
-./scripts/parse/parse_tpcc.py ./results/test1 # parse results
-./scripts/plot/plot_tpcc_sundial.py ./results/test1 # generate Figure 5(a)
-./scripts/plot/plot_tpcc_twopl.py ./results/test1 # generate Figure 5(b)
-./scripts/plot/plot_tpcc.py ./results/test1 # generate Figure 5(c)
-```
-To inteprete the results:
-* Figure 5 (a): ``results/test1/tpcc/tpcc-sundial.pdf``
-* Figure 5 (b): ``results/test1/tpcc/tpcc-twopl.pdf``
-* Figure 5 (c): ``results/test1/tpcc/tpcc.pdf``
-
-### Reproduce Figure 5 (~2.5h)
-
-```bash
-./scripts/run_ycsb.sh ./results/test1 # run experiments
-./scripts/parse/parse_ycsb.py ./results/test1 # parse results
-./scripts/plot/plot_ycsb.py ./results/test1 # generate Figure 6
-```
-The result pdf is ``results/test1/ycsb/ycsb.pdf``
-
-### Reproduce Figure 7 (~3h)
-
-```bash
-./scripts/run_hwcc_budget.sh ./results/test1 # run experiments
-./scripts/parse/parse_hwcc_budget.py ./results/test1 # parse results
-./scripts/plot/plot_hwcc_budget.py ./results/test1 # generate Figure 7
-```
-The result pdf is ``results/test1/hwcc_budget/hwcc_budget.pdf``
-
-### Reproduce Figure 8 (~1h)
-
-```bash
-./scripts/run_swcc.sh ./results/test1 # run experiments
-./scripts/parse/parse_swcc.py ./results/test1 # parse results
-./scripts/plot/plot_swcc.py ./results/test1 # generate Figure 8
-```
-The result pdf is ``results/test1/swcc/swcc.pdf``
-
-## Test Tigon in Various Configurations
-
-Tigon is highly-configurable. Here we explain how to use ``scripts/run.sh`` to test Tigon in various configurations.
-
-```bash
-# run TPCC experiments
-./scripts/run.sh TPCC SYSTEM HOST_NUM WORKER_NUM QUERY_TYPE REMOTE_NEWORDER_PERC REMOTE_PAYMENT_PERC USE_CXL_TRANS USE_OUTPUT_THREAD ENABLE_MIGRATION_OPTIMIZATION MIGRATION_POLICY WHEN_TO_MOVE_OUT HW_CC_BUDGET ENABLE_SCC SCC_MECH PRE_MIGRATE TIME_TO_RUN TIME_TO_WARMUP LOGGING_TYPE EPOCH_LEN MODEL_CXL_SEARCH GATHER_OUTPUTS
-
-# example command to run TPC-C
-./scripts/run.sh TPCC TwoPLPasha 8 3 mixed 10 15 1 0 1 Clock OnDemand 200000000 1 WriteThrough None 30 10 BLACKHOLE 20000 0 0
-
-# run YCSB experiments
-./scripts/run.sh YCSB SYSTEM HOST_NUM WORKER_NUM QUERY_TYPE KEYS RW_RATIO ZIPF_THETA CROSS_RATIO USE_CXL_TRANS USE_OUTPUT_THREAD ENABLE_MIGRATION_OPTIMIZATION MIGRATION_POLICY WHEN_TO_MOVE_OUT HW_CC_BUDGET ENABLE_SCC SCC_MECH PRE_MIGRATE TIME_TO_RUN TIME_TO_WARMUP LOGGING_TYPE EPOCH_LEN MODEL_CXL_SEARCH GATHER_OUTPUTS
-
-# example command to run YCSB
-./scripts/run.sh YCSB TwoPLPasha 8 3 rmw 300000 50 0.7 10 1 0 1 Clock OnDemand 200000000 1 WriteThrough None 30 10 BLACKHOLE 20000 0 0
-```
-TPC-C Specific Arguments:
-* ``QUERY_TYPE``: Query type to run. ``mixed`` includes all five transactions; ``first_two`` includes only the first two transactions
-* ``REMOTE_NEWORDER_PERC``: Percentage of remote NewOrder transactions (0-100)
-* ``REMOTE_PAYMENT_PERC``: Percentage of remote Payment transactions (0-100)
-
-YCSB Specific Arguments:
-* ``QUERY_TYPE``: Query type to run. ``rmw`` includes standard YCSB read/write queries; ``scan`` runs range queries; ``custom`` includes mixed inserts/deletes
-* ``KEYS``: Number of KV pairs per host
-* ``RW_RATIO``: Ratio of read/write operations (e.g., 50 means 50% read and 50% write)
-* ``ZIPF_THETA``: Skewness factor for Zipfian distribution
-* ``CROSS_RATIO``: Percentage of remote operations within a transaction (0-100)
-
-Common Arguments:
-* ``SYSTEM``: System to run. ``Sundial``, ``TwoPL``, ``TwoPLPasha`` (Tigon), ``TwoPLPashaPhantom`` (Tigon with phantom avoidance disabled), ``SundialPasha`` (Sundial adopting the Pasha architecture).
-* ``HOST_NUM``: Number of hosts
-* ``WORKER_NUM``: Number of transaction workers per host
-* ``USE_CXL_TRANS``: Enable/Disable CXL transport
-* ``USE_OUTPUT_THREAD``: Enable/Disable repurposing output threads for transaction processing. If enabled, ``USE_CXL_TRANS`` must also be enabled
-* ``ENABLE_MIGRATION_OPTIMIZATION``: Enable/Disable data movement optimization
-* ``MIGRATION_POLICY``: Migration policy to use. ``Clock``, ``LRU``, ``FIFO``, ``NoMoveOut``
-* ``WHEN_TO_MOVE_OUT``: When to move out data. ``OnDemand`` triggers data moving out only when CXL memory is full
-* ``HW_CC_BUDGET``: Size of hardware cache-coherent region (in bytes)
-* ``ENABLE_SCC``: Enable/Disable software cache coherence
-* ``SCC_MECH``: Software cache coherence protocol to use. ``WriteThrough`` is Tigon's default protocol; ``WriteThroughNoSharedRead`` disables shared reader; ``NonTemporal`` always do non-temporal access; ``NoOP`` always do temporal access, assuming full hardware cache coherence
-* ``PRE_MIGRATE``: Pre-migrate data before experiments. ``None`` migrates nothing; ``NonPart`` migrates non-partitionable data; ``All`` migrates all data
-* ``TIME_TO_RUN``: Total run time in seconds, including warmup time
-* ``TIME_TO_WARMUP``: Warmup time in seconds
-* ``LOGGING_TYPE``: Logging mechanism to use. ``BLACKHOLE`` disables logging. ``GROUP_WAL`` enables epoch-based group commit
-* ``EPOCH_LEN``: Epoch length (ms). Effective only when epoch-based group commit is enabled
-* ``MODEL_CXL_SEARCH``: Enable/Disable the shortcut pointer optimization
-* ``GATHER_OUTPUTS``: Enable/Disable collecting outputs from all hosts. If disabled, only the output of the first host is shown
-
-This script will print out statistics every second during the experiment, such as transaction throughput, abort rate and data movement frequency, and averaged statistics at the end.
-
-## Publications
-
-A paper describing Tigon can be found [here](https://yibo-huang.github.io/papers/tigon_osdi25.pdf). The Pasha paper can be found [here](https://yibo-huang.github.io/papers/pasha_cidr25.pdf). Please cite them as:
-
-``` bibtex
-@inproceedings{tigon,
-author = {Yibo Huang and Haowei Chen and Newton Ni and Yan Sun and Vijay Chidambaram and Dixin Tang and Emmett Witchel},
-title = {Tigon: A Distributed Database for a {CXL} Pod},
-booktitle = {19th USENIX Symposium on Operating Systems Design and Implementation (OSDI 25)},
-year = {2025},
-address = {Boston, MA},
-publisher = {USENIX Association},
-month = jul
-}
-
-@inproceedings{pasha,
-author = {Yibo Huang and Newton Ni and Vijay Chidambaram and Emmett Witchel and Dixin Tang},
-title = {Pasha: An Efficient, Scalable Database Architecture for {CXL} Pods},
-booktitle = {15th Conference on Innovative Data Systems Research, {CIDR} 2025, Amsterdam, The Netherlands, January 19-22, 2025},
-publisher = {www.cidrdb.org},
-year = {2025}
-}
-```
-
-[^1]: Tigon: A Distributed Database for a CXL Pod, *OSDI '25*
-[^2]: Pasha: An Efficient, Scalable Database Architecture for CXL Pods, *CIDR '25*
-[^3]: Sundial: Harmonizing Concurrency Control and Caching in a Distributed OLTP Database Management System, *VLDB '18*
-[^4]: Lotus: scalable multi-partition transactions on single-threaded partitioned databases, *VLDB '22*
-[^5]: Motor: Enabling Multi-Versioning for Distributed Transactions on Disaggregated Memory, *OSDI '24*
+本仓库的 B+Tree、MPSC ring、lotus/Tigon/Pasha 代码保留各自的许可证和上游归属；
+详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

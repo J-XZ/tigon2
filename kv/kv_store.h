@@ -149,8 +149,8 @@ struct Config {
   // Pin foreground workers and the inbound demuxer to distinct CPUs from the
   // process's allowed affinity mask. Performance configurations enable this.
   bool cpu_affinity = false;
-  // Canonical four-module hardware simulation configuration. JSONC is the
-  // only configuration surface; the former flat/cache-model schema is gone.
+  // Canonical fixed-latency-only configuration. JSONC is the only
+  // configuration surface; removed statistics/cache-model fields are rejected.
   latency_sim::Config hardware_simulation{};
 
   static Config FromJsonc(const std::string &path);

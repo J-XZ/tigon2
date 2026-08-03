@@ -55,8 +55,7 @@ if shared['swcc']['size_mb'] <= 0: raise SystemExit('shared size must exceed fix
 if numa: shared['numa_node']=[int(x) for x in numa.split(',')]
 lat=d['tigon_kv']['latency_inject']
 if no_latency == 'true':
-    for section in ('fixed_latency', 'hwcc_access_count', 'atomic_count', 'remote_cache_invalidation'):
-        lat[section]['enabled'] = False
+    lat['fixed_latency']['enabled'] = False
 else:
     lat['fixed_latency']['enabled'] = True
 # Formal YCSB / e2e_trace alignment with cxlkv: fixed 32/32.

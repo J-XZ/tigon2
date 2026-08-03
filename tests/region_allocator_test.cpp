@@ -149,42 +149,26 @@ void TestInvalidAttachment() {
   assert(rejected);
 }
 
-void TestRemoteInstrumentationReserve() {
-  Mapping mapping(true, 64 * 1024 * 1024);
-  DualRegionConfig config;
-  config.total_pool_bytes = 64 * 1024 * 1024;
-  config.hwcc_offset_bytes = 0;
-  config.hwcc_size_bytes = 32 * 1024 * 1024;
-  config.swcc_offset_bytes = 32 * 1024 * 1024;
-  config.swcc_size_bytes = config.total_pool_bytes - config.swcc_offset_bytes;
-  config.config_hash = 0x5151;
-  config.vm_count = 2;
-  config.partition_count = 8;
-  config.fixed_key_size = 32;
-  config.fixed_value_size = 128;
-  config.remote_invalidation_enabled = true;
-  config.remote_shared_sequencer_offset = 192;
-  config.remote_event_log_capacity = 64;
+DualRegionConfig TestDualConfig();
 
+void TestBusinessHwccUsesFullAllocator() {
+  Mapping mapping(true, 64 * 1024 * 1024);
+  DualRegionConfig config = TestDualConfig();
   auto dual = DualRegionAllocator::Initialize(mapping.base, config);
-  assert(dual.HasRemoteInstrumentation());
-  assert(dual.RemoteSequenceWord() != nullptr);
-  assert(dual.RemoteEventLog() != nullptr);
-  assert(dual.RemoteEventLogCapacity() == 64);
-  assert(reinterpret_cast<uintptr_t>(dual.RemoteEventLog()) % 64 == 0);
-  const auto sequence_offset = dual.hwcc().ToOffset(dual.RemoteSequenceWord());
-  const auto event_offset = dual.hwcc().ToOffset(dual.RemoteEventLog());
-  assert(sequence_offset < event_offset);
-  assert(!dual.hwcc().Contains(dual.RemoteSequenceWord()));
-  assert(!dual.hwcc().Contains(dual.RemoteEventLog()));
+  const uint64_t dual_header_bytes =
+      (sizeof(DualRegionPersistentHeader) + RegionAllocator::kAlignment - 1) &
+      ~(RegionAllocator::kAlignment - 1);
+  assert(dual.ReadStaticDomainUsedBytes(AllocationDomain::kHwccLayout) ==
+         dual_header_bytes);
   void *business = dual.Allocate(64, AllocationDomain::kTransport, 0);
-  const auto business_offset = dual.hwcc().ToOffset(business);
-  assert(business_offset >= event_offset + 64 * 64);
+  assert(dual.hwcc().Contains(business));
+  assert(dual.hwcc().ToOffset(business) >= dual.hwcc().metadata_bytes());
+  dual.Free(business, 64, AllocationDomain::kTransport, 0, 0);
   dual.FinalizeStaticHwccLayout();
   dual.PublishStaticHwccLayout();
   auto attached = DualRegionAllocator::Attach(mapping.base, config);
-  assert(attached.HasRemoteInstrumentation());
-  assert(attached.RemoteEventLogCapacity() == 64);
+  assert(attached.ReadStaticDomainUsedBytes(AllocationDomain::kHwccLayout) ==
+         dual_header_bytes);
 }
 
 void TestDualPhysicalRegions() {
@@ -329,7 +313,7 @@ void TestDualPhysicalRegions() {
   latency_sim::Config checkpoint_latency;
   checkpoint_latency.fixed_latency.enabled = true;
   checkpoint_latency.fixed_latency.foreground_enabled = true;
-  checkpoint_latency.fixed_latency.delayed_time_stats_enabled = true;
+  checkpoint_latency.fixed_latency.background_enabled = true;
   checkpoint_latency.fixed_latency.swcc_fixed_ns_per_line = 1;
   checkpoint_latency.fixed_latency.hwcc_fixed_ns_per_line = 1;
   auto &checkpoint_simulator = latency_sim::GlobalLatencySimulator();
@@ -337,9 +321,8 @@ void TestDualPhysicalRegions() {
   checkpoint_simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   dual.FlushOwnedRanges(0);
   attached.FlushOwnedRanges(1);
+  assert(checkpoint_simulator.PendingDelayNsForTest() > 0);
   checkpoint_simulator.EndScopeAndDelay();
-  const auto checkpoint_stats = checkpoint_simulator.TakeStatsAndReset();
-  assert(checkpoint_stats.TotalDelayedNs() > 0);
   checkpoint_simulator.Configure(latency_sim::Config{});
   assert(dual.layout().state.load(std::memory_order_acquire) ==
          static_cast<uint32_t>(LayoutState::kReady));
@@ -422,7 +405,7 @@ void TestAllocatorLatencyAccounting() {
   latency_sim::Config latency;
   latency.fixed_latency.enabled = true;
   latency.fixed_latency.foreground_enabled = true;
-  latency.fixed_latency.delayed_time_stats_enabled = true;
+  latency.fixed_latency.background_enabled = true;
   latency.fixed_latency.swcc_fixed_ns_per_line = 1;
   latency.fixed_latency.hwcc_fixed_ns_per_line = 1;
   auto &simulator = latency_sim::GlobalLatencySimulator();
@@ -435,10 +418,8 @@ void TestAllocatorLatencyAccounting() {
                               &hwcc_counter, 0);
   hwcc_allocator.Free(hwcc, 80, AllocationDomain::kHwccMetadata,
                       &hwcc_counter, 0, 0);
+  assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-  auto stats = simulator.TakeStatsAndReset();
-  assert(stats.hwcc_read_ops > 0 || stats.hwcc_delayed_ns > 0);
-  assert(stats.swcc_delayed_ns == 0);
 
   DomainCounter swcc_counter;
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
@@ -447,32 +428,25 @@ void TestAllocatorLatencyAccounting() {
                               &swcc_counter, 0);
   swcc_allocator.Free(swcc, 80, AllocationDomain::kSharedPayloadSwcc,
                       &swcc_counter, 0, 0);
+  assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-  stats = simulator.TakeStatsAndReset();
-  // Shared-payload allocator controls and accounting are owner-private SWCC.
-  assert(stats.swcc_delayed_ns > 0);
-  assert(stats.hwcc_read_ops == 0);
 
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   void *owner = dual.AllocateOwnerPrivate(80, 0, 0);
   dual.FreeOwnerPrivate(owner, 80, 0, 0);
   assert(dual.SharedPayloadCapacityBytes(0) > 0);
+  assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-  stats = simulator.TakeStatsAndReset();
-  // Owner arena metadata/data and its accounting are private SWCC.
-  assert(stats.swcc_delayed_ns > 0);
 
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   void *dynamic = dual.Allocate(80, AllocationDomain::kHwccIndex, 0);
   dual.Free(dynamic, 80, AllocationDomain::kHwccIndex, 0, 0);
+  assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-  stats = simulator.TakeStatsAndReset();
-  // Dynamic HWCC: owner-private control (SWCC) + HWCC free-block/payload.
-  assert(stats.swcc_delayed_ns > 0);
-  assert(stats.hwcc_delayed_ns > 0);
 
   simulator.Configure(latency_sim::Config{});
 }
+
 
 void TestOwnerPrivateRetireQueue() {
   Mapping mapping(true, 64 * 1024 * 1024);
@@ -501,7 +475,7 @@ int main() {
   TestCrossProcessFreeRejected();
   TestConcurrencyAndBounds();
   TestInvalidAttachment();
-  TestRemoteInstrumentationReserve();
+  TestBusinessHwccUsesFullAllocator();
   TestDualPhysicalRegions();
   TestMappedPoolAttach();
   TestAllocatorLatencyAccounting();

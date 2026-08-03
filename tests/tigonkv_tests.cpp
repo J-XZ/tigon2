@@ -204,37 +204,24 @@ int main(int argc, char **argv) {
   assert(fractional.hardware_simulation.fixed_latency.swcc_fixed_ns_per_line == 1.25);
   assert(fractional.cpu_affinity);
 
-  static constexpr std::string_view kLatencyFields[] = {
-      "fixed_latency", "hwcc_access_count", "atomic_count",
-      "remote_cache_invalidation", "swcc_fixed_ns_per_line",
-      "hwcc_fixed_ns_per_line", "background_enabled",
-      "delayed_time_stats_enabled", "read_enabled", "write_enabled",
-      "operation_count_enabled", "line_count_enabled", "byte_count_enabled",
-      "max_tags", "hwcc_enabled", "owner_private_swcc_enabled",
-      "local_dram_enabled", "cas_enabled", "exchange_enabled",
-      "fetch_arithmetic_enabled", "fetch_bitwise_enabled",
-      "result_breakdown_enabled", "fence_enabled", "wait_notify_enabled",
-      "memory_order_breakdown_enabled", "scope_breakdown_enabled",
-      "tag_breakdown_enabled", "dirty_handoff_enabled",
-      "clean_copy_invalidation_enabled", "dirty_eviction_writeback_enabled",
-      "swcc_explicit_visibility_handoff_enabled", "node_count",
-      "cache_size_bytes_per_node", "total_cpu_cache_size_bytes",
-      "cache_size_bytes_by_node", "cache_instances_per_node", "associativity",
-      "capacity_mode", "replacement_policy", "lfu_counter_bits",
-      "lfu_aging_interval_accesses", "lfu_tie_breaker",
-      "shared_sequencer_offset", "event_log_capacity"};
-  for (const std::string_view field : kLatencyFields) {
+  static constexpr std::string_view kRequiredLatencyFields[] = {
+      "fixed_latency", "enabled", "cache_line_bytes",
+      "swcc_fixed_ns_per_line", "hwcc_fixed_ns_per_line",
+      "foreground_enabled", "background_enabled"};
+  for (const std::string_view field : kRequiredLatencyFields) {
     assert(ParseTextThrows(latency_config_path,
                            RemoveJsonFieldLine(base_config_text, field)));
   }
+  // Removed module objects and the former delayed-time field are rejected,
+  // rather than being silently ignored.
   assert(ParseTextThrows(
       latency_config_path,
-      ReplaceOnce(base_config_text, "\"enabled\": false",
-                  "\"enabled\": \"false\"")));
+      ReplaceOnce(base_config_text, "\"latency_inject\": {",
+                  "\"latency_inject\": {\"hwcc_access_count\": {},")));
   assert(ParseTextThrows(
       latency_config_path,
-      ReplaceOnce(base_config_text, "\"cache_line_bytes\": 64",
-                  "\"cache_line_bytes\": 64.0")));
+      ReplaceOnce(base_config_text, "\"fixed_latency\": {",
+                  "\"fixed_latency\": {\"delayed_time_stats_enabled\": false,")));
   assert(ParseTextThrows(
       latency_config_path,
       ReplaceOnce(base_config_text, "\"fixed_latency\": {",
@@ -242,18 +229,7 @@ int main(int argc, char **argv) {
   assert(ParseTextThrows(
       latency_config_path,
       ReplaceOnce(base_config_text, "\"latency_inject\": {",
-                  "\"latency_inject\": {\"partition_count\": 16,")));
-  assert(ParseTextThrows(
-      latency_config_path,
-      ReplaceOnce(base_config_text, "\"latency_inject\": {",
                   "\"latency_inject\": {\"enabled\": true,")));
-  assert(ParseTextThrows(
-      latency_config_path,
-      ReplaceOnce(base_config_text, "{\n", "{\n  \"enabled\": false,\n")));
-  assert(ParseTextThrows(
-      latency_config_path,
-      ReplaceOnce(base_config_text, "\"network\": {",
-                  "\"network\": {\"enabled\": false,")));
   assert(ParseTextThrows(
       latency_config_path,
       ReplaceOnce(base_config_text, "{\n", "{\n  \"latency_inject\": {},\n")));
@@ -261,8 +237,8 @@ int main(int argc, char **argv) {
                          ReplaceLatencyObjectWithFalse(base_config_text)));
   assert(ParseTextThrows(
       latency_config_path,
-      ReplaceOnce(base_config_text, "\"max_tags\": 32",
-                  "\"max_tags\": 0")));
+      ReplaceOnce(base_config_text, "\"cache_line_bytes\": 64",
+                  "\"cache_line_bytes\": 64.0")));
 
   std::string enabled = ReplaceOnce(
       base_config_text, "\"enabled\": false", "\"enabled\": true");
@@ -289,10 +265,25 @@ int main(int argc, char **argv) {
   assert(ParseTextThrows(
       latency_config_path,
       ReplaceOnce(enabled, "\"extra_check\": false", "\"extra_check\": true")));
-  assert(ParseTextThrows(
-      latency_config_path,
-      ReplaceOnce(enabled, "\"foreground_enabled\": true",
-                  "\"foreground_enabled\": false")));
+  {
+    std::string background_only = ReplaceOnce(
+        enabled, "\"foreground_enabled\": true",
+        "\"foreground_enabled\": false");
+    if (RelWithDebInfoBuild()) {
+      const Config parsed_background_only = [&] {
+        std::ofstream output(latency_config_path);
+        output << background_only;
+        output.close();
+        return Config::FromJsonc(latency_config_path);
+      }();
+      assert(!parsed_background_only.hardware_simulation.fixed_latency
+                  .foreground_enabled);
+      assert(parsed_background_only.hardware_simulation.fixed_latency
+                 .background_enabled);
+    } else {
+      assert(ParseTextThrows(latency_config_path, background_only));
+    }
+  }
   std::remove(latency_config_path.c_str());
 
   Config uneven;
@@ -369,13 +360,13 @@ int main(int argc, char **argv) {
     gated.extra_check = false;
     gated.hardware_simulation.fixed_latency.foreground_enabled = false;
     gated.hardware_simulation.fixed_latency.background_enabled = true;
-    assert(ValidateThrows(gated));
+    gated.Validate();
   } else {
     assert(ValidateThrows(gated));
   }
   config.hardware_simulation.fixed_latency.enabled = RelWithDebInfoBuild();
   config.hardware_simulation.fixed_latency.foreground_enabled = true;
-  config.hardware_simulation.fixed_latency.delayed_time_stats_enabled = true;
+  config.hardware_simulation.fixed_latency.background_enabled = true;
   config.hardware_simulation.fixed_latency.swcc_fixed_ns_per_line = 1;
   config.hardware_simulation.fixed_latency.hwcc_fixed_ns_per_line = 1;
   // HWCC is bounded by the configured physical shared region, not by an
@@ -456,14 +447,12 @@ int main(int argc, char **argv) {
   const std::string stats = store->DumpStats();
   assert(stats.find("allocator_shared_overhead_bytes=") != std::string::npos);
   assert(stats.find("network_tx_bytes=") != std::string::npos);
-  assert(stats.find("TIGONKV_HARDWARE_SIM_STATS\n") != std::string::npos);
+  assert(stats.find("TIGONKV_HARDWARE_SIM_STATS\n") == std::string::npos);
   assert(stats.find("\nswcc_raw=") == std::string::npos);
   assert(stats.find("\nhwcc_raw=") == std::string::npos);
   assert(stats.find("\nswcc_misses=") == std::string::npos);
-  assert(stats.find("\nfixed_latency_enabled=") != std::string::npos);
-  assert(stats.find("\nhwcc_access_count_enabled=") != std::string::npos);
-  assert(stats.find("\natomic_count_enabled=") != std::string::npos);
-  assert(stats.find("\nremote_cache_invalidation_enabled=") != std::string::npos);
+  assert(stats.find("\nhwcc_read_ops=") == std::string::npos);
+  assert(stats.find("\nremote_events=") == std::string::npos);
   store->BindWorker(0);
   store->ReleaseWorker();
   store.reset();

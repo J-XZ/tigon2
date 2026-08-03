@@ -157,7 +157,6 @@ int main() {
   latency_sim::Config latency;
   latency.fixed_latency.enabled = true;
   latency.fixed_latency.foreground_enabled = true;
-  latency.fixed_latency.delayed_time_stats_enabled = true;
   latency.fixed_latency.swcc_fixed_ns_per_line = 10;
   latency.fixed_latency.hwcc_fixed_ns_per_line = 10;
   auto &simulator = latency_sim::GlobalLatencySimulator();
@@ -324,8 +323,6 @@ int main() {
   }
 
   simulator.EndScopeAndDelay();
-  const auto latency_stats = simulator.TakeStatsAndReset();
-  assert(latency_stats.hwcc_read_ops > 0 || latency_stats.hwcc_delayed_ns > 0);
   pthread_spin_destroy(&legacy_local.latch);
   pthread_spin_destroy(&offset_local.latch);
   star::scc_manager = nullptr;

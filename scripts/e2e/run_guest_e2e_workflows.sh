@@ -120,7 +120,7 @@ run_phase() {
       break
     fi
     # A guest can fail before publishing replay_done (for example after a
-    # hard-fail from instrumentation).  Do not wait until the outer timeout
+    # hard-fail from the guest runtime).  Do not wait until the outer timeout
     # in that case: the background timeout/ssh process is already complete,
     # so report its log and reap the remaining children immediately.
     local dead_vm=-1

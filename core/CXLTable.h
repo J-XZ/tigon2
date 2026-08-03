@@ -106,10 +106,10 @@ class CXLTableBTreeOLC : public CXLTableBase {
                 BTreeOLCValue(const BTreeOLCValue &value)
                 {
                         this->row = value.row;
-                        const bool valid = latency_sim::CountedAtomicLoad(
+                        const bool valid = latency_sim::FixedLatencyAtomicLoad(
                             value.is_valid, std::memory_order_relaxed,
                             latency_sim::AtomicDomain::kLocalDram);
-                        latency_sim::CountedAtomicStore(
+                        latency_sim::FixedLatencyAtomicStore(
                             this->is_valid, valid, std::memory_order_relaxed,
                             latency_sim::AtomicDomain::kLocalDram);
                 }
@@ -117,10 +117,10 @@ class CXLTableBTreeOLC : public CXLTableBase {
                 BTreeOLCValue &operator=(const BTreeOLCValue &value)
                 {
                         this->row = value.row;
-                        const bool valid = latency_sim::CountedAtomicLoad(
+                        const bool valid = latency_sim::FixedLatencyAtomicLoad(
                             value.is_valid, std::memory_order_relaxed,
                             latency_sim::AtomicDomain::kLocalDram);
-                        latency_sim::CountedAtomicStore(
+                        latency_sim::FixedLatencyAtomicStore(
                             this->is_valid, valid, std::memory_order_relaxed,
                             latency_sim::AtomicDomain::kLocalDram);
                         return *this;
@@ -167,7 +167,7 @@ class CXLTableBTreeOLC : public CXLTableBase {
                 const auto &k = *static_cast<const KeyType *>(key);
                 BTreeOLCValue value;
                 if (!cxl_btree_->lookup(k, value)) return false;
-                if (!latency_sim::CountedAtomicLoad(
+                if (!latency_sim::FixedLatencyAtomicLoad(
                         value.is_valid, std::memory_order_relaxed,
                         latency_sim::AtomicDomain::kLocalDram)) return false;
                 *row = value.row;
@@ -197,7 +197,7 @@ class CXLTableBTreeOLC : public CXLTableBase {
 
                 BTreeOLCValue value;
                 value.row = row_policy_.Encode(row);
-                latency_sim::CountedAtomicStore(
+                latency_sim::FixedLatencyAtomicStore(
                     value.is_valid, is_placeholder == false,
                     std::memory_order_relaxed,
                     latency_sim::AtomicDomain::kLocalDram);

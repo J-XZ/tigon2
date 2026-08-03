@@ -22,8 +22,6 @@ class TwoPLPashaSCCWriteThroughNoSharedRead : public SCCManager {
         void init_scc_metadata(void *scc_meta, std::size_t cur_host_id) override
         {
                 TwoPLPashaMetadataShared *smeta = reinterpret_cast<TwoPLPashaMetadataShared *>(scc_meta);
-                std::size_t host_bit_index = 0;
-
                 // clear all the bits except the current host
                 smeta->clear_all_scc_bits();
                 smeta->set_scc_bit(cur_host_id);
@@ -51,12 +49,6 @@ class TwoPLPashaSCCWriteThroughNoSharedRead : public SCCManager {
                         // clear all the bits except the current host
                         smeta->clear_all_scc_bits();
                         smeta->set_scc_bit(cur_host_id);
-
-                        // statistics
-                        num_cache_miss.fetch_add(1);
-                } else {
-                        // statistics
-                        num_cache_hit.fetch_add(1);
                 }
         }
 
@@ -74,8 +66,7 @@ class TwoPLPashaSCCWriteThroughNoSharedRead : public SCCManager {
                 smeta->set_scc_bit(cur_host_id);
 
                 clwb(scc_data, size);
-                tigonkv::engine::mem_access::SwccExplicitHandoffToRemotes(
-                    scc_data, size, static_cast<uint32_t>(cur_host_id));
+                tigonkv::engine::mem_access::SwccWriteback(scc_data, size);
         }
 };
 

@@ -174,9 +174,9 @@ inline void RecordTreeDataWrite(const void *address, uint64_t bytes) {
 template <typename T>
 inline T TreeAtomicLoad(const std::atomic<T> &value, std::memory_order order) {
 	return TreeAccessIsHwcc
-	           ? latency_sim::CountedAtomicLoad(
+	           ? latency_sim::FixedLatencyAtomicLoad(
 	                 value, order, latency_sim::AtomicDomain::kHwcc)
-	           : latency_sim::CountedAtomicLoad(
+	           : latency_sim::FixedLatencyAtomicLoad(
 	                 value, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
 
@@ -184,10 +184,10 @@ template <typename T>
 inline void TreeAtomicStore(std::atomic<T> &value, T desired,
                             std::memory_order order) {
 	if (TreeAccessIsHwcc)
-		latency_sim::CountedAtomicStore(
+		latency_sim::FixedLatencyAtomicStore(
 		    value, desired, order, latency_sim::AtomicDomain::kHwcc);
 	else
-		latency_sim::CountedAtomicStore(
+		latency_sim::FixedLatencyAtomicStore(
 		    value, desired, order,
 		    latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
@@ -197,10 +197,10 @@ inline bool TreeAtomicCompareExchangeStrong(
     std::atomic<T> &value, T &expected, T desired,
     std::memory_order success, std::memory_order failure) {
 	return TreeAccessIsHwcc
-	           ? latency_sim::CountedCompareExchangeStrong(
+	           ? latency_sim::FixedLatencyAtomicCompareExchangeStrong(
 	                 value, expected, desired, success, failure,
 	                 latency_sim::AtomicDomain::kHwcc)
-	           : latency_sim::CountedCompareExchangeStrong(
+	           : latency_sim::FixedLatencyAtomicCompareExchangeStrong(
 	                 value, expected, desired, success, failure,
 	                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
@@ -210,10 +210,10 @@ inline bool TreeAtomicCompareExchangeWeak(
     std::atomic<T> &value, T &expected, T desired,
     std::memory_order success, std::memory_order failure) {
 	return TreeAccessIsHwcc
-	           ? latency_sim::CountedCompareExchangeWeak(
+	           ? latency_sim::FixedLatencyAtomicCompareExchangeWeak(
 	                 value, expected, desired, success, failure,
 	                 latency_sim::AtomicDomain::kHwcc)
-	           : latency_sim::CountedCompareExchangeWeak(
+	           : latency_sim::FixedLatencyAtomicCompareExchangeWeak(
 	                 value, expected, desired, success, failure,
 	                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
@@ -222,9 +222,9 @@ template <typename T>
 inline T TreeAtomicFetchAdd(std::atomic<T> &value, T operand,
                             std::memory_order order) {
 	return TreeAccessIsHwcc
-	           ? latency_sim::CountedAtomicFetchAdd(
+	           ? latency_sim::FixedLatencyAtomicFetchAdd(
 	                 value, operand, order, latency_sim::AtomicDomain::kHwcc)
-	           : latency_sim::CountedAtomicFetchAdd(
+	           : latency_sim::FixedLatencyAtomicFetchAdd(
 	                 value, operand, order,
 	                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
@@ -233,9 +233,9 @@ template <typename T>
 inline T TreeAtomicFetchSub(std::atomic<T> &value, T operand,
                             std::memory_order order) {
 	return TreeAccessIsHwcc
-	           ? latency_sim::CountedAtomicFetchSub(
+	           ? latency_sim::FixedLatencyAtomicFetchSub(
 	                 value, operand, order, latency_sim::AtomicDomain::kHwcc)
-	           : latency_sim::CountedAtomicFetchSub(
+	           : latency_sim::FixedLatencyAtomicFetchSub(
 	                 value, operand, order,
                  latency_sim::AtomicDomain::kOwnerPrivateSwcc);
 }
@@ -1709,7 +1709,7 @@ class BPlusTree {
 		TreeAccessScope access_scope(allocation_);
 		if (slot == nullptr)
 			throw std::invalid_argument("BPlusTree published root slot is null");
-			const auto off = latency_sim::CountedAtomicLoad(
+			const auto off = latency_sim::FixedLatencyAtomicLoad(
 			    *slot, std::memory_order_acquire,
 			    latency_sim::AtomicDomain::kHwcc);
 		if (off == tigonkv::engine::kNullOffset) {
@@ -1722,7 +1722,7 @@ class BPlusTree {
 			if (local == nullptr)
 				throw std::runtime_error("BPlusTree has no local root to publish");
 			published_root_ = slot;
-				latency_sim::CountedAtomicStore(
+				latency_sim::FixedLatencyAtomicStore(
 				    *slot, allocation_.ToOffset(local),
 				    std::memory_order_release,
 				    latency_sim::AtomicDomain::kHwcc);
@@ -3367,7 +3367,7 @@ restart:
 	NodeBase *load_root() const
 	{
 		if (published_root_ != nullptr) {
-			const auto off = latency_sim::CountedAtomicLoad(
+			const auto off = latency_sim::FixedLatencyAtomicLoad(
 			    *published_root_, std::memory_order_acquire,
 			    latency_sim::AtomicDomain::kHwcc);
 			if (off == tigonkv::engine::kNullOffset) return nullptr;
@@ -3385,7 +3385,7 @@ restart:
 		                                        : allocation_.ToOffset(node),
 		                std::memory_order_release);
 		if (published_root_ != nullptr) {
-			latency_sim::CountedAtomicStore(
+			latency_sim::FixedLatencyAtomicStore(
 			    *published_root_, allocation_.ToOffset(node),
 			    std::memory_order_release, latency_sim::AtomicDomain::kHwcc);
 		}

@@ -500,7 +500,7 @@ void ParseStrictLatencyConfig(const std::string &text, Config *config) {
   RejectUnknownMembers(root,
                        {"shared_memory", "host_cpu", "vm", "network",
                         "sync", "e2e", "tigon_kv"},
-                       "$" );
+                       "$");
   const auto reject_child_members = [&](std::string_view name,
                                         const std::vector<std::string_view> &allowed) {
     for (const auto &member : root) {
@@ -579,162 +579,49 @@ void ParseStrictLatencyConfig(const std::string &text, Config *config) {
     throw std::invalid_argument(
         "tigon_kv.latency_inject must appear exactly once");
   const auto latency_members = ParseJsonObjectMembers(text, latency.value_begin);
-  RejectUnknownMembers(
-      latency_members,
-      {"fixed_latency", "hwcc_access_count", "atomic_count",
-       "remote_cache_invalidation"},
-      "tigon_kv.latency_inject");
-  const auto parse_section = [&](std::string_view name,
-                                 const std::vector<std::string_view> &allowed,
-                                 const std::vector<std::string_view> &required) {
-    const auto &member = RequireUniqueMember(latency_members, name,
-                                             "tigon_kv.latency_inject");
-    if (member.kind != JsonValueKind::kObject)
-      throw std::invalid_argument("config field must be object: tigon_kv.latency_inject." +
-                                  std::string(name));
-    auto members = ParseJsonObjectMembers(text, member.value_begin);
-    RejectUnknownMembers(members, allowed,
-                         std::string("tigon_kv.latency_inject.") +
-                             std::string(name));
-    for (const auto field_name : required)
-      (void)RequireUniqueMember(members, field_name,
-                                std::string("tigon_kv.latency_inject.") +
-                                    std::string(name));
-    return members;
-  };
-  const auto field = [&](const std::vector<JsonMemberSpan> &members,
-                         std::string_view section, std::string_view name)
-      -> const JsonMemberSpan & {
-    return RequireUniqueMember(
-        members, name, std::string("tigon_kv.latency_inject.") +
-                           std::string(section));
-  };
+  RejectUnknownMembers(latency_members, {"fixed_latency"},
+                       "tigon_kv.latency_inject");
+  const auto &fixed_member =
+      RequireUniqueMember(latency_members, "fixed_latency",
+                          "tigon_kv.latency_inject");
+  if (fixed_member.kind != JsonValueKind::kObject)
+    throw std::invalid_argument(
+        "config field must be object: tigon_kv.latency_inject.fixed_latency");
+  const auto fixed_members =
+      ParseJsonObjectMembers(text, fixed_member.value_begin);
   const std::vector<std::string_view> fixed_fields = {
       "enabled", "cache_line_bytes", "swcc_fixed_ns_per_line",
-      "hwcc_fixed_ns_per_line", "foreground_enabled", "background_enabled",
-      "delayed_time_stats_enabled"};
-  const auto fixed = parse_section("fixed_latency", fixed_fields, fixed_fields);
-  const std::vector<std::string_view> access_fields = {
-      "enabled", "cache_line_bytes", "read_enabled", "write_enabled",
-      "operation_count_enabled", "line_count_enabled", "byte_count_enabled",
-      "breakdown_by_scope_enabled", "breakdown_by_tag_enabled", "max_tags"};
-  const auto access = parse_section("hwcc_access_count", access_fields, access_fields);
-  const std::vector<std::string_view> atomic_fields = {
-      "enabled", "hwcc_enabled", "owner_private_swcc_enabled",
-      "local_dram_enabled", "load_enabled", "store_enabled", "cas_enabled",
-      "exchange_enabled", "fetch_arithmetic_enabled", "fetch_bitwise_enabled",
-      "result_breakdown_enabled", "fence_enabled", "wait_notify_enabled",
-      "memory_order_breakdown_enabled", "scope_breakdown_enabled",
-      "tag_breakdown_enabled", "max_tags"};
-  const auto atomic = parse_section("atomic_count", atomic_fields, atomic_fields);
-  const std::vector<std::string_view> remote_fields = {
-      "enabled", "dirty_handoff_enabled", "clean_copy_invalidation_enabled",
-      "dirty_eviction_writeback_enabled",
-      "swcc_explicit_visibility_handoff_enabled", "cache_line_bytes",
-      "node_count", "cache_size_bytes_per_node", "total_cpu_cache_size_bytes",
-      "cache_size_bytes_by_node", "cache_instances_per_node", "associativity",
-      "capacity_mode", "replacement_policy", "lfu_counter_bits",
-      "lfu_aging_interval_accesses", "lfu_tie_breaker", "scope_breakdown_enabled",
-      "tag_breakdown_enabled", "max_tags", "shared_sequencer_offset",
-      "event_log_capacity"};
-  const auto remote = parse_section("remote_cache_invalidation", remote_fields,
-                                    remote_fields);
+      "hwcc_fixed_ns_per_line", "foreground_enabled", "background_enabled"};
+  RejectUnknownMembers(fixed_members, fixed_fields,
+                       "tigon_kv.latency_inject.fixed_latency");
+  for (const auto field_name : fixed_fields)
+    (void)RequireUniqueMember(
+        fixed_members, field_name,
+        "tigon_kv.latency_inject.fixed_latency");
 
-  auto &sim = config->hardware_simulation;
-  auto bool_field = [&](const std::vector<JsonMemberSpan> &members,
-                        std::string_view section, std::string_view name) {
-    return ParseStrictBool(text, field(members, section, name),
-                           std::string("tigon_kv.latency_inject.") +
-                               std::string(section) + "." + std::string(name));
+  const auto field = [&](std::string_view name) -> const JsonMemberSpan & {
+    return RequireUniqueMember(fixed_members, name,
+                               "tigon_kv.latency_inject.fixed_latency");
   };
-  auto u64_field = [&](const std::vector<JsonMemberSpan> &members,
-                       std::string_view section, std::string_view name) {
-    return ParseStrictUint64(text, field(members, section, name),
-                             std::string("tigon_kv.latency_inject.") +
-                                 std::string(section) + "." + std::string(name));
-  };
-  auto double_field = [&](const std::vector<JsonMemberSpan> &members,
-                          std::string_view section, std::string_view name) {
-    return ParseStrictDouble(text, field(members, section, name),
-                             std::string("tigon_kv.latency_inject.") +
-                                 std::string(section) + "." + std::string(name));
-  };
-  auto string_field = [&](const std::vector<JsonMemberSpan> &members,
-                          std::string_view section, std::string_view name) {
-    return ParseStrictString(text, field(members, section, name),
-                             std::string("tigon_kv.latency_inject.") +
-                                 std::string(section) + "." + std::string(name));
-  };
-  auto &f = sim.fixed_latency;
-  f.enabled = bool_field(fixed, "fixed_latency", "enabled");
-  f.cache_line_bytes = u64_field(fixed, "fixed_latency", "cache_line_bytes");
-  f.swcc_fixed_ns_per_line = double_field(fixed, "fixed_latency", "swcc_fixed_ns_per_line");
-  f.hwcc_fixed_ns_per_line = double_field(fixed, "fixed_latency", "hwcc_fixed_ns_per_line");
-  f.foreground_enabled = bool_field(fixed, "fixed_latency", "foreground_enabled");
-  f.background_enabled = bool_field(fixed, "fixed_latency", "background_enabled");
-  f.delayed_time_stats_enabled = bool_field(fixed, "fixed_latency", "delayed_time_stats_enabled");
-  auto &a = sim.hwcc_access_count;
-  a.enabled = bool_field(access, "hwcc_access_count", "enabled");
-  a.cache_line_bytes = u64_field(access, "hwcc_access_count", "cache_line_bytes");
-  a.read_enabled = bool_field(access, "hwcc_access_count", "read_enabled");
-  a.write_enabled = bool_field(access, "hwcc_access_count", "write_enabled");
-  a.operation_count_enabled = bool_field(access, "hwcc_access_count", "operation_count_enabled");
-  a.line_count_enabled = bool_field(access, "hwcc_access_count", "line_count_enabled");
-  a.byte_count_enabled = bool_field(access, "hwcc_access_count", "byte_count_enabled");
-  a.breakdown_by_scope_enabled = bool_field(access, "hwcc_access_count", "breakdown_by_scope_enabled");
-  a.breakdown_by_tag_enabled = bool_field(access, "hwcc_access_count", "breakdown_by_tag_enabled");
-  a.max_tags = u64_field(access, "hwcc_access_count", "max_tags");
-  auto &ac = sim.atomic_count;
-  ac.enabled = bool_field(atomic, "atomic_count", "enabled");
-  ac.hwcc_enabled = bool_field(atomic, "atomic_count", "hwcc_enabled");
-  ac.owner_private_swcc_enabled = bool_field(atomic, "atomic_count", "owner_private_swcc_enabled");
-  ac.local_dram_enabled = bool_field(atomic, "atomic_count", "local_dram_enabled");
-  ac.load_enabled = bool_field(atomic, "atomic_count", "load_enabled");
-  ac.store_enabled = bool_field(atomic, "atomic_count", "store_enabled");
-  ac.cas_enabled = bool_field(atomic, "atomic_count", "cas_enabled");
-  ac.exchange_enabled = bool_field(atomic, "atomic_count", "exchange_enabled");
-  ac.fetch_arithmetic_enabled = bool_field(atomic, "atomic_count", "fetch_arithmetic_enabled");
-  ac.fetch_bitwise_enabled = bool_field(atomic, "atomic_count", "fetch_bitwise_enabled");
-  ac.result_breakdown_enabled = bool_field(atomic, "atomic_count", "result_breakdown_enabled");
-  ac.fence_enabled = bool_field(atomic, "atomic_count", "fence_enabled");
-  ac.wait_notify_enabled = bool_field(atomic, "atomic_count", "wait_notify_enabled");
-  ac.memory_order_breakdown_enabled = bool_field(atomic, "atomic_count", "memory_order_breakdown_enabled");
-  ac.scope_breakdown_enabled = bool_field(atomic, "atomic_count", "scope_breakdown_enabled");
-  ac.tag_breakdown_enabled = bool_field(atomic, "atomic_count", "tag_breakdown_enabled");
-  ac.max_tags = u64_field(atomic, "atomic_count", "max_tags");
-  auto &r = sim.remote_cache_invalidation;
-  r.enabled = bool_field(remote, "remote_cache_invalidation", "enabled");
-  r.dirty_handoff_enabled = bool_field(remote, "remote_cache_invalidation", "dirty_handoff_enabled");
-  r.clean_copy_invalidation_enabled = bool_field(remote, "remote_cache_invalidation", "clean_copy_invalidation_enabled");
-  r.dirty_eviction_writeback_enabled = bool_field(remote, "remote_cache_invalidation", "dirty_eviction_writeback_enabled");
-  r.swcc_explicit_visibility_handoff_enabled = bool_field(remote, "remote_cache_invalidation", "swcc_explicit_visibility_handoff_enabled");
-  r.cache_line_bytes = u64_field(remote, "remote_cache_invalidation", "cache_line_bytes");
-  r.node_count = u64_field(remote, "remote_cache_invalidation", "node_count");
-  r.cache_size_bytes_per_node = u64_field(remote, "remote_cache_invalidation", "cache_size_bytes_per_node");
-  r.total_cpu_cache_size_bytes = u64_field(remote, "remote_cache_invalidation", "total_cpu_cache_size_bytes");
-  const auto &capacity = field(remote, "remote_cache_invalidation", "cache_size_bytes_by_node");
-  if (capacity.kind != JsonValueKind::kArray)
-    throw std::invalid_argument("config field must be array: tigon_kv.latency_inject.remote_cache_invalidation.cache_size_bytes_by_node");
-  for (const auto &element : ParseJsonArrayElements(text, capacity.value_begin))
-    r.cache_size_bytes_by_node.push_back(ParseStrictUint64(
-        text, element,
-        "tigon_kv.latency_inject.remote_cache_invalidation.cache_size_bytes_by_node"));
-  r.cache_instances_per_node = u64_field(remote, "remote_cache_invalidation", "cache_instances_per_node");
-  r.associativity = u64_field(remote, "remote_cache_invalidation", "associativity");
-  r.capacity_mode = string_field(remote, "remote_cache_invalidation", "capacity_mode");
-  r.replacement_policy = string_field(remote, "remote_cache_invalidation", "replacement_policy");
-  r.lfu_counter_bits = u64_field(remote, "remote_cache_invalidation", "lfu_counter_bits");
-  r.lfu_aging_interval_accesses = u64_field(remote, "remote_cache_invalidation", "lfu_aging_interval_accesses");
-  r.lfu_tie_breaker = string_field(remote, "remote_cache_invalidation", "lfu_tie_breaker");
-  r.scope_breakdown_enabled = bool_field(remote, "remote_cache_invalidation", "scope_breakdown_enabled");
-  r.tag_breakdown_enabled = bool_field(remote, "remote_cache_invalidation", "tag_breakdown_enabled");
-  r.max_tags = u64_field(remote, "remote_cache_invalidation", "max_tags");
-  r.shared_sequencer_offset = u64_field(remote, "remote_cache_invalidation", "shared_sequencer_offset");
-  r.event_log_capacity = u64_field(remote, "remote_cache_invalidation", "event_log_capacity");
-  sim.enabled = f.enabled;
-
+  auto &fixed = config->hardware_simulation.fixed_latency;
+  fixed.enabled = ParseStrictBool(text, field("enabled"),
+                                  "tigon_kv.latency_inject.fixed_latency.enabled");
+  fixed.cache_line_bytes =
+      ParseStrictUint64(text, field("cache_line_bytes"),
+                        "tigon_kv.latency_inject.fixed_latency.cache_line_bytes");
+  fixed.swcc_fixed_ns_per_line =
+      ParseStrictDouble(text, field("swcc_fixed_ns_per_line"),
+                        "tigon_kv.latency_inject.fixed_latency.swcc_fixed_ns_per_line");
+  fixed.hwcc_fixed_ns_per_line =
+      ParseStrictDouble(text, field("hwcc_fixed_ns_per_line"),
+                        "tigon_kv.latency_inject.fixed_latency.hwcc_fixed_ns_per_line");
+  fixed.foreground_enabled =
+      ParseStrictBool(text, field("foreground_enabled"),
+                      "tigon_kv.latency_inject.fixed_latency.foreground_enabled");
+  fixed.background_enabled =
+      ParseStrictBool(text, field("background_enabled"),
+                      "tigon_kv.latency_inject.fixed_latency.background_enabled");
 }
-
 void ParsePartitioningConfig(const std::string &text, Config *config) {
   size_t root_begin = 0;
   SkipJsonWhitespace(text, &root_begin);
@@ -818,28 +705,10 @@ void ValidateKnownKeys(const std::string &s) {
       "fixed_key_size", "fixed_value_size", "hw_cc_budget_mb",
       "owner_private_swcc_fraction", "migration_policy", "when_to_move_out",
       "scc_mechanism", "transport_ring_total_mb",
-      "verbose", "extra_check", "cpu_affinity",
-      "latency_inject", "fixed_latency", "hwcc_access_count", "atomic_count",
-      "remote_cache_invalidation", "enabled", "cache_line_bytes",
+      "verbose", "extra_check", "cpu_affinity", "latency_inject",
+      "fixed_latency", "enabled", "cache_line_bytes",
       "swcc_fixed_ns_per_line", "hwcc_fixed_ns_per_line", "foreground_enabled",
-      "background_enabled", "delayed_time_stats_enabled", "read_enabled",
-      "write_enabled", "operation_count_enabled", "line_count_enabled",
-      "byte_count_enabled", "breakdown_by_scope_enabled",
-      "breakdown_by_tag_enabled", "max_tags", "hwcc_enabled",
-      "owner_private_swcc_enabled", "local_dram_enabled", "load_enabled",
-      "store_enabled", "cas_enabled", "exchange_enabled",
-      "fetch_arithmetic_enabled", "fetch_bitwise_enabled",
-      "result_breakdown_enabled", "fence_enabled", "wait_notify_enabled",
-      "memory_order_breakdown_enabled", "scope_breakdown_enabled",
-      "tag_breakdown_enabled",
-      "dirty_handoff_enabled", "clean_copy_invalidation_enabled",
-      "dirty_eviction_writeback_enabled",
-      "swcc_explicit_visibility_handoff_enabled", "node_count",
-      "cache_size_bytes_per_node", "total_cpu_cache_size_bytes",
-      "cache_size_bytes_by_node", "cache_instances_per_node", "associativity",
-      "capacity_mode", "replacement_policy", "lfu_counter_bits",
-      "lfu_aging_interval_accesses", "lfu_tie_breaker",
-      "shared_sequencer_offset", "event_log_capacity"};
+      "background_enabled"};
   std::regex key(R"KEY("([A-Za-z0-9_.-]+)"\s*:)KEY");
   for (auto it = std::sregex_iterator(s.begin(), s.end(), key); it != std::sregex_iterator(); ++it) {
     if (!known.count((*it)[1].str()))
@@ -989,48 +858,18 @@ void Config::Validate() {
       throw std::invalid_argument(
           "owner migration dynamic HWCC budget underflows to zero");
   }
-  const auto &simulation = hardware_simulation;
+  const auto &fixed = hardware_simulation.fixed_latency;
   const auto is_power_of_two = [](uint64_t value) {
     return value != 0 && (value & (value - 1)) == 0;
   };
-  if (!is_power_of_two(simulation.fixed_latency.cache_line_bytes) ||
-      !is_power_of_two(simulation.hwcc_access_count.cache_line_bytes) ||
-      !is_power_of_two(simulation.remote_cache_invalidation.cache_line_bytes) ||
-      simulation.hwcc_access_count.max_tags == 0 ||
-      simulation.atomic_count.max_tags == 0 ||
-      simulation.remote_cache_invalidation.max_tags == 0 ||
-      simulation.hwcc_access_count.max_tags > latency_sim::kMaxBreakdownTags ||
-      simulation.atomic_count.max_tags > latency_sim::kMaxBreakdownTags ||
-      simulation.remote_cache_invalidation.max_tags > latency_sim::kMaxBreakdownTags ||
-      simulation.remote_cache_invalidation.node_count == 0 ||
-      simulation.remote_cache_invalidation.associativity == 0 ||
-      simulation.remote_cache_invalidation.cache_instances_per_node == 0 ||
-      simulation.remote_cache_invalidation.event_log_capacity == 0 ||
-      simulation.remote_cache_invalidation.shared_sequencer_offset % 8 != 0)
-    throw std::invalid_argument("invalid hardware simulation geometry");
-  for (double value : {simulation.fixed_latency.swcc_fixed_ns_per_line,
-                       simulation.fixed_latency.hwcc_fixed_ns_per_line}) {
-    if (!std::isfinite(value) || value < 0.0)
-      throw std::invalid_argument("fixed latency values must be finite and non-negative");
-  }
-  if (simulation.remote_cache_invalidation.replacement_policy != "lru" &&
-      simulation.remote_cache_invalidation.replacement_policy != "lfu")
-    throw std::invalid_argument("remote replacement_policy must be lru or lfu");
-  if (simulation.remote_cache_invalidation.capacity_mode != "per_node" &&
-      simulation.remote_cache_invalidation.capacity_mode != "total_equal_split" &&
-      simulation.remote_cache_invalidation.capacity_mode != "explicit_by_node")
-    throw std::invalid_argument("remote capacity_mode is invalid");
-  if (simulation.remote_cache_invalidation.lfu_counter_bits == 0 ||
-      simulation.remote_cache_invalidation.lfu_counter_bits > 63 ||
-      simulation.remote_cache_invalidation.lfu_aging_interval_accesses == 0)
-    throw std::invalid_argument("invalid remote LFU configuration");
-  if (simulation.fixed_latency.enabled) {
-    // This build has no independent merge worker: migration/EBR maintenance
-    // runs inside foreground operations. Allowing foreground=false would
-    // advertise enabled injection while recording and delaying no accesses.
-    if (!simulation.fixed_latency.foreground_enabled)
-      throw std::invalid_argument(
-          "fixed_latency.enabled=true requires foreground_enabled=true");
+  if (!is_power_of_two(fixed.cache_line_bytes) ||
+      !std::isfinite(fixed.swcc_fixed_ns_per_line) ||
+      !std::isfinite(fixed.hwcc_fixed_ns_per_line) ||
+      fixed.swcc_fixed_ns_per_line < 0.0 ||
+      fixed.hwcc_fixed_ns_per_line < 0.0)
+    throw std::invalid_argument("invalid fixed latency geometry");
+
+  if (hardware_simulation.fixed_latency.enabled) {
     if (verbose)
       throw std::invalid_argument(
         "fixed_latency.enabled=true is incompatible with verbose=true");
@@ -1072,7 +911,6 @@ KVStore::KVStore(const Config &config)
     : impl_(new Impl()), config_(config) {
   config_.Validate();
   latency_sim::GlobalLatencySimulator().Configure(config_.hardware_simulation);
-  latency_sim::GlobalLatencySimulator().SetNodeId(config_.node_id);
 }
 
 KVStore::~KVStore() {
@@ -1319,46 +1157,6 @@ std::string KVStore::DumpStats() const {
   out += "scan_partition_probes=" +
          std::to_string(runtime.scan_partition_probes) + "\n";
   out += "scan_migrate_rpcs=" + std::to_string(runtime.scan_migrate_rpcs) + "\n";
-  const latency_sim::Stats latency = latency_sim::GlobalLatencySimulator().SnapshotStats();
-  const auto &simulation = latency_sim::GlobalLatencySimulator().config();
-  out += "TIGONKV_HARDWARE_SIM_STATS\nfeatures=" +
-      std::to_string(latency_sim::GlobalLatencySimulator().feature_mask()) +
-      "\nfixed_latency_enabled=" +
-      std::to_string(simulation.fixed_latency.enabled) +
-      "\nhwcc_access_count_enabled=" +
-      std::to_string(simulation.hwcc_access_count.enabled) +
-      "\natomic_count_enabled=" +
-      std::to_string(simulation.atomic_count.enabled) +
-      "\nremote_cache_invalidation_enabled=" +
-      std::to_string(simulation.remote_cache_invalidation.enabled) +
-      "\nhwcc_read_ops=" + std::to_string(latency.hwcc_read_ops) +
-      "\nhwcc_write_ops=" + std::to_string(latency.hwcc_write_ops) +
-      "\nhwcc_read_lines=" + std::to_string(latency.hwcc_read_lines) +
-      "\nhwcc_write_lines=" + std::to_string(latency.hwcc_write_lines) +
-      "\nhwcc_read_bytes=" + std::to_string(latency.hwcc_read_bytes) +
-      "\nhwcc_write_bytes=" + std::to_string(latency.hwcc_write_bytes) +
-      "\nhwcc_atomic_ops=" + std::to_string(latency.hwcc_atomic_ops) +
-      "\nhwcc_cas_attempts=" + std::to_string(latency.hwcc_cas_attempts) +
-      "\nhwcc_cas_successes=" + std::to_string(latency.hwcc_cas_successes) +
-      "\nhwcc_cas_failures=" + std::to_string(latency.hwcc_cas_failures) +
-      "\nowner_private_swcc_atomic_ops=" +
-      std::to_string(latency.owner_private_swcc_atomic_ops) +
-      "\nlocal_dram_atomic_ops=" +
-      std::to_string(latency.local_dram_atomic_ops) +
-      "\nremote_dirty_handoffs=" +
-      std::to_string(latency.remote_dirty_handoffs) +
-      "\nremote_clean_copy_invalidations=" +
-      std::to_string(latency.remote_clean_copy_invalidations) +
-      "\nremote_write_transactions_causing_invalidation=" +
-      std::to_string(latency.remote_write_transactions_causing_invalidation) +
-      "\nremote_dirty_capacity_evictions=" +
-      std::to_string(latency.remote_dirty_capacity_evictions) +
-      "\nremote_swcc_explicit_handoffs=" +
-      std::to_string(latency.remote_swcc_explicit_handoffs) +
-      "\nremote_events=" + std::to_string(latency.remote_events) +
-      "\nswcc_delayed_ns=" + std::to_string(latency.swcc_delayed_ns) +
-      "\nhwcc_delayed_ns=" + std::to_string(latency.hwcc_delayed_ns) +
-      "\ndelayed_ns=" + std::to_string(latency.TotalDelayedNs()) + "\n";
   return out;
 }
 
