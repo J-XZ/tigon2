@@ -133,7 +133,7 @@ uint64_t SharedLayoutConfigDigest(const Config &config) {
     text("range_lower", config.partition_ranges[partition].lower_key);
     text("range_upper", config.partition_ranges[partition].upper_key);
   }
-  const auto &fixed = config.hardware_simulation.fixed_latency;
+  const auto &fixed = config.hardware_simulation;
   boolean("fixed_latency.enabled", fixed.enabled);
   u64("fixed_latency.cache_line_bytes", fixed.cache_line_bytes);
   decimal("fixed_latency.swcc_fixed_ns_per_line", fixed.swcc_fixed_ns_per_line);
@@ -364,7 +364,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   // Isolate pool open from any previously enabled simulator state in this
   // process (tests create sequential stores).  Pool open itself runs with the
   // gate disabled; fixed latency is enabled below after registration.
-  latency_sim::GlobalLatencySimulator().Configure(latency_sim::Config{});
+  latency_sim::GlobalLatencySimulator().Configure(latency_sim::FixedLatencyConfig{});
   latency_sim::GlobalLatencySimulator().ClearPoolRegistrations();
   auto pool = std::make_unique<DualRegionMappedPool>(
       DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
@@ -374,17 +374,17 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   const DualRegionConfig region_config = RegionConfig(config);
   auto &simulator = latency_sim::GlobalLatencySimulator();
   simulator.RegisterPool(
-      latency_sim::PoolKind::kHwcc,
+      latency_sim::MemoryDomain::kHwcc,
       static_cast<const std::byte *>(pool->base()) +
           region_config.hwcc_offset_bytes,
       region_config.hwcc_size_bytes);
   simulator.RegisterPool(
-      latency_sim::PoolKind::kSwcc,
+      latency_sim::MemoryDomain::kSwcc,
       static_cast<const std::byte *>(pool->base()) +
           region_config.swcc_offset_bytes,
       region_config.swcc_size_bytes);
   simulator.Configure(config.hardware_simulation);
-  mem_access::LatencyScope open_scope(latency_sim::ScopeKind::kOther);
+  mem_access::LatencyScope open_scope(latency_sim::ExecutionClass::kBackground);
   star::CXLMemory::bind_dual_region_allocator(&pool->allocator(), config.node_id);
   star::MPSCRingBuffer *rings = nullptr;
   star::CXL_EBR *ebr = nullptr;
@@ -1106,7 +1106,7 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
 MemoryStats KVEngine::Memory() const {
   // Snapshot/maintenance query that reads HWCC layout counters and
   // owner-private SWCC control words; runs inside its own background scope.
-  mem_access::LatencyScope latency_scope(latency_sim::ScopeKind::kOther);
+  mem_access::LatencyScope latency_scope(latency_sim::ExecutionClass::kBackground);
   const auto &regions = pool_->allocator();
   MemoryStats stats;
   stats.allocator_mode = "dual_region";
@@ -1409,20 +1409,32 @@ void KVEngine::ReleaseWorker() {
 
 void KVEngine::PollTransport() {
   RequireBoundWorker();
-  EbrOperationScope ebr_scope(ebr_);
   WorkerMailbox &mailbox = CurrentMailbox();
   const bool awaiting = mailbox.operation.expected_response_type != 0;
 
+  // Each message dispatch runs inside its own narrowed EBR critical section.
+  // Peer requests additionally run inside a dedicated background scope that
+  // outlives the EBR guard: the caller's foreground scope is suspended first
+  // (no busy-wait), the request charges to the background scope, and the
+  // background scope settles only after the EBR guard has been destroyed, so
+  // no busy-wait ever happens inside the EBR-protected region.  Responses
+  // dispatch inside the caller's still-active scope with the same narrowed
+  // EBR protection; their settlement happens at the caller's outermost scope
+  // exit, long after this EBR region is gone.
   auto dispatch_one = [&](std::unique_ptr<star::Message> message) {
     const auto piece = *message->begin();
     if (IsResponseType(piece.get_message_type())) {
+      EbrOperationScope ebr_scope(ebr_);
       DispatchMessage(*message, mailbox);
       return;
     }
     mem_access::ForegroundScopeSuspension suspend_foreground;
-    mem_access::DeferredLatencyScope request_scope(
-        latency_sim::ScopeKind::kOther);
-    DispatchMessage(*message, mailbox);
+    latency_sim::ScopeGuard request_scope(
+        latency_sim::ExecutionClass::kBackground);
+    {
+      EbrOperationScope ebr_scope(ebr_);
+      DispatchMessage(*message, mailbox);
+    }  // EBR guard destroyed before request_scope settles
   };
 
   // Finish requests deferred from a previous await that already completed.

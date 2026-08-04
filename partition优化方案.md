@@ -71,7 +71,7 @@ pending_delay_ns += touched_hwcc_lines * hwcc_fixed_ns_per_line
 启用时要求 RelWithDebInfo、verbose/extra_check 关闭和校准成功的 x86 TSC；只用
 `rdtsc + _mm_pause` busy-wait。禁用时仅保留进程本地 fast gate，不读 TSC、不建 TLS、
 不换算地址、不获取锁、不做统计原子、不创建后台线程或额外映射。编译期关闭由
-`TIGONKV_DISABLE_HARDWARE_SIMULATION=ON` 验证。
+`LATENCY_SIM_COMPILE_OFF=ON`（独立 build） 验证。
 
 ## 5. Scope 与安全出口
 

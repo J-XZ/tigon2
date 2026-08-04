@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 include(cmake/TigonBuildOptions.cmake)
+include(cmake/TigonLatencySim.cmake)
 
 # Compiler selection must happen before project() so the default clang-18
 # toolchain (and its ccache launcher / LLVM archive tools) is honored.
@@ -16,8 +17,19 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include(CTest)
 enable_testing()
 
-option(TIGONKV_DISABLE_HARDWARE_SIMULATION
-       "Compile out all hardware-simulation wrapper slow paths" OFF)
+# LATENCY_SIM_COMPILE_OFF is the only compile-off gate (the private
+# TIGONKV_DISABLE_HARDWARE_SIMULATION option has been removed).  Default is
+# OFF; ON requires an independent build directory so no translation unit ever
+# mixes compile-off and runtime public-header definitions.
+set(LATENCY_SIM_COMPILE_OFF "OFF" CACHE STRING
+  "Compile-time removal of the latency_sim slow path (independent build only)")
+set_property(CACHE LATENCY_SIM_COMPILE_OFF PROPERTY STRINGS ON OFF)
+if(NOT LATENCY_SIM_COMPILE_OFF STREQUAL "ON"
+   AND NOT LATENCY_SIM_COMPILE_OFF STREQUAL "OFF")
+  message(FATAL_ERROR
+    "LATENCY_SIM_COMPILE_OFF must be ON or OFF; got '${LATENCY_SIM_COMPILE_OFF}'")
+endif()
+tigonkv_enable_latency_sim()
 
 # Keep the single-config default identical to the documented production
 # build before any build-type-specific flags are selected.  An explicit
@@ -36,7 +48,7 @@ add_compile_options(-Wall -Wextra -Wpedantic
 
 include_directories(${CMAKE_SOURCE_DIR})
 
-add_library(tigonkv STATIC kv/kv_store.cpp kv/engine/latency_inject.cpp
+add_library(tigonkv STATIC kv/kv_store.cpp
   core/Table.cpp
   kv/engine/kv_engine.cpp kv/engine/kv_partition.cpp kv/engine/kv_migration.cpp
   kv/engine/region_allocator.cpp
@@ -44,12 +56,9 @@ add_library(tigonkv STATIC kv/kv_store.cpp kv/engine/latency_inject.cpp
   common/btree_olc_cxl/BTreeOLC_CXL.cpp
   protocol/Pasha/SCCManager.cpp protocol/Pasha/MigrationManager.cpp
   protocol/Pasha/PolicyClock.cpp protocol/TwoPLPasha/TwoPLPashaHelper.cpp)
-target_link_libraries(tigonkv PUBLIC pthread glog)
+target_link_libraries(tigonkv PUBLIC pthread glog latency_sim::latency_sim)
 target_compile_definitions(tigonkv PUBLIC
   TIGONKV_CMAKE_BUILD_TYPE="$<CONFIG>")
-if(TIGONKV_DISABLE_HARDWARE_SIMULATION)
-  target_compile_definitions(tigonkv PUBLIC TIGONKV_DISABLE_HARDWARE_SIMULATION=1)
-endif()
 
 # tigonkv: legacy transaction benchmarks retain source-only reference status.
 # The redesigned KV target must not link the obsolete cxlalloc implementation.
@@ -89,14 +98,6 @@ add_executable(cxl_pool_initer tools/cxl_pool_initer.cpp)
 add_executable(hardware_sim_disabled_benchmark
                tests/hardware_sim_disabled_benchmark.cpp)
 target_link_libraries(hardware_sim_disabled_benchmark PRIVATE tigonkv)
-# Compile-time-removal variant: the wrapper fast gate becomes a constant zero,
-# so the wrapped loop compiles to the raw atomic operations with no runtime
-# branch.  Used only for the disabled-overhead comparison.
-add_executable(hardware_sim_disabled_benchmark_compile_off
-               tests/hardware_sim_disabled_benchmark.cpp)
-target_link_libraries(hardware_sim_disabled_benchmark_compile_off PRIVATE tigonkv)
-target_compile_definitions(hardware_sim_disabled_benchmark_compile_off
-                           PRIVATE TIGONKV_DISABLE_HARDWARE_SIMULATION=1)
 
 # Every project-owned C/C++ target receives the mode-consistent optimization
 # and LTO policy (audit list: nothing below may bypass the policy).
@@ -120,7 +121,6 @@ set(TIGONKV_PROJECT_TARGETS
   numa_placement_probe
   cxl_pool_initer
   hardware_sim_disabled_benchmark
-  hardware_sim_disabled_benchmark_compile_off
 )
 foreach(TIGONKV_TARGET IN LISTS TIGONKV_PROJECT_TARGETS)
   tigonkv_apply_target_build_policy(${TIGONKV_TARGET})

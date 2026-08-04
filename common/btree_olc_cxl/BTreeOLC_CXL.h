@@ -175,9 +175,9 @@ template <typename T>
 inline T TreeAtomicLoad(const std::atomic<T> &value, std::memory_order order) {
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicLoad(
-	                 value, order, latency_sim::AtomicDomain::kHwcc)
+	                 value, order, latency_sim::MemoryDomain::kHwcc)
 	           : latency_sim::FixedLatencyAtomicLoad(
-	                 value, order, latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+	                 value, order, latency_sim::MemoryDomain::kOwnerPrivateSwcc);
 }
 
 template <typename T>
@@ -185,11 +185,11 @@ inline void TreeAtomicStore(std::atomic<T> &value, T desired,
                             std::memory_order order) {
 	if (TreeAccessIsHwcc)
 		latency_sim::FixedLatencyAtomicStore(
-		    value, desired, order, latency_sim::AtomicDomain::kHwcc);
+		    value, desired, order, latency_sim::MemoryDomain::kHwcc);
 	else
 		latency_sim::FixedLatencyAtomicStore(
 		    value, desired, order,
-		    latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+		    latency_sim::MemoryDomain::kOwnerPrivateSwcc);
 }
 
 template <typename T>
@@ -199,10 +199,10 @@ inline bool TreeAtomicCompareExchangeStrong(
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicCompareExchangeStrong(
 	                 value, expected, desired, success, failure,
-	                 latency_sim::AtomicDomain::kHwcc)
+	                 latency_sim::MemoryDomain::kHwcc)
 	           : latency_sim::FixedLatencyAtomicCompareExchangeStrong(
 	                 value, expected, desired, success, failure,
-	                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+	                 latency_sim::MemoryDomain::kOwnerPrivateSwcc);
 }
 
 template <typename T>
@@ -212,10 +212,10 @@ inline bool TreeAtomicCompareExchangeWeak(
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicCompareExchangeWeak(
 	                 value, expected, desired, success, failure,
-	                 latency_sim::AtomicDomain::kHwcc)
+	                 latency_sim::MemoryDomain::kHwcc)
 	           : latency_sim::FixedLatencyAtomicCompareExchangeWeak(
 	                 value, expected, desired, success, failure,
-	                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+	                 latency_sim::MemoryDomain::kOwnerPrivateSwcc);
 }
 
 template <typename T>
@@ -223,10 +223,10 @@ inline T TreeAtomicFetchAdd(std::atomic<T> &value, T operand,
                             std::memory_order order) {
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicFetchAdd(
-	                 value, operand, order, latency_sim::AtomicDomain::kHwcc)
+	                 value, operand, order, latency_sim::MemoryDomain::kHwcc)
 	           : latency_sim::FixedLatencyAtomicFetchAdd(
 	                 value, operand, order,
-	                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+	                 latency_sim::MemoryDomain::kOwnerPrivateSwcc);
 }
 
 template <typename T>
@@ -234,10 +234,10 @@ inline T TreeAtomicFetchSub(std::atomic<T> &value, T operand,
                             std::memory_order order) {
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicFetchSub(
-	                 value, operand, order, latency_sim::AtomicDomain::kHwcc)
+	                 value, operand, order, latency_sim::MemoryDomain::kHwcc)
 	           : latency_sim::FixedLatencyAtomicFetchSub(
 	                 value, operand, order,
-                 latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+                 latency_sim::MemoryDomain::kOwnerPrivateSwcc);
 }
 
 // Record the cache line containing the node latch and metadata at each node

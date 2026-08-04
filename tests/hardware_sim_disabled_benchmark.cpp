@@ -1,4 +1,9 @@
-#include "kv/engine/latency_inject.h"
+#include <latency_sim/access.h>
+#include <latency_sim/atomic_access.h>
+#include <latency_sim/config.h>
+#include <latency_sim/domain.h>
+#include <latency_sim/scope.h>
+#include <latency_sim/simulator.h>
 #include "kv/engine/mem_access.h"
 
 #include <algorithm>
@@ -44,7 +49,7 @@ double Median(std::vector<double> values) {
 }  // namespace
 
 int main() {
-  latency_sim::GlobalLatencySimulator().Configure(latency_sim::Config{});
+  latency_sim::GlobalLatencySimulator().Configure(latency_sim::FixedLatencyConfig{});
   constexpr size_t kSamples = 5;
   std::vector<double> direct;
   std::vector<double> wrapped;

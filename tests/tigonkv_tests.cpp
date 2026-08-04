@@ -1,5 +1,10 @@
 #include "kv/kv_store.h"
-#include "kv/engine/latency_inject.h"
+#include <latency_sim/access.h>
+#include <latency_sim/atomic_access.h>
+#include <latency_sim/config.h>
+#include <latency_sim/domain.h>
+#include <latency_sim/scope.h>
+#include <latency_sim/simulator.h>
 #include "kv/engine/kv_types_layout.h"
 
 #ifdef NDEBUG
@@ -201,7 +206,7 @@ int main(int argc, char **argv) {
     output << text;
   }
   const Config fractional = Config::FromJsonc(latency_config_path);
-  assert(fractional.hardware_simulation.fixed_latency.swcc_fixed_ns_per_line == 1.25);
+  assert(fractional.hardware_simulation.swcc_fixed_ns_per_line == 1.25);
   assert(fractional.cpu_affinity);
 
   static constexpr std::string_view kRequiredLatencyFields[] = {
@@ -249,8 +254,8 @@ int main(int argc, char **argv) {
       output.close();
       return Config::FromJsonc(latency_config_path);
     }();
-    assert(parsed_enabled.hardware_simulation.fixed_latency.enabled);
-    assert(parsed_enabled.hardware_simulation.fixed_latency.foreground_enabled);
+    assert(parsed_enabled.hardware_simulation.enabled);
+    assert(parsed_enabled.hardware_simulation.foreground_enabled);
   } else {
     assert(ParseTextThrows(latency_config_path, enabled));
   }
@@ -276,9 +281,9 @@ int main(int argc, char **argv) {
         output.close();
         return Config::FromJsonc(latency_config_path);
       }();
-      assert(!parsed_background_only.hardware_simulation.fixed_latency
+      assert(!parsed_background_only.hardware_simulation
                   .foreground_enabled);
-      assert(parsed_background_only.hardware_simulation.fixed_latency
+      assert(parsed_background_only.hardware_simulation
                  .background_enabled);
     } else {
       assert(ParseTextThrows(latency_config_path, background_only));
@@ -350,7 +355,7 @@ int main(int argc, char **argv) {
   insufficient_cpu.vm_core_count_per_vm = 4;
   assert(ValidateThrows(insufficient_cpu));
   Config gated = config;
-  gated.hardware_simulation.fixed_latency.enabled = true;
+  gated.hardware_simulation.enabled = true;
   if (RelWithDebInfoBuild()) {
     gated.verbose = true;
     assert(ValidateThrows(gated));
@@ -358,17 +363,17 @@ int main(int argc, char **argv) {
     gated.extra_check = true;
     assert(ValidateThrows(gated));
     gated.extra_check = false;
-    gated.hardware_simulation.fixed_latency.foreground_enabled = false;
-    gated.hardware_simulation.fixed_latency.background_enabled = true;
+    gated.hardware_simulation.foreground_enabled = false;
+    gated.hardware_simulation.background_enabled = true;
     gated.Validate();
   } else {
     assert(ValidateThrows(gated));
   }
-  config.hardware_simulation.fixed_latency.enabled = RelWithDebInfoBuild();
-  config.hardware_simulation.fixed_latency.foreground_enabled = true;
-  config.hardware_simulation.fixed_latency.background_enabled = true;
-  config.hardware_simulation.fixed_latency.swcc_fixed_ns_per_line = 1;
-  config.hardware_simulation.fixed_latency.hwcc_fixed_ns_per_line = 1;
+  config.hardware_simulation.enabled = RelWithDebInfoBuild();
+  config.hardware_simulation.foreground_enabled = true;
+  config.hardware_simulation.background_enabled = true;
+  config.hardware_simulation.swcc_fixed_ns_per_line = 1;
+  config.hardware_simulation.hwcc_fixed_ns_per_line = 1;
   // HWCC is bounded by the configured physical shared region, not by an
   // arbitrary 1GiB validation ceiling.  Larger verified configurations are
   // permitted when a smaller policy budget cannot satisfy a focused test.

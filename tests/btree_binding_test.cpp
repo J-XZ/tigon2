@@ -224,35 +224,37 @@ int main() {
   assert(regions.OwnerPrivateUsedBytes(0) > 0);
   regions.BindOwnerPrivateAllocators(1);
   assert(regions.DynamicHwccUsedBytes(1) > 0);
-  latency_sim::Config latency;
-  latency.fixed_latency.enabled = true;
-  latency.fixed_latency.foreground_enabled = true;
-  latency.fixed_latency.swcc_fixed_ns_per_line = 1;
-  latency.fixed_latency.hwcc_fixed_ns_per_line = 1;
+  latency_sim::FixedLatencyConfig latency;
+  latency.enabled = true;
+  latency.foreground_enabled = true;
+  latency.swcc_fixed_ns_per_line = 1;
+  latency.hwcc_fixed_ns_per_line = 1;
   auto &simulator = latency_sim::GlobalLatencySimulator();
   const auto binding_config = MakeConfig(kPoolBytes);
   simulator.RegisterPool(
-      latency_sim::PoolKind::kHwcc,
+      latency_sim::MemoryDomain::kHwcc,
       static_cast<const std::byte *>(pool.base()) +
           binding_config.hwcc_offset_bytes,
       binding_config.hwcc_size_bytes);
   simulator.RegisterPool(
-      latency_sim::PoolKind::kSwcc,
+      latency_sim::MemoryDomain::kSwcc,
       static_cast<const std::byte *>(pool.base()) +
           binding_config.swcc_offset_bytes,
       binding_config.swcc_size_bytes);
   simulator.Configure(latency);
   uint64_t value = 0;
-  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+  simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
   regions.BindOwnerPrivateAllocators(0);
   assert(private_tree->lookup(Key(250), value) && value == 250);
   assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
   assert(shared_tree->lookup(Key(250), value) && value == 1250);
   assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-  simulator.Configure(latency_sim::Config{});
+#endif
+  simulator.Configure(latency_sim::FixedLatencyConfig{});
 
   // Collapse the private root after a split.  The only persistent authority
   // must be the owner-private atomic slot, not the process-local wrapper.

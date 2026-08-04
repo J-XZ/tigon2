@@ -1,6 +1,11 @@
 #pragma once
 
-#include "kv/engine/latency_inject.h"
+#include <latency_sim/access.h>
+#include <latency_sim/atomic_access.h>
+#include <latency_sim/config.h>
+#include <latency_sim/domain.h>
+#include <latency_sim/scope.h>
+#include <latency_sim/simulator.h>
 
 #include <cstdint>
 #include <memory>
@@ -151,7 +156,7 @@ struct Config {
   bool cpu_affinity = false;
   // Canonical fixed-latency-only configuration. JSONC is the only
   // configuration surface; removed statistics/cache-model fields are rejected.
-  latency_sim::Config hardware_simulation{};
+  latency_sim::FixedLatencyConfig hardware_simulation{};
 
   static Config FromJsonc(const std::string &path);
   // Normalizes non-infinite range boundaries into their persisted FixedKey

@@ -1,8 +1,10 @@
 # Third-party notices
 
-TigonKV 的延迟安全点实现参考 cxlkv `my-work` @
-`984ad91a614ae65b57d0fe53ccc174bb6e962bcd` 的 TSC 校准与忙等结构；本仓保留自身
-API、代码和构建，运行时不依赖该兄弟仓。
+固定延迟实现来自固定 Git 子模块 `thirdparty_libs/latency_sim`（gitlink
+`5ed2a2e7cf670e52141a7d1908c4c62d70335cfd`，`my-work` 分支），Apache-2.0 与
+NOTICE 随子模块分发（`thirdparty_libs/latency_sim/LICENSE`、
+`thirdparty_libs/latency_sim/NOTICE`）。本仓只保留项目薄适配（mem_access.h、
+KVEngine 生命周期与 scope 分类），运行时不依赖其它兄弟仓库。
 
 VM/YCSB 编排参考同一对照版本的参数与产物合同。YCSB trace 生成使用本仓
 `thirdparty_libs/YCSB-cpp` 子模块（gitlink

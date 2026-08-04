@@ -69,8 +69,10 @@ worker 若访问 HWCC/SWCC 都必须建立自己的 scope，并在释放锁、pi
 
 `enabled=false` 时只允许一个初始化后不可变、可预测的进程本地 fast gate：不读 TSC、
 不建立 TLS、不做地址/line 换算、不获取锁、不做统计原子、不创建共享状态/后台线程，
-也不映射额外设备。`TIGONKV_DISABLE_HARDWARE_SIMULATION=ON` 用于编译期移除 wrapper
-slow path 的对照。
+也不映射额外设备。`LATENCY_SIM_COMPILE_OFF=ON`（独立 build 目录）用于编译期移除 wrapper
+slow path 的对照；私有 `TIGONKV_DISABLE_HARDWARE_SIMULATION` 已删除。固定延迟公共实现
+来自固定子模块 `thirdparty_libs/latency_sim`（gitlink `5ed2a2e7cf670e52141a7d1908c4c62d70335cfd`），
+本仓只保留 `mem_access.h` 薄适配、生命周期与 scope 分类。
 
 ## 修改和验证
 

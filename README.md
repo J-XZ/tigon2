@@ -30,8 +30,10 @@ replay 和 instrumentation ivshmem 均已删除；旧配置字段会 hard-fail�
 flush/invalidate/writeback 和业务 runtime/memory accounting 仍保留，因为它们属于一致性
 协议或数据库运行时，而不是延迟模拟器。
 
-禁用时路径只有进程本地 fixed-latency fast gate；不会读 TSC、建立 TLS、维护统计或
-创建额外共享状态。`TIGONKV_DISABLE_HARDWARE_SIMULATION=ON` 提供编译期关闭对照。
+禁用时路径只有工具库进程本地 fixed-latency fast gate；不会读 TSC、建立 TLS、维护
+统计或创建额外共享状态。固定延迟公共实现来自固定 Git 子模块
+`thirdparty_libs/latency_sim`（gitlink `5ed2a2e7cf670e52141a7d1908c4c62d70335cfd`，
+`my-work` 分支）；`LATENCY_SIM_COMPILE_OFF` 是唯一编译期关闭开关。
 详细规则见 [硬件模拟当前实现.md](硬件模拟当前实现.md) 和
 [延迟插入审计报告.md](延迟插入审计报告.md)。
 
@@ -77,17 +79,24 @@ Release:        -O3 -march=native，编译和最终链接均 -flto=full，保留
 `-DTIGONKV_ENABLE_FRAME_POINTERS=ON`（仅对项目自有目标生效）。
 
 ```bash
+# 默认可运行时配置（显式 OFF 等价于不传）
+cmake -S . -B build-relwithdebinfo -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DLATENCY_SIM_COMPILE_OFF=OFF
+cmake --build build-relwithdebinfo -j2
+ctest --test-dir build-relwithdebinfo -E '^e2e_' --output-on-failure -j1
+
 cmake -S . -B build-debug -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
-  -DTIGONKV_DISABLE_HARDWARE_SIMULATION=OFF
+  -DLATENCY_SIM_COMPILE_OFF=OFF
 cmake --build build-debug -j2
 ctest --test-dir build-debug -E '^e2e_' --output-on-failure -j1
 
-cmake -S . -B build-relwithdebinfo -G Ninja \
+# 编译期完全移除：独立 build 目录，不得与默认 build 混用
+cmake -S . -B build-relwithdebinfo-compile-off -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DTIGONKV_DISABLE_HARDWARE_SIMULATION=OFF
-cmake --build build-relwithdebinfo -j2
-ctest --test-dir build-relwithdebinfo -E '^e2e_' --output-on-failure -j1
+  -DLATENCY_SIM_COMPILE_OFF=ON
+cmake --build build-relwithdebinfo-compile-off -j2
 ```
 
 固定延迟定向测试是 `latency_modes_test`；禁用热路径对照是

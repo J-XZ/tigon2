@@ -154,23 +154,23 @@ int main() {
   regions.PublishStaticHwccLayout();
   regions.InitializeOwnerPrivateArenas(0);
   star::CXLMemory::bind_dual_region_allocator(&regions, 0);
-  latency_sim::Config latency;
-  latency.fixed_latency.enabled = true;
-  latency.fixed_latency.foreground_enabled = true;
-  latency.fixed_latency.swcc_fixed_ns_per_line = 10;
-  latency.fixed_latency.hwcc_fixed_ns_per_line = 10;
+  latency_sim::FixedLatencyConfig latency;
+  latency.enabled = true;
+  latency.foreground_enabled = true;
+  latency.swcc_fixed_ns_per_line = 10;
+  latency.hwcc_fixed_ns_per_line = 10;
   auto &simulator = latency_sim::GlobalLatencySimulator();
   const auto region_config = Config(bytes);
   simulator.RegisterPool(
-      latency_sim::PoolKind::kHwcc,
+      latency_sim::MemoryDomain::kHwcc,
       static_cast<const std::byte *>(pool) + region_config.hwcc_offset_bytes,
       region_config.hwcc_size_bytes);
   simulator.RegisterPool(
-      latency_sim::PoolKind::kSwcc,
+      latency_sim::MemoryDomain::kSwcc,
       static_cast<const std::byte *>(pool) + region_config.swcc_offset_bytes,
       region_config.swcc_size_bytes);
   simulator.Configure(latency);
-  simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
   auto *payload = new (regions.Allocate(
       sizeof(star::TwoPLPashaSharedDataSCC) + 16,
       tigonkv::engine::AllocationDomain::kSharedPayloadSwcc, 0)) star::TwoPLPashaSharedDataSCC;
@@ -248,7 +248,7 @@ int main() {
   std::vector<std::thread> incrementers;
   for (std::size_t host = 0; host < 4; ++host) {
     incrementers.emplace_back([&, host] {
-      simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+      simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
       for (int iteration = 0; iteration < 250; ++iteration) {
         for (;;) {
           if (IncrementViaOriginalPrimitives(meta, host % 2)) break;
@@ -281,7 +281,7 @@ int main() {
     meta->unlock();
     std::atomic<bool> writer_started{false};
     std::thread stalled_writer([&] {
-      simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+      simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
       writer_started.store(true, std::memory_order_release);
       const std::string y = fixed("y");
       assert(!WriteViaOriginalPrimitives(meta, 0, y.data(), y.size()));

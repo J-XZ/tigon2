@@ -2,7 +2,13 @@
 
 #include "common/CXL_EBR.h"
 #include "kv/engine/kv_engine.h"
-#include "kv/engine/latency_inject.h"
+#include <latency_sim/access.h>
+#include <latency_sim/atomic_access.h>
+#include <latency_sim/config.h>
+#include <latency_sim/domain.h>
+#include <latency_sim/json_config.h>
+#include <latency_sim/scope.h>
+#include <latency_sim/simulator.h>
 #include "kv/engine/mem_access.h"
 
 #include <algorithm>
@@ -599,28 +605,19 @@ void ParseStrictLatencyConfig(const std::string &text, Config *config) {
         fixed_members, field_name,
         "tigon_kv.latency_inject.fixed_latency");
 
-  const auto field = [&](std::string_view name) -> const JsonMemberSpan & {
-    return RequireUniqueMember(fixed_members, name,
-                               "tigon_kv.latency_inject.fixed_latency");
-  };
-  auto &fixed = config->hardware_simulation.fixed_latency;
-  fixed.enabled = ParseStrictBool(text, field("enabled"),
-                                  "tigon_kv.latency_inject.fixed_latency.enabled");
-  fixed.cache_line_bytes =
-      ParseStrictUint64(text, field("cache_line_bytes"),
-                        "tigon_kv.latency_inject.fixed_latency.cache_line_bytes");
-  fixed.swcc_fixed_ns_per_line =
-      ParseStrictDouble(text, field("swcc_fixed_ns_per_line"),
-                        "tigon_kv.latency_inject.fixed_latency.swcc_fixed_ns_per_line");
-  fixed.hwcc_fixed_ns_per_line =
-      ParseStrictDouble(text, field("hwcc_fixed_ns_per_line"),
-                        "tigon_kv.latency_inject.fixed_latency.hwcc_fixed_ns_per_line");
-  fixed.foreground_enabled =
-      ParseStrictBool(text, field("foreground_enabled"),
-                      "tigon_kv.latency_inject.fixed_latency.foreground_enabled");
-  fixed.background_enabled =
-      ParseStrictBool(text, field("background_enabled"),
-                      "tigon_kv.latency_inject.fixed_latency.background_enabled");
+  // The fixed_latency six fields are owned by the latency_sim library parser
+  // (/tigon_kv/latency_inject/fixed_latency); this project only keeps the
+  // outer schema checks above (exactly-once latency_inject/fixed_latency keys,
+  // unknown-member rejection) and hands the same raw JSONC text to the library.
+  try {
+    config->hardware_simulation =
+        latency_sim::ParseFixedLatencyJsonc(text,
+                                            latency_sim::ConfigLayout::kTigon2)
+            .config;
+  } catch (const std::exception &error) {
+    throw std::invalid_argument(std::string("invalid fixed latency config: ") +
+                                error.what());
+  }
 }
 void ParsePartitioningConfig(const std::string &text, Config *config) {
   size_t root_begin = 0;
@@ -858,18 +855,8 @@ void Config::Validate() {
       throw std::invalid_argument(
           "owner migration dynamic HWCC budget underflows to zero");
   }
-  const auto &fixed = hardware_simulation.fixed_latency;
-  const auto is_power_of_two = [](uint64_t value) {
-    return value != 0 && (value & (value - 1)) == 0;
-  };
-  if (!is_power_of_two(fixed.cache_line_bytes) ||
-      !std::isfinite(fixed.swcc_fixed_ns_per_line) ||
-      !std::isfinite(fixed.hwcc_fixed_ns_per_line) ||
-      fixed.swcc_fixed_ns_per_line < 0.0 ||
-      fixed.hwcc_fixed_ns_per_line < 0.0)
-    throw std::invalid_argument("invalid fixed latency geometry");
-
-  if (hardware_simulation.fixed_latency.enabled) {
+  const auto &fixed = hardware_simulation;
+  if (hardware_simulation.enabled) {
     if (verbose)
       throw std::invalid_argument(
         "fixed_latency.enabled=true is incompatible with verbose=true");
@@ -952,7 +939,7 @@ RuntimeStats &KVStore::CurrentWorkerRuntime() {
 
 Status KVStore::Put(std::string_view key, std::string_view value) {
   engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kForeground);
+      latency_sim::ExecutionClass::kForeground);
   try { ValidateKeyValue(key, value); }
   catch (const std::exception &e) { return Status::Error(StatusCode::kInvalidArgument, e.what()); }
   RuntimeStats &runtime = ThreadRuntime();
@@ -967,7 +954,7 @@ Status KVStore::Put(std::string_view key, std::string_view value) {
 
 GetResult KVStore::Get(std::string_view key) {
   engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kForeground);
+      latency_sim::ExecutionClass::kForeground);
   if (key.size() != config_.fixed_key_size ||
       IsInternalMaxKey(key, config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), {}};
@@ -986,7 +973,7 @@ GetResult KVStore::Get(std::string_view key) {
 
 Status KVStore::Delete(std::string_view key) {
   engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kForeground);
+      latency_sim::ExecutionClass::kForeground);
   if (key.size() != config_.fixed_key_size ||
       IsInternalMaxKey(key, config_.fixed_key_size))
     return Status::Error(StatusCode::kInvalidArgument, "invalid key");
@@ -1003,7 +990,7 @@ Status KVStore::Delete(std::string_view key) {
 ScanResult KVStore::Scan(std::string_view start_key, std::string_view end_key,
                          uint64_t limit) {
   engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kForeground);
+      latency_sim::ExecutionClass::kForeground);
   if (start_key.size() != config_.fixed_key_size ||
       IsInternalMaxKey(start_key, config_.fixed_key_size) ||
       (!end_key.empty() && end_key.size() != config_.fixed_key_size))
@@ -1037,7 +1024,7 @@ ScanResult KVStore::Scan(std::string_view start_key, std::string_view end_key,
 CasResult KVStore::CompareExchange(std::string_view key, std::string_view expected,
                                    std::string_view desired) {
   engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kForeground);
+      latency_sim::ExecutionClass::kForeground);
   try { ValidateKeyValue(key, desired); }
   catch (const std::exception &e) { return {Status::Error(StatusCode::kInvalidArgument, e.what()), false}; }
   if (!expected.empty() && expected.size() != config_.fixed_value_size)
@@ -1059,7 +1046,7 @@ CasResult KVStore::CompareExchange(std::string_view key, std::string_view expect
 
 IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
   engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kForeground);
+      latency_sim::ExecutionClass::kForeground);
   if (key.size() != config_.fixed_key_size ||
       IsInternalMaxKey(key, config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument, "invalid key"), 0};
@@ -1082,7 +1069,7 @@ Status KVStore::PollTransport() {
   // Standalone transport polling touches HWCC ring/control words outside any
   // facade operation; run it inside its own background scope.
   engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ScopeKind::kOther);
+      latency_sim::ExecutionClass::kBackground);
   impl_->engine->PollTransport();
   return Status::Ok();
 }

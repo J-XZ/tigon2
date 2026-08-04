@@ -93,6 +93,14 @@ if [[ "$skip_trace_gen" != true ]]; then
       exit 2
     }
   else
+    # The default build contract is LATENCY_SIM_COMPILE_OFF=OFF; refuse a
+    # cache that inherited ON from an independent compile-off build.
+    if [[ ! -f "$root/build-relwithdebinfo/CMakeCache.txt" ]]; then
+      cmake -S "$root" -B "$root/build-relwithdebinfo" -G Ninja         -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF=OFF
+    elif ! grep -q '^LATENCY_SIM_COMPILE_OFF:.*=OFF$' "$root/build-relwithdebinfo/CMakeCache.txt"; then
+      echo "build-relwithdebinfo must be configured with LATENCY_SIM_COMPILE_OFF=OFF" >&2
+      exit 2
+    fi
     cmake --build "$root/build-relwithdebinfo" --target ycsb_partition_splits -j2
   fi
   "$root/build-relwithdebinfo/ycsb_partition_splits" \
@@ -160,6 +168,12 @@ if [[ "$skip_build" == true ]]; then
     exit 2
   }
 else
+  if [[ ! -f "$root/build-relwithdebinfo/CMakeCache.txt" ]]; then
+    cmake -S "$root" -B "$root/build-relwithdebinfo" -G Ninja       -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF=OFF
+  elif ! grep -q '^LATENCY_SIM_COMPILE_OFF:.*=OFF$' "$root/build-relwithdebinfo/CMakeCache.txt"; then
+    echo "build-relwithdebinfo must be configured with LATENCY_SIM_COMPILE_OFF=OFF" >&2
+    exit 2
+  fi
   cmake --build "$root/build-relwithdebinfo" --target e2e_trace_runner -j2
 fi
 [[ "$skip_vm_init" == true ]] || "$root/tigonkv_check_vms.sh" --config "$generated_config"

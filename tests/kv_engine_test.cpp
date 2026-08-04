@@ -5,7 +5,12 @@
 #include "common/MessagePiece.h"
 #include "common/MPSCRingBuffer.h"
 #include "core/CxlIncomingDispatcher.h"
-#include "kv/engine/latency_inject.h"
+#include <latency_sim/access.h>
+#include <latency_sim/atomic_access.h>
+#include <latency_sim/config.h>
+#include <latency_sim/domain.h>
+#include <latency_sim/scope.h>
+#include <latency_sim/simulator.h>
 #include "protocol/TwoPLPasha/TwoPLPashaMessage.h"
 
 #ifdef NDEBUG

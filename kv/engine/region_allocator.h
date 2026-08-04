@@ -89,8 +89,8 @@ class RegionAllocator {
   uint64_t metadata_bytes() const { return header_->metadata_bytes; }
   uint64_t allocated() const {
     const auto domain = control_is_hwcc_
-                            ? latency_sim::AtomicDomain::kHwcc
-                            : latency_sim::AtomicDomain::kOwnerPrivateSwcc;
+                            ? latency_sim::MemoryDomain::kHwcc
+                            : latency_sim::MemoryDomain::kOwnerPrivateSwcc;
     return latency_sim::FixedLatencyAtomicLoad(header_->allocated_bytes,
                                           std::memory_order_acquire, domain);
   }

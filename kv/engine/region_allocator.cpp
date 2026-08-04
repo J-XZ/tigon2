@@ -24,7 +24,7 @@ bool RangeContains(uint64_t begin, uint64_t length, uint64_t offset,
 
 uint64_t CheckedAtomicSubtract(std::atomic<uint64_t> *counter, uint64_t bytes,
                                const char *detail,
-                               latency_sim::AtomicDomain domain) {
+                               latency_sim::MemoryDomain domain) {
   uint64_t before = latency_sim::FixedLatencyAtomicLoad(
       *counter, std::memory_order_relaxed, domain);
   for (;;) {
@@ -36,12 +36,12 @@ uint64_t CheckedAtomicSubtract(std::atomic<uint64_t> *counter, uint64_t bytes,
   }
 }
 
-latency_sim::AtomicDomain AtomicDomainFor(bool hwcc, bool /*shared_payload*/) {
+latency_sim::MemoryDomain AtomicDomainFor(bool hwcc, bool /*shared_payload*/) {
   // Shared-payload allocator control is still owner-local metadata.  Mapping
   // it to the owner-private bucket records the executed operation without
   // pretending that SWCC has hardware coherence.
-  return hwcc ? latency_sim::AtomicDomain::kHwcc
-              : latency_sim::AtomicDomain::kOwnerPrivateSwcc;
+  return hwcc ? latency_sim::MemoryDomain::kHwcc
+              : latency_sim::MemoryDomain::kOwnerPrivateSwcc;
 }
 
 template <typename T>
@@ -282,8 +282,8 @@ void RegionAllocator::AccountAllocate(uint64_t bytes, DomainCounter *counter) {
                                    std::memory_order_relaxed);
   }
   const auto domain = control_is_hwcc_
-                          ? latency_sim::AtomicDomain::kHwcc
-                          : latency_sim::AtomicDomain::kOwnerPrivateSwcc;
+                          ? latency_sim::MemoryDomain::kHwcc
+                          : latency_sim::MemoryDomain::kOwnerPrivateSwcc;
   const uint64_t used = latency_sim::FixedLatencyAtomicFetchAdd(
                             counter->used_bytes, bytes,
                             std::memory_order_relaxed, domain) + bytes;
@@ -299,14 +299,14 @@ void RegionAllocator::AccountAllocate(uint64_t bytes, DomainCounter *counter) {
 
 void RegionAllocator::AccountFree(uint64_t bytes, DomainCounter *counter) {
   const auto domain = control_is_hwcc_
-                          ? latency_sim::AtomicDomain::kHwcc
-                          : latency_sim::AtomicDomain::kOwnerPrivateSwcc;
+                          ? latency_sim::MemoryDomain::kHwcc
+                          : latency_sim::MemoryDomain::kOwnerPrivateSwcc;
   CheckedAtomicSubtract(&counter->used_bytes, bytes,
                         "allocator domain accounting underflow", domain);
   if (control_is_hwcc_) {
     CheckedAtomicSubtract(&header_->allocated_bytes, bytes,
                           "allocator total accounting underflow",
-                          latency_sim::AtomicDomain::kHwcc);
+                          latency_sim::MemoryDomain::kHwcc);
     mem_access::HwccAtomicFetchAdd(header_->free_count, uint64_t{1},
                                    std::memory_order_relaxed);
   }
@@ -1121,7 +1121,7 @@ void DualRegionAllocator::FreeOwnerPrivate(void *pointer, uint64_t bytes,
                                  std::memory_order_release);
   CheckedAtomicSubtract(&arena->allocated_bytes, block_bytes,
                         "owner-private allocator accounting underflow",
-                        latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+                        latency_sim::MemoryDomain::kOwnerPrivateSwcc);
 }
 
 void DualRegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain domain,
@@ -1137,7 +1137,7 @@ void DualRegionAllocator::Free(void *pointer, uint64_t bytes, AllocationDomain d
     allocator->Free(pointer, bytes, domain, &control->dynamic_hwcc, 0, 0);
     CheckedAtomicSubtract(&control->total_hw_cc_usage, bytes,
                           "owner Clock policy counter underflow",
-                          latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+                          latency_sim::MemoryDomain::kOwnerPrivateSwcc);
     return;
   }
   if (domain == AllocationDomain::kSharedPayloadSwcc) {
@@ -1230,7 +1230,7 @@ std::vector<OwnerPrivateRetireRecord> DualRegionAllocator::TakeRetired(
   if (removed != 0) {
     CheckedAtomicSubtract(&control->retire_counts[worker_id][epoch], removed,
                           "owner-private EBR retire accounting underflow",
-                          latency_sim::AtomicDomain::kOwnerPrivateSwcc);
+                          latency_sim::MemoryDomain::kOwnerPrivateSwcc);
   }
   return retired;
 }
