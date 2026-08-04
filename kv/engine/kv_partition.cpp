@@ -1735,7 +1735,12 @@ bool KVPartition::DeletePrivateForMigrationManager(
   bool initially_migrated = false;
   bool reserved_shared_write = false;
   LockRow(preflight_metadata);
-  if (!preflight_metadata->is_valid) {
+  // A remote insert deliberately leaves the owner-private mirror invalid
+  // until the requester publishes the shared payload.  The requester-held
+  // ref/write lock is the authority for this remote-delete path, so do not
+  // reject that valid migrated placeholder merely because its local mirror
+  // has not been made valid.
+  if (!preflight_metadata->is_valid && !requester_prelocked) {
     UnlockRow(preflight_metadata);
     return false;
   }
@@ -1834,7 +1839,8 @@ bool KVPartition::DeletePrivateForMigrationManager(
 
         LockRow(metadata);
         const auto unlock = [&] { UnlockRow(metadata); };
-        if (!metadata->is_valid || metadata->is_migrated != initially_migrated ||
+        if ((!metadata->is_valid && !requester_prelocked) ||
+            metadata->is_migrated != initially_migrated ||
             (initially_migrated && metadata->migrated_smeta_off != smeta_offset)) {
           unlock();
           release_reserved_shared_write();

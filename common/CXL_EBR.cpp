@@ -17,6 +17,11 @@ void CXL_EBR::bind_dual_region_allocator(tigonkv::engine::DualRegionAllocator *r
         g_ebr_regions = regions;
 }
 
+void CXL_EBR::clear_dual_region_allocator() noexcept
+{
+        g_ebr_regions = nullptr;
+}
+
 tigonkv::engine::DualRegionAllocator *CXL_EBR::bound_regions()
 {
         return g_ebr_regions;

@@ -29,9 +29,8 @@ enum class TwoPLPashaMessage {
         REMOTE_INSERT_REQUEST,
         REMOTE_INSERT_RESPONSE,
         REMOTE_DELETE_REQUEST,
-        // The original remote delete is one-way because transaction cleanup
-        // owns completion.  The synchronous KV facade needs only this empty
-        // completion marker; it carries no new status framing.
+        // The transaction-free KV facade uses the response to distinguish
+        // owner-side completion from retryable delete contention.
         REMOTE_DELETE_RESPONSE,
         REPLICATION_REQUEST,
 	REPLICATION_RESPONSE,
@@ -43,6 +42,15 @@ enum class RemoteInsertOutcome : uint8_t {
         AlreadyExists = 1,
         Busy = 2,
         NoMemory = 3,
+};
+
+// A remote delete is a request/response operation in the transaction-free KV
+// facade.  The requester has already published an invalid shared row before
+// sending the request, so a false owner-side delete is retryable contention,
+// not a malformed transport frame.
+enum class RemoteDeleteOutcome : uint8_t {
+        Deleted = 0,
+        Busy = 1,
 };
 
 enum class MigrationResponseOutcome : uint8_t {
@@ -257,14 +265,14 @@ class TwoPLPashaMessageHandler {
         static bool remote_delete_request_handler(
                 MessagePiece inputPiece, Message &responseMessage, ITable &table,
                 std::size_t key_size,
-                const std::function<bool(const void *)> &delete_row)
+                const std::function<RemoteDeleteOutcome(const void *)> &delete_row)
         {
                 const char *key = nullptr;
-                if (!decode_remote_delete_request(inputPiece, key_size, key) ||
-                    !delete_row(key))
+                if (!decode_remote_delete_request(inputPiece, key_size, key))
                         return false;
+                const RemoteDeleteOutcome outcome = delete_row(key);
                 append_remote_delete_response(responseMessage, table.tableID(),
-                    table.partitionID());
+                    table.partitionID(), outcome, /*key_offset=*/0);
                 return true;
         }
 
@@ -420,13 +428,22 @@ class TwoPLPashaMessageHandler {
                 return decoder.size() == 0;
         }
 
-        static bool decode_remote_delete_response(MessagePiece piece)
+        static bool decode_remote_delete_response(
+                MessagePiece piece, RemoteDeleteOutcome &outcome,
+                uint32_t &key_offset)
         {
-                return piece.get_message_type() == static_cast<uint32_t>(
-                           TwoPLPashaMessage::REMOTE_DELETE_RESPONSE) &&
-                       piece.get_message_length() ==
-                           TwoPLPashaMessageFactory::empty_response_size() &&
-                       piece.toStringPiece().size() == 0;
+                if (piece.get_message_type() != static_cast<uint32_t>(
+                            TwoPLPashaMessage::REMOTE_DELETE_RESPONSE) ||
+                    piece.get_message_length() !=
+                        TwoPLPashaMessageFactory::status_key_offset_response_size())
+                        return false;
+                Decoder decoder(piece.toStringPiece());
+                uint8_t raw = 0;
+                decoder >> raw >> key_offset;
+                if (decoder.size() != 0 || raw > 1) return false;
+                outcome = raw == 0 ? RemoteDeleteOutcome::Deleted
+                                   : RemoteDeleteOutcome::Busy;
+                return true;
         }
 
         static void append_data_migration_response(
@@ -491,14 +508,22 @@ class TwoPLPashaMessageHandler {
         }
 
         static void append_remote_delete_response(
-                Message &message, std::size_t table_id, std::size_t partition_id)
+                Message &message, std::size_t table_id, std::size_t partition_id,
+                RemoteDeleteOutcome outcome, uint32_t key_offset)
         {
+                const auto size =
+                    TwoPLPashaMessageFactory::status_key_offset_response_size();
                 Encoder encoder(message.data);
                 encoder << MessagePiece::construct_message_piece_header(
                     static_cast<uint32_t>(TwoPLPashaMessage::REMOTE_DELETE_RESPONSE),
-                    TwoPLPashaMessageFactory::empty_response_size(), table_id,
-                    partition_id);
-                message.flush();
+                    size, table_id, partition_id);
+                switch (outcome) {
+                        case RemoteDeleteOutcome::Deleted:
+                                encoder << uint8_t{0} << key_offset; message.flush(); return;
+                        case RemoteDeleteOutcome::Busy:
+                                encoder << uint8_t{1} << key_offset; message.flush(); return;
+                }
+                LOG(FATAL) << "unknown remote delete response outcome";
         }
 
         // The owner half of the original scan migration request.  Keeping it

@@ -217,12 +217,10 @@ inline void TransportWrite(const void* address, size_t bytes) {
   HwccWrite(address, bytes);
 }
 inline void SwccWriteback(const void* address, size_t bytes) {
-  Record(latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kFlush, address,
-         bytes);
+  latency_sim::FixedLatencyFlushAuditTag(address, bytes);
 }
 inline void SwccInvalidate(const void* address, size_t bytes) {
-  Record(latency_sim::MemoryDomain::kSwcc,
-         latency_sim::AccessKind::kInvalidate, address, bytes);
+  latency_sim::FixedLatencyInvalidateAuditTag(address, bytes);
 }
 inline void SharedPayloadRead(const void* address, size_t bytes) {
   Record(latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kRead, address,

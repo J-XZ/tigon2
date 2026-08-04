@@ -147,6 +147,17 @@ void RunFocusedG() {
   star::TwoPLPashaMessageFactory::new_remote_delete_message(
       two_pieces, 0, 3, key.data(), key.size());
   assert(two_pieces.get_message_count() == 2);
+  // Remote delete completion is a framed status response: owner-side
+  // contention is retryable and must not be reported as a malformed request.
+  star::Message busy_delete_response;
+  star::TwoPLPashaMessageHandler::append_remote_delete_response(
+      busy_delete_response, 0, 3, star::RemoteDeleteOutcome::Busy, 0);
+  star::RemoteDeleteOutcome delete_outcome{};
+  uint32_t delete_key_offset = 99;
+  assert(star::TwoPLPashaMessageHandler::decode_remote_delete_response(
+      *busy_delete_response.begin(), delete_outcome, delete_key_offset));
+  assert(delete_outcome == star::RemoteDeleteOutcome::Busy &&
+         delete_key_offset == 0);
   // Initialize two owner arenas so the second published transport ring is
   // idle in this process; the parent demuxer consumes only ring 0.
   char path_template[] = "/tmp/tigonkv-engine-g-XXXXXX";
@@ -219,6 +230,34 @@ void RunFocusedG() {
   assert(delivered.load(std::memory_order_acquire));
   engine.reset();
   unlink(path_template);
+
+  // Explicit lifecycle contract: an active foreground binding prevents
+  // Close/Shutdown from tearing down the pool; after ReleaseWorker the close
+  // clears the gate and process-local bindings, and a different mapping can
+  // attach cleanly again.
+  char lifecycle_template[] = "/tmp/tigonkv-engine-lifecycle-XXXXXX";
+  const int lifecycle_fd = mkstemp(lifecycle_template);
+  assert(lifecycle_fd >= 0);
+  close(lifecycle_fd);
+  auto lifecycle = tigonkv::engine::KVEngine::Open(
+      ConfigFor(lifecycle_template), true);
+  lifecycle->BindWorker(0);
+  bool shutdown_refused = false;
+  try {
+    lifecycle->Shutdown();
+  } catch (const std::runtime_error &) {
+    shutdown_refused = true;
+  }
+  assert(shutdown_refused);
+  lifecycle->ReleaseWorker();
+  lifecycle->Shutdown();
+  assert(latency_sim::FixedLatencyFeaturesFast() == 0);
+  assert(!star::CXLMemory::dual_region_allocator_bound());
+  assert(star::CXL_EBR::bound_regions() == nullptr);
+  auto reopened = tigonkv::engine::KVEngine::Open(
+      ConfigFor(lifecycle_template), false);
+  reopened->Shutdown();
+  unlink(lifecycle_template);
 }
 
 // The production Clock chooses a victim only when its measured dynamic HWCC

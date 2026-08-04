@@ -352,27 +352,99 @@ KVEngine::KVEngine(const Config &config, std::unique_ptr<DualRegionMappedPool> p
 }
 
 KVEngine::~KVEngine() {
+  if (shutdown_complete_) return;
+  try {
+    Shutdown();
+  } catch (...) {
+    // Destruction cannot report an active worker to its caller.  Refusing to
+    // unmap a live pool is a hard safety invariant, so an omitted explicit
+    // ReleaseWorker/Shutdown is treated as a programming error rather than
+    // silently tearing down protocol state underneath a worker.
+    std::terminate();
+  }
+}
+
+void KVEngine::Shutdown() {
+  if (shutdown_complete_) return;
+  {
+    std::lock_guard<std::mutex> lock(worker_owner_mutex_);
+    const auto active = std::count_if(
+        worker_owners_.begin(), worker_owners_.end(),
+        [](const std::thread::id &owner) { return owner != std::thread::id{}; });
+    if (active != 0)
+      throw std::runtime_error(
+          "KVEngine::Shutdown requires every foreground worker to ReleaseWorker");
+  }
+
+  // Quiesce all asynchronous protocol activity before touching any global or
+  // mapped state.  The demuxer is the sole MPSC consumer and must be joined
+  // before rings_ or its callback-owned mailboxes disappear.
   StopInboundDemuxer();
+  KvMigrationRuntime::Instance().Reset();
+  partitions_.clear();
+
   if (star::scc_manager == scc_.get()) star::scc_manager = nullptr;
   if (star::global_ebr_meta == ebr_) star::global_ebr_meta = nullptr;
-  KvMigrationRuntime::Instance().Reset();
+  star::CXL_EBR::clear_dual_region_allocator();
+  star::CXLMemory::clear_dual_region_allocator();
+  scc_.reset();
+  rings_ = nullptr;
+  ebr_ = nullptr;
+
+  // This is the library's required disabled -> clear-registration boundary;
+  // it happens before the allocator unmaps the registered ranges.
+  auto &simulator = latency_sim::GlobalLatencySimulator();
+  simulator.DisableAtQuiescentBoundary();
+  simulator.ClearPoolRegistrations();
+
+  worker_mailboxes_.clear();
+  pool_.reset();
+  shutdown_complete_ = true;
 }
 
 std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
-  config.Validate();
-  auto affinity_cpus = ResolveAffinityCpus(config);
-  // Isolate pool open from any previously enabled simulator state in this
-  // process (tests create sequential stores).  Pool open itself runs with the
-  // gate disabled; fixed latency is enabled below after registration.
-  latency_sim::GlobalLatencySimulator().Configure(latency_sim::FixedLatencyConfig{});
-  latency_sim::GlobalLatencySimulator().ClearPoolRegistrations();
-  auto pool = std::make_unique<DualRegionMappedPool>(
-      DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
+  auto &simulator = latency_sim::GlobalLatencySimulator();
+  std::unique_ptr<DualRegionMappedPool> pool;
+  std::unique_ptr<KVEngine> engine;
+  std::unique_ptr<star::SCCManager> scc;
+  star::CXL_EBR *ebr = nullptr;
+  bool lifecycle_touched = false;
+  auto rollback = [&]() noexcept {
+    if (!lifecycle_touched) return;
+    if (engine) {
+      try {
+        engine->Shutdown();
+      } catch (...) {
+        // Open has no live foreground workers.  Continue clearing every
+        // process-local binding even if a future shutdown check is tightened.
+      }
+      engine.reset();
+    }
+    KvMigrationRuntime::Instance().Reset();
+    if (star::scc_manager == scc.get()) star::scc_manager = nullptr;
+    if (star::global_ebr_meta == ebr) star::global_ebr_meta = nullptr;
+    star::CXL_EBR::clear_dual_region_allocator();
+    star::CXLMemory::clear_dual_region_allocator();
+    scc.reset();
+    simulator.DisableAtQuiescentBoundary();
+    simulator.ClearPoolRegistrations();
+    pool.reset();
+  };
+  try {
+    config.Validate();
+    auto affinity_cpus = ResolveAffinityCpus(config);
+    // Isolate pool open from any previously enabled simulator state in this
+    // process (tests create sequential stores).  Pool open itself runs with
+    // the gate disabled; fixed latency is enabled below after registration.
+    simulator.Configure(latency_sim::FixedLatencyConfig{});
+    simulator.ClearPoolRegistrations();
+    lifecycle_touched = true;
+    pool = std::make_unique<DualRegionMappedPool>(
+        DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
   // Register the immutable HWCC/SWCC mapping boundaries before enabling fixed
   // latency for the rest of startup.  Pool open itself runs with the gate
   // disabled; every later shared access is validated and scoped.
   const DualRegionConfig region_config = RegionConfig(config);
-  auto &simulator = latency_sim::GlobalLatencySimulator();
   simulator.RegisterPool(
       latency_sim::MemoryDomain::kHwcc,
       static_cast<const std::byte *>(pool->base()) +
@@ -387,7 +459,6 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   mem_access::LatencyScope open_scope(latency_sim::ExecutionClass::kBackground);
   star::CXLMemory::bind_dual_region_allocator(&pool->allocator(), config.node_id);
   star::MPSCRingBuffer *rings = nullptr;
-  star::CXL_EBR *ebr = nullptr;
   if (reset) {
     rings = static_cast<star::MPSCRingBuffer *>(star::cxl_memory.cxlalloc_malloc_wrapper(
         sizeof(star::MPSCRingBuffer) * config.vm_count,
@@ -426,10 +497,10 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   // Process-local allocator binding (VA not portable across VMs).
   star::CXL_EBR::bind_dual_region_allocator(&pool->allocator());
   star::global_ebr_meta = ebr;
-  auto scc = std::make_unique<star::TwoPLPashaSCCWriteThrough>();
+  scc = std::make_unique<star::TwoPLPashaSCCWriteThrough>();
   star::scc_manager = scc.get();
-  auto engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool), ebr,
-                                                        std::move(scc)));
+  engine = std::unique_ptr<KVEngine>(new KVEngine(config, std::move(pool), ebr,
+                                                   std::move(scc)));
   // Root/sentinel construction is not a foreground operation, but it must
   // advance a concrete worker-owned TID slot rather than an unbounded TLS
   // high-water mark.  Worker 0 owns this bootstrap slot after BindWorker.
@@ -451,7 +522,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
       static_cast<uint64_t>(star::TwoPLPashaMessageFactory::
           bool_key_offset_response_size()),
       static_cast<uint64_t>(star::TwoPLPashaMessageFactory::
-          empty_response_size())});
+          status_key_offset_response_size())});
   const uint64_t maximum_message_bytes =
       star::Message::get_prefix_size() + maximum_piece_bytes;
   if (maximum_message_bytes > star::BufferedReader::BUFFER_SIZE)
@@ -581,6 +652,10 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   // does not rebuild a process-heap tracker (§11.14).
   engine->StartInboundDemuxer();
   return engine;
+  } catch (...) {
+    rollback();
+    throw;
+  }
 }
 
 uint32_t KVEngine::PartitionForKey(std::string_view key) const {
@@ -616,7 +691,6 @@ KVPartition *KVEngine::VisiblePartition(std::string_view key) const {
 
 Status KVEngine::Put(std::string_view key, std::string_view value) {
   RequireBoundWorker();
-  EbrOperationScope ebr_scope(ebr_);
   PollTransport();
   if (IsInternalMaxSentinel(key, config_.fixed_key_size))
     return Status::Error(StatusCode::kInvalidArgument,
@@ -626,6 +700,7 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
     if (route.partition == nullptr)
       return Status::Error(StatusCode::kCorruption, "missing visible partition");
     const auto write_shared = [&](bool record_clock_access = true) {
+      EbrOperationScope ebr_scope(ebr_);
       const SharedAccessState state =
           route.partition->PutShared(key, config_.node_id, value,
                                      record_clock_access);
@@ -660,6 +735,7 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
     return Status::Ok();
   }
   try {
+    EbrOperationScope ebr_scope(ebr_);
     switch (route.partition->PutPrivate(key, value)) {
       case star::RowOutcome::kDone:
         return Status::Ok();
@@ -681,7 +757,6 @@ Status KVEngine::Put(std::string_view key, std::string_view value) {
 
 GetResult KVEngine::Get(std::string_view key) {
   RequireBoundWorker();
-  EbrOperationScope ebr_scope(ebr_);
   PollTransport();
   if (IsInternalMaxSentinel(key, config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument,
@@ -692,8 +767,12 @@ GetResult KVEngine::Get(std::string_view key) {
     if (visible == nullptr)
       return {Status::Error(StatusCode::kCorruption, "missing visible partition"), {}};
     std::string shared;
-    const SharedAccessState first =
-        visible->GetShared(key, config_.node_id, &shared);
+    const auto get_shared = [&](bool record_clock_access = true) {
+      EbrOperationScope ebr_scope(ebr_);
+      return visible->GetShared(key, config_.node_id, &shared,
+                               record_clock_access);
+    };
+    const SharedAccessState first = get_shared();
     if (first == SharedAccessState::kDone) {
       ++CurrentWorkerRuntime().shared_gets;
       return {Status::Ok(), std::move(shared)};
@@ -703,8 +782,8 @@ GetResult KVEngine::Get(std::string_view key) {
     const Status migrated =
         Forward(star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST, key, {}, route.partition_id, route.owner);
     if (!migrated.ok()) return {migrated, {}};
-    const SharedAccessState second = visible->GetShared(
-        key, config_.node_id, &shared, /*record_clock_access=*/false);
+    const SharedAccessState second =
+        get_shared(/*record_clock_access=*/false);
     if (second == SharedAccessState::kDone) {
       ++CurrentWorkerRuntime().shared_gets;
       return {Status::Ok(), std::move(shared)};
@@ -715,6 +794,7 @@ GetResult KVEngine::Get(std::string_view key) {
                           "owner acknowledged migration without readable shared row"), {}};
   }
   try {
+    EbrOperationScope ebr_scope(ebr_);
     std::string value;
     switch (route.partition->GetPrivate(key, &value)) {
       case star::RowOutcome::kDone:
@@ -733,7 +813,6 @@ GetResult KVEngine::Get(std::string_view key) {
 
 Status KVEngine::Delete(std::string_view key) {
   RequireBoundWorker();
-  EbrOperationScope ebr_scope(ebr_);
   PollTransport();
   if (IsInternalMaxSentinel(key, config_.fixed_key_size))
     return Status::Error(StatusCode::kInvalidArgument,
@@ -742,6 +821,7 @@ Status KVEngine::Delete(std::string_view key) {
   if (!route.owned_by_this_node) {
     star::TwoPLPashaMetadataShared *locked_row = nullptr;
     const auto prepare_delete = [&](bool record_clock_access = true) {
+      EbrOperationScope ebr_scope(ebr_);
       return route.partition->PrepareRemoteDelete(key, config_.node_id,
                                                   &locked_row,
                                                   record_clock_access);
@@ -768,6 +848,7 @@ Status KVEngine::Delete(std::string_view key) {
     return deleted;
   }
   try {
+    EbrOperationScope ebr_scope(ebr_);
     switch (route.partition->DeletePrivate(key)) {
       case star::RowOutcome::kDone:
         return Status::Ok();
@@ -786,7 +867,6 @@ Status KVEngine::Delete(std::string_view key) {
 ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
                           uint64_t limit) {
   RequireBoundWorker();
-  EbrOperationScope ebr_scope(ebr_);
   PollTransport();
   if (IsInternalMaxSentinel(start_key, config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument,
@@ -802,9 +882,13 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
     // First probe: master adjacency only. K1 on a cold first probe would accept
     // a distant migrated island, then move_in(min, limit) only fills the first
     // limit+1 private keys and never reaches that island's trailing hole.
-    KVPartition::SharedScanResult probe = partition->ScanSharedPartition(
-        config_.node_id, min_key, scan_limit, inclusive_max,
-        /*allow_lower_bound_left_boundary=*/false);
+    KVPartition::SharedScanResult probe;
+    {
+      EbrOperationScope ebr_scope(ebr_);
+      probe = partition->ScanSharedPartition(
+          config_.node_id, min_key, scan_limit, inclusive_max,
+          /*allow_lower_bound_left_boundary=*/false);
+    }
     ++runtime.scan_partition_probes;
     PollTransport();
     if (!probe.status.ok()) return probe.status;
@@ -823,9 +907,12 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
       // Prescribed continuation: same min/max/limit, with K1 so a post-move-in
       // lower-bound row without migrated predecessor can pass. A second
       // incomplete probe remains Busy for the facade boundary.
-      probe = partition->ScanSharedPartition(
-          config_.node_id, min_key, scan_limit, inclusive_max,
-          /*allow_lower_bound_left_boundary=*/true);
+      {
+        EbrOperationScope ebr_scope(ebr_);
+        probe = partition->ScanSharedPartition(
+            config_.node_id, min_key, scan_limit, inclusive_max,
+            /*allow_lower_bound_left_boundary=*/true);
+      }
       ++runtime.scan_partition_probes;
       PollTransport();
       if (!probe.status.ok()) return probe.status;
@@ -867,8 +954,12 @@ ScanResult KVEngine::Scan(std::string_view start_key, std::string_view end_key,
     Status status;
     if (OwnerForPartition(partition_id) == config_.node_id) {
       std::vector<std::pair<std::string, std::string>> items;
-      const bool ok = partitions_[partition_id]->ScanLocalPartition(
-          min_key, remaining, &items, inclusive_max);
+      bool ok = false;
+      {
+        EbrOperationScope ebr_scope(ebr_);
+        ok = partitions_[partition_id]->ScanLocalPartition(
+            min_key, remaining, &items, inclusive_max);
+      }
       ++runtime.scan_partition_probes;
       PollTransport();
       status = ok ? Status::Ok()
@@ -941,7 +1032,6 @@ CasResult KVEngine::CompareExchange(std::string_view key,
                                     std::string_view expected,
                                     std::string_view desired) {
   RequireBoundWorker();
-  EbrOperationScope ebr_scope(ebr_);
   PollTransport();
   if (IsInternalMaxSentinel(key, config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument,
@@ -953,6 +1043,7 @@ CasResult KVEngine::CompareExchange(std::string_view key,
       return {Status::Error(StatusCode::kCorruption, "missing visible partition"), false};
     bool exchanged = false;
     auto compare_shared = [&](bool record_clock_access = true) {
+      EbrOperationScope ebr_scope(ebr_);
       return visible->CompareExchangeShared(key, config_.node_id, expected,
                                             desired, &exchanged,
                                             record_clock_access);
@@ -1005,6 +1096,7 @@ CasResult KVEngine::CompareExchange(std::string_view key,
     return {Status::Ok(), true};
   }
   try {
+    EbrOperationScope ebr_scope(ebr_);
     bool exchanged = false;
     switch (route.partition->CompareExchangePrivate(key, expected, desired,
                                                      &exchanged)) {
@@ -1031,7 +1123,6 @@ CasResult KVEngine::CompareExchange(std::string_view key,
 
 IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
   RequireBoundWorker();
-  EbrOperationScope ebr_scope(ebr_);
   PollTransport();
   if (IsInternalMaxSentinel(key, config_.fixed_key_size))
     return {Status::Error(StatusCode::kInvalidArgument,
@@ -1043,6 +1134,7 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
       return {Status::Error(StatusCode::kCorruption, "missing visible partition"), 0};
     int64_t shared = 0;
     auto increment_shared = [&](bool record_clock_access = true) {
+      EbrOperationScope ebr_scope(ebr_);
       return visible->IncrementShared(key, config_.node_id, delta, &shared,
                                       record_clock_access);
     };
@@ -1085,6 +1177,7 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
     return {Status::Ok(), delta};
   }
   try {
+    EbrOperationScope ebr_scope(ebr_);
     int64_t value = 0;
     switch (route.partition->IncrementPrivate(key, delta, &value)) {
       case star::RowOutcome::kDone:
@@ -1408,33 +1501,28 @@ void KVEngine::ReleaseWorker() {
 }
 
 void KVEngine::PollTransport() {
+  // Cooperative transport is never allowed to busy-wait or settle latency
+  // while an operation-wide foreground/EBR section is active.  Suspend the
+  // outer foreground scope first, run the complete poll in background, and
+  // let the background guard settle only after each narrowed EBR dispatch has
+  // been destroyed.  The suspension then restores the foreground scope.
+  mem_access::ForegroundScopeSuspension suspend_foreground;
+  latency_sim::ScopeGuard background_scope(
+      latency_sim::ExecutionClass::kBackground);
+  PollTransportImpl();
+}
+
+void KVEngine::PollTransportImpl() {
   RequireBoundWorker();
   WorkerMailbox &mailbox = CurrentMailbox();
   const bool awaiting = mailbox.operation.expected_response_type != 0;
 
-  // Each message dispatch runs inside its own narrowed EBR critical section.
-  // Peer requests additionally run inside a dedicated background scope that
-  // outlives the EBR guard: the caller's foreground scope is suspended first
-  // (no busy-wait), the request charges to the background scope, and the
-  // background scope settles only after the EBR guard has been destroyed, so
-  // no busy-wait ever happens inside the EBR-protected region.  Responses
-  // dispatch inside the caller's still-active scope with the same narrowed
-  // EBR protection; their settlement happens at the caller's outermost scope
-  // exit, long after this EBR region is gone.
+  // Every message dispatch runs inside a narrowed EBR critical section while
+  // the outer background scope above remains active.  Thus no dispatch can
+  // settle/busy-wait latency while EBR, latches, locks or ring state is held.
   auto dispatch_one = [&](std::unique_ptr<star::Message> message) {
-    const auto piece = *message->begin();
-    if (IsResponseType(piece.get_message_type())) {
-      EbrOperationScope ebr_scope(ebr_);
-      DispatchMessage(*message, mailbox);
-      return;
-    }
-    mem_access::ForegroundScopeSuspension suspend_foreground;
-    latency_sim::ScopeGuard request_scope(
-        latency_sim::ExecutionClass::kBackground);
-    {
-      EbrOperationScope ebr_scope(ebr_);
-      DispatchMessage(*message, mailbox);
-    }  // EBR guard destroyed before request_scope settles
+    EbrOperationScope ebr_scope(ebr_);
+    DispatchMessage(*message, mailbox);
   };
 
   // Finish requests deferred from a previous await that already completed.
@@ -1526,9 +1614,14 @@ void KVEngine::ConsumeTransportResponse(star::Message &message,
     TransportFatal(config_.node_id, "response", "unexpected response for worker operation");
   uint32_t key_offset = 0;
   if (piece.get_message_type() == static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE)) {
-    if (!star::TwoPLPashaMessageHandler::decode_remote_delete_response(piece))
-      TransportFatal(config_.node_id, "response", "remote delete completion has payload");
-    operation.result = Status::Ok();
+    star::RemoteDeleteOutcome delete_outcome{};
+    if (!star::TwoPLPashaMessageHandler::decode_remote_delete_response(
+            piece, delete_outcome, key_offset) || key_offset != 0)
+      TransportFatal(config_.node_id, "response", "malformed remote delete response");
+    operation.result = delete_outcome == star::RemoteDeleteOutcome::Deleted
+                           ? Status::Ok()
+                           : Status::Error(StatusCode::kBusy,
+                                           "owner delete busy");
   } else if (piece.get_message_type() == static_cast<uint32_t>(
                  star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN)) {
     bool success = false;
@@ -1717,11 +1810,13 @@ void KVEngine::ServeTransportRequest(star::Message &message,
               const FixedKey fixed_key = FixedKey::From(
                   key, config_.fixed_key_size);
               return star::migration_manager->delete_specific_row_and_move_out(
-                  table, &fixed_key, /*is_delete_local=*/false);
+                         table, &fixed_key, /*is_delete_local=*/false)
+                         ? star::RemoteDeleteOutcome::Deleted
+                         : star::RemoteDeleteOutcome::Busy;
             });
     if (!framed)
       TransportFatal(config_.node_id, "request",
-                     "bad remote delete request or owner delete", &message);
+                     "bad remote delete request fields", &message);
     return;
   }
 

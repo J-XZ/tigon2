@@ -17,11 +17,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include(CTest)
 enable_testing()
 
-# LATENCY_SIM_COMPILE_OFF is the only compile-off gate (the private
-# TIGONKV_DISABLE_HARDWARE_SIMULATION option has been removed).  Default is
-# OFF; ON requires an independent build directory so no translation unit ever
+# LATENCY_SIM_COMPILE_OFF is the only compile-off gate.  Default is OFF; ON
+# requires an independent build directory so no translation unit ever
 # mixes compile-off and runtime public-header definitions.
-set(LATENCY_SIM_COMPILE_OFF "OFF" CACHE STRING
+set(LATENCY_SIM_COMPILE_OFF "OFF" CACHE BOOL
   "Compile-time removal of the latency_sim slow path (independent build only)")
 set_property(CACHE LATENCY_SIM_COMPILE_OFF PROPERTY STRINGS ON OFF)
 if(NOT LATENCY_SIM_COMPILE_OFF STREQUAL "ON"

@@ -21,8 +21,12 @@ assert d['tigon_kv']['fixed_key_size'] == 32
 assert d['tigon_kv']['fixed_value_size'] == 32
 assert d['tigon_kv']['cpu_affinity'] is True
 assert 'base_ssh_port' not in d.get('network', {})
+assert d['tigon_kv']['latency_inject']['fixed_latency']['enabled'] is False
 meta=json.load(open(sys.argv[2]))
 assert meta['partition_sample_stride'] == 16
+assert meta['fixed_latency_enabled'] is False
+assert meta['latency_sim_compile_off'] == 'OFF'
+assert meta['build_dir'].endswith('/build-relwithdebinfo')
 print('generated ycsb config schema ok')
 PY
 # Ensure VM scripts still derive ports/backing from the generated config.

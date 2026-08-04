@@ -62,6 +62,7 @@ class CXL_EBR {
         }
 
         static void bind_dual_region_allocator(tigonkv::engine::DualRegionAllocator *regions);
+        static void clear_dual_region_allocator() noexcept;
         static tigonkv::engine::DualRegionAllocator *bound_regions();
 
         void thread_init_ebr_meta(uint64_t coordinator_id, uint64_t thread_id)

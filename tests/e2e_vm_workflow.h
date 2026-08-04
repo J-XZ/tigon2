@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kv/engine/fixed_value.h"
 #include "kv/kv_store.h"
 
 #include <atomic>
@@ -127,6 +128,13 @@ inline std::string Value09(uint64_t index, uint64_t generation) {
   return value;
 }
 
+inline std::string FixedDecimalValue(int64_t value, uint32_t fixed_value_size) {
+  std::string encoded;
+  if (!engine::EncodeCanonicalFixedDecimal(value, fixed_value_size, &encoded))
+    throw std::invalid_argument("mixed worker decimal does not fit fixed value size");
+  return encoded;
+}
+
 struct PhaseResult {
   uint64_t duration_us = 0;
   uint64_t operations = 0;
@@ -240,11 +248,16 @@ PhaseResult RunWorkersWithPeerService(KVStore &store, const Config &base,
   return {NowUs() - phase_start, node_count};
 }
 
-inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
+template <typename OnReplayDone>
+inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base,
+                                   OnReplayDone on_replay_done) {
   const uint64_t threads = PositiveEnv("TIGONKV_E2E_THREADS",
                                        base.foreground_worker_count_per_vm);
   const uint64_t seconds = PositiveEnv("TIGONKV_E2E_MIXED_SECONDS", 60);
   std::atomic<bool> start{false};
+  std::atomic<bool> release{false};
+  std::atomic<uint64_t> replayed{0};
+  std::atomic<bool> failed{false};
   std::mutex error_mutex;
   std::exception_ptr error;
   std::atomic<uint64_t> operations{0};
@@ -258,20 +271,23 @@ inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
         while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
         const std::string key = Key09(static_cast<uint64_t>(base.node_id) * threads + worker);
+        const std::string zero = FixedDecimalValue(0, base.fixed_value_size);
+        const std::string one = FixedDecimalValue(1, base.fixed_value_size);
+        const std::string two = FixedDecimalValue(2, base.fixed_value_size);
         while (std::chrono::steady_clock::now() < deadline) {
-          const Status put = store.Put(key, "0");
+          const Status put = store.Put(key, zero);
           if (!put.ok()) throw std::runtime_error("mixed PUT failed: " + put.message);
           const GetResult promoted = store.Get(key);
-          if (!promoted.status.ok() || promoted.value != "0")
+          if (!promoted.status.ok() || promoted.value != zero)
             throw std::runtime_error("mixed GET promotion verification failed");
           const IncrementResult increment = store.Increment(key, 1);
           if (!increment.status.ok() || increment.value != 1)
             throw std::runtime_error("mixed INCR verification failed");
-          const CasResult cas = store.CompareExchange(key, "1", "2");
+          const CasResult cas = store.CompareExchange(key, one, two);
           if (!cas.status.ok() || !cas.exchanged)
             throw std::runtime_error("mixed CAS verification failed");
           const GetResult verified = store.Get(key);
-          if (!verified.status.ok() || verified.value != "2")
+          if (!verified.status.ok() || verified.value != two)
             throw std::runtime_error("mixed GET after CAS verification failed");
           operations.fetch_add(5, std::memory_order_relaxed);
         }
@@ -279,6 +295,14 @@ inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
         const GetResult deleted = store.Get(key);
         if (deleted.status.code != StatusCode::kNotFound)
           throw std::runtime_error("mixed DELETE visibility verification failed");
+        replayed.fetch_add(1, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire) &&
+               !failed.load(std::memory_order_acquire)) {
+          const Status status = store.PollTransport();
+          if (!status.ok())
+            throw std::runtime_error("mixed transport poll failed: " + status.message);
+          std::this_thread::yield();
+        }
         store.ReleaseWorker();
       } catch (...) {
         try {
@@ -287,10 +311,16 @@ inline PhaseResult RunMixedWorkers(KVStore &store, const Config &base) {
         }
         std::lock_guard<std::mutex> guard(error_mutex);
         if (!error) error = std::current_exception();
+        failed.store(true, std::memory_order_release);
       }
     });
   }
   start.store(true, std::memory_order_release);
+  while (replayed.load(std::memory_order_acquire) != threads &&
+         !failed.load(std::memory_order_acquire))
+    std::this_thread::yield();
+  if (!failed.load(std::memory_order_acquire)) on_replay_done();
+  release.store(true, std::memory_order_release);
   for (auto &worker : workers) worker.join();
   if (error) std::rethrow_exception(error);
   return {NowUs() - begin, operations.load(std::memory_order_relaxed)};
@@ -429,7 +459,14 @@ inline int RunE2E09MultiVm() {
       WaitForHostRelease(phase, *main_store, /*service_transport=*/false);
     });
   } else if (phase == "mixed") {
-    result = RunMixedWorkers(*main_store, config);
+    result = RunMixedWorkers(*main_store, config, [&] {
+      std::cerr << "E2E_09_STAGE node=" << config.node_id << " phase=" << phase
+                << " stage=replay_done\n" << std::flush;
+      // Mixed workers keep polling their own queues while the host waits for
+      // every VM.  The main thread only owns the phase barrier and therefore
+      // must not enter the foreground PollTransport path without a binding.
+      WaitForHostRelease(phase, *main_store, /*service_transport=*/false);
+    });
   } else {
     throw std::invalid_argument("e2e09 phase must be fill, update, read, or mixed");
   }

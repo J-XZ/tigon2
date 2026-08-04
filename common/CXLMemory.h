@@ -64,6 +64,16 @@ class CXLMemory {
                 owner_shard_ = owner_shard;
         }
 
+        // Explicit process-lifetime boundary.  The mapped pool must outlive
+        // every allocator/EBR user, and the binding must be cleared before the
+        // pool is unmapped so a later Open cannot accidentally resolve through
+        // a stale VA.
+        static void clear_dual_region_allocator() noexcept
+        {
+                dual_regions_ = nullptr;
+                owner_shard_ = 0;
+        }
+
         // Read-only process binding used by tests / Open invariants (§11.3).
         static uint32_t bound_owner_shard() { return owner_shard_; }
         static bool dual_region_allocator_bound() { return dual_regions_ != nullptr; }

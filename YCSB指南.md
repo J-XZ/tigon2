@@ -13,9 +13,24 @@
 ```bash
 cmake -S . -B build-relwithdebinfo -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DTIGONKV_DISABLE_HARDWARE_SIMULATION=OFF
+  -DLATENCY_SIM_COMPILE_OFF=OFF
 cmake --build build-relwithdebinfo -j2
 ```
+
+默认 `LATENCY_SIM_COMPILE_OFF=OFF`，允许 JSONC 在运行时启用或禁用固定延迟。若要在
+编译期完全移除延迟模拟路径，必须使用独立构建目录：
+
+```bash
+cmake -S . -B build-relwithdebinfo-compile-off -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DLATENCY_SIM_COMPILE_OFF=ON
+cmake --build build-relwithdebinfo-compile-off -j2
+```
+
+实验封装 `tigonkv_run_ycsb_experiment.sh` 默认生成
+`fixed_latency.enabled=false`；只有显式传入 `--enable-fixed-latency` 才会生成启用配置。
+编译选择只接受精确的 `--latency-sim-compile-off=ON|OFF`，并分别使用上述两个构建目录；
+脚本会在构建目录写入 fixed-latency-only 契约 stamp，`--skip-build` 会校验该 stamp。
 
 先用 `experiment_config.jsonc` 的 `fixed_latency.enabled=false` 生成并回放一轮小
 trace。非零 canary 只在临时副本中设置小的

@@ -15,8 +15,8 @@ function print_usage {
         echo "SmallBank: [SundialPasha/Sundial/TwoPLPasha/TwoPLPashaPhantom/TwoPL] HOST_NUM WORKER_NUM KEYS ZIPF_THETA CROSS_RATIO USE_CXL_TRANS USE_OUTPUT_THREAD ENABLE_MIGRATION_OPTIMIZATION MIGRATION_POLICY WHEN_TO_MOVE_OUT HW_CC_BUDGET ENABLE_SCC SCC_MECH PRE_MIGRATE TIME_TO_RUN TIME_TO_WARMUP LOGGING_TYPE EPOCH_LEN MODEL_CXL_SEARCH GATHER_OUTPUTS"
         echo "TATP: [SundialPasha/Sundial/TwoPLPasha/TwoPLPashaPhantom/TwoPL] HOST_NUM WORKER_NUM KEYS CROSS_RATIO USE_CXL_TRANS USE_OUTPUT_THREAD ENABLE_MIGRATION_OPTIMIZATION MIGRATION_POLICY WHEN_TO_MOVE_OUT HW_CC_BUDGET ENABLE_SCC SCC_MECH PRE_MIGRATE TIME_TO_RUN TIME_TO_WARMUP LOGGING_TYPE EPOCH_LEN MODEL_CXL_SEARCH GATHER_OUTPUTS"
         echo "KILL: None"
-        echo "COMPILE: None"
-        echo "COMPILE_SYNC: HOST_NUM"
+        echo "COMPILE: [--latency-sim-compile-off=ON|OFF]"
+        echo "COMPILE_SYNC: HOST_NUM [--latency-sim-compile-off=ON|OFF]"
         echo "CI: HOST_NUM WORKER_NUM"
         echo "COLLECT_OUTPUTS: HOST_NUM"
 }
@@ -69,8 +69,8 @@ function sync_binaries {
         do
                 ssh_command "mkdir -p pasha" $i
         done
-        sync_files $SCRIPT_DIR/../build/bench_tpcc /root/pasha/ $HOST_NUM
-        sync_files $SCRIPT_DIR/../build/bench_ycsb /root/pasha/ $HOST_NUM
+        sync_files "$TIGONKV_BUILD_DIR/bench_tpcc" /root/pasha/ $HOST_NUM
+        sync_files "$TIGONKV_BUILD_DIR/bench_ycsb" /root/pasha/ $HOST_NUM
         # sync_files $SCRIPT_DIR/../build/bench_smallbank /root/pasha/ $HOST_NUM
         # sync_files $SCRIPT_DIR/../build/bench_tatp /root/pasha/ $HOST_NUM
         exit -1
@@ -807,13 +807,70 @@ function run_exp_tatp {
         kill_prev_exps $HOST_NUM
 }
 
-# process arguments
+# Process arguments.  This legacy entry point may still build the root
+# project, so keep the compile-off selector exact and remove it before the
+# historical positional-argument checks. Environment inheritance is ignored:
+# an omitted selector is always the ordinary OFF consumer build.
+typeset LATENCY_SIM_COMPILE_OFF_VALUE=OFF
+typeset LATENCY_SIM_COMPILE_OFF_SEEN=0
+typeset -a FILTERED_ARGS=()
+for ARG in "$@"; do
+        case "$ARG" in
+                --latency-sim-compile-off=ON|--latency-sim-compile-off=OFF)
+                        VALUE=${ARG#*=}
+                        if [ $LATENCY_SIM_COMPILE_OFF_SEEN = 1 ] &&
+                           [ "$LATENCY_SIM_COMPILE_OFF_VALUE" != "$VALUE" ]; then
+                                echo "conflicting --latency-sim-compile-off values" >&2
+                                exit 2
+                        fi
+                        LATENCY_SIM_COMPILE_OFF_VALUE=$VALUE
+                        LATENCY_SIM_COMPILE_OFF_SEEN=1
+                        ;;
+                --latency-sim-compile-off=*)
+                        echo "--latency-sim-compile-off accepts only ON or OFF" >&2
+                        exit 2
+                        ;;
+                --latency-sim-compile-off)
+                        echo "use --latency-sim-compile-off=ON|OFF" >&2
+                        exit 2
+                        ;;
+                *) FILTERED_ARGS+=("$ARG") ;;
+        esac
+done
+set -- "${FILTERED_ARGS[@]}"
 if [ $# -lt 1 ]; then
         print_usage
         exit -1
 fi
 
 typeset RUN_TYPE=$1
+typeset TIGONKV_BUILD_DIR="$SCRIPT_DIR/../build-relwithdebinfo"
+[ "$LATENCY_SIM_COMPILE_OFF_VALUE" = ON ] &&
+        TIGONKV_BUILD_DIR="$SCRIPT_DIR/../build-relwithdebinfo-compile-off"
+
+function write_latency_sim_build_contract_stamp {
+        typeset STAMP="$TIGONKV_BUILD_DIR/tigonkv_latency_sim_build_contract.json"
+        python3 - "$STAMP" "$SCRIPT_DIR/.." "$LATENCY_SIM_COMPILE_OFF_VALUE" <<'PY'
+import json, os, sys
+path, source_dir, compile_off = sys.argv[1:]
+payload = {
+    'source_dir': os.path.realpath(source_dir),
+    'build_type': 'RelWithDebInfo',
+    'generator': 'Ninja',
+    'latency_sim_compile_off': compile_off,
+    'contract': 'fixed-latency-only',
+}
+tmp = path + '.tmp'
+with open(tmp, 'w', encoding='utf-8') as output:
+        json.dump(payload, output, indent=2, sort_keys=True)
+        output.write('\n')
+os.replace(tmp, path)
+PY
+        if [ $? -ne 0 ]; then
+                echo "failed to write latency_sim build contract stamp" >&2
+                exit 2
+        fi
+}
 
 # global configurations
 typeset PASHA_CXL_TRANS_ENTRY_STRUCT_SIZE=2048
@@ -1073,12 +1130,12 @@ elif [ $RUN_TYPE = "COMPILE" ]; then
                 exit -1
         fi
 
-        # compile
-        cd $SCRIPT_DIR/../
-        mkdir -p build
-        cd build
-        cmake ..
-        make -j
+        # Compile the ordinary or independent compile-off consumer cache.
+        cmake -S "$SCRIPT_DIR/../" -B "$TIGONKV_BUILD_DIR" -G Ninja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DLATENCY_SIM_COMPILE_OFF="$LATENCY_SIM_COMPILE_OFF_VALUE"
+        cmake --build "$TIGONKV_BUILD_DIR" -j2
+        write_latency_sim_build_contract_stamp
 
         exit 0
 elif [ $RUN_TYPE = "COMPILE_SYNC" ]; then
@@ -1089,12 +1146,12 @@ elif [ $RUN_TYPE = "COMPILE_SYNC" ]; then
 
         typeset HOST_NUM=$2
 
-        # compile
-        cd $SCRIPT_DIR/../
-        mkdir -p build
-        cd build
-        cmake ..
-        make -j
+        # Compile the ordinary or independent compile-off consumer cache.
+        cmake -S "$SCRIPT_DIR/../" -B "$TIGONKV_BUILD_DIR" -G Ninja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DLATENCY_SIM_COMPILE_OFF="$LATENCY_SIM_COMPILE_OFF_VALUE"
+        cmake --build "$TIGONKV_BUILD_DIR" -j2
+        write_latency_sim_build_contract_stamp
 
         # sync
         sync_binaries $HOST_NUM

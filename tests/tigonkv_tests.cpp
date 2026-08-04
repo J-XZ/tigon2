@@ -209,6 +209,39 @@ int main(int argc, char **argv) {
   assert(fractional.hardware_simulation.swcc_fixed_ns_per_line == 1.25);
   assert(fractional.cpu_affinity);
 
+  // The project outer parser and latency_sim must both consume the original
+  // JSONC.  In particular, comment markers in a string value are data, not
+  // comments, and the library must still see the surrounding JSONC comments.
+  const std::string jsonc_string_path = latency_config_path + ".string";
+  const std::string jsonc_with_string_comment = ReplaceOnce(
+      ReplaceOnce(base_config_text, "\"path\": \"/mnt/xz_shared_mem\"",
+                  "\"path\": \"https://example.test/a//b\", // URL data"),
+      "\"fixed_latency\": {",
+      "/* fixed-latency object comment */ \"fixed_latency\": {");
+  {
+    std::ofstream output(jsonc_string_path);
+    assert(output.good());
+    output << jsonc_with_string_comment;
+  }
+  const Config string_config = Config::FromJsonc(jsonc_string_path);
+  assert(string_config.shared_memory_path == "https://example.test/a//b");
+  assert(!string_config.hardware_simulation.enabled);
+  std::remove(jsonc_string_path.c_str());
+
+  const std::string missing_field_error = [&] {
+    std::ofstream output(latency_config_path);
+    output << RemoveJsonFieldLine(base_config_text, "enabled");
+    output.close();
+    try {
+      (void)Config::FromJsonc(latency_config_path);
+    } catch (const std::invalid_argument &error) {
+      return std::string(error.what());
+    }
+    return std::string();
+  }();
+  assert(missing_field_error.find(latency_config_path) != std::string::npos);
+  assert(missing_field_error.find("fixed_latency") != std::string::npos);
+
   static constexpr std::string_view kRequiredLatencyFields[] = {
       "fixed_latency", "enabled", "cache_line_bytes",
       "swcc_fixed_ns_per_line", "hwcc_fixed_ns_per_line",
@@ -217,6 +250,10 @@ int main(int argc, char **argv) {
     assert(ParseTextThrows(latency_config_path,
                            RemoveJsonFieldLine(base_config_text, field)));
   }
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"enabled\": false,\n        \"cache_line_bytes\"",
+                  "\"enabled\": false,\n        \"enabled\": false,\n        \"cache_line_bytes\"")));
   // Removed module objects and the former delayed-time field are rejected,
   // rather than being silently ignored.
   assert(ParseTextThrows(
@@ -244,6 +281,32 @@ int main(int argc, char **argv) {
       latency_config_path,
       ReplaceOnce(base_config_text, "\"cache_line_bytes\": 64",
                   "\"cache_line_bytes\": 64.0")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"cache_line_bytes\": 64",
+                  "\"cache_line_bytes\": 0")));
+  assert(ParseTextThrows(
+      latency_config_path,
+      ReplaceOnce(base_config_text, "\"cache_line_bytes\": 64",
+                  "\"cache_line_bytes\": -1")));
+  for (const std::string_view field : {"swcc_fixed_ns_per_line",
+                                       "hwcc_fixed_ns_per_line"}) {
+    assert(ParseTextThrows(
+        latency_config_path,
+        ReplaceOnce(base_config_text,
+                    "\"" + std::string(field) + "\": 0",
+                    "\"" + std::string(field) + "\": -1")));
+    assert(ParseTextThrows(
+        latency_config_path,
+        ReplaceOnce(base_config_text,
+                    "\"" + std::string(field) + "\": 0",
+                    "\"" + std::string(field) + "\": NaN")));
+    assert(ParseTextThrows(
+        latency_config_path,
+        ReplaceOnce(base_config_text,
+                    "\"" + std::string(field) + "\": 0",
+                    "\"" + std::string(field) + "\": Infinity")));
+  }
 
   std::string enabled = ReplaceOnce(
       base_config_text, "\"enabled\": false", "\"enabled\": true");

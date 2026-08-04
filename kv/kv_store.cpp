@@ -61,10 +61,71 @@ Status RunWithBusyRetry(KVStore *store, RuntimeStats *runtime, Op &&op) {
   }
 }
 
-std::string StripComments(std::string text) {
-  text = std::regex_replace(text, std::regex(R"(//[^\n\r]*)"), "");
-  text = std::regex_replace(text, std::regex(R"((/\*)(.|\n|\r)*?\*/)"), "");
-  return text;
+// Remove JSONC comments only outside JSON strings.  The project parser uses
+// the result for its outer-schema checks, while latency_sim receives the
+// untouched JSONC below so it remains the sole owner of fixed_latency's six
+// fields.  A regexp cannot distinguish `//` in a URL or a string value from a
+// line comment.
+std::string StripJsonComments(std::string_view input) {
+  std::string output;
+  output.reserve(input.size());
+  bool in_string = false;
+  bool escaped = false;
+  for (size_t position = 0; position < input.size(); ++position) {
+    const char c = input[position];
+    if (in_string) {
+      output.push_back(c);
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        in_string = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      in_string = true;
+      output.push_back(c);
+      continue;
+    }
+    if (c != '/') {
+      output.push_back(c);
+      continue;
+    }
+    if (position + 1 >= input.size() ||
+        (input[position + 1] != '/' && input[position + 1] != '*')) {
+      output.push_back(c);
+      continue;
+    }
+    const bool line_comment = input[position + 1] == '/';
+    position += 2;
+    if (line_comment) {
+      while (position < input.size() && input[position] != '\n' &&
+             input[position] != '\r') {
+        ++position;
+      }
+      if (position < input.size()) output.push_back(input[position]);
+      continue;
+    }
+    bool closed = false;
+    while (position < input.size()) {
+      if (position + 1 < input.size() && input[position] == '*' &&
+          input[position + 1] == '/') {
+        position += 1;
+        closed = true;
+        break;
+      }
+      // Keep line boundaries so diagnostics and the outer parser remain
+      // readable after a block comment is removed.
+      if (input[position] == '\n' || input[position] == '\r')
+        output.push_back(input[position]);
+      ++position;
+    }
+    if (!closed) throw std::invalid_argument("unterminated JSONC block comment");
+  }
+  if (in_string) throw std::invalid_argument("unterminated JSON string");
+  return output;
 }
 
 template <typename T>
@@ -493,7 +554,8 @@ size_t CountJsonKey(std::string_view text, std::string_view name) {
   return count;
 }
 
-void ParseStrictLatencyConfig(const std::string &text, Config *config) {
+void ParseStrictLatencyConfig(std::string_view text, std::string_view raw_text,
+                              Config *config) {
   size_t root_begin = 0;
   SkipJsonWhitespace(text, &root_begin);
   size_t root_end = 0;
@@ -593,25 +655,14 @@ void ParseStrictLatencyConfig(const std::string &text, Config *config) {
   if (fixed_member.kind != JsonValueKind::kObject)
     throw std::invalid_argument(
         "config field must be object: tigon_kv.latency_inject.fixed_latency");
-  const auto fixed_members =
-      ParseJsonObjectMembers(text, fixed_member.value_begin);
-  const std::vector<std::string_view> fixed_fields = {
-      "enabled", "cache_line_bytes", "swcc_fixed_ns_per_line",
-      "hwcc_fixed_ns_per_line", "foreground_enabled", "background_enabled"};
-  RejectUnknownMembers(fixed_members, fixed_fields,
-                       "tigon_kv.latency_inject.fixed_latency");
-  for (const auto field_name : fixed_fields)
-    (void)RequireUniqueMember(
-        fixed_members, field_name,
-        "tigon_kv.latency_inject.fixed_latency");
-
-  // The fixed_latency six fields are owned by the latency_sim library parser
-  // (/tigon_kv/latency_inject/fixed_latency); this project only keeps the
-  // outer schema checks above (exactly-once latency_inject/fixed_latency keys,
-  // unknown-member rejection) and hands the same raw JSONC text to the library.
+  // The fixed_latency object and all of its six fields are owned by the
+  // latency_sim library parser (/tigon_kv/latency_inject/fixed_latency).  This
+  // project deliberately checks only the outer presence/uniqueness/type and
+  // hands the original JSONC, including comments and trailing commas, to the
+  // library.
   try {
     config->hardware_simulation =
-        latency_sim::ParseFixedLatencyJsonc(text,
+        latency_sim::ParseFixedLatencyJsonc(raw_text,
                                             latency_sim::ConfigLayout::kTigon2)
             .config;
   } catch (const std::exception &error) {
@@ -686,85 +737,62 @@ bool JsonNumberOrFirstArrayInObject(const std::string &s, const char *object, co
   return true;
 }
 
-void ValidateKnownKeys(const std::string &s) {
-  static const std::unordered_set<std::string> known = {
-      "shared_memory", "size_mb", "path", "device_path", "numa_node",
-      "hwcc", "offset_mb", "swcc", "host_cpu", "reserved_cores",
-      "ivshmem_server_cores", "vm_cores", "vm", "count", "core_count_per_vm",
-      "storage_path", "mem_size_mb_per_vm", "first_ip", "bridge_tap_ip",
-      "copy_root_img", "use_ivshmem_doorbell", "local_ssh_pub_key",
-      "ssh_base_port",
-      "network", "base_ssh_port", "sriov_nic", "outside_nic", "sync", "e2e",
-      "foreground_worker_count_per_vm", "tigon_kv", "partition_count",
-      "partitioning", "strategy", "ranges", "lower_key", "upper_key",
-      "timeout_sec", "vm_ssh_user", "vm_direct_ssh_port", "host_rsync_dest",
-      "host_ssh_port", "host_ssh_extra", "project_root_on_targets", "vm_ssh_extra",
-      "fixed_key_size", "fixed_value_size", "hw_cc_budget_mb",
-      "owner_private_swcc_fraction", "migration_policy", "when_to_move_out",
-      "scc_mechanism", "transport_ring_total_mb",
-      "verbose", "extra_check", "cpu_affinity", "latency_inject",
-      "fixed_latency", "enabled", "cache_line_bytes",
-      "swcc_fixed_ns_per_line", "hwcc_fixed_ns_per_line", "foreground_enabled",
-      "background_enabled"};
-  std::regex key(R"KEY("([A-Za-z0-9_.-]+)"\s*:)KEY");
-  for (auto it = std::sregex_iterator(s.begin(), s.end(), key); it != std::sregex_iterator(); ++it) {
-    if (!known.count((*it)[1].str()))
-      throw std::invalid_argument("unknown experiment_config field: " + (*it)[1].str());
-  }
-}
-
 }  // namespace
 
 struct KVStore::Impl {
   std::unique_ptr<engine::KVEngine> engine;
 };
 Config Config::FromJsonc(const std::string &path) {
-  std::ifstream input(path);
-  if (!input) throw std::runtime_error("cannot open experiment config: " + path);
-  std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-  text = StripComments(std::move(text));
-  ValidateKnownKeys(text);
-  Config c;
-  JsonString(text, "path", &c.shared_memory_path);
-  JsonString(text, "device_path", &c.device_path);
-  JsonNumber(text, "size_mb", &c.size_mb);
-  JsonNumberOrFirstArrayInObject(text, "shared_memory", "numa_node", &c.shared_memory_numa_node);
-  JsonNumberArray(text, "reserved_cores", &c.host_reserved_cores);
-  JsonNumberArray(text, "ivshmem_server_cores", &c.ivshmem_server_cores);
-  JsonNumberArray(text, "vm_cores", &c.vm_cores);
-  JsonNumber(text, "count", &c.vm_count);
-  JsonNumberInObject(text, "vm", "core_count_per_vm", &c.vm_core_count_per_vm);
-  JsonString(text, "storage_path", &c.vm_storage_path);
-  JsonNumberOrFirstArrayInObject(text, "vm", "numa_node", &c.vm_numa_node);
-  if (!JsonNumberInObject(text, "vm", "ssh_base_port", &c.network_base_ssh_port))
-    JsonNumber(text, "base_ssh_port", &c.network_base_ssh_port);
-  JsonNumber(text, "timeout_sec", &c.sync_timeout_sec);
-  JsonNumber(text, "foreground_worker_count_per_vm", &c.foreground_worker_count_per_vm);
-  JsonNumber(text, "partition_count", &c.partition_count);
-  JsonNumber(text, "fixed_key_size", &c.fixed_key_size);
-  JsonNumber(text, "fixed_value_size", &c.fixed_value_size);
-  JsonNumber(text, "hw_cc_budget_mb", &c.hw_cc_budget_mb);
-  JsonDouble(text, "owner_private_swcc_fraction", &c.owner_private_swcc_fraction);
-  JsonString(text, "migration_policy", &c.migration_policy);
-  JsonString(text, "when_to_move_out", &c.when_to_move_out);
-  JsonString(text, "scc_mechanism", &c.scc_mechanism);
-  JsonNumber(text, "transport_ring_total_mb", &c.transport_ring_total_mb);
-  JsonBool(text, "cpu_affinity", &c.cpu_affinity);
-  JsonNumberInObject(text, "hwcc", "offset_mb", &c.hwcc_offset_mb);
-  JsonNumberInObject(text, "hwcc", "size_mb", &c.hwcc_size_mb);
-  JsonNumberInObject(text, "swcc", "offset_mb", &c.swcc_offset_mb);
-  JsonNumberInObject(text, "swcc", "size_mb", &c.swcc_size_mb);
-  ParseStrictLatencyConfig(text, &c);
-  ParsePartitioningConfig(text, &c);
-  if (c.shared_memory_path == "/mnt/xz_shared_mem" || c.shared_memory_path == "/mnt/xz_shared_mem/")
-    c.shared_memory_path = "/mnt/xz_shared_mem/ivshmem_shared_mem";
-  struct stat device_stat {};
-  if (!c.device_path.empty() && ::stat(c.device_path.c_str(), &device_stat) == 0 &&
-      S_ISCHR(device_stat.st_mode)) {
-    c.shared_memory_path = c.device_path;
+  try {
+    std::ifstream input(path);
+    if (!input) throw std::runtime_error("cannot open experiment config");
+    std::string raw_text((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+    const std::string text = StripJsonComments(raw_text);
+    Config c;
+    JsonString(text, "path", &c.shared_memory_path);
+    JsonString(text, "device_path", &c.device_path);
+    JsonNumber(text, "size_mb", &c.size_mb);
+    JsonNumberOrFirstArrayInObject(text, "shared_memory", "numa_node", &c.shared_memory_numa_node);
+    JsonNumberArray(text, "reserved_cores", &c.host_reserved_cores);
+    JsonNumberArray(text, "ivshmem_server_cores", &c.ivshmem_server_cores);
+    JsonNumberArray(text, "vm_cores", &c.vm_cores);
+    JsonNumber(text, "count", &c.vm_count);
+    JsonNumberInObject(text, "vm", "core_count_per_vm", &c.vm_core_count_per_vm);
+    JsonString(text, "storage_path", &c.vm_storage_path);
+    JsonNumberOrFirstArrayInObject(text, "vm", "numa_node", &c.vm_numa_node);
+    if (!JsonNumberInObject(text, "vm", "ssh_base_port", &c.network_base_ssh_port))
+      JsonNumber(text, "base_ssh_port", &c.network_base_ssh_port);
+    JsonNumber(text, "timeout_sec", &c.sync_timeout_sec);
+    JsonNumber(text, "foreground_worker_count_per_vm", &c.foreground_worker_count_per_vm);
+    JsonNumber(text, "partition_count", &c.partition_count);
+    JsonNumber(text, "fixed_key_size", &c.fixed_key_size);
+    JsonNumber(text, "fixed_value_size", &c.fixed_value_size);
+    JsonNumber(text, "hw_cc_budget_mb", &c.hw_cc_budget_mb);
+    JsonDouble(text, "owner_private_swcc_fraction", &c.owner_private_swcc_fraction);
+    JsonString(text, "migration_policy", &c.migration_policy);
+    JsonString(text, "when_to_move_out", &c.when_to_move_out);
+    JsonString(text, "scc_mechanism", &c.scc_mechanism);
+    JsonNumber(text, "transport_ring_total_mb", &c.transport_ring_total_mb);
+    JsonBool(text, "cpu_affinity", &c.cpu_affinity);
+    JsonNumberInObject(text, "hwcc", "offset_mb", &c.hwcc_offset_mb);
+    JsonNumberInObject(text, "hwcc", "size_mb", &c.hwcc_size_mb);
+    JsonNumberInObject(text, "swcc", "offset_mb", &c.swcc_offset_mb);
+    JsonNumberInObject(text, "swcc", "size_mb", &c.swcc_size_mb);
+    ParseStrictLatencyConfig(text, raw_text, &c);
+    ParsePartitioningConfig(text, &c);
+    if (c.shared_memory_path == "/mnt/xz_shared_mem" || c.shared_memory_path == "/mnt/xz_shared_mem/")
+      c.shared_memory_path = "/mnt/xz_shared_mem/ivshmem_shared_mem";
+    struct stat device_stat {};
+    if (!c.device_path.empty() && ::stat(c.device_path.c_str(), &device_stat) == 0 &&
+        S_ISCHR(device_stat.st_mode)) {
+      c.shared_memory_path = c.device_path;
+    }
+    c.Validate();
+    return c;
+  } catch (const std::exception &error) {
+    throw std::invalid_argument("config file '" + path + "': " + error.what());
   }
-  c.Validate();
-  return c;
 }
 
 void Config::Validate() {
@@ -904,11 +932,13 @@ KVStore::~KVStore() {
 }
 
 void KVStore::Open(bool reset) {
+  if (impl_->engine != nullptr) Close();
   impl_->engine = engine::KVEngine::Open(config_, reset);
 }
 
 void KVStore::Close() {
   if (impl_ == nullptr || impl_->engine == nullptr) return;
+  impl_->engine->Shutdown();
   impl_->engine.reset();
 }
 
@@ -1066,10 +1096,10 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
 Status KVStore::PollTransport() {
   if (impl_ == nullptr || impl_->engine == nullptr)
     return Status::Error(StatusCode::kCorruption, "KVStore is closed");
-  // Standalone transport polling touches HWCC ring/control words outside any
-  // facade operation; run it inside its own background scope.
-  engine::mem_access::LatencyScope latency_scope(
-      latency_sim::ExecutionClass::kBackground);
+  // KVEngine owns the standalone/background boundary.  If this call is made
+  // from RunWithBusyRetry while a foreground scope is active, the engine
+  // suspends that scope without waiting, enters background, polls, settles the
+  // background delay, and restores foreground before returning.
   impl_->engine->PollTransport();
   return Status::Ok();
 }

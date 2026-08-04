@@ -37,6 +37,12 @@ class KVEngine {
   static std::unique_ptr<KVEngine> Open(Config config, bool reset);
   ~KVEngine();
 
+  // Explicit quiescent close.  New foreground bindings are refused by the
+  // caller while any worker is owned; Close then stops/join workers, disables
+  // fixed latency, clears process-local protocol/allocator registrations and
+  // finally releases the mapped pool.  It is idempotent after success.
+  void Shutdown();
+
   Status Put(std::string_view key, std::string_view value);
   GetResult Get(std::string_view key);
   Status Delete(std::string_view key);
@@ -139,6 +145,7 @@ class KVEngine {
   void StartInboundDemuxer();
   void StopInboundDemuxer();
   void InboundDemuxerLoop();
+  void PollTransportImpl();
 
   Config config_;
   // Per-owner Clock dynamic HWCC limit after Open clamps configured budget to
@@ -169,6 +176,7 @@ class KVEngine {
   // The demuxer has no foreground worker identity. Its receive byte counter is
   // isolated from foreground statistics; only EngineRuntime reads it.
   std::atomic<uint64_t> demux_network_rx_bytes_{0};
+  bool shutdown_complete_ = false;
 };
 
 }  // namespace tigonkv::engine
