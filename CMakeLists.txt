@@ -93,6 +93,14 @@ add_executable(cxl_pool_initer tools/cxl_pool_initer.cpp)
 add_executable(hardware_sim_disabled_benchmark
                tests/hardware_sim_disabled_benchmark.cpp)
 target_link_libraries(hardware_sim_disabled_benchmark PRIVATE tigonkv)
+# Compile-time-removal variant: the wrapper fast gate becomes a constant zero,
+# so the wrapped loop compiles to the raw atomic operations with no runtime
+# branch.  Used only for the disabled-overhead comparison.
+add_executable(hardware_sim_disabled_benchmark_compile_off
+               tests/hardware_sim_disabled_benchmark.cpp)
+target_link_libraries(hardware_sim_disabled_benchmark_compile_off PRIVATE tigonkv)
+target_compile_definitions(hardware_sim_disabled_benchmark_compile_off
+                           PRIVATE TIGONKV_DISABLE_HARDWARE_SIMULATION=1)
 
 add_custom_target(tigonkv_target ALL DEPENDS tigonkv)
 add_custom_target(e2e_trace_target DEPENDS e2e_trace_runner)
