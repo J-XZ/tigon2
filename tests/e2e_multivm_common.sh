@@ -50,26 +50,63 @@ tigonkv_e2e_multivm_preflight() {
 
 # Reclaim a CTest log directory unless the caller asked to keep it.
 # Arguments: $1 log_root, $2 "1" when the script created the directory (and
-# therefore owns it), $3 label for the keep message.
+# therefore owns it), $3 label for the keep/error message.
 #
 # Contract:
-#   * a script-created directory is removed by default on EXIT/INT/TERM/HUP
-#     (even when a child asserts/aborts) and kept with its path printed when
+#   * a script-created directory is removed by default on exit (even when a
+#     child asserts/aborts) and kept with its path printed when
 #     TIGONKV_E2E_KEEP_CTEST_LOGS=1|true|yes;
 #   * a caller-provided TIGONKV_E2E_CTEST_LOG_ROOT (created=0) is owned by
-#     the caller and is never removed.
-# Exits with $? so it works as a trap on both success and failure paths.
+#     the caller and is never removed;
+#   * returns 0 on success (including caller-owned or kept directories) and
+#     nonzero when removing a script-owned directory failed;
+#   * it never inspects or preserves the caller's exit status and never exits
+#     the shell: final status belongs to the caller's EXIT finalizer.
 tigonkv_e2e_ctest_reclaim_logs() {
-  local log_root="$1" created="$2" label="$3" status=$? keep=0
+  local log_root="$1" created="$2" label="$3" keep=0
   case "${TIGONKV_E2E_KEEP_CTEST_LOGS:-0}" in
     1|true|yes) keep=1 ;;
   esac
-  if [[ "$created" == 1 ]]; then
-    if (( keep )); then
-      printf '%s kept log_root=%s\n' "$label" "$log_root"
-    else
-      rm -rf -- "$log_root"
+  if [[ "$created" != 1 ]]; then
+    return 0
+  fi
+  if (( keep )); then
+    printf '%s kept log_root=%s\n' "$label" "$log_root"
+    return 0
+  fi
+  if ! rm -rf -- "$log_root"; then
+    printf '%s failed to remove log_root=%s\n' "$label" "$log_root" >&2
+    return 1
+  fi
+  return 0
+}
+
+# EXIT finalizer shared by the e2e CTest wrappers.
+# Arguments: $1 log_root, $2 "1" when the script created the directory,
+# $3 label, $4 optional prepare_config path (may be empty).
+#
+# The FIRST operation captures the status that triggered the exit (a failing
+# test body, a signal mapping, or normal completion) and then disables all
+# traps so cleanup never recurses.  It next removes prepare_config, reclaims
+# the script-owned log directory (a caller-owned one is left untouched) and
+# exits with:
+#   * the original status when it was nonzero;
+#   * 1 when the original run succeeded but cleanup failed, with an explicit
+#     error on stderr.
+# INT/TERM/HUP are mapped to 130/143/129 by each wrapper's trap and reach this
+# finalizer through the EXIT trap, so cleanup runs exactly once per exit.
+tigonkv_e2e_ctest_finalize() {
+  local status=$? log_root="$1" created="$2" label="$3" prepare_config="${4:-}"
+  trap - EXIT INT TERM HUP
+  if [[ -n "$prepare_config" ]]; then
+    if ! rm -f -- "$prepare_config"; then
+      printf '%s failed to remove prepare_config=%s\n' \
+        "$label" "$prepare_config" >&2
+      [[ "$status" -ne 0 ]] || status=1
     fi
+  fi
+  if ! tigonkv_e2e_ctest_reclaim_logs "$log_root" "$created" "$label"; then
+    [[ "$status" -ne 0 ]] || status=1
   fi
   exit "$status"
 }

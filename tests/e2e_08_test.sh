@@ -18,12 +18,12 @@ if [[ -z "$log_root" ]]; then
   created_log_root=1
 fi
 mkdir -p "$log_root"
-if (( created_log_root )); then
-  cleanup() {
-    tigonkv_e2e_ctest_reclaim_logs "$log_root" "$created_log_root" TIGONKV_E2E08_CTEST
-  }
-  trap cleanup EXIT INT TERM HUP
-fi
+# INT/TERM/HUP map to their conventional codes and reach the shared EXIT
+# finalizer, which runs cleanup exactly once and preserves the status.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'tigonkv_e2e_ctest_finalize "$log_root" "$created_log_root" TIGONKV_E2E08_CTEST ""' EXIT
 echo "TIGONKV_E2E08_CTEST log_root=$log_root"
 TIGONKV_E2E_ROUNDS=1 TIGONKV_E2E_SUITES=08 \
   "$root/scripts/e2e/run_guest_e2e_workflows.sh" "$log_root" 1 08

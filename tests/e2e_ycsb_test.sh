@@ -24,11 +24,13 @@ if [[ -z "$logs" ]]; then
 fi
 mkdir -p "$logs"
 prepare_config=""
-cleanup() {
-  [[ -z "${prepare_config:-}" ]] || rm -f -- "$prepare_config"
-  tigonkv_e2e_ctest_reclaim_logs "$logs" "$created_logs" TIGONKV_E2E_YCSB_CTEST
-}
-trap cleanup EXIT INT TERM HUP
+# INT/TERM/HUP map to their conventional codes and reach the shared EXIT
+# finalizer, which removes prepare_config, reclaims the script-owned log
+# directory (a caller-owned one is left untouched) and preserves the status.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'tigonkv_e2e_ctest_finalize "$logs" "$created_logs" TIGONKV_E2E_YCSB_CTEST "${prepare_config:-}"' EXIT
 
 need_prepare=0
 if [[ ! -d "$traces/load" || ! -d "$traces/workloada" ]]; then
