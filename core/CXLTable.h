@@ -106,23 +106,17 @@ class CXLTableBTreeOLC : public CXLTableBase {
                 BTreeOLCValue(const BTreeOLCValue &value)
                 {
                         this->row = value.row;
-                        const bool valid = latency_sim::FixedLatencyAtomicLoad(
-                            value.is_valid, std::memory_order_relaxed,
-                            latency_sim::AtomicDomain::kLocalDram);
-                        latency_sim::FixedLatencyAtomicStore(
-                            this->is_valid, valid, std::memory_order_relaxed,
-                            latency_sim::AtomicDomain::kLocalDram);
+                        const bool valid =
+                            value.is_valid.load(std::memory_order_relaxed);
+                        this->is_valid.store(valid, std::memory_order_relaxed);
                 }
 
                 BTreeOLCValue &operator=(const BTreeOLCValue &value)
                 {
                         this->row = value.row;
-                        const bool valid = latency_sim::FixedLatencyAtomicLoad(
-                            value.is_valid, std::memory_order_relaxed,
-                            latency_sim::AtomicDomain::kLocalDram);
-                        latency_sim::FixedLatencyAtomicStore(
-                            this->is_valid, valid, std::memory_order_relaxed,
-                            latency_sim::AtomicDomain::kLocalDram);
+                        const bool valid =
+                            value.is_valid.load(std::memory_order_relaxed);
+                        this->is_valid.store(valid, std::memory_order_relaxed);
                         return *this;
                 }
 
@@ -167,9 +161,7 @@ class CXLTableBTreeOLC : public CXLTableBase {
                 const auto &k = *static_cast<const KeyType *>(key);
                 BTreeOLCValue value;
                 if (!cxl_btree_->lookup(k, value)) return false;
-                if (!latency_sim::FixedLatencyAtomicLoad(
-                        value.is_valid, std::memory_order_relaxed,
-                        latency_sim::AtomicDomain::kLocalDram)) return false;
+                if (!value.is_valid.load(std::memory_order_relaxed)) return false;
                 *row = value.row;
                 return !row_policy_.IsNull(*row);
         }
@@ -197,10 +189,8 @@ class CXLTableBTreeOLC : public CXLTableBase {
 
                 BTreeOLCValue value;
                 value.row = row_policy_.Encode(row);
-                latency_sim::FixedLatencyAtomicStore(
-                    value.is_valid, is_placeholder == false,
-                    std::memory_order_relaxed,
-                    latency_sim::AtomicDomain::kLocalDram);
+                value.is_valid.store(is_placeholder == false,
+                                     std::memory_order_relaxed);
 
 		bool success = cxl_btree_->insert(k, value);
 		return success;

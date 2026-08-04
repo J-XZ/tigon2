@@ -37,9 +37,11 @@ flush/invalidate/writeback 和业务 runtime/memory accounting 仍保留，因�
 
 ## 内存与 VM
 
-业务 backing 只有一个 ivshmem 设备，并划分为不重叠的 HWCC 与 SWCC。默认根配置使用
-32GiB backing、HWCC 1024MiB、SWCC 31744MiB；`hw_cc_budget_mb` 是 PolicyClock 的
-动态预算，不是物理 HWCC 容量。VM 在 NUMA0，shared backing 与 ivshmem 服务在 NUMA1。
+业务 backing 只有一个 ivshmem 设备，并划分为不重叠的 HWCC 与 SWCC。默认设备是
+CloudLab R6525 2-NUMA；根 `experiment_config.jsonc` 使用 32GiB backing、HWCC
+1024MiB、SWCC 31744MiB。`hw_cc_budget_mb` 是 PolicyClock 的动态预算，不是物理
+HWCC 容量。4 台 VM 使用 NUMA0 连续 CPU `0..31`，shared backing 与 ivshmem 服务在
+NUMA1。
 布局和可见性规则见 [内存布局.md](内存布局.md) 与
 [缓存一致性设计.md](缓存一致性设计.md)。
 

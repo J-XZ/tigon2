@@ -5,6 +5,12 @@ TwoPLPasha WriteThrough 的 CXL/ivshmem 共享内存模拟路径；不能通过 
 import、symlink、运行时文件读取或 VM backing 依赖其它仓库。跨项目比较只能复制已经
 理解的通用规则，复制后的代码由本仓库独立维护。
 
+## 默认设备与配置
+
+默认设备是 CloudLab R6525 2-NUMA。仓库根 `experiment_config.jsonc` 是默认配置：
+4 台 VM 使用 NUMA0 连续 CPU `0..31`，共享 backing 和 ivshmem-server 使用 NUMA1。
+共享内存不得放在 NUMA0。其它设备 profile 可以独立保留，但不得改变根配置的默认身份。
+
 ## 当前实现
 
 - `tigonkv` 是正式 KV 路径；legacy transaction/benchmark 源码仅作参考，不要为清理
@@ -38,8 +44,9 @@ import、symlink、运行时文件读取或 VM backing 依赖其它仓库。跨�
 `hwcc_access_count`、`atomic_count`、`remote_cache_invalidation`、
 `delayed_time_stats_enabled`、cache-model 字段都不再是合法配置。
 
-每次真实 HWCC/SWCC 读、写、原子操作、flush 或 invalidate 覆盖的 cache line 数按下式
-累加到当前线程 scope 的 pending delay：
+只有真实 HWCC/SWCC load/store/原子操作/批量 copy 覆盖的 cache line 数按下式累加到
+当前线程 scope 的 pending delay；flush/invalidate 标签本身不产生第二份固定延迟，但
+真实 `clflush`/`clwb`/invalidate/writeback/fence 及其顺序必须原样保留：
 
 ```text
 pending_delay_ns += touched_swcc_lines * swcc_fixed_ns_per_line

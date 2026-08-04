@@ -910,7 +910,6 @@ std::unique_ptr<KVStore> KVStore::Create(const Config &config, bool reset) {
 KVStore::KVStore(const Config &config)
     : impl_(new Impl()), config_(config) {
   config_.Validate();
-  latency_sim::GlobalLatencySimulator().Configure(config_.hardware_simulation);
 }
 
 KVStore::~KVStore() {
@@ -1080,6 +1079,10 @@ IncrementResult KVStore::Increment(std::string_view key, int64_t delta) {
 Status KVStore::PollTransport() {
   if (impl_ == nullptr || impl_->engine == nullptr)
     return Status::Error(StatusCode::kCorruption, "KVStore is closed");
+  // Standalone transport polling touches HWCC ring/control words outside any
+  // facade operation; run it inside its own background scope.
+  engine::mem_access::LatencyScope latency_scope(
+      latency_sim::ScopeKind::kOther);
   impl_->engine->PollTransport();
   return Status::Ok();
 }

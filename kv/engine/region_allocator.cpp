@@ -350,15 +350,16 @@ void *RegionAllocator::AllocateFromShard(uint64_t bytes, uint32_t size_class,
   Lock(shard);
   if (size_class < kAllocatorSizeClasses) {
     const RegionOffset head = FixedLatencyLoadFor(
-        shard.free_heads[size_class], block_is_hwcc_,
-        block_is_shared_payload_, std::memory_order_relaxed);
+        shard.free_heads[size_class], control_is_hwcc_,
+        /*shared_payload=*/false, std::memory_order_relaxed);
     if (head != kNullOffset) {
       auto *block = static_cast<RegionFreeBlock *>(FromOffset(head));
       const RegionOffset next = FixedLatencyLoadFor(
           block->next, block_is_hwcc_, block_is_shared_payload_,
           std::memory_order_relaxed);
-      FixedLatencyStoreFor(shard.free_heads[size_class], next, block_is_hwcc_,
-                      block_is_shared_payload_, std::memory_order_relaxed);
+      FixedLatencyStoreFor(shard.free_heads[size_class], next,
+                           control_is_hwcc_, /*shared_payload=*/false,
+                           std::memory_order_relaxed);
       Unlock(shard);
       return block;
     }
@@ -404,12 +405,12 @@ void RegionAllocator::FreeLocal(RegionOffset offset, uint32_t size_class, uint32
   Lock(shard);
   auto *block = static_cast<RegionFreeBlock *>(FromOffset(offset));
   const RegionOffset head = FixedLatencyLoadFor(
-      shard.free_heads[size_class], block_is_hwcc_, block_is_shared_payload_,
-      std::memory_order_relaxed);
+      shard.free_heads[size_class], control_is_hwcc_,
+      /*shared_payload=*/false, std::memory_order_relaxed);
   FixedLatencyStoreFor(block->next, head, block_is_hwcc_, block_is_shared_payload_,
                   std::memory_order_relaxed);
-  FixedLatencyStoreFor(shard.free_heads[size_class], offset, block_is_hwcc_,
-                  block_is_shared_payload_, std::memory_order_release);
+  FixedLatencyStoreFor(shard.free_heads[size_class], offset, control_is_hwcc_,
+                       /*shared_payload=*/false, std::memory_order_release);
   Unlock(shard);
 }
 

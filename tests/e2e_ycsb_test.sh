@@ -16,10 +16,19 @@ tigonkv_e2e_multivm_preflight
 
 # Keep traces under results/ (gitignored). Reuse if already generated for 4×4×100k.
 traces=${TIGONKV_E2E_YCSB_TRACES:-$root/results/e2e_ycsb_traces}
-logs=${TIGONKV_E2E_CTEST_LOG_ROOT:-$(mktemp -d /tmp/tigonkv-e2e-ycsb-XXXXXX)}
+logs="${TIGONKV_E2E_CTEST_LOG_ROOT:-}"
+created_logs=0
+if [[ -z "$logs" ]]; then
+  logs=$(mktemp -d /tmp/tigonkv-e2e-ycsb-XXXXXX)
+  created_logs=1
+fi
 mkdir -p "$logs"
 prepare_config=""
-trap '[[ -z ${prepare_config:-} ]] || rm -f -- "$prepare_config"' EXIT
+cleanup() {
+  [[ -z "${prepare_config:-}" ]] || rm -f -- "$prepare_config"
+  tigonkv_e2e_ctest_reclaim_logs "$logs" "$created_logs" TIGONKV_E2E_YCSB_CTEST
+}
+trap cleanup EXIT INT TERM HUP
 
 need_prepare=0
 if [[ ! -d "$traces/load" || ! -d "$traces/workloada" ]]; then

@@ -1,9 +1,11 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace latency_sim {
 
@@ -19,7 +21,6 @@ enum class MemoryDomain : uint8_t {
   kSwcc = 0,
   kHwcc = 1,
   kOwnerPrivateSwcc = 2,
-  kLocalDram = 3,
 };
 using PoolKind = MemoryDomain;
 using AtomicDomain = MemoryDomain;
@@ -56,12 +57,27 @@ struct Config {
 #if defined(TIGONKV_DISABLE_HARDWARE_SIMULATION)
 inline constexpr uint32_t FixedLatencyFeaturesFast() noexcept { return 0; }
 #else
-uint32_t FixedLatencyFeaturesFast() noexcept;
+// Immutable-after-startup feature mask.  Configure() must run at an explicit
+// startup boundary (or after business threads joined) and never concurrently
+// with wrapper use.  A plain aligned read lets the disabled fast gate be
+// hoisted out of hot loops while keeping one predictable branch; no TLS,
+// clock, address arithmetic, lock, or allocation is touched on that path.
+inline uint32_t g_hardware_simulation_features = 0;
+inline uint32_t FixedLatencyFeaturesFast() noexcept {
+  return g_hardware_simulation_features;
+}
 #endif
 
 inline bool FixedLatencyEnabledFast() noexcept {
   return FixedLatencyFeaturesFast() != 0;
 }
+
+// Test-only conversions.  RoundDelayPsToNsForTest is round-half-up and cannot
+// overflow for any uint64 input; TicksForDelayNsForTest validates the tick
+// conversion (finite, positive, <= UINT64_MAX) and hard fails on overflow
+// instead of saturating.  Neither is a production statistics interface.
+uint64_t RoundDelayPsToNsForTest(uint64_t pending_ps);
+uint64_t TicksForDelayNsForTest(double ticks_per_ns, uint64_t ns);
 
 LatencySimulator& GlobalLatencySimulator();
 
@@ -74,9 +90,33 @@ class LatencySimulator {
   const Config& config() const { return config_; }
   uint32_t feature_mask() const noexcept { return feature_mask_; }
 
+  // Process-initialization registration of immutable HWCC/SWCC mapping
+  // boundaries.  When fixed latency is enabled every charged access is
+  // validated against the matching domain range and converted to a pool-local
+  // offset before cache-line accounting; wrong-domain, out-of-range and
+  // overflowing accesses hard fail.
+  void RegisterPool(PoolKind pool, const void* base, uint64_t size);
+  // Clear all registered pool ranges.  Legal only at an initialization
+  // boundary: the gate must be disabled and every business thread joined.
+  void ClearPoolRegistrations();
+
   void BeginScope(ScopeKind scope);
   void EndScopeAndDelay();
   bool HasActiveScopeForCurrentThread() const;
+  bool HasActiveForegroundScopeForCurrentThread() const;
+  // True only when the current thread's active scope is a top-level
+  // foreground scope (depth == 1).  Suspending a nested foreground would
+  // otherwise decrement a nesting level without a matching resume and could
+  // settle the outer budget while guards are still alive.
+  bool HasTopLevelForegroundScopeForCurrentThread() const;
+  // Deactivate the current top-level scope without busy-waiting and defer its
+  // pending delay to the next outermost EndScopeAndDelay.  Returns true when a
+  // scope was actually suspended.  Used to switch scope classes at points
+  // where EBR/other guards are still alive; the busy-wait happens only after
+  // every guard has exited.
+  bool SuspendScopeAndDelayLater();
+  // Restore a top-level foreground scope after a suspension.
+  void ResumeScope();
 
   // The caller performs the real access before calling this method.  Only the
   // covered HWCC/SWCC cache lines are added to the current scope's pending
@@ -87,20 +127,30 @@ class LatencySimulator {
                           const void* address, uint64_t bytes);
 
   uint64_t PendingDelayNsForTest() const;
+  uint64_t PendingDelayPsForTest() const;
+  size_t ThreadStateCountForTest() const;
 
  private:
   ThreadState& GetThreadState();
+  uint64_t LineDelayPs(PoolKind pool) const;
 
   Config config_;
   uint32_t feature_mask_ = 0;
   uint64_t generation_ = 0;
+  struct PoolRange {
+    uintptr_t base = 0;
+    uint64_t size = 0;
+  };
+  std::array<std::vector<PoolRange>, 3> pool_ranges_;
+  uint64_t swcc_delay_ps_per_line_ = 0;
+  uint64_t hwcc_delay_ps_per_line_ = 0;
 };
 
 // Typed memory wrappers execute the real operation first and charge exactly
 // that operation once.  Their names intentionally do not claim to count it.
 template <typename T>
 T FixedLatencyMemoryLoad(PoolKind pool, const T* address) {
-  if (!FixedLatencyEnabledFast()) return *address;
+  if (!FixedLatencyEnabledFast()) [[likely]] return *address;
   const T result = *address;
   GlobalLatencySimulator().RecordRange(pool, AccessKind::kRead, address,
                                        sizeof(T));
@@ -109,7 +159,7 @@ T FixedLatencyMemoryLoad(PoolKind pool, const T* address) {
 
 template <typename T>
 void FixedLatencyMemoryStore(PoolKind pool, T* address, T value) {
-  if (!FixedLatencyEnabledFast()) {
+  if (!FixedLatencyEnabledFast()) [[likely]] {
     *address = value;
     return;
   }
@@ -122,7 +172,7 @@ inline bool FixedLatencyAtomicFlagTestAndSet(std::atomic_flag& value,
                                              std::memory_order order,
                                              AtomicDomain domain,
                                              uint32_t = 0) {
-  if (!FixedLatencyEnabledFast()) return value.test_and_set(order);
+  if (!FixedLatencyEnabledFast()) [[likely]] return value.test_and_set(order);
   const bool old = value.test_and_set(order);
   GlobalLatencySimulator().RecordAtomicAccess(
       domain, AccessKind::kAtomicRmw, &value, sizeof(value));
@@ -132,11 +182,13 @@ inline bool FixedLatencyAtomicFlagTestAndSet(std::atomic_flag& value,
 inline void FixedLatencyAtomicFlagClear(std::atomic_flag& value,
                                         std::memory_order order,
                                         AtomicDomain domain, uint32_t = 0) {
-  value.clear(order);
-  if (FixedLatencyEnabledFast()) {
-    GlobalLatencySimulator().RecordAtomicAccess(
-        domain, AccessKind::kAtomicStore, &value, sizeof(value));
+  if (!FixedLatencyEnabledFast()) [[likely]] {
+    value.clear(order);
+    return;
   }
+  value.clear(order);
+  GlobalLatencySimulator().RecordAtomicAccess(
+      domain, AccessKind::kAtomicStore, &value, sizeof(value));
 }
 
 inline void FixedLatencyAtomicFence(std::memory_order order, AtomicDomain,
@@ -149,7 +201,7 @@ inline void FixedLatencyAtomicFence(std::memory_order order, AtomicDomain,
 template <typename T>
 T FixedLatencyAtomicLoad(const std::atomic<T>& value, std::memory_order order,
                          AtomicDomain domain, uint32_t = 0) {
-  if (!FixedLatencyEnabledFast()) return value.load(order);
+  if (!FixedLatencyEnabledFast()) [[likely]] return value.load(order);
   const T result = value.load(order);
   GlobalLatencySimulator().RecordAtomicAccess(
       domain, AccessKind::kAtomicLoad, &value, sizeof(T));
@@ -160,22 +212,24 @@ template <typename T>
 void FixedLatencyAtomicStore(std::atomic<T>& value, T desired,
                              std::memory_order order, AtomicDomain domain,
                              uint32_t = 0) {
-  value.store(desired, order);
-  if (FixedLatencyEnabledFast()) {
-    GlobalLatencySimulator().RecordAtomicAccess(
-        domain, AccessKind::kAtomicStore, &value, sizeof(T));
+  if (!FixedLatencyEnabledFast()) [[likely]] {
+    value.store(desired, order);
+    return;
   }
+  value.store(desired, order);
+  GlobalLatencySimulator().RecordAtomicAccess(
+      domain, AccessKind::kAtomicStore, &value, sizeof(T));
 }
 
 template <typename T>
 T FixedLatencyAtomicExchange(std::atomic<T>& value, T desired,
                              std::memory_order order, AtomicDomain domain,
                              uint32_t = 0) {
+  if (!FixedLatencyEnabledFast()) [[likely]]
+    return value.exchange(desired, order);
   const T result = value.exchange(desired, order);
-  if (FixedLatencyEnabledFast()) {
-    GlobalLatencySimulator().RecordAtomicAccess(
-        domain, AccessKind::kAtomicRmw, &value, sizeof(T));
-  }
+  GlobalLatencySimulator().RecordAtomicAccess(
+      domain, AccessKind::kAtomicRmw, &value, sizeof(T));
   return result;
 }
 
@@ -183,11 +237,11 @@ template <typename T>
 T FixedLatencyAtomicFetchAdd(std::atomic<T>& value, T operand,
                              std::memory_order order, AtomicDomain domain,
                              uint32_t = 0) {
+  if (!FixedLatencyEnabledFast()) [[likely]]
+    return value.fetch_add(operand, order);
   const T result = value.fetch_add(operand, order);
-  if (FixedLatencyEnabledFast()) {
-    GlobalLatencySimulator().RecordAtomicAccess(
-        domain, AccessKind::kAtomicRmw, &value, sizeof(T));
-  }
+  GlobalLatencySimulator().RecordAtomicAccess(
+      domain, AccessKind::kAtomicRmw, &value, sizeof(T));
   return result;
 }
 
@@ -195,11 +249,11 @@ template <typename T>
 T FixedLatencyAtomicFetchSub(std::atomic<T>& value, T operand,
                              std::memory_order order, AtomicDomain domain,
                              uint32_t = 0) {
+  if (!FixedLatencyEnabledFast()) [[likely]]
+    return value.fetch_sub(operand, order);
   const T result = value.fetch_sub(operand, order);
-  if (FixedLatencyEnabledFast()) {
-    GlobalLatencySimulator().RecordAtomicAccess(
-        domain, AccessKind::kAtomicRmw, &value, sizeof(T));
-  }
+  GlobalLatencySimulator().RecordAtomicAccess(
+      domain, AccessKind::kAtomicRmw, &value, sizeof(T));
   return result;
 }
 
@@ -207,11 +261,11 @@ template <typename T>
 T FixedLatencyAtomicFetchOr(std::atomic<T>& value, T operand,
                             std::memory_order order, AtomicDomain domain,
                             uint32_t = 0) {
+  if (!FixedLatencyEnabledFast()) [[likely]]
+    return value.fetch_or(operand, order);
   const T result = value.fetch_or(operand, order);
-  if (FixedLatencyEnabledFast()) {
-    GlobalLatencySimulator().RecordAtomicAccess(
-        domain, AccessKind::kAtomicRmw, &value, sizeof(T));
-  }
+  GlobalLatencySimulator().RecordAtomicAccess(
+      domain, AccessKind::kAtomicRmw, &value, sizeof(T));
   return result;
 }
 
@@ -219,11 +273,11 @@ template <typename T>
 T FixedLatencyAtomicFetchAnd(std::atomic<T>& value, T operand,
                              std::memory_order order, AtomicDomain domain,
                              uint32_t = 0) {
+  if (!FixedLatencyEnabledFast()) [[likely]]
+    return value.fetch_and(operand, order);
   const T result = value.fetch_and(operand, order);
-  if (FixedLatencyEnabledFast()) {
-    GlobalLatencySimulator().RecordAtomicAccess(
-        domain, AccessKind::kAtomicRmw, &value, sizeof(T));
-  }
+  GlobalLatencySimulator().RecordAtomicAccess(
+      domain, AccessKind::kAtomicRmw, &value, sizeof(T));
   return result;
 }
 
@@ -231,11 +285,11 @@ template <typename T>
 T FixedLatencyAtomicFetchXor(std::atomic<T>& value, T operand,
                              std::memory_order order, AtomicDomain domain,
                              uint32_t = 0) {
+  if (!FixedLatencyEnabledFast()) [[likely]]
+    return value.fetch_xor(operand, order);
   const T result = value.fetch_xor(operand, order);
-  if (FixedLatencyEnabledFast()) {
-    GlobalLatencySimulator().RecordAtomicAccess(
-        domain, AccessKind::kAtomicRmw, &value, sizeof(T));
-  }
+  GlobalLatencySimulator().RecordAtomicAccess(
+      domain, AccessKind::kAtomicRmw, &value, sizeof(T));
   return result;
 }
 
@@ -243,9 +297,11 @@ template <typename T>
 bool FixedLatencyAtomicCompareExchangeWeak(
     std::atomic<T>& value, T& expected, T desired, std::memory_order success,
     std::memory_order failure, AtomicDomain domain, uint32_t = 0) {
+  if (!FixedLatencyEnabledFast()) [[likely]]
+    return value.compare_exchange_weak(expected, desired, success, failure);
   const bool ok = value.compare_exchange_weak(expected, desired, success,
                                                failure);
-  if (FixedLatencyEnabledFast()) {
+  {
     GlobalLatencySimulator().RecordAtomicAccess(
         domain, AccessKind::kAtomicRmw, &value, sizeof(T));
   }
@@ -256,9 +312,11 @@ template <typename T>
 bool FixedLatencyAtomicCompareExchangeStrong(
     std::atomic<T>& value, T& expected, T desired, std::memory_order success,
     std::memory_order failure, AtomicDomain domain, uint32_t = 0) {
+  if (!FixedLatencyEnabledFast()) [[likely]]
+    return value.compare_exchange_strong(expected, desired, success, failure);
   const bool ok = value.compare_exchange_strong(expected, desired, success,
                                                 failure);
-  if (FixedLatencyEnabledFast()) {
+  {
     GlobalLatencySimulator().RecordAtomicAccess(
         domain, AccessKind::kAtomicRmw, &value, sizeof(T));
   }

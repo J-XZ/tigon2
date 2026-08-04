@@ -317,6 +317,14 @@ void TestDualPhysicalRegions() {
   checkpoint_latency.fixed_latency.swcc_fixed_ns_per_line = 1;
   checkpoint_latency.fixed_latency.hwcc_fixed_ns_per_line = 1;
   auto &checkpoint_simulator = latency_sim::GlobalLatencySimulator();
+  checkpoint_simulator.RegisterPool(
+      latency_sim::PoolKind::kHwcc,
+      static_cast<const std::byte *>(mapping.base) + config.hwcc_offset_bytes,
+      config.hwcc_size_bytes);
+  checkpoint_simulator.RegisterPool(
+      latency_sim::PoolKind::kSwcc,
+      static_cast<const std::byte *>(mapping.base) + config.swcc_offset_bytes,
+      config.swcc_size_bytes);
   checkpoint_simulator.Configure(checkpoint_latency);
   checkpoint_simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   dual.FlushOwnedRanges(0);
@@ -390,12 +398,16 @@ void TestAllocatorLatencyAccounting() {
   Mapping hwcc_mapping(true);
   Mapping swcc_mapping(true);
   Mapping dual_mapping(true, 64 * 1024 * 1024);
+  Mapping counter_mapping(true, kBytes);
   auto hwcc_allocator =
       RegionAllocator::Initialize(hwcc_mapping.base, kBytes, 2, 0, true, true);
   auto swcc_allocator =
       RegionAllocator::Initialize(swcc_mapping.base, kBytes, 2, 0, false, false);
   const DualRegionConfig config = TestDualConfig();
   auto dual = DualRegionAllocator::Initialize(dual_mapping.base, config);
+  auto *hwcc_counter = new (counter_mapping.base) DomainCounter;
+  auto *swcc_counter =
+      new (static_cast<std::byte *>(counter_mapping.base) + 64) DomainCounter;
   dual.FinalizeStaticHwccLayout();
   dual.PublishStaticHwccLayout();
   dual.InitializeOwnerPrivateArenas(0);
@@ -409,25 +421,41 @@ void TestAllocatorLatencyAccounting() {
   latency.fixed_latency.swcc_fixed_ns_per_line = 1;
   latency.fixed_latency.hwcc_fixed_ns_per_line = 1;
   auto &simulator = latency_sim::GlobalLatencySimulator();
+  // The domain counters stand in for the shared HWCC layout / owner-private
+  // SWCC control counters; register their page under both domains.
+  simulator.RegisterPool(latency_sim::PoolKind::kHwcc, hwcc_mapping.base,
+                         kBytes);
+  simulator.RegisterPool(latency_sim::PoolKind::kSwcc, swcc_mapping.base,
+                         kBytes);
+  simulator.RegisterPool(latency_sim::PoolKind::kHwcc,
+                         static_cast<const std::byte *>(dual_mapping.base) +
+                             config.hwcc_offset_bytes,
+                         config.hwcc_size_bytes);
+  simulator.RegisterPool(latency_sim::PoolKind::kSwcc,
+                         static_cast<const std::byte *>(dual_mapping.base) +
+                             config.swcc_offset_bytes,
+                         config.swcc_size_bytes);
+  simulator.RegisterPool(latency_sim::PoolKind::kHwcc, counter_mapping.base,
+                         kBytes);
+  simulator.RegisterPool(latency_sim::PoolKind::kSwcc, counter_mapping.base,
+                         kBytes);
   simulator.Configure(latency);
 
-  DomainCounter hwcc_counter;
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   void *hwcc =
       hwcc_allocator.Allocate(80, AllocationDomain::kHwccMetadata,
-                              &hwcc_counter, 0);
+                              hwcc_counter, 0);
   hwcc_allocator.Free(hwcc, 80, AllocationDomain::kHwccMetadata,
-                      &hwcc_counter, 0, 0);
+                      hwcc_counter, 0, 0);
   assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
 
-  DomainCounter swcc_counter;
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   void *swcc =
       swcc_allocator.Allocate(80, AllocationDomain::kSharedPayloadSwcc,
-                              &swcc_counter, 0);
+                              swcc_counter, 0);
   swcc_allocator.Free(swcc, 80, AllocationDomain::kSharedPayloadSwcc,
-                      &swcc_counter, 0, 0);
+                      swcc_counter, 0, 0);
   assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
 
@@ -468,6 +496,72 @@ void TestOwnerPrivateRetireQueue() {
   dual.Free(object, 96, AllocationDomain::kHwccIndex, 0, 0);
 }
 
+// Directed test for the allocator free-head classification.  shard.free_heads
+// is allocator control and must be charged at the control domain rate, while
+// block->next stays at the block domain rate.  With rates swapped between two
+// runs, control-HWCC/block-SWCC under rate A must equal control-SWCC/block-HWCC
+// under rate B (and vice versa); a free_heads misclassification breaks the
+// invariant.
+void TestFreeHeadControlDomainClassification() {
+  // Re-initialize one region with different control/block classifications so
+  // both variants charge identical addresses and cache-line boundaries.
+  Mapping region(true);
+  Mapping counters(true, kBytes);
+  auto *counter = new (counters.base) DomainCounter;
+  auto &simulator = latency_sim::GlobalLatencySimulator();
+  simulator.RegisterPool(latency_sim::PoolKind::kHwcc, region.base, kBytes);
+  simulator.RegisterPool(latency_sim::PoolKind::kSwcc, region.base, kBytes);
+  simulator.RegisterPool(latency_sim::PoolKind::kHwcc, counters.base, kBytes);
+  simulator.RegisterPool(latency_sim::PoolKind::kSwcc, counters.base, kBytes);
+
+  latency_sim::Config rate_a;
+  rate_a.fixed_latency.enabled = true;
+  rate_a.fixed_latency.cache_line_bytes = 64;
+  rate_a.fixed_latency.swcc_fixed_ns_per_line = 1;
+  rate_a.fixed_latency.hwcc_fixed_ns_per_line = 4;
+  latency_sim::Config rate_b = rate_a;
+  rate_b.fixed_latency.swcc_fixed_ns_per_line = 4;
+  rate_b.fixed_latency.hwcc_fixed_ns_per_line = 1;
+
+  const auto measure = [&](bool control_hwcc, bool block_hwcc,
+                           const latency_sim::Config &cfg) {
+    auto allocator = RegionAllocator::Initialize(
+        region.base, kBytes, 1, 0, control_hwcc, block_hwcc);
+    // Reset the accounting counter so the peak CAS charges identically on
+    // every run (the peak only rises above the previous peak once otherwise).
+    std::memset(counters.base, 0, kBytes);
+    simulator.Configure(cfg);
+    simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+    void *block = allocator.Allocate(80, AllocationDomain::kHwccMetadata,
+                                     counter, 0);
+    allocator.Free(block, 80, AllocationDomain::kHwccMetadata, counter, 0, 0);
+    const uint64_t pending = simulator.PendingDelayPsForTest();
+    simulator.EndScopeAndDelay();
+    return pending;
+  };
+
+  // Same allocator, same addresses, three rate configurations.  With control
+  // at HWCC rate and block at SWCC rate, the pending delay must fit the
+  // linear model P = control_lines*rate_control + block_lines*rate_block, so
+  // the differences isolate integer per-domain line counts.  A free_heads
+  // misclassification (charged at the block rate instead of the control
+  // rate) shifts those counts and breaks the model.
+  const uint64_t p_hwcc_high = measure(true, false, rate_a);
+  const uint64_t p_swcc_high = measure(true, false, rate_b);
+  latency_sim::Config rate_eq = rate_a;
+  rate_eq.fixed_latency.hwcc_fixed_ns_per_line = 1;
+  rate_eq.fixed_latency.swcc_fixed_ns_per_line = 1;
+  const uint64_t p_eq = measure(true, false, rate_eq);
+  assert((p_hwcc_high - p_eq) % 3000 == 0);
+  assert((p_swcc_high - p_eq) % 3000 == 0);
+  const uint64_t control_lines = (p_hwcc_high - p_eq) / 3000;
+  const uint64_t block_lines = (p_swcc_high - p_eq) / 3000;
+  // Control (lock, free_heads, bump, accounting) dominates the block fields
+  // (next/size-class) in an allocate+free cycle.
+  assert(control_lines > 0 && block_lines > 0 && control_lines > block_lines);
+  simulator.Configure(latency_sim::Config{});
+}
+
 }  // namespace
 
 int main() {
@@ -479,6 +573,7 @@ int main() {
   TestDualPhysicalRegions();
   TestMappedPoolAttach();
   TestAllocatorLatencyAccounting();
+  TestFreeHeadControlDomainClassification();
   TestOwnerPrivateRetireQueue();
   return 0;
 }

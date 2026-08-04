@@ -230,10 +230,21 @@ int main() {
   latency.fixed_latency.swcc_fixed_ns_per_line = 1;
   latency.fixed_latency.hwcc_fixed_ns_per_line = 1;
   auto &simulator = latency_sim::GlobalLatencySimulator();
+  const auto binding_config = MakeConfig(kPoolBytes);
+  simulator.RegisterPool(
+      latency_sim::PoolKind::kHwcc,
+      static_cast<const std::byte *>(pool.base()) +
+          binding_config.hwcc_offset_bytes,
+      binding_config.hwcc_size_bytes);
+  simulator.RegisterPool(
+      latency_sim::PoolKind::kSwcc,
+      static_cast<const std::byte *>(pool.base()) +
+          binding_config.swcc_offset_bytes,
+      binding_config.swcc_size_bytes);
   simulator.Configure(latency);
   uint64_t value = 0;
-  regions.BindOwnerPrivateAllocators(0);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
+  regions.BindOwnerPrivateAllocators(0);
   assert(private_tree->lookup(Key(250), value) && value == 250);
   assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();

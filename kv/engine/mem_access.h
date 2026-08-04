@@ -10,8 +10,9 @@ namespace tigonkv::engine::mem_access {
 class LatencyScope {
  public:
   explicit LatencyScope(latency_sim::ScopeKind scope) {
-    active_ = latency_sim::FixedLatencyEnabledFast();
-    if (active_) latency_sim::GlobalLatencySimulator().BeginScope(scope);
+    if (!latency_sim::FixedLatencyEnabledFast()) [[likely]] return;
+    active_ = true;
+    latency_sim::GlobalLatencySimulator().BeginScope(scope);
   }
   ~LatencyScope() {
     if (active_) latency_sim::GlobalLatencySimulator().EndScopeAndDelay();
@@ -23,21 +24,52 @@ class LatencyScope {
   bool active_ = false;
 };
 
-inline bool HasActiveScope() {
-  return latency_sim::FixedLatencyEnabledFast() &&
-         latency_sim::GlobalLatencySimulator().HasActiveScopeForCurrentThread();
-}
+// Suspends an active foreground scope without busy-waiting and restores it on
+// destruction.  The busy-wait for the suspended segment happens later at the
+// outermost scope exit, after EBR and other protocol guards have gone.  RAII
+// guarantees that exceptions and early returns neither lose nor duplicate the
+// foreground scope restoration.
+class ForegroundScopeSuspension {
+ public:
+  ForegroundScopeSuspension() {
+    if (!latency_sim::FixedLatencyEnabledFast()) [[likely]] return;
+    if (latency_sim::GlobalLatencySimulator()
+            .HasTopLevelForegroundScopeForCurrentThread()) {
+      suspended_ = latency_sim::GlobalLatencySimulator()
+                       .SuspendScopeAndDelayLater();
+    }
+  }
+  ~ForegroundScopeSuspension() {
+    if (suspended_) latency_sim::GlobalLatencySimulator().ResumeScope();
+  }
+  ForegroundScopeSuspension(const ForegroundScopeSuspension&) = delete;
+  ForegroundScopeSuspension& operator=(const ForegroundScopeSuspension&) =
+      delete;
 
-inline void EndActiveScopeAndDelay() {
-  if (latency_sim::FixedLatencyEnabledFast())
-    latency_sim::GlobalLatencySimulator().EndScopeAndDelay();
-}
+ private:
+  bool suspended_ = false;
+};
 
-inline void BeginForegroundScope() {
-  if (latency_sim::FixedLatencyEnabledFast())
-    latency_sim::GlobalLatencySimulator().BeginScope(
-        latency_sim::ScopeKind::kForeground);
-}
+// A scope whose accumulated delay is deferred to the next outermost scope exit
+// instead of busy-waiting here.  Used for peer-request servicing that runs
+// inside an EBR-protected region.
+class DeferredLatencyScope {
+ public:
+  explicit DeferredLatencyScope(latency_sim::ScopeKind scope) {
+    if (!latency_sim::FixedLatencyEnabledFast()) [[likely]] return;
+    active_ = true;
+    latency_sim::GlobalLatencySimulator().BeginScope(scope);
+  }
+  ~DeferredLatencyScope() {
+    if (active_)
+      latency_sim::GlobalLatencySimulator().SuspendScopeAndDelayLater();
+  }
+  DeferredLatencyScope(const DeferredLatencyScope&) = delete;
+  DeferredLatencyScope& operator=(const DeferredLatencyScope&) = delete;
+
+ private:
+  bool active_ = false;
+};
 
 inline void Record(latency_sim::PoolKind pool, latency_sim::AccessKind kind,
                    const void* address, size_t bytes) {

@@ -46,8 +46,7 @@ rg -Fq 'expected exactly $TIGONKV_VM_COUNT QEMUs attached' \
   "$root/scripts/tigonkv_vm_common.sh"
 rg -Fq 'prepare_config=$(mktemp "$logs/prepare-config.XXXXXX")' \
   "$root/tests/e2e_ycsb_test.sh"
-rg -Fq 'trap '\''[[ -z ${prepare_config:-} ]] || rm -f -- "$prepare_config"'\'' EXIT' \
-  "$root/tests/e2e_ycsb_test.sh"
+rg -Fq 'rm -f -- "$prepare_config"' "$root/tests/e2e_ycsb_test.sh"
 rg -Fq -- '--config "$TIGONKV_EXPERIMENT_CONFIG_JSONC"' \
   "$root/tests/e2e_ycsb_test.sh"
 ! rg -q 'summarize_ycsb_experiment' "$root/run_e2e_ycsb_rounds.sh"
@@ -83,6 +82,45 @@ rg -Fq 'for _ in 1 2 3 4 5; do' "$root/tigonkv_kill_vms.sh"
 ! rg -q 'TIGONKV_E2E_PROGRESS=1' "$guest_workflow"
 rg -Fq '"E2E_TRACE_HEARTBEAT phase="' \
   "$root/tools/e2e_trace_runner.cpp"
+# CTest log-dir reclaim contract shared by the three e2e wrappers: only a
+# directory the script created itself is removed by default; a caller-provided
+# TIGONKV_E2E_CTEST_LOG_ROOT is owned by the caller; KEEP=1|true|yes preserves
+# the created directory and prints its path.
+for e2e_wrapper in e2e_08_test.sh e2e_09_test.sh e2e_ycsb_test.sh; do
+  rg -Fq 'TIGONKV_E2E_CTEST_LOG_ROOT:-}' "$root/tests/$e2e_wrapper"
+  rg -Fq 'created_log' "$root/tests/$e2e_wrapper"
+  rg -Fq 'tigonkv_e2e_ctest_reclaim_logs' "$root/tests/$e2e_wrapper"
+  rg -Fq 'trap cleanup EXIT INT TERM HUP' "$root/tests/$e2e_wrapper"
+done
+# Behavioral contract check of the shared helper (no VMs required).
+source "$root/tests/e2e_multivm_common.sh"
+reclaim_sandbox() {  # $1 dir, $2 created, $3 keep, $4 label
+  TIGONKV_E2E_KEEP_CTEST_LOGS="$3" \
+    bash -c "source '$root/tests/e2e_multivm_common.sh'; tigonkv_e2e_ctest_reclaim_logs '$1' '$2' '$4'" \
+    >"$tmp/reclaim.log" 2>&1 || true
+}
+created_dir=$(mktemp -d /tmp/tigonkv-e2e08-XXXXXX)
+reclaim_sandbox "$created_dir" 1 0 TIGONKV_E2E08_CTEST
+[[ ! -e "$created_dir" ]]
+created_dir=$(mktemp -d /tmp/tigonkv-e2e08-XXXXXX)
+reclaim_sandbox "$created_dir" 1 1 TIGONKV_E2E08_CTEST
+[[ -e "$created_dir" ]]
+grep -Fq "TIGONKV_E2E08_CTEST kept log_root=$created_dir" "$tmp/reclaim.log"
+rm -rf -- "$created_dir"
+created_dir=$(mktemp -d /tmp/tigonkv-e2e09-XXXXXX)
+reclaim_sandbox "$created_dir" 1 true TIGONKV_E2E09_CTEST
+[[ -e "$created_dir" ]]
+grep -Fq "TIGONKV_E2E09_CTEST kept log_root=$created_dir" "$tmp/reclaim.log"
+rm -rf -- "$created_dir"
+created_dir=$(mktemp -d /tmp/tigonkv-e2e09-XXXXXX)
+reclaim_sandbox "$created_dir" 1 yes TIGONKV_E2E09_CTEST
+[[ -e "$created_dir" ]]
+grep -Fq "TIGONKV_E2E09_CTEST kept log_root=$created_dir" "$tmp/reclaim.log"
+rm -rf -- "$created_dir"
+caller_dir=$(mktemp -d /tmp/tigonkv-e2e08-XXXXXX)
+reclaim_sandbox "$caller_dir" 0 0 TIGONKV_E2E08_CTEST
+[[ -e "$caller_dir" ]]
+rm -rf -- "$caller_dir"
 python3 - "$root/tools/e2e_trace_runner.cpp" <<'PY'
 from pathlib import Path
 import sys

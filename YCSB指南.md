@@ -3,6 +3,9 @@
 本指南只覆盖当前 TigonKV fixed-latency-only 路径。YCSB trace、镜像、backing、日志和
 结果必须由本仓库独立生成；不得读取其它项目的构建目录或实验产物。
 
+默认设备是 CloudLab R6525 2-NUMA，根 `experiment_config.jsonc` 已按 VM NUMA0、共享
+内存 NUMA1 配置。其它拓扑必须通过本仓独立配置显式选择。
+
 ## 构建
 
 生产 fixed-latency build 使用 RelWithDebInfo：

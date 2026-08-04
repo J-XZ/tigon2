@@ -25,10 +25,20 @@ class PolicyClock::ClockTracker {
 
   void lock() {
     auto *control = partition_.ClockTrackerControl();
+    // The pthread spin lock lives in the owner-private SWCC control arena.
+    // Cover its real atomic acquisition without changing the lock protocol.
+    tigonkv::engine::mem_access::PrivateWrite(
+        reinterpret_cast<const void *>(
+            reinterpret_cast<uintptr_t>(&control->lock)),
+        sizeof(control->lock));
     pthread_spin_lock(&control->lock);
   }
   void unlock() {
     auto *control = partition_.ClockTrackerControl();
+    tigonkv::engine::mem_access::PrivateWrite(
+        reinterpret_cast<const void *>(
+            reinterpret_cast<uintptr_t>(&control->lock)),
+        sizeof(control->lock));
     pthread_spin_unlock(&control->lock);
   }
 

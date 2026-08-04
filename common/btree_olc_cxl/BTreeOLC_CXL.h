@@ -1697,8 +1697,8 @@ class BPlusTree {
 		if (persisted_root == nullptr) {
 			throw std::invalid_argument("BPlusTree attach requires a persisted root");
 		}
-		TreeAtomicStore(root_, allocation_.ToOffset(persisted_root),
-		                std::memory_order_release);
+		root_.store(allocation_.ToOffset(persisted_root),
+		            std::memory_order_release);
 	}
 
 	// Shared CXL trees: publish/load the live root via an HWCC atomic offset so
@@ -1709,27 +1709,23 @@ class BPlusTree {
 		TreeAccessScope access_scope(allocation_);
 		if (slot == nullptr)
 			throw std::invalid_argument("BPlusTree published root slot is null");
-			const auto off = latency_sim::FixedLatencyAtomicLoad(
-			    *slot, std::memory_order_acquire,
-			    latency_sim::AtomicDomain::kHwcc);
+		const auto off = TreeAtomicLoad(*slot, std::memory_order_acquire);
 		if (off == tigonkv::engine::kNullOffset) {
 			// Creator: publish the process-local root allocated by the ctor.
-			const auto local_offset = TreeAtomicLoad(
-			    root_, std::memory_order_acquire);
+			const auto local_offset =
+			    root_.load(std::memory_order_acquire);
 			NodeBase *local = local_offset == tigonkv::engine::kNullOffset
 			    ? nullptr
 			    : static_cast<NodeBase *>(allocation_.FromOffset(local_offset));
 			if (local == nullptr)
 				throw std::runtime_error("BPlusTree has no local root to publish");
 			published_root_ = slot;
-				latency_sim::FixedLatencyAtomicStore(
-				    *slot, allocation_.ToOffset(local),
-				    std::memory_order_release,
-				    latency_sim::AtomicDomain::kHwcc);
+			TreeAtomicStore(*slot, allocation_.ToOffset(local),
+			                std::memory_order_release);
 		} else {
 			// Attacher: adopt the HWCC live root.
 			published_root_ = slot;
-			TreeAtomicStore(root_, off, std::memory_order_release);
+			root_.store(off, std::memory_order_release);
 		}
 	}
 
@@ -3367,13 +3363,15 @@ restart:
 	NodeBase *load_root() const
 	{
 		if (published_root_ != nullptr) {
-			const auto off = latency_sim::FixedLatencyAtomicLoad(
-			    *published_root_, std::memory_order_acquire,
-			    latency_sim::AtomicDomain::kHwcc);
+			// The published root slot follows the tree domain: shared trees
+			// publish into the HWCC layout, private trees into their
+			// owner-private SWCC arena.
+			const auto off =
+			    TreeAtomicLoad(*published_root_, std::memory_order_acquire);
 			if (off == tigonkv::engine::kNullOffset) return nullptr;
 			return static_cast<NodeBase *>(allocation_.FromOffset(off));
 		}
-		const auto off = TreeAtomicLoad(root_, std::memory_order_acquire);
+		const auto off = root_.load(std::memory_order_acquire);
 		return off == tigonkv::engine::kNullOffset
 		           ? nullptr
 		           : static_cast<NodeBase *>(allocation_.FromOffset(off));
@@ -3381,13 +3379,12 @@ restart:
 
 	void store_root(NodeBase *node)
 	{
-		TreeAtomicStore(root_, node == nullptr ? tigonkv::engine::kNullOffset
-		                                        : allocation_.ToOffset(node),
-		                std::memory_order_release);
+		root_.store(node == nullptr ? tigonkv::engine::kNullOffset
+		                            : allocation_.ToOffset(node),
+		            std::memory_order_release);
 		if (published_root_ != nullptr) {
-			latency_sim::FixedLatencyAtomicStore(
-			    *published_root_, allocation_.ToOffset(node),
-			    std::memory_order_release, latency_sim::AtomicDomain::kHwcc);
+			TreeAtomicStore(*published_root_, allocation_.ToOffset(node),
+			                std::memory_order_release);
 		}
 	}
 

@@ -60,7 +60,6 @@ class TwoPLPashaSCCWriteThrough : public SCCManager {
                 smeta->clear_all_scc_bits();
                 smeta->set_scc_bit(cur_host_id);
                 clwb(scc_data, size);
-                tigonkv::engine::mem_access::SwccWriteback(scc_data, size);
         }
 };
 

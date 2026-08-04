@@ -361,8 +361,30 @@ KVEngine::~KVEngine() {
 std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
   config.Validate();
   auto affinity_cpus = ResolveAffinityCpus(config);
+  // Isolate pool open from any previously enabled simulator state in this
+  // process (tests create sequential stores).  Pool open itself runs with the
+  // gate disabled; fixed latency is enabled below after registration.
+  latency_sim::GlobalLatencySimulator().Configure(latency_sim::Config{});
+  latency_sim::GlobalLatencySimulator().ClearPoolRegistrations();
   auto pool = std::make_unique<DualRegionMappedPool>(
       DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
+  // Register the immutable HWCC/SWCC mapping boundaries before enabling fixed
+  // latency for the rest of startup.  Pool open itself runs with the gate
+  // disabled; every later shared access is validated and scoped.
+  const DualRegionConfig region_config = RegionConfig(config);
+  auto &simulator = latency_sim::GlobalLatencySimulator();
+  simulator.RegisterPool(
+      latency_sim::PoolKind::kHwcc,
+      static_cast<const std::byte *>(pool->base()) +
+          region_config.hwcc_offset_bytes,
+      region_config.hwcc_size_bytes);
+  simulator.RegisterPool(
+      latency_sim::PoolKind::kSwcc,
+      static_cast<const std::byte *>(pool->base()) +
+          region_config.swcc_offset_bytes,
+      region_config.swcc_size_bytes);
+  simulator.Configure(config.hardware_simulation);
+  mem_access::LatencyScope open_scope(latency_sim::ScopeKind::kOther);
   star::CXLMemory::bind_dual_region_allocator(&pool->allocator(), config.node_id);
   star::MPSCRingBuffer *rings = nullptr;
   star::CXL_EBR *ebr = nullptr;
@@ -1082,6 +1104,9 @@ IncrementResult KVEngine::Increment(std::string_view key, int64_t delta) {
 }
 
 MemoryStats KVEngine::Memory() const {
+  // Snapshot/maintenance query that reads HWCC layout counters and
+  // owner-private SWCC control words; runs inside its own background scope.
+  mem_access::LatencyScope latency_scope(latency_sim::ScopeKind::kOther);
   const auto &regions = pool_->allocator();
   MemoryStats stats;
   stats.allocator_mode = "dual_region";
@@ -1275,10 +1300,11 @@ Status KVEngine::Forward(star::TwoPLPashaMessage type, std::string_view key,
   // cooperative wait deliberately has no active latency scope: any peer
   // request it services is charged as that peer's independent request, and
   // the response starts a fresh local continuation below.
-  const bool resume_foreground = mem_access::HasActiveScope();
-  if (resume_foreground) mem_access::EndActiveScopeAndDelay();
+  // The suspension only deactivates the scope; its pending delay is settled at
+  // the outermost scope exit after the caller's EBR and other guards are gone.
+  // RAII restores the foreground scope on every return path.
+  mem_access::ForegroundScopeSuspension suspend_foreground;
   const Status result = AwaitResponse(mailbox);
-  if (resume_foreground) mem_access::BeginForegroundScope();
   return result;
 }
 
@@ -1393,13 +1419,10 @@ void KVEngine::PollTransport() {
       DispatchMessage(*message, mailbox);
       return;
     }
-    const bool resume_foreground = mem_access::HasActiveScope();
-    if (resume_foreground) mem_access::EndActiveScopeAndDelay();
-    {
-      mem_access::LatencyScope request_scope(latency_sim::ScopeKind::kOther);
-      DispatchMessage(*message, mailbox);
-    }
-    if (resume_foreground) mem_access::BeginForegroundScope();
+    mem_access::ForegroundScopeSuspension suspend_foreground;
+    mem_access::DeferredLatencyScope request_scope(
+        latency_sim::ScopeKind::kOther);
+    DispatchMessage(*message, mailbox);
   };
 
   // Finish requests deferred from a previous await that already completed.

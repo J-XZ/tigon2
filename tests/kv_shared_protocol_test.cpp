@@ -160,6 +160,15 @@ int main() {
   latency.fixed_latency.swcc_fixed_ns_per_line = 10;
   latency.fixed_latency.hwcc_fixed_ns_per_line = 10;
   auto &simulator = latency_sim::GlobalLatencySimulator();
+  const auto region_config = Config(bytes);
+  simulator.RegisterPool(
+      latency_sim::PoolKind::kHwcc,
+      static_cast<const std::byte *>(pool) + region_config.hwcc_offset_bytes,
+      region_config.hwcc_size_bytes);
+  simulator.RegisterPool(
+      latency_sim::PoolKind::kSwcc,
+      static_cast<const std::byte *>(pool) + region_config.swcc_offset_bytes,
+      region_config.swcc_size_bytes);
   simulator.Configure(latency);
   simulator.BeginScope(latency_sim::ScopeKind::kForeground);
   auto *payload = new (regions.Allocate(

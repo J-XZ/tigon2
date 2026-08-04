@@ -1,5 +1,5 @@
-// Aligned with cxlkv root experiment_config.jsonc topology.
-// VMs on NUMA0; shared/remote memory on NUMA1.
+// Default CloudLab R6525 4VM configuration for the 2-NUMA BIOS topology.
+// VMs stay on NUMA0; shared memory and ivshmem-server stay on NUMA1.
 //
 // Host CPU layout (SMT-off, 32 cores on NUMA0 + 32 on NUMA1):
 //   NUMA0 CPUs 0..31   — 4 VMs × 8 vCPU

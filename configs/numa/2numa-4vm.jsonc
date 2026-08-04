@@ -1,6 +1,6 @@
 {
-  // Portable two-NUMA example aligned with cxlkv root topology.
-  // Replace CPU lists and paths for the host as needed.
+  // CloudLab R6525 2-NUMA, 4VM profile; the root config is the default copy.
+  // Replace CPU lists and paths only when explicitly targeting another host.
   "shared_memory": {
     "size_mb": 32768,
     "hwcc": { "offset_mb": 0, "size_mb": 1024 },

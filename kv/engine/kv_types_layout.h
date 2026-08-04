@@ -8,6 +8,9 @@
 #include <pthread.h>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
+
+#include "kv/engine/mem_access.h"
 
 namespace tigonkv::engine {
 
@@ -69,8 +72,27 @@ struct TwoPLPashaMetadataLocalStorage {
     pthread_spin_init(&latch, PTHREAD_PROCESS_PRIVATE);
   }
 
-  void lock() { pthread_spin_lock(&latch); }
-  void unlock() { pthread_spin_unlock(&latch); }
+  static constexpr bool kOffsetBacked = std::is_integral_v<MigratedRowRef>;
+
+  void lock() {
+    // The offset-backed storage lives in owner-private SWCC; cover the real
+    // pthread spin-lock atomic accesses without changing the lock protocol.
+    // The legacy DRAM form is pure local memory and stays direct.
+    if constexpr (kOffsetBacked) {
+      tigonkv::engine::mem_access::PrivateWrite(
+          reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(&latch)),
+          sizeof(latch));
+    }
+    pthread_spin_lock(&latch);
+  }
+  void unlock() {
+    if constexpr (kOffsetBacked) {
+      tigonkv::engine::mem_access::PrivateWrite(
+          reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(&latch)),
+          sizeof(latch));
+    }
+    pthread_spin_unlock(&latch);
+  }
 
   pthread_spinlock_t latch;
   uint64_t tid{0};

@@ -47,3 +47,29 @@ tigonkv_e2e_multivm_preflight() {
   "$root/tigonkv_check_vms.sh" --config "$TIGONKV_EXPERIMENT_CONFIG_JSONC"
   echo "TIGONKV_E2E_MULTIVM_PREFLIGHT ok vms=4 threads=4 binary_dir=$build"
 }
+
+# Reclaim a CTest log directory unless the caller asked to keep it.
+# Arguments: $1 log_root, $2 "1" when the script created the directory (and
+# therefore owns it), $3 label for the keep message.
+#
+# Contract:
+#   * a script-created directory is removed by default on EXIT/INT/TERM/HUP
+#     (even when a child asserts/aborts) and kept with its path printed when
+#     TIGONKV_E2E_KEEP_CTEST_LOGS=1|true|yes;
+#   * a caller-provided TIGONKV_E2E_CTEST_LOG_ROOT (created=0) is owned by
+#     the caller and is never removed.
+# Exits with $? so it works as a trap on both success and failure paths.
+tigonkv_e2e_ctest_reclaim_logs() {
+  local log_root="$1" created="$2" label="$3" status=$? keep=0
+  case "${TIGONKV_E2E_KEEP_CTEST_LOGS:-0}" in
+    1|true|yes) keep=1 ;;
+  esac
+  if [[ "$created" == 1 ]]; then
+    if (( keep )); then
+      printf '%s kept log_root=%s\n' "$label" "$log_root"
+    else
+      rm -rf -- "$log_root"
+    fi
+  fi
+  exit "$status"
+}
