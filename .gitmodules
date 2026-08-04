@@ -2,3 +2,7 @@
 	path = thirdparty_libs/YCSB-cpp
 	url = https://github.com/J-XZ/YCSB-cpp.git
 	branch = cxlkv_trace
+[submodule "thirdparty_libs/latency_sim"]
+	path = thirdparty_libs/latency_sim
+	url = https://github.com/J-XZ/latency_sim.git
+	branch = my-work
