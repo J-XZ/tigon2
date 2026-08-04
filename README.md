@@ -59,14 +59,31 @@ NUMA1。
 
 ## 构建和测试
 
+标准工具链入口：`clang-18`/`clang++-18`（调用者显式指定其它编译器时保留其选择，
+GCC 仍可用，此时 LTO 使用 `-flto`），Ninja 生成器（命令中显式 `-G Ninja`），
+检测到 `ccache` 时自动作为 compiler launcher。单配置构建未指定
+`CMAKE_BUILD_TYPE` 时默认 `RelWithDebInfo`。
+
+优化参数按模式应用到全部项目自有 C/C++ 目标（`cmake/TigonBuildOptions.cmake`）：
+
+```text
+Debug:          -O0 -g3，无 -march=native，无 LTO
+RelWithDebInfo: -O3 -g3 -march=native，编译和最终链接均 -flto=full，保留 -DNDEBUG
+Release:        -O3 -march=native，编译和最终链接均 -flto=full，保留 -DNDEBUG
+```
+
+配置阶段执行 full-LTO 能力检查，工具链不支持时明确失败而不是静默降级。默认不强制
+保留 frame pointer；需要 profiler 友好构建时显式加
+`-DTIGONKV_ENABLE_FRAME_POINTERS=ON`（仅对项目自有目标生效）。
+
 ```bash
-cmake -S . -B build-debug \
+cmake -S . -B build-debug -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
   -DTIGONKV_DISABLE_HARDWARE_SIMULATION=OFF
 cmake --build build-debug -j2
 ctest --test-dir build-debug -E '^e2e_' --output-on-failure -j1
 
-cmake -S . -B build-relwithdebinfo \
+cmake -S . -B build-relwithdebinfo -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DTIGONKV_DISABLE_HARDWARE_SIMULATION=OFF
 cmake --build build-relwithdebinfo -j2

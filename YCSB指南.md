@@ -11,7 +11,7 @@
 生产 fixed-latency build 使用 RelWithDebInfo：
 
 ```bash
-cmake -S . -B build-relwithdebinfo \
+cmake -S . -B build-relwithdebinfo -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DTIGONKV_DISABLE_HARDWARE_SIMULATION=OFF
 cmake --build build-relwithdebinfo -j2

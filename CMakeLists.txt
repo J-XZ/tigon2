@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
+
+include(cmake/TigonBuildOptions.cmake)
+
+# Compiler selection must happen before project() so the default clang-18
+# toolchain (and its ccache launcher / LLVM archive tools) is honored.
+tigonkv_select_default_toolchain()
+
 project(tigon LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -15,28 +22,17 @@ option(TIGONKV_DISABLE_HARDWARE_SIMULATION
 # Keep the single-config default identical to the documented production
 # build before any build-type-specific flags are selected.  An explicit
 # caller value, and multi-config generators, remain untouched.
-if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
-endif()
+tigonkv_set_default_build_type()
 
-add_compile_options(-Wall -Wextra -Wpedantic -fno-omit-frame-pointer
-  -march=native
+# Full-LTO capability gate: Release/RelWithDebInfo must not silently degrade.
+tigonkv_check_lto_support()
+
+# Warning hygiene stays directory-local.  Optimization level, -march=native,
+# frame-pointer and LTO flags are project-target policy applied through
+# tigonkv_apply_target_build_policy() at the end of this file.
+add_compile_options(-Wall -Wextra -Wpedantic
   -Wno-unused-variable -Wno-unused-but-set-variable -Wno-variadic-macros
   -Wno-deprecated-declarations)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-  add_compile_options(-O0 -g3)
-elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-  # tigonkv: keep the release-with-symbols contract aligned with the fairness
-  # plan.  GCC spells full-program LTO as bare -flto; Clang uses -flto=full.
-  add_compile_options(-O3 -g3 -march=native)
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    add_compile_options(-flto)
-    add_link_options(-flto)
-  else()
-    add_compile_options(-flto=full)
-    add_link_options(-flto=full)
-  endif()
-endif()
 
 include_directories(${CMAKE_SOURCE_DIR})
 
@@ -101,6 +97,55 @@ add_executable(hardware_sim_disabled_benchmark_compile_off
 target_link_libraries(hardware_sim_disabled_benchmark_compile_off PRIVATE tigonkv)
 target_compile_definitions(hardware_sim_disabled_benchmark_compile_off
                            PRIVATE TIGONKV_DISABLE_HARDWARE_SIMULATION=1)
+
+# Every project-owned C/C++ target receives the mode-consistent optimization
+# and LTO policy (audit list: nothing below may bypass the policy).
+set(TIGONKV_PROJECT_TARGETS
+  tigonkv
+  unit_tests
+  e2e_08
+  e2e_09
+  e2e_trace_runner
+  ycsb_partition_splits
+  latency_modes_test
+  kv_layout_test
+  btree_binding_test
+  kv_partition_test
+  kv_engine_test
+  kv_startup_test
+  scc_protocol_test
+  kv_shared_protocol_test
+  region_allocator_test
+  cxl_ebr_test
+  numa_placement_probe
+  cxl_pool_initer
+  hardware_sim_disabled_benchmark
+  hardware_sim_disabled_benchmark_compile_off
+)
+foreach(TIGONKV_TARGET IN LISTS TIGONKV_PROJECT_TARGETS)
+  tigonkv_apply_target_build_policy(${TIGONKV_TARGET})
+endforeach()
+
+# Functionally required ISA features for the targets that compile sources
+# reaching the clflushopt/clwb intrinsics in common/MPSCRingBuffer.h and
+# protocol/Pasha/SCCManager.h.  These flags exist only because that source
+# uses the intrinsics; they are not a general optimization baseline and are
+# never applied to third-party/imported targets.
+set(TIGONKV_ISA_REQUIRED_TARGETS
+  tigonkv
+  unit_tests
+  e2e_08
+  e2e_09
+  e2e_trace_runner
+  kv_layout_test
+  kv_partition_test
+  kv_engine_test
+  kv_startup_test
+  kv_shared_protocol_test
+)
+foreach(TIGONKV_TARGET IN LISTS TIGONKV_ISA_REQUIRED_TARGETS)
+  target_compile_options(${TIGONKV_TARGET} PRIVATE -mclflushopt -mclwb)
+endforeach()
 
 add_custom_target(tigonkv_target ALL DEPENDS tigonkv)
 add_custom_target(e2e_trace_target DEPENDS e2e_trace_runner)
