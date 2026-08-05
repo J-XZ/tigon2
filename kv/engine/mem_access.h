@@ -37,7 +37,7 @@ class LatencyScope {
 class ForegroundScopeSuspension {
  public:
   ForegroundScopeSuspension() {
-    if (!latency_sim::FixedLatencyEnabledFast()) [[likely]] return;
+    if (!latency_sim::FixedLatencyEnabledFast()) return;
     if (latency_sim::GlobalLatencySimulator()
             .HasTopLevelScopeForCurrentThread(
                 latency_sim::ExecutionClass::kForeground)) {

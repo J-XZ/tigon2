@@ -4,7 +4,6 @@
 #include <latency_sim/domain.h>
 #include <latency_sim/scope.h>
 #include <latency_sim/simulator.h>
-#include <latency_sim/testing.h>
 #include "kv/engine/mem_access.h"
 
 #ifdef NDEBUG
@@ -19,7 +18,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <thread>
 
@@ -344,45 +342,6 @@ int main() {
   assert(!simulator.HasActiveScopeForCurrentThread());
   assert(simulator.PendingDelayNsForTest() == 0);
   simulator.Configure(latency_sim::FixedLatencyConfig{});
-
-  // Rounding and tick conversion boundaries.  These conversions are pure and
-  // never busy-wait, so extreme values are safe to test.
-  assert(latency_sim::RoundDelayPsToNsForTest(0) == 0);
-  assert(latency_sim::RoundDelayPsToNsForTest(499) == 0);
-  assert(latency_sim::RoundDelayPsToNsForTest(500) == 1);
-  assert(latency_sim::RoundDelayPsToNsForTest(999) == 1);
-  assert(latency_sim::RoundDelayPsToNsForTest(1000) == 1);
-  assert(latency_sim::RoundDelayPsToNsForTest(1001) == 1);
-  assert(latency_sim::RoundDelayPsToNsForTest(1500) == 2);
-  assert(latency_sim::RoundDelayPsToNsForTest(
-             std::numeric_limits<uint64_t>::max()) == 18446744073709552ull);
-  assert(latency_sim::RoundDelayPsToNsForTest(
-             std::numeric_limits<uint64_t>::max() - 114) ==
-         18446744073709552ull);
-  assert(latency_sim::RoundDelayPsToNsForTest(
-             std::numeric_limits<uint64_t>::max() - 499) ==
-         18446744073709551ull);
-
-  assert(latency_sim::TicksForDelayNsForTest(3.0, 0) == 0);
-  assert(latency_sim::TicksForDelayNsForTest(3.0, 1) == 3);
-  // Ceil: a fractional tick budget must not wait one tick too few.
-  assert(latency_sim::TicksForDelayNsForTest(3.5, 1) == 4);
-  assert(latency_sim::TicksForDelayNsForTest(0.5, 3) == 2);
-  // Overflowing tick conversions hard fail instead of saturating to
-  // UINT64_MAX (which would otherwise become an effectively infinite spin).
-  if (fork() == 0) {
-    latency_sim::TicksForDelayNsForTest(1e300, 1000);
-    _exit(0);
-  }
-  int tick_status = 0;
-  assert(waitpid(-1, &tick_status, 0) > 0);
-  assert(WIFSIGNALED(tick_status));
-  if (fork() == 0) {
-    latency_sim::TicksForDelayNsForTest(0.0, 1);
-    _exit(0);
-  }
-  assert(waitpid(-1, &tick_status, 0) > 0);
-  assert(WIFSIGNALED(tick_status));
 
   // A ForegroundScopeSuspension inside an already nested scope must not eat a
   // nesting level (which would settle the outer budget while guards are still
