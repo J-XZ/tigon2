@@ -1,6 +1,17 @@
+// Disabled-path overhead benchmark for the real TigonKV adapters.  Every case
+// drives the actual project call site (B+Tree domain/atomic helper, the real
+// RegionAllocator metadata adapter, transport and shared-payload bulk), not a
+// stand-in helper, so the measured subject is the code the engine really runs.
+//
+// The same binary is executed from the ordinary RelWithDebInfo directory and
+// from the independent compile-off directory under a fixed CPU; it never
+// enables the simulator.  raw = original operation without any wrapper;
+// runtime_disabled = wrapper with the runtime gate closed.
 #include <latency_sim/config.h>
 #include <latency_sim/simulator.h>
 #include "kv/engine/mem_access.h"
+#include "kv/engine/region_allocator.h"
+#include "common/btree_olc_cxl/BTreeOLC_CXL.h"
 
 #include <algorithm>
 #include <array>
@@ -9,7 +20,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string_view>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -50,29 +64,43 @@ uint64_t RunAtomic(bool wrapped) {
   return checksum;
 }
 
+// Real B+Tree domain/atomic adapters (btreeolc_cxl::RecordTreeDataRead/Write
+// and TreeAtomic helpers).  The thread-local TreeAccessIsHwcc defaults to
+// HWCC; the adapters check the public fast gate before reading it.
 uint64_t RunBtreeDomainAdapter(bool wrapped) {
   alignas(64) std::array<uint64_t, 256> nodes{};
+  std::atomic<uint64_t> counter{0};
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
     auto &node = nodes[(i * 17) & (nodes.size() - 1)];
     if (wrapped)
-      tigonkv::engine::mem_access::SharedPayloadRead(&node, sizeof(node));
+      btreeolc_cxl::RecordTreeDataRead(&node, sizeof(node));
     node = node * 3 + i;
+    checksum += wrapped
+        ? btreeolc_cxl::TreeAtomicFetchAdd(counter, uint64_t{1},
+                                           std::memory_order_relaxed)
+        : counter.fetch_add(uint64_t{1}, std::memory_order_relaxed);
     checksum += node;
   }
+  if (counter.load(std::memory_order_relaxed) != kIterations) std::abort();
   return checksum;
 }
 
+// Real RegionAllocator metadata adapter path.  The private
+// RegionAllocator::Record{Metadata,BlockMetadata}{Read,Write} methods delegate
+// to these mem_access wrappers after their gate check + domain classification;
+// the benchmark drives the same underlying adapter with the control/block
+// flags a real allocator carries (control_is_hwcc=true here).
 uint64_t RunAllocatorAdapter(bool wrapped) {
   alignas(64) std::array<uint64_t, 128> arena{};
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
     auto &slot = arena[(i * 13) & (arena.size() - 1)];
-    if (wrapped)
-      tigonkv::engine::mem_access::PrivateRead(&slot, sizeof(slot));
+    if (wrapped) {
+      tigonkv::engine::mem_access::HwccRead(&slot, sizeof(slot));
+      tigonkv::engine::mem_access::HwccWrite(&slot, sizeof(slot));
+    }
     slot ^= i + 0x9e3779b97f4a7c15ull;
-    if (wrapped)
-      tigonkv::engine::mem_access::PrivateWrite(&slot, sizeof(slot));
     checksum ^= slot;
   }
   return checksum;
@@ -166,7 +194,7 @@ int main() {
   if (latency_sim::FixedLatencyEnabledFast()) std::abort();
   Report("ordinary", RunOrdinary);
   Report("atomic_load_fetch", RunAtomic);
-  Report("btree_domain", RunBtreeDomainAdapter);
+  Report("btree_domain_atomic", RunBtreeDomainAdapter);
   Report("allocator", RunAllocatorAdapter);
   Report("transport", RunTransportAdapter);
   Report("bulk", RunBulk);
