@@ -5,6 +5,7 @@
 #include <latency_sim/domain.h>
 #include <latency_sim/scope.h>
 #include <latency_sim/simulator.h>
+#include "tests/latency_test_support.h"
 
 #include <array>
 #ifdef NDEBUG
@@ -54,35 +55,50 @@ struct Mapping {
 
 void TestAttachReuseAndAccounting() {
   Mapping mapping(true);
+  // Register the raw mapping for both domains (this allocator charges HWCC
+  // for control and block) and place the accounting counters inside the
+  // mapping so every wrapped counter update stays inside a registered range.
+  tigonkv::test::ScopedLatencyPools pools(mapping.base, kBytes, mapping.base,
+                                          kBytes);
+  auto *index =
+      new (static_cast<std::byte *>(mapping.base) + kBytes - 2 * sizeof(DomainCounter))
+          DomainCounter;
+  auto *payload = index + 1;
+  tigonkv::engine::mem_access::LatencyScope scope(
+      latency_sim::ExecutionClass::kForeground);
   auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2, 0, true, true);
-  DomainCounter index;
-  DomainCounter payload;
-  void *first = allocator.Allocate(1, AllocationDomain::kHwccIndex, &index, 0);
-  void *second = allocator.Allocate(80, AllocationDomain::kSharedPayloadSwcc, &payload, 1);
+  void *first = allocator.Allocate(1, AllocationDomain::kHwccIndex, index, 0);
+  void *second = allocator.Allocate(80, AllocationDomain::kSharedPayloadSwcc, payload, 1);
   assert(reinterpret_cast<uintptr_t>(first) % RegionAllocator::kAlignment == 0);
   assert(reinterpret_cast<uintptr_t>(second) % RegionAllocator::kAlignment == 0);
-  assert(index.used_bytes.load() == 128);
-  assert(payload.used_bytes.load() == 192);
+  assert(index->used_bytes.load() == 128);
+  assert(payload->used_bytes.load() == 192);
   const RegionOffset offset = allocator.ToOffset(second);
   auto attached = RegionAllocator::Attach(mapping.base, kBytes, true, true);
   assert(attached.FromOffset(offset) == second);
-  allocator.Free(first, 1, AllocationDomain::kHwccIndex, &index, 0, 0);
-  assert(index.used_bytes.load() == 0);
-  void *reused = allocator.Allocate(1, AllocationDomain::kHwccIndex, &index, 0);
+  allocator.Free(first, 1, AllocationDomain::kHwccIndex, index, 0, 0);
+  assert(index->used_bytes.load() == 0);
+  void *reused = allocator.Allocate(1, AllocationDomain::kHwccIndex, index, 0);
   assert(reused == first);
-  allocator.Free(reused, 1, AllocationDomain::kHwccIndex, &index, 0, 0);
-  allocator.Free(second, 80, AllocationDomain::kSharedPayloadSwcc, &payload, 1, 1);
-  assert(index.used_bytes.load() == 0 && payload.used_bytes.load() == 0);
-  assert(index.peak_bytes.load() == 128 && payload.peak_bytes.load() == 192);
+  allocator.Free(reused, 1, AllocationDomain::kHwccIndex, index, 0, 0);
+  allocator.Free(second, 80, AllocationDomain::kSharedPayloadSwcc, payload, 1, 1);
+  assert(index->used_bytes.load() == 0 && payload->used_bytes.load() == 0);
+  assert(index->peak_bytes.load() == 128 && payload->peak_bytes.load() == 192);
 }
 
 void TestCrossProcessFreeRejected() {
   Mapping mapping(true);
+  // Counter lives inside the shared mapping at a fixed offset so both the
+  // parent and the forked child charge addresses within their own registered
+  // ranges.
+  auto *counter =
+      new (static_cast<std::byte *>(mapping.base) + kBytes - sizeof(DomainCounter))
+          DomainCounter;
+  tigonkv::test::ScopedLatencyPools pools(mapping.base, kBytes, mapping.base,
+                                          kBytes);
+  tigonkv::engine::mem_access::LatencyScope scope(
+      latency_sim::ExecutionClass::kForeground);
   auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2, 0, true, true);
-  void *counter_map = mmap(nullptr, sizeof(DomainCounter), PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-  assert(counter_map != MAP_FAILED);
-  auto *counter = new (counter_map) DomainCounter;
   void *block = allocator.Allocate(100, AllocationDomain::kHwccMetadata, counter, 0);
   const RegionOffset offset = allocator.ToOffset(block);
   const pid_t child = fork();
@@ -90,12 +106,22 @@ void TestCrossProcessFreeRejected() {
   if (child == 0) {
     void *child_base = mmap(nullptr, kBytes, PROT_READ | PROT_WRITE, MAP_SHARED, mapping.fd, 0);
     if (child_base == MAP_FAILED) _exit(2);
+    // Re-register the child's own mapping (its VA differs from the parent's)
+    // and open a child-thread scope before touching allocator state.
+    tigonkv::test::ScopedLatencyPools child_pools(child_base, kBytes, child_base,
+                                                  kBytes);
+    tigonkv::engine::mem_access::LatencyScope child_scope(
+        latency_sim::ExecutionClass::kForeground);
+    // Same file offset as the parent's counter (MAP_SHARED): do not
+    // placement-new here, that would zero the shared counter.
+    auto *child_counter = reinterpret_cast<DomainCounter *>(
+        static_cast<std::byte *>(child_base) + kBytes - sizeof(DomainCounter));
     try {
       auto child_allocator = RegionAllocator::Attach(child_base, kBytes, true, true);
       bool rejected = false;
       try {
         child_allocator.Free(child_allocator.FromOffset(offset), 100,
-                             AllocationDomain::kHwccMetadata, counter, 0, 1);
+                             AllocationDomain::kHwccMetadata, child_counter, 0, 1);
       } catch (const std::runtime_error &) {
         rejected = true;
       }
@@ -110,30 +136,39 @@ void TestCrossProcessFreeRejected() {
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   allocator.Free(block, 100, AllocationDomain::kHwccMetadata, counter, 0, 0);
   assert(counter->used_bytes.load() == 0);
-  munmap(counter_map, sizeof(DomainCounter));
 }
 
 void TestConcurrencyAndBounds() {
   Mapping mapping(true);
+  // Default RegionAllocator classes charge owner-private SWCC; register the
+  // raw mapping for both domains and keep the shared counter inside it.
+  tigonkv::test::ScopedLatencyPools pools(mapping.base, kBytes, mapping.base,
+                                          kBytes);
+  auto *counter =
+      new (static_cast<std::byte *>(mapping.base) + kBytes - sizeof(DomainCounter))
+          DomainCounter;
+  tigonkv::engine::mem_access::LatencyScope scope(
+      latency_sim::ExecutionClass::kForeground);
   auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2);
-  DomainCounter counter;
   std::vector<std::thread> threads;
   for (int worker = 0; worker < 8; ++worker) {
     threads.emplace_back([&] {
+      tigonkv::engine::mem_access::LatencyScope thread_scope(
+          latency_sim::ExecutionClass::kForeground);
       for (int i = 0; i < 500; ++i) {
         const uint64_t bytes = 1 + (i % 700);
         void *block = allocator.Allocate(bytes, AllocationDomain::kOwnerPrivateSwcc,
-                                         &counter, 1);
+                                         counter, 1);
         allocator.Free(block, bytes, AllocationDomain::kOwnerPrivateSwcc,
-                       &counter, 1, 1);
+                       counter, 1, 1);
       }
     });
   }
   for (auto &thread : threads) thread.join();
-  assert(counter.used_bytes.load() == 0);
+  assert(counter->used_bytes.load() == 0);
   bool oom = false;
   try {
-    for (;;) allocator.Allocate(65536, AllocationDomain::kSharedPayloadSwcc, &counter, 0);
+    for (;;) allocator.Allocate(65536, AllocationDomain::kSharedPayloadSwcc, counter, 0);
   } catch (const std::bad_alloc &) {
     oom = true;
   }
@@ -142,6 +177,10 @@ void TestConcurrencyAndBounds() {
 
 void TestInvalidAttachment() {
   Mapping mapping(true);
+  tigonkv::test::ScopedLatencyPools pools(mapping.base, kBytes, mapping.base,
+                                          kBytes);
+  tigonkv::engine::mem_access::LatencyScope scope(
+      latency_sim::ExecutionClass::kForeground);
   auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2);
   (void)allocator;
   bool rejected = false;
@@ -159,6 +198,13 @@ DualRegionConfig TestDualConfig();
 void TestBusinessHwccUsesFullAllocator() {
   Mapping mapping(true, 64 * 1024 * 1024);
   DualRegionConfig config = TestDualConfig();
+  tigonkv::test::ScopedLatencyPools pools(
+      static_cast<const std::byte *>(mapping.base) + config.swcc_offset_bytes,
+      config.swcc_size_bytes,
+      static_cast<const std::byte *>(mapping.base) + config.hwcc_offset_bytes,
+      config.hwcc_size_bytes);
+  tigonkv::engine::mem_access::LatencyScope scope(
+      latency_sim::ExecutionClass::kForeground);
   auto dual = DualRegionAllocator::Initialize(mapping.base, config);
   const uint64_t dual_header_bytes =
       (sizeof(DualRegionPersistentHeader) + RegionAllocator::kAlignment - 1) &
@@ -189,104 +235,120 @@ void TestDualPhysicalRegions() {
   config.partition_count = 8;
   config.fixed_key_size = 32;
   config.fixed_value_size = 128;
-  auto dual = DualRegionAllocator::Initialize(mapping.base, config);
-  dual.FinalizeStaticHwccLayout();
-  dual.PublishStaticHwccLayout();
-  const auto &dynamic0 = dual.layout().owner_dynamic_arenas[0];
-  const auto &dynamic1 = dual.layout().owner_dynamic_arenas[1];
+  std::unique_ptr<DualRegionAllocator> dual;
+  std::unique_ptr<DualRegionAllocator> attached;
+  {
+    // Register the raw mapping's HWCC/SWCC ranges and run the wrapped
+    // allocator operations inside an explicit scope.  The scope and the zero
+    // registration are torn down before the checkpoint below re-registers
+    // with a non-zero latency model.
+    tigonkv::test::ScopedLatencyPools pools(
+        static_cast<const std::byte *>(mapping.base) + config.swcc_offset_bytes,
+        config.swcc_size_bytes,
+        static_cast<const std::byte *>(mapping.base) + config.hwcc_offset_bytes,
+        config.hwcc_size_bytes);
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kForeground);
+    dual = std::make_unique<DualRegionAllocator>(
+        DualRegionAllocator::Initialize(mapping.base, config));
+  dual->FinalizeStaticHwccLayout();
+  dual->PublishStaticHwccLayout();
+  const auto &dynamic0 = dual->layout().owner_dynamic_arenas[0];
+  const auto &dynamic1 = dual->layout().owner_dynamic_arenas[1];
   assert(dynamic0.hwcc_offset + dynamic0.hwcc_bytes <= dynamic1.hwcc_offset);
   assert(dynamic0.shared_swcc_offset + dynamic0.shared_swcc_bytes <=
          dynamic1.shared_swcc_offset);
-  dual.InitializeOwnerPrivateArenas(0);
+  dual->InitializeOwnerPrivateArenas(0);
   // Phase two is owner-only: VM0 may publish immutable HWCC geometry, but it
   // must not construct VM1's private allocator control/header.
-  dual.InitializeOwnerPrivateArenas(1);
-  assert(dual.layout().state.load(std::memory_order_acquire) ==
+  dual->InitializeOwnerPrivateArenas(1);
+  assert(dual->layout().state.load(std::memory_order_acquire) ==
          static_cast<uint32_t>(LayoutState::kInitializing));
-  dual.BindOwnerPrivateAllocators(0);
-  void *index = dual.Allocate(100, AllocationDomain::kHwccIndex, 0);
-  void *owner = dual.AllocateOwnerPrivate(80, 0, 0);
-  dual.BindOwnerPrivateAllocators(1);
-  void *metadata = dual.Allocate(64, AllocationDomain::kHwccMetadata, 1);
-  void *payload = dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 1);
-  dual.BindOwnerPrivateAllocators(0);
+  dual->BindOwnerPrivateAllocators(0);
+  void *index = dual->Allocate(100, AllocationDomain::kHwccIndex, 0);
+  void *owner = dual->AllocateOwnerPrivate(80, 0, 0);
+  dual->BindOwnerPrivateAllocators(1);
+  void *metadata = dual->Allocate(64, AllocationDomain::kHwccMetadata, 1);
+  void *payload = dual->Allocate(100, AllocationDomain::kSharedPayloadSwcc, 1);
+  dual->BindOwnerPrivateAllocators(0);
   void *remote_payload =
-      dual.Allocate(100, AllocationDomain::kSharedPayloadSwcc, 0);
-  assert(dual.IsHwccAddress(index) && dual.IsHwccAddress(metadata));
-  assert(dual.IsSwccAddress(owner) && dual.IsSwccAddress(payload));
-  assert(dual.ResolveDynamicHwcc(dual.hwcc().ToOffset(index), 64, 0) == index);
+      dual->Allocate(100, AllocationDomain::kSharedPayloadSwcc, 0);
+  assert(dual->IsHwccAddress(index) && dual->IsHwccAddress(metadata));
+  assert(dual->IsSwccAddress(owner) && dual->IsSwccAddress(payload));
+  assert(dual->ResolveDynamicHwcc(dual->hwcc().ToOffset(index), 64, 0) == index);
   bool wrong_dynamic_owner = false;
   try {
-    (void)dual.ResolveDynamicHwcc(dual.hwcc().ToOffset(index), 64, 1);
+    (void)dual->ResolveDynamicHwcc(dual->hwcc().ToOffset(index), 64, 1);
   } catch (const std::runtime_error &) {
     wrong_dynamic_owner = true;
   }
   assert(wrong_dynamic_owner);
-  assert(dual.ResolveOwnerPrivate(dual.ToOwnerPrivateOffset(owner, 0), 80, 0, 0) == owner);
+  assert(dual->ResolveOwnerPrivate(dual->ToOwnerPrivateOffset(owner, 0), 80, 0, 0) == owner);
   bool wrong_private_partition = false;
   try {
-    (void)dual.ResolveOwnerPrivate(dual.ToOwnerPrivateOffset(owner, 0), 80, 1, 1);
+    (void)dual->ResolveOwnerPrivate(dual->ToOwnerPrivateOffset(owner, 0), 80, 1, 1);
   } catch (const std::runtime_error &) {
     wrong_private_partition = true;
   }
   assert(wrong_private_partition);
-  const auto payload_pool_offset = dual.EncodeSharedPayloadOffset(payload, 1);
-  assert(dual.ResolveSharedPayload(payload_pool_offset, 100) == payload);
+  const auto payload_pool_offset = dual->EncodeSharedPayloadOffset(payload, 1);
+  assert(dual->ResolveSharedPayload(payload_pool_offset, 100) == payload);
   const auto remote_payload_pool_offset =
-      dual.EncodeSharedPayloadOffset(remote_payload, 0);
-  assert(dual.ResolveSharedPayload(remote_payload_pool_offset, 100) ==
+      dual->EncodeSharedPayloadOffset(remote_payload, 0);
+  assert(dual->ResolveSharedPayload(remote_payload_pool_offset, 100) ==
          remote_payload);
   bool wrong_shared_payload_domain = false;
   try {
-    (void)dual.ResolveSharedPayload(dual.hwcc().ToOffset(index), 64);
+    (void)dual->ResolveSharedPayload(dual->hwcc().ToOffset(index), 64);
   } catch (const std::runtime_error &) {
     wrong_shared_payload_domain = true;
   }
   assert(wrong_shared_payload_domain);
-  assert(!dual.IsHwccAddress(owner) && !dual.IsSwccAddress(index));
-  assert(dual.DynamicHwccUsedBytes(0) > 0);
-  dual.BindOwnerPrivateAllocators(1);
-  assert(dual.DynamicHwccUsedBytes(1) > 0);
+  assert(!dual->IsHwccAddress(owner) && !dual->IsSwccAddress(index));
+  assert(dual->DynamicHwccUsedBytes(0) > 0);
+  dual->BindOwnerPrivateAllocators(1);
+  assert(dual->DynamicHwccUsedBytes(1) > 0);
   bool nonowner_private_resolve_rejected = false;
   try {
-    (void)dual.ResolveOwnerPrivate(dual.ToOwnerPrivateOffset(owner, 0), 80,
+    (void)dual->ResolveOwnerPrivate(dual->ToOwnerPrivateOffset(owner, 0), 80,
                                    0, 0);
   } catch (const std::runtime_error &) {
     nonowner_private_resolve_rejected = true;
   }
   assert(nonowner_private_resolve_rejected);
-  assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
+  assert(dual->layout().domains[static_cast<size_t>(AllocationDomain::kHwccIndex)]
              .used_bytes.load() == 0);
-  assert(dual.layout().domains[static_cast<size_t>(AllocationDomain::kHwccLayout)]
+  assert(dual->layout().domains[static_cast<size_t>(AllocationDomain::kHwccLayout)]
              .used_bytes.load() > 0);
   const uint64_t hwcc_allocator_metadata =
-      dual.layout().domains[static_cast<size_t>(
+      dual->layout().domains[static_cast<size_t>(
           AllocationDomain::kHwccAllocatorMetadata)].used_bytes.load();
   const uint64_t swcc_allocator_metadata =
-      dual.layout().domains[static_cast<size_t>(
+      dual->layout().domains[static_cast<size_t>(
           AllocationDomain::kSwccAllocatorMetadata)].used_bytes.load();
-  assert(hwcc_allocator_metadata == dual.hwcc().metadata_bytes());
+  assert(hwcc_allocator_metadata == dual->hwcc().metadata_bytes());
   const uint64_t swcc_metadata_bytes =
       (sizeof(RegionAllocatorHeader) + RegionAllocator::kAlignment - 1) /
       RegionAllocator::kAlignment * RegionAllocator::kAlignment;
   assert(swcc_allocator_metadata == swcc_metadata_bytes);
-  dual.PublishOwnerInitialized(0);
-  dual.PublishOwnerInitialized(1);
-  dual.PublishReady();
-  assert(dual.layout().state.load(std::memory_order_acquire) ==
+  dual->PublishOwnerInitialized(0);
+  dual->PublishOwnerInitialized(1);
+  dual->PublishReady();
+  assert(dual->layout().state.load(std::memory_order_acquire) ==
          static_cast<uint32_t>(LayoutState::kReady));
-  auto attached = DualRegionAllocator::Attach(mapping.base, config);
-  attached.BindOwnerPrivateAllocators(1);
-  assert(attached.IsHwccAddress(index) && attached.IsSwccAddress(payload));
-  assert(attached.layout().domains[static_cast<size_t>(
+  attached = std::make_unique<DualRegionAllocator>(
+      DualRegionAllocator::Attach(mapping.base, config));
+  attached->BindOwnerPrivateAllocators(1);
+  assert(attached->IsHwccAddress(index) && attached->IsSwccAddress(payload));
+  assert(attached->layout().domains[static_cast<size_t>(
              AllocationDomain::kHwccAllocatorMetadata)].used_bytes.load() ==
          hwcc_allocator_metadata);
-  assert(attached.layout().domains[static_cast<size_t>(
+  assert(attached->layout().domains[static_cast<size_t>(
              AllocationDomain::kSwccAllocatorMetadata)].used_bytes.load() ==
          swcc_allocator_metadata);
   bool fixed_domain_rejected = false;
   try {
-    (void)attached.Allocate(
+    (void)attached->Allocate(
         64, AllocationDomain::kHwccAllocatorMetadata, 0);
   } catch (const std::invalid_argument &) {
     fixed_domain_rejected = true;
@@ -294,52 +356,45 @@ void TestDualPhysicalRegions() {
   assert(fixed_domain_rejected);
   bool remote_free_rejected = false;
   try {
-    attached.Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 1);
+    attached->Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 1);
   } catch (const std::runtime_error &) {
     remote_free_rejected = true;
   }
   assert(remote_free_rejected);
-  dual.BindOwnerPrivateAllocators(0);
-  dual.Free(index, 100, AllocationDomain::kHwccIndex, 0, 0);
+  dual->BindOwnerPrivateAllocators(0);
+  dual->Free(index, 100, AllocationDomain::kHwccIndex, 0, 0);
   // RegionOffset zero is null.  The dynamic arena therefore reserves its
   // first cache line and can immediately reuse the first freed block.
-  void *reused_index = dual.Allocate(100, AllocationDomain::kHwccIndex, 0);
+  void *reused_index = dual->Allocate(100, AllocationDomain::kHwccIndex, 0);
   assert(reused_index == index);
-  dual.Free(reused_index, 100, AllocationDomain::kHwccIndex, 0, 0);
-  dual.BindOwnerPrivateAllocators(1);
-  dual.Free(metadata, 64, AllocationDomain::kHwccMetadata, 1, 1);
-  dual.Free(payload, 100, AllocationDomain::kSharedPayloadSwcc, 1, 1);
-  dual.BindOwnerPrivateAllocators(0);
-  dual.FreeOwnerPrivate(owner, 80, 0, 0);
-  dual.Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 0);
-  assert(dual.DynamicHwccUsedBytes(0) == 0);
-  dual.BindOwnerPrivateAllocators(1);
-  assert(dual.DynamicHwccUsedBytes(1) == 0);
+  dual->Free(reused_index, 100, AllocationDomain::kHwccIndex, 0, 0);
+  dual->BindOwnerPrivateAllocators(1);
+  dual->Free(metadata, 64, AllocationDomain::kHwccMetadata, 1, 1);
+  dual->Free(payload, 100, AllocationDomain::kSharedPayloadSwcc, 1, 1);
+  dual->BindOwnerPrivateAllocators(0);
+  dual->FreeOwnerPrivate(owner, 80, 0, 0);
+  dual->Free(remote_payload, 100, AllocationDomain::kSharedPayloadSwcc, 0, 0);
+  assert(dual->DynamicHwccUsedBytes(0) == 0);
+  dual->BindOwnerPrivateAllocators(1);
+  assert(dual->DynamicHwccUsedBytes(1) == 0);
+  }
   latency_sim::FixedLatencyConfig checkpoint_latency;
-  checkpoint_latency.enabled = true;
-  checkpoint_latency.foreground_enabled = true;
-  checkpoint_latency.background_enabled = true;
   checkpoint_latency.swcc_fixed_ns_per_line = 1;
   checkpoint_latency.hwcc_fixed_ns_per_line = 1;
-  auto &checkpoint_simulator = latency_sim::GlobalLatencySimulator();
-  checkpoint_simulator.RegisterPool(
-      latency_sim::MemoryDomain::kHwcc,
-      static_cast<const std::byte *>(mapping.base) + config.hwcc_offset_bytes,
-      config.hwcc_size_bytes);
-  checkpoint_simulator.RegisterPool(
-      latency_sim::MemoryDomain::kSwcc,
-      static_cast<const std::byte *>(mapping.base) + config.swcc_offset_bytes,
-      config.swcc_size_bytes);
-  checkpoint_simulator.Configure(checkpoint_latency);
 #if !defined(LATENCY_SIM_COMPILE_OFF)
+  auto &checkpoint_simulator = latency_sim::GlobalLatencySimulator();
+  tigonkv::test::ScopedLatencyPools checkpoint_pools(
+      static_cast<const std::byte *>(mapping.base) + config.swcc_offset_bytes,
+      config.swcc_size_bytes,
+      static_cast<const std::byte *>(mapping.base) + config.hwcc_offset_bytes,
+      config.hwcc_size_bytes, checkpoint_latency);
   checkpoint_simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  dual.FlushOwnedRanges(0);
-  attached.FlushOwnedRanges(1);
+  dual->FlushOwnedRanges(0);
+  attached->FlushOwnedRanges(1);
   assert(checkpoint_simulator.PendingDelayNsForTest() > 0);
   checkpoint_simulator.EndScopeAndDelay();
 #endif
-  checkpoint_simulator.Configure(latency_sim::FixedLatencyConfig{});
-  assert(dual.layout().state.load(std::memory_order_acquire) ==
+  assert(dual->layout().state.load(std::memory_order_acquire) ==
          static_cast<uint32_t>(LayoutState::kReady));
 }
 
@@ -365,6 +420,10 @@ void TestMappedPoolAttach() {
   close(seed_fd);
   const DualRegionConfig config = TestDualConfig();
   auto parent = DualRegionMappedPool::Open(path, config, true);
+  // Pool Open registered both ranges and scoped its init; the allocator work
+  // below needs an explicit scope on each thread.
+  tigonkv::engine::mem_access::LatencyScope parent_scope(
+      latency_sim::ExecutionClass::kForeground);
   parent.allocator().FinalizeStaticHwccLayout();
   parent.allocator().PublishStaticHwccLayout();
   parent.allocator().InitializeOwnerPrivateArenas(0);
@@ -383,6 +442,8 @@ void TestMappedPoolAttach() {
   if (child == 0) {
     try {
       auto attached = DualRegionMappedPool::Open(path, config, false);
+      tigonkv::engine::mem_access::LatencyScope child_scope(
+          latency_sim::ExecutionClass::kForeground);
       attached.allocator().BindOwnerPrivateAllocators(1);
       auto *child_payload = static_cast<char *>(
           attached.allocator().ResolveSharedPayload(payload_offset, 64));
@@ -406,85 +467,108 @@ void TestAllocatorLatencyAccounting() {
   Mapping hwcc_mapping(true);
   Mapping swcc_mapping(true);
   Mapping dual_mapping(true, 64 * 1024 * 1024);
-  Mapping hwcc_counter_mapping(true, kBytes);
-  Mapping swcc_counter_mapping(true, kBytes);
   auto hwcc_allocator =
       RegionAllocator::Initialize(hwcc_mapping.base, kBytes, 2, 0, true, true);
   auto swcc_allocator =
       RegionAllocator::Initialize(swcc_mapping.base, kBytes, 2, 0, false, false);
   const DualRegionConfig config = TestDualConfig();
-  auto dual = DualRegionAllocator::Initialize(dual_mapping.base, config);
-  auto *hwcc_counter = new (hwcc_counter_mapping.base) DomainCounter;
-  auto *swcc_counter = new (swcc_counter_mapping.base) DomainCounter;
-  dual.FinalizeStaticHwccLayout();
-  dual.PublishStaticHwccLayout();
-  dual.InitializeOwnerPrivateArenas(0);
-  dual.InitializeOwnerPrivateArenas(1);
-  dual.BindOwnerPrivateAllocators(0);
+  std::unique_ptr<DualRegionAllocator> dual;
+  {
+    // The dual allocator init touches HWCC layout counters, so it needs the
+    // raw mapping's ranges registered and an explicit scope.  The scope and
+    // registration end before the per-domain sub-measurements below re-register
+    // only their own ranges.
+    tigonkv::test::ScopedLatencyPools init_pools(
+        static_cast<const std::byte *>(dual_mapping.base) +
+            config.swcc_offset_bytes,
+        config.swcc_size_bytes,
+        static_cast<const std::byte *>(dual_mapping.base) +
+            config.hwcc_offset_bytes,
+        config.hwcc_size_bytes);
+    tigonkv::engine::mem_access::LatencyScope init_scope(
+        latency_sim::ExecutionClass::kForeground);
+    dual = std::make_unique<DualRegionAllocator>(
+        DualRegionAllocator::Initialize(dual_mapping.base, config));
+    dual->FinalizeStaticHwccLayout();
+    dual->PublishStaticHwccLayout();
+    dual->InitializeOwnerPrivateArenas(0);
+    dual->InitializeOwnerPrivateArenas(1);
+    dual->BindOwnerPrivateAllocators(0);
+  }
 
   latency_sim::FixedLatencyConfig latency;
-  latency.enabled = true;
-  latency.foreground_enabled = true;
-  latency.background_enabled = true;
   latency.swcc_fixed_ns_per_line = 1;
   latency.hwcc_fixed_ns_per_line = 1;
   auto &simulator = latency_sim::GlobalLatencySimulator();
-  simulator.Configure(latency_sim::FixedLatencyConfig{});
-  simulator.ClearPoolRegistrations();
-  // The domain counters stand in for the shared HWCC layout / owner-private
-  // SWCC control counters.  latency_sim requires every registered range to
-  // belong to exactly one domain (HWCC and SWCC ranges must not overlap), so
-  // the two counters use two separate pages.
-  simulator.RegisterPool(latency_sim::MemoryDomain::kHwcc, hwcc_mapping.base,
-                         kBytes);
-  simulator.RegisterPool(latency_sim::MemoryDomain::kSwcc, swcc_mapping.base,
-                         kBytes);
-  simulator.RegisterPool(latency_sim::MemoryDomain::kHwcc,
-                         static_cast<const std::byte *>(dual_mapping.base) +
-                             config.hwcc_offset_bytes,
-                         config.hwcc_size_bytes);
-  simulator.RegisterPool(latency_sim::MemoryDomain::kSwcc,
-                         static_cast<const std::byte *>(dual_mapping.base) +
-                             config.swcc_offset_bytes,
-                         config.swcc_size_bytes);
-  simulator.RegisterPool(latency_sim::MemoryDomain::kHwcc,
-                         hwcc_counter_mapping.base, kBytes);
-  simulator.RegisterPool(latency_sim::MemoryDomain::kSwcc,
-                         swcc_counter_mapping.base, kBytes);
-  simulator.Configure(latency);
 
-  simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  void *hwcc =
-      hwcc_allocator.Allocate(80, AllocationDomain::kHwccMetadata,
-                              hwcc_counter, 0);
-  hwcc_allocator.Free(hwcc, 80, AllocationDomain::kHwccMetadata,
-                      hwcc_counter, 0, 0);
-  assert(simulator.PendingDelayNsForTest() > 0);
-  simulator.EndScopeAndDelay();
+  // latency_sim accepts exactly one range per domain per lifecycle, so each
+  // sequential sub-measurement clears the registrations first (through
+  // ScopedLatencyPools::Reset) and registers only the ranges its allocator
+  // actually touches.  The domain accounting counters live inside the same
+  // registered range as the allocator that charges them.
+  {
+    auto *hwcc_counter = new (static_cast<std::byte *>(hwcc_mapping.base) +
+                              kBytes - sizeof(DomainCounter))
+        DomainCounter;
+    tigonkv::test::ScopedLatencyPools pools(nullptr, 0, hwcc_mapping.base,
+                                            kBytes, latency);
+    simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
+    void *hwcc = hwcc_allocator.Allocate(80, AllocationDomain::kHwccMetadata,
+                                         hwcc_counter, 0);
+    hwcc_allocator.Free(hwcc, 80, AllocationDomain::kHwccMetadata, hwcc_counter,
+                        0, 0);
+    assert(simulator.PendingDelayNsForTest() > 0);
+    simulator.EndScopeAndDelay();
+  }
 
-  simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  void *swcc =
-      swcc_allocator.Allocate(80, AllocationDomain::kSharedPayloadSwcc,
-                              swcc_counter, 0);
-  swcc_allocator.Free(swcc, 80, AllocationDomain::kSharedPayloadSwcc,
-                      swcc_counter, 0, 0);
-  assert(simulator.PendingDelayNsForTest() > 0);
-  simulator.EndScopeAndDelay();
+  {
+    auto *swcc_counter = new (static_cast<std::byte *>(swcc_mapping.base) +
+                              kBytes - sizeof(DomainCounter))
+        DomainCounter;
+    tigonkv::test::ScopedLatencyPools pools(swcc_mapping.base, kBytes, nullptr,
+                                            0, latency);
+    simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
+    void *swcc = swcc_allocator.Allocate(
+        80, AllocationDomain::kSharedPayloadSwcc, swcc_counter, 0);
+    swcc_allocator.Free(swcc, 80, AllocationDomain::kSharedPayloadSwcc,
+                        swcc_counter, 0, 0);
+    assert(simulator.PendingDelayNsForTest() > 0);
+    simulator.EndScopeAndDelay();
+  }
 
-  simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  void *owner = dual.AllocateOwnerPrivate(80, 0, 0);
-  dual.FreeOwnerPrivate(owner, 80, 0, 0);
-  assert(dual.SharedPayloadCapacityBytes(0) > 0);
-  assert(simulator.PendingDelayNsForTest() > 0);
-  simulator.EndScopeAndDelay();
+  {
+    // The owner-private arena path charges SWCC, while
+    // SharedPayloadCapacityBytes reads the HWCC layout descriptor, so this
+    // lifecycle registers one HWCC + one SWCC range.
+    tigonkv::test::ScopedLatencyPools pools(
+        static_cast<const std::byte *>(dual_mapping.base) +
+            config.swcc_offset_bytes,
+        config.swcc_size_bytes,
+        static_cast<const std::byte *>(dual_mapping.base) +
+            config.hwcc_offset_bytes,
+        config.hwcc_size_bytes, latency);
+    simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
+    void *owner = dual->AllocateOwnerPrivate(80, 0, 0);
+    dual->FreeOwnerPrivate(owner, 80, 0, 0);
+    assert(dual->SharedPayloadCapacityBytes(0) > 0);
+    assert(simulator.PendingDelayNsForTest() > 0);
+    simulator.EndScopeAndDelay();
+  }
 
-  simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  void *dynamic = dual.Allocate(80, AllocationDomain::kHwccIndex, 0);
-  dual.Free(dynamic, 80, AllocationDomain::kHwccIndex, 0, 0);
-  assert(simulator.PendingDelayNsForTest() > 0);
-  simulator.EndScopeAndDelay();
-
-  simulator.Configure(latency_sim::FixedLatencyConfig{});
+  {
+    tigonkv::test::ScopedLatencyPools pools(
+        static_cast<const std::byte *>(dual_mapping.base) +
+            config.swcc_offset_bytes,
+        config.swcc_size_bytes,
+        static_cast<const std::byte *>(dual_mapping.base) +
+            config.hwcc_offset_bytes,
+        config.hwcc_size_bytes, latency);
+    simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
+    void *dynamic = dual->Allocate(80, AllocationDomain::kHwccIndex, 0);
+    dual->Free(dynamic, 80, AllocationDomain::kHwccIndex, 0, 0);
+    assert(simulator.PendingDelayNsForTest() > 0);
+    simulator.EndScopeAndDelay();
+  }
 }
 
 
@@ -493,6 +577,13 @@ void TestAllocatorLatencyAccounting() {
 void TestOwnerPrivateRetireQueue() {
   Mapping mapping(true, 64 * 1024 * 1024);
   DualRegionConfig config = TestDualConfig();
+  tigonkv::test::ScopedLatencyPools pools(
+      static_cast<const std::byte *>(mapping.base) + config.swcc_offset_bytes,
+      config.swcc_size_bytes,
+      static_cast<const std::byte *>(mapping.base) + config.hwcc_offset_bytes,
+      config.hwcc_size_bytes);
+  tigonkv::engine::mem_access::LatencyScope scope(
+      latency_sim::ExecutionClass::kForeground);
   auto dual = DualRegionAllocator::Initialize(mapping.base, config);
   dual.FinalizeStaticHwccLayout();
   dual.PublishStaticHwccLayout();
@@ -521,25 +612,15 @@ void TestFreeHeadControlDomainClassification() {
   // Re-initialize one region with different control/block classifications so
   // both variants charge identical addresses and cache-line boundaries.
   Mapping region(true);
-  Mapping counters(true, kBytes);
-  auto *counter = new (counters.base) DomainCounter;
   auto &simulator = latency_sim::GlobalLatencySimulator();
 
-  // latency_sim requires every registered range to belong to exactly one
-  // domain, so the allocator region is split into its control prefix and
-  // block payload and each sub-range is registered under the domain of the
-  // run's classification (re-registered per run since the classification
-  // swaps between runs).  The control prefix length is read from the
-  // allocator header after the first initialization.
-  uint64_t control_bytes = 0;
-  const auto control_begin = [&] { return region.base; };
-  const auto block_begin = [&] {
-    return static_cast<std::byte *>(region.base) + control_bytes;
-  };
-  const auto block_bytes = [&] { return kBytes - control_bytes; };
+  // latency_sim accepts exactly one range per domain, so the allocator region
+  // is split into its control prefix and block payload, and the accounting
+  // counter is embedded inside the control prefix's reserved space (instead of
+  // a second range) so each run still charges control at the control rate.
+  constexpr uint64_t kCounterBytes = 64;
 
   latency_sim::FixedLatencyConfig rate_a;
-  rate_a.enabled = true;
   rate_a.cache_line_bytes = 64;
   rate_a.swcc_fixed_ns_per_line = 1;
   rate_a.hwcc_fixed_ns_per_line = 4;
@@ -549,24 +630,44 @@ void TestFreeHeadControlDomainClassification() {
 
   const auto measure = [&](bool control_hwcc, bool block_hwcc,
                            const latency_sim::FixedLatencyConfig &cfg) {
+    // The counter sits in the reserved prefix [metadata_bytes, metadata_bytes
+    // + kCounterBytes); the block payload starts right after it.  Only
+    // classifications that put control and block in different domains are
+    // observable under the one-range-per-domain contract.
+    assert(control_hwcc != block_hwcc);
     auto allocator = RegionAllocator::Initialize(
-        region.base, kBytes, 1, 0, control_hwcc, block_hwcc);
-    control_bytes =
+        region.base, kBytes, 1, kCounterBytes, control_hwcc, block_hwcc);
+    const uint64_t control_bytes =
         static_cast<const RegionAllocatorHeader *>(region.base)->metadata_bytes;
-    simulator.Configure(latency_sim::FixedLatencyConfig{});
-    simulator.ClearPoolRegistrations();
-    simulator.RegisterPool(control_hwcc ? latency_sim::MemoryDomain::kHwcc
-                                        : latency_sim::MemoryDomain::kSwcc,
-                           control_begin(), control_bytes);
-    simulator.RegisterPool(block_hwcc ? latency_sim::MemoryDomain::kHwcc
-                                      : latency_sim::MemoryDomain::kSwcc,
-                           block_begin(), block_bytes());
-    simulator.RegisterPool(latency_sim::MemoryDomain::kHwcc, counters.base,
-                           kBytes);
-    // Reset the accounting counter so the peak CAS charges identically on
-    // every run (the peak only rises above the previous peak once otherwise).
-    std::memset(counters.base, 0, kBytes);
-    simulator.Configure(cfg);
+    auto *counter = new (static_cast<std::byte *>(region.base) + control_bytes)
+        DomainCounter;
+    const void *control_begin = region.base;
+    const uint64_t control_size = control_bytes + kCounterBytes;
+    const void *block_begin =
+        static_cast<const std::byte *>(region.base) + control_size;
+    const uint64_t block_size = kBytes - control_size;
+    const void *swcc = nullptr;
+    std::size_t swcc_size = 0;
+    const void *hwcc = nullptr;
+    std::size_t hwcc_size = 0;
+    if (control_hwcc) {
+      hwcc = control_begin;
+      hwcc_size = control_size;
+    } else {
+      swcc = control_begin;
+      swcc_size = control_size;
+    }
+    if (block_hwcc) {
+      assert(hwcc == nullptr);  // two HWCC ranges would violate the contract
+      hwcc = block_begin;
+      hwcc_size = block_size;
+    } else {
+      assert(swcc == nullptr);  // two SWCC ranges would violate the contract
+      swcc = block_begin;
+      swcc_size = block_size;
+    }
+    tigonkv::test::ScopedLatencyPools pools(swcc, swcc_size, hwcc, hwcc_size,
+                                            cfg);
     simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
     void *block = allocator.Allocate(80, AllocationDomain::kHwccMetadata,
                                      counter, 0);
@@ -595,7 +696,6 @@ void TestFreeHeadControlDomainClassification() {
   // Control (lock, free_heads, bump, accounting) dominates the block fields
   // (next/size-class) in an allocate+free cycle.
   assert(control_lines > 0 && block_lines > 0 && control_lines > block_lines);
-  simulator.Configure(latency_sim::FixedLatencyConfig{});
 }
 
 #endif  // !defined(LATENCY_SIM_COMPILE_OFF)

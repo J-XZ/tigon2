@@ -3,7 +3,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 rounds=1; records=100000; operations=100000; threads=4; workloads='a,b,c,d,e'; timeout=7200
 base_config="$root/experiment_config.jsonc"; out_dir=""; shared_size=32768; shared_numa=""
-no_latency=false; enable_fixed_latency=false; latency_sim_compile_off=OFF
+latency_sim_compile_off=OFF
 latency_sim_compile_off_seen=false
 skip_build=false; skip_vm_init=false; skip_trace_gen=false; prepare_only=false
 sample_stride=64
@@ -11,7 +11,7 @@ usage() { cat <<'EOF'
 usage: tigonkv_run_ycsb_experiment.sh [options]
   --rounds N --record-count N --operation-count N --threads-per-node N
   --workloads a,b,c,d,e [--out-dir DIR] [--base-config PATH]
-  --shared-size-mb N [--shared-numa N[,N]] [--no-latency|--enable-fixed-latency]
+  --shared-size-mb N [--shared-numa N[,N]]
   --latency-sim-compile-off=ON|OFF
   --sample-stride N
   --skip-build --skip-vm-init --skip-trace-gen --prepare-only
@@ -24,12 +24,7 @@ while (($#)); do
     --round-timeout) timeout=$2; shift;; --base-config) base_config=$2; shift;; --shared-size-mb) shared_size=$2; shift;;
     --sample-stride) sample_stride=$2; shift;;
     --shared-numa) shared_numa=$2; shift;;
-    --no-latency)
-      [[ "$enable_fixed_latency" == false ]] || { echo "--no-latency conflicts with --enable-fixed-latency" >&2; exit 2; }
-      no_latency=true;;
-    --enable-fixed-latency)
-      [[ "$no_latency" == false ]] || { echo "--enable-fixed-latency conflicts with --no-latency" >&2; exit 2; }
-      enable_fixed_latency=true;;
+
     --latency-sim-compile-off=ON|--latency-sim-compile-off=OFF)
       value=${1#*=}
       if [[ "$latency_sim_compile_off_seen" == true && "$latency_sim_compile_off" != "$value" ]]; then
@@ -93,9 +88,9 @@ done
 if [[ -z "$out_dir" ]]; then out_dir="$root/exp_data/ycsb_tigonkv_$(date -u +%Y%m%dT%H%M%SZ)"; fi
 mkdir -p "$out_dir" "$out_dir/configs" "$out_dir/traces" "$out_dir/round_logs"
 generated_config="$out_dir/configs/experiment_config_ycsb_4vm.jsonc"
-python3 - "$base_config" "$generated_config" "$shared_size" "$shared_numa" "$no_latency" "$enable_fixed_latency" "$rounds" "$records" "$operations" "$threads" "$workloads" "$sample_stride" "$latency_sim_compile_off" "$build_dir" <<'PY'
+python3 - "$base_config" "$generated_config" "$shared_size" "$shared_numa" "$rounds" "$records" "$operations" "$threads" "$workloads" "$sample_stride" "$latency_sim_compile_off" "$build_dir" <<'PY'
 import json, os, sys
-src, dst, size, numa, no_latency, enable_fixed_latency, rounds, records, ops, threads, workloads, sample_stride, compile_off, build_dir = sys.argv[1:]
+src, dst, size, numa, rounds, records, ops, threads, workloads, sample_stride, compile_off, build_dir = sys.argv[1:]
 text=open(src, encoding='utf-8').read()
 
 def strip_jsonc(value):
@@ -139,7 +134,6 @@ shared['swcc']['offset_mb']=1024; shared['swcc']['size_mb']=size-1024
 if shared['swcc']['size_mb'] <= 0: raise SystemExit('shared size must exceed fixed 1024MB HWCC')
 if numa: shared['numa_node']=[int(x) for x in numa.split(',')]
 lat=d['tigon_kv']['latency_inject']
-lat['fixed_latency']['enabled'] = enable_fixed_latency == 'true' and no_latency != 'true'
 # Formal YCSB / e2e_trace alignment with cxlkv: fixed 32/32.
 d['tigon_kv']['fixed_key_size']=32
 d['tigon_kv']['fixed_value_size']=32
@@ -147,7 +141,7 @@ d['tigon_kv']['fixed_value_size']=32
 # Clock dynamic budget after static domains; do not pre-shrink here.
 json.dump(d, open(dst, 'w', encoding='utf-8'), indent=2)
 selected=workloads.split(',')
-meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'operation_count_semantics':'logical_ycsb_requests_before_update_expansion','vm_count':4,'foreground_workers_per_vm':4,'demuxer_threads_per_vm':1,'kv_threads_per_vm':5,'affinity':'distinct_allowed_cpus','threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32,'partition_sample_stride':int(sample_stride),'fixed_latency_enabled':lat['fixed_latency']['enabled'],'latency_sim_compile_off':compile_off,'build_dir':build_dir,'reproduce_command':f'cmake -S {src!r} -B {build_dir!r} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF={compile_off}'}
+meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'operation_count_semantics':'logical_ycsb_requests_before_update_expansion','vm_count':4,'foreground_workers_per_vm':4,'demuxer_threads_per_vm':1,'kv_threads_per_vm':5,'affinity':'distinct_allowed_cpus','threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32,'partition_sample_stride':int(sample_stride),'fixed_latency_nonzero':lat['fixed_latency']['swcc_fixed_ns_per_line'] != 0 or lat['fixed_latency']['hwcc_fixed_ns_per_line'] != 0,'latency_sim_compile_off':compile_off,'build_dir':build_dir,'reproduce_command':f'cmake -S {src!r} -B {build_dir!r} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF={compile_off}'}
 json.dump(meta, open(dst.rsplit('/',1)[0] + '/../run_meta.json', 'w', encoding='utf-8'), indent=2, sort_keys=True)
 PY
 echo "TIGONKV_YCSB_PREPARED out_dir=$out_dir config=$generated_config workloads=$workloads"

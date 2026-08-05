@@ -17,8 +17,9 @@ ivshmem 或专用后台搬运器扩大差分。
 | 路径 | 当前职责 |
 |---|---|
 | `kv/engine/region_allocator.*`、`kv_types_layout.h` | 双区域布局、业务容量、RegionOffset 和 layout version 28。 |
-| `kv/engine/latency_inject.*`、`mem_access.h` | 唯一 fixed-latency line coverage、scope、TSC 结算和 fast gate。 |
+| `kv/engine/latency_inject.*`、`mem_access.h` | 唯一 fixed-latency line coverage、scope、TSC 结算和 pool 注册/静默边界生命周期。 |
 | `common/btree_olc_cxl/*` | 原 B+Tree/OLC 的 offset/domain 适配和真实访问 wrapper。 |
+| `common/MPSCRingBuffer.h` | 原 MPSC ring 的 HWCC 访问 wrapper；构造时把 ring header 与每个 entry 的 metadata + payload 作为真实 HWCC 写计费。 |
 | `protocol/Pasha/SCCManager.h`、`TwoPLPashaSCCWriteThrough*.h` | 原 SCC 位图、flush/writeback/invalidate 可见性协议；不累计模拟统计。 |
 | `protocol/Pasha/PolicyClock.*`、`common/CXL_EBR.*` | 原 migration/victim/epoch/reclaim 顺序和访问域。 |
 | `kv/engine/kv_partition.*`、`kv_engine.*`、`kv_store.*` | 单表定长 facade、range 路由、操作边界、RPC/response framing。 |

@@ -47,7 +47,6 @@ latency_sim::MemoryDomain AtomicDomainFor(bool hwcc, bool /*shared_payload*/) {
 template <typename T>
 T FixedLatencyLoadFor(const std::atomic<T> &value, bool hwcc, bool shared_payload,
                  std::memory_order order) {
-  if (!latency_sim::FixedLatencyEnabledFast()) return value.load(order);
   return latency_sim::FixedLatencyAtomicLoad(
       value, order, AtomicDomainFor(hwcc, shared_payload));
 }
@@ -55,10 +54,6 @@ T FixedLatencyLoadFor(const std::atomic<T> &value, bool hwcc, bool shared_payloa
 template <typename T>
 void FixedLatencyStoreFor(std::atomic<T> &value, T desired, bool hwcc,
                      bool shared_payload, std::memory_order order) {
-  if (!latency_sim::FixedLatencyEnabledFast()) {
-    value.store(desired, order);
-    return;
-  }
   latency_sim::FixedLatencyAtomicStore(
       value, desired, order, AtomicDomainFor(hwcc, shared_payload));
 }
@@ -66,7 +61,6 @@ void FixedLatencyStoreFor(std::atomic<T> &value, T desired, bool hwcc,
 template <typename T>
 T FixedLatencyFetchAddFor(std::atomic<T> &value, T operand, bool hwcc,
                      bool shared_payload, std::memory_order order) {
-  if (!latency_sim::FixedLatencyEnabledFast()) return value.fetch_add(operand, order);
   return latency_sim::FixedLatencyAtomicFetchAdd(
       value, operand, order, AtomicDomainFor(hwcc, shared_payload));
 }
@@ -75,8 +69,6 @@ template <typename T>
 bool FixedLatencyCasWeakFor(std::atomic<T> &value, T &expected, T desired,
                        bool hwcc, bool shared_payload,
                        std::memory_order success, std::memory_order failure) {
-  if (!latency_sim::FixedLatencyEnabledFast())
-    return value.compare_exchange_weak(expected, desired, success, failure);
   return latency_sim::FixedLatencyAtomicCompareExchangeWeak(
       value, expected, desired, success, failure,
       AtomicDomainFor(hwcc, shared_payload));
@@ -224,7 +216,6 @@ RegionAllocator RegionAllocator::AttachWithExternalHeader(
 
 void RegionAllocator::RecordMetadataRead(const void *address,
                                          uint64_t bytes) const {
-  if (!latency_sim::FixedLatencyEnabledFast()) return;
   if (control_is_hwcc_)
     mem_access::HwccRead(address, bytes);
   else
@@ -233,7 +224,6 @@ void RegionAllocator::RecordMetadataRead(const void *address,
 
 void RegionAllocator::RecordMetadataWrite(const void *address,
                                           uint64_t bytes) const {
-  if (!latency_sim::FixedLatencyEnabledFast()) return;
   if (control_is_hwcc_)
     mem_access::HwccWrite(address, bytes);
   else
@@ -242,7 +232,6 @@ void RegionAllocator::RecordMetadataWrite(const void *address,
 
 void RegionAllocator::RecordBlockMetadataRead(const void *address,
                                               uint64_t bytes) const {
-  if (!latency_sim::FixedLatencyEnabledFast()) return;
   if (block_is_hwcc_)
     mem_access::HwccRead(address, bytes);
   else if (block_is_shared_payload_)
@@ -253,7 +242,6 @@ void RegionAllocator::RecordBlockMetadataRead(const void *address,
 
 void RegionAllocator::RecordBlockMetadataWrite(const void *address,
                                                uint64_t bytes) const {
-  if (!latency_sim::FixedLatencyEnabledFast()) return;
   if (block_is_hwcc_)
     mem_access::HwccWrite(address, bytes);
   else if (block_is_shared_payload_)
@@ -1522,7 +1510,34 @@ DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,
     void *base = mmap(nullptr, config.total_pool_bytes, PROT_READ | PROT_WRITE,
                       MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) throw std::runtime_error("map dual-region backing file failed");
+    // Pool init writes/reads the mapped HWCC/SWCC regions through the wrapped
+    // accessors.  Under the always-active model those need the two ranges
+    // registered and an executing scope, so register them (0/0 zero-nanosecond
+    // model) and run the init inside a scope.  The engine startup re-applies
+    // the real three-field policy after clearing the registrations.  No-op in
+    // a compile-off build.
     std::unique_ptr<DualRegionAllocator> allocator;
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    {
+      auto &simulator = latency_sim::GlobalLatencySimulator();
+      simulator.Configure({});
+      simulator.ClearPoolRegistrations();
+      simulator.RegisterPool(
+          latency_sim::MemoryDomain::kHwcc,
+          static_cast<const std::byte *>(base) + config.hwcc_offset_bytes,
+          config.hwcc_size_bytes);
+      simulator.RegisterPool(
+          latency_sim::MemoryDomain::kSwcc,
+          static_cast<const std::byte *>(base) + config.swcc_offset_bytes,
+          config.swcc_size_bytes);
+      latency_sim::FixedLatencyConfig zero;
+      zero.cache_line_bytes = 64;
+      zero.swcc_fixed_ns_per_line = 0.0;
+      zero.hwcc_fixed_ns_per_line = 0.0;
+      simulator.Configure(zero);
+      latency_sim::ScopeGuard pool_init_scope(
+          latency_sim::ExecutionClass::kBackground);
+#endif
     try {
       if (reset) {
         // Guest workflows set TIGONKV_DEVICE_BACKING_ZEROED=1 after the host
@@ -1543,6 +1558,9 @@ DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,
       munmap(base, config.total_pool_bytes);
       throw;
     }
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    }  // pool-init scope and 0/0 registration end
+#endif
     if (!is_character_device) flock(fd, LOCK_UN);
     return DualRegionMappedPool(fd, base, config.total_pool_bytes, std::move(allocator));
   } catch (...) {

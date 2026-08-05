@@ -56,55 +56,67 @@ int main() {
 
   auto pool = DualRegionMappedPool::Open(path, Config(), true);
   auto &regions = pool.allocator();
+  // The CXL_EBR objects must live inside the registered HWCC range: their
+  // members are charged as HWCC.  Allocate the storage from the static HWCC
+  // region before finalizing.  Pool Open already registered both ranges and
+  // scoped its own init; the wrapped accesses below need explicit scopes.
+  tigonkv::engine::mem_access::LatencyScope main_scope(
+      latency_sim::ExecutionClass::kForeground);
+  void *ebr_storage = regions.Allocate(
+      sizeof(star::CXL_EBR), tigonkv::engine::AllocationDomain::kHwccEbr, 0);
+  void *handoff_storage = regions.Allocate(
+      sizeof(star::CXL_EBR), tigonkv::engine::AllocationDomain::kHwccEbr, 0);
+  star::CXL_EBR *ebr = new (ebr_storage) star::CXL_EBR(1, 2, &regions);
   regions.FinalizeStaticHwccLayout();
   regions.PublishStaticHwccLayout();
   regions.InitializeOwnerPrivateArenas(0);
   regions.InitializeOwnerPrivateArenas(1);
   regions.BindOwnerPrivateAllocators(0);
 
-  star::CXL_EBR ebr(1, 2, &regions);
   std::atomic<uint32_t> phase{0};
 
   std::thread lagging_worker([&] {
-    ebr.thread_init_ebr_meta(0, 1);
+    tigonkv::engine::mem_access::LatencyScope worker_scope(
+        latency_sim::ExecutionClass::kForeground);
+    ebr->thread_init_ebr_meta(0, 1);
     phase.store(1, std::memory_order_release);
 
     // Worker 1 starts at epoch 0 after worker 0 advanced the global epoch.
     WaitFor(phase, 2);
-    ebr.enter_critical_section();
+    ebr->enter_critical_section();
     phase.store(3, std::memory_order_release);
 
     // Retire in epoch 1, then advance to epoch 2 after both workers caught up.
     WaitFor(phase, 4);
-    RetireEpoch(&ebr, &regions, 0, 0);
+    RetireEpoch(ebr, &regions, 0, 0);
     assert(regions.RetireCount(0, 1, 1) ==
            star::CXL_EBR::epoch_advance_threshold);
     phase.store(5, std::memory_order_release);
     WaitFor(phase, 6);
-    ebr.enter_critical_section();
+    ebr->enter_critical_section();
     phase.store(7, std::memory_order_release);
 
     // Retire in epoch 2 to advance to 3. That grace period reclaims the
     // epoch-1 records and exercises the original consecutive-epoch check.
     WaitFor(phase, 8);
-    RetireEpoch(&ebr, &regions, 0, 0);
+    RetireEpoch(ebr, &regions, 0, 0);
     phase.store(9, std::memory_order_release);
     WaitFor(phase, 10);
-    ebr.enter_critical_section();
+    ebr->enter_critical_section();
     assert(regions.RetireCount(0, 1, 1) == 0);
     phase.store(11, std::memory_order_release);
 
     // Empty queue is a valid next critical section, not a special path.
     WaitFor(phase, 12);
-    ebr.enter_critical_section();
+    ebr->enter_critical_section();
   });
 
-  ebr.thread_init_ebr_meta(0, 0);
+  ebr->thread_init_ebr_meta(0, 0);
   WaitFor(phase, 1);
-  RetireEpoch(&ebr, &regions, 0, 0);
+  RetireEpoch(ebr, &regions, 0, 0);
   assert(regions.RetireCount(0, 0, 0) ==
          star::CXL_EBR::epoch_advance_threshold);
-  ebr.enter_critical_section();  // global 0 -> 1
+  ebr->enter_critical_section();  // global 0 -> 1
 
   phase.store(2, std::memory_order_release);
   WaitFor(phase, 3);
@@ -113,7 +125,7 @@ int main() {
   phase.store(6, std::memory_order_release);
   WaitFor(phase, 7);
 
-  ebr.enter_critical_section();  // worker 0 catches up to epoch 2
+  ebr->enter_critical_section();  // worker 0 catches up to epoch 2
   phase.store(8, std::memory_order_release);
   WaitFor(phase, 9);
   phase.store(10, std::memory_order_release);
@@ -126,19 +138,19 @@ int main() {
   // A worker id may move to another OS thread only after Release.  The
   // externally owned meta is the same object, so the reclaim cursor cannot
   // reset merely because the TLS handle changed threads.
-  star::CXL_EBR handoff(1, 1, &regions);
+  star::CXL_EBR *handoff = new (handoff_storage) star::CXL_EBR(1, 1, &regions);
   star::CXL_EBR::EBRMetaLocal handoff_meta{};
-  handoff.initialize_ebr_meta(handoff_meta, 0, 0);
+  handoff->initialize_ebr_meta(handoff_meta, 0, 0);
   handoff_meta.last_freed_epoch = 2;
   std::thread first([&] {
-    handoff.bind_external_ebr_meta(&handoff_meta);
-    handoff.unbind_external_ebr_meta();
+    handoff->bind_external_ebr_meta(&handoff_meta);
+    handoff->unbind_external_ebr_meta();
   });
   first.join();
   std::thread second([&] {
-    handoff.bind_external_ebr_meta(&handoff_meta);
+    handoff->bind_external_ebr_meta(&handoff_meta);
     assert(handoff_meta.last_freed_epoch == 2);
-    handoff.unbind_external_ebr_meta();
+    handoff->unbind_external_ebr_meta();
   });
   second.join();
   unlink(path.c_str());

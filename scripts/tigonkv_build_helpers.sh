@@ -92,7 +92,26 @@ git -C "$root" ls-files --others --exclude-standard -z 2>/dev/null \
       elif [ -L "$abs" ]; then readlink "$abs" | sha256sum
       fi
     done | sha256sum | awk "{print \$1}"' _ "$root")"
-  submodule="$(git -C "$root" submodule status --recursive 2>/dev/null | sha256sum | awk '{print $1}')"
+  # `git submodule status` only captures the committed gitlinks; it misses
+  # tracked modifications, staged changes and untracked source inside each
+  # submodule, so a dirty submodule could otherwise be reused by a stale
+  # binary.  Hash each submodule's own tracked/index/untracked source state
+  # too, so reuse is refused unless every relevant submodule is clean.
+  submodule="$(git -C "$root" submodule status --recursive 2>/dev/null \
+    | while IFS= read -r line; do
+        path="${line#* }"
+        path="${path#* }"
+        if [ -d "$root/$path" ]; then
+          git -C "$root/$path" diff --no-ext-diff --binary 2>/dev/null
+          git -C "$root/$path" diff --cached --no-ext-diff --binary 2>/dev/null
+          git -C "$root/$path" ls-files --others --exclude-standard -z 2>/dev/null \
+            | while IFS= read -r -d "" rel; do
+                if [ -f "$root/$path/$rel" ]; then sha256sum "$root/$path/$rel"
+                elif [ -L "$root/$path/$rel" ]; then readlink "$root/$path/$rel" | sha256sum
+                fi
+              done
+        fi
+      done | sha256sum | awk '{print $1}')"
   printf '%s:%s:%s:%s:%s' "$head" "$worktree" "$index" "$untracked" "$submodule"
 }
 

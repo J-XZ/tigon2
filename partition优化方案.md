@@ -43,35 +43,40 @@ backing 使用不同 NUMA 节点。任何 layout 变化都必须用新 backing �
 
 ## 4. 唯一 fixed-latency-only 模拟
 
-合法配置入口是 `tigon_kv.latency_inject.fixed_latency`，严格字段如下：
+合法配置入口是 `tigon_kv.latency_inject.fixed_latency`，严格三字段：
 
 ```jsonc
 {
-  "enabled": false,
   "cache_line_bytes": 64,
   "swcc_fixed_ns_per_line": 0,
-  "hwcc_fixed_ns_per_line": 0,
-  "foreground_enabled": true,
-  "background_enabled": true
+  "hwcc_fixed_ns_per_line": 0
 }
 ```
 
-解析器对未知、重复、缺失、错误类型和旧字段 hard-fail。唯一计费规则为：
+没有 `enabled`/`foreground_enabled`/`background_enabled`、feature mask、
+`FixedLatencyEnabledFast()` 或 `DisableAtQuiescentBoundary()`；`0` 延迟是该域零纳秒
+模型，不是禁用。解析器对未知、重复、缺失、错误类型和旧字段（含旧布尔开关）
+hard-fail。唯一计费规则为：
 
 ```text
 pending_delay_ns += touched_swcc_lines * swcc_fixed_ns_per_line
 pending_delay_ns += touched_hwcc_lines * hwcc_fixed_ns_per_line
 ```
 
-执行型 memory/atomic/SCC wrapper 先完成真实动作，再按本次地址范围覆盖的 line 数收费。
-同一行的两次真实访问分别收费；CAS 成功/失败都保留 expected、返回值和 memory order，
-但不累计访问/原子计数。不得保存访问历史、cache 状态、remote event、全局序号、共享
-日志、replay 或统计 schema。
+compile-on（默认）下模拟器被编译进去，配置完成后始终参与；每次真实访问只累加线程
+本地 line counter，只在最外层安全出口结算一次。执行型 memory/atomic/SCC wrapper 先
+完成真实动作，再按本次地址范围覆盖的 line 数收费。同一行的两次真实访问分别收费；
+CAS 成功/失败都保留 expected、返回值和 memory order，但不累计访问/原子计数。不得
+保存访问历史、cache 状态、remote event、全局序号、共享日志、replay 或统计 schema。
 
-启用时要求 RelWithDebInfo、verbose/extra_check 关闭和校准成功的 x86 TSC；只用
-`rdtsc + _mm_pause` busy-wait。禁用时仅保留进程本地 fast gate，不读 TSC、不建 TLS、
-不换算地址、不获取锁、不做统计原子、不创建后台线程或额外映射。编译期关闭由
-`LATENCY_SIM_COMPILE_OFF=ON`（独立 build） 验证。
+正式运行要求 RelWithDebInfo、verbose/extra_check 关闭和校准成功的 x86 TSC；只用
+`rdtsc + _mm_pause` busy-wait。`LATENCY_SIM_COMPILE_OFF=ON`（独立 build）是唯一
+无模拟代码方式：wrapper 编译为原始操作、scope 为 no-op、消费者不解析配置/不注册
+pool/不校准 TSC/不初始化清理 simulator，compile-off ELF 不含 simulator/TLS/TSC/
+parser 符号。`DualRegionMappedPool::Open` 注册 HWCC/SWCC range 并在 scope 内完成
+pool init；`KVEngine::Open` 清空后重新应用真实三字段策略，shutdown 在静默边界清空
+注册（生命周期复位，不是运行时 disable）。`MPSCRingBuffer` 构造把 ring header 与每个
+entry 的 metadata + payload 作为真实 HWCC 写收费，每个连续 range 恰好一次。
 
 ## 5. Scope 与安全出口
 
@@ -80,7 +85,8 @@ pending_delay_ns += touched_hwcc_lines * hwcc_fixed_ns_per_line
   前台和后台线程间共享。
 - nested scope 只在最外层结束时结算；RAII/异常/早返回清理 pending。
 - 结算不得发生在 B+Tree/OLC、row/smeta、Clock/allocator、EBR guard、ring reservation、
-  SCC 发布中间态或会阻塞其它 worker 的 RPC 状态中。
+  SCC 发布中间态或会阻塞其它 worker 的 RPC 状态中。合作式 transport 用
+  `mem_access::ForegroundScopeSuspension` 挂起前台 scope，在 background scope 中运行。
 - 生产 Put pacing、poll/yield/backoff 和协议 Busy retry 是业务控制流，不能被删除或
   当作模拟延迟。
 
@@ -101,8 +107,8 @@ README、AGENTS、YCSB 指南、比较口径、延迟审计和验证证据必须
 2. Debug、RelWithDebInfo、compile-off clean build；非 VM CTest 全通过。
 3. fixed-latency 定向测试覆盖 line geometry、不同域/数值、重复访问、原子/CAS、
    nested/前后台 scope、异常清理、disabled fast path 和旧配置拒绝。
-4. disabled benchmark 重复 5 次，比较运行时关闭和编译期关闭，检查反汇编没有 TSC/
-   pause/TLS slow path。
+4. disabled benchmark 用 compile-on+0ns 与 compile-off 两个独立二进制跑相同真实
+   adapter 路径；检查 compile-off ELF 没有 simulator/TSC/TLS/parser 符号。
 5. 停止所有项目 VM，清理 `/mnt/xz_vm_storage` 和 `/mnt/xz_shared_mem`，用本仓库新
    backing 创建 4VM；先跑无延迟代表性 trace，再跑小型非零 fixed-latency canary。
 6. 立即停止并清理本仓库 VM，记录命令、结果和清理前后占用，再进入其它项目。

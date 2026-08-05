@@ -37,12 +37,24 @@ class MPSCRingBuffer {
                     cxl_memory.cxlalloc_malloc_wrapper(
                         entry_struct_size * entry_num,
                         CXLMemory::TRANSPORT_ALLOCATION));
+                // Construction writes the ring header (offset/length fields and
+                // the head/tail/count atomics) and every entry's metadata and
+                // payload into HWCC.  Charge each real contiguous range exactly
+                // once; the surrounding KVEngine::Open background scope is the
+                // settlement boundary.  Wrappers are raw operations in a
+                // compile-off build.
+                tigonkv::engine::mem_access::TransportWrite(
+                    &this->entry_struct_size, sizeof(entry_num) * 3);
+                tigonkv::engine::mem_access::TransportWrite(
+                    &head, sizeof(head) * 3);
                 for (int i = 0; i < entry_num; i++) {
                         Entry *entry = reinterpret_cast<Entry *>(entries() + i * entry_struct_size);
                         entry->is_ready = 0;
                         entry->remaining_size = 0;
                         entry->dequeue_offset = 0;
                         memset(entry->data, 0, entry_data_size);
+                        tigonkv::engine::mem_access::TransportWrite(
+                            entry, entry_struct_size);
                 }
         }
 

@@ -66,41 +66,56 @@ int main() {
   auto pool = tigonkv::engine::DualRegionMappedPool::Open(
       path, MakeConfig(kPoolBytes), true);
   auto &regions = pool.allocator();
-  regions.FinalizeStaticHwccLayout();
-  regions.PublishStaticHwccLayout();
-  regions.InitializeOwnerPrivateArenas(0);
-  regions.InitializeOwnerPrivateArenas(1);
-  star::CXL_EBR ebr(2, 1, &regions);
-  ebr.thread_init_ebr_meta(0, 0);
   using Tree = btreeolc_cxl::BPlusTree<FixedKey, uint64_t, FixedKeyComparator,
                                        std::equal_to<uint64_t>>;
-  btreeolc_cxl::TreeNodeAllocation private_binding{
-      &regions, AllocationDomain::kOwnerPrivateSwcc, 0, &ebr, 0};
-  btreeolc_cxl::TreeNodeAllocation shared_binding{
-      &regions, AllocationDomain::kHwccIndex, 1, &ebr};
-  regions.BindOwnerPrivateAllocators(0);
-  // The original tree intentionally has no safe destructor; this test keeps
-  // the tree lifetime within the mapped pool and releases the entire test map.
-  auto *private_tree = new Tree(private_binding);
-  regions.BindOwnerPrivateAllocators(1);
-  auto *shared_tree = new Tree(shared_binding);
-  regions.BindOwnerPrivateAllocators(0);
-  auto &private_root_slot = PrivateArena(regions, 0, 0)->private_root;
-  private_tree->bind_published_root(&private_root_slot);
-  const auto initial_private_root =
-      private_root_slot.load(std::memory_order_acquire);
-  assert(initial_private_root != tigonkv::engine::kNullOffset);
-  auto &shared_root_slot = regions.layout().partitions[0].shared_root;
-  shared_tree->bind_published_root(&shared_root_slot);
-  assert(shared_root_slot.load() != tigonkv::engine::kNullOffset);
+  Tree *private_tree = nullptr;
+  Tree *shared_tree = nullptr;
+  std::atomic<tigonkv::engine::RegionOffset> *private_root_slot = nullptr;
+  tigonkv::engine::RegionOffset split_private_root =
+      tigonkv::engine::kNullOffset;
+  {
+    // Pool Open already registered the HWCC/SWCC ranges (with the zero-ns
+    // model) and scoped its own init.  Every later wrapped tree/allocator
+    // access must run inside an explicit scope.  The CXL_EBR object must also
+    // live inside the registered HWCC range (its members are charged as HWCC),
+    // so its storage is carved from the static HWCC region before finalizing.
+    tigonkv::engine::mem_access::LatencyScope main_scope(
+        latency_sim::ExecutionClass::kForeground);
+    void *ebr_storage = regions.Allocate(
+        sizeof(star::CXL_EBR), tigonkv::engine::AllocationDomain::kHwccEbr, 0);
+    star::CXL_EBR *ebr = new (ebr_storage) star::CXL_EBR(2, 1, &regions);
+    regions.FinalizeStaticHwccLayout();
+    regions.PublishStaticHwccLayout();
+    regions.InitializeOwnerPrivateArenas(0);
+    regions.InitializeOwnerPrivateArenas(1);
+    ebr->thread_init_ebr_meta(0, 0);
+    btreeolc_cxl::TreeNodeAllocation private_binding{
+        &regions, AllocationDomain::kOwnerPrivateSwcc, 0, ebr, 0};
+    btreeolc_cxl::TreeNodeAllocation shared_binding{
+        &regions, AllocationDomain::kHwccIndex, 1, ebr};
+    regions.BindOwnerPrivateAllocators(0);
+    // The original tree intentionally has no safe destructor; this test keeps
+    // the tree lifetime within the mapped pool and releases the entire test map.
+    private_tree = new Tree(private_binding);
+    regions.BindOwnerPrivateAllocators(1);
+    shared_tree = new Tree(shared_binding);
+    regions.BindOwnerPrivateAllocators(0);
+    private_root_slot = &PrivateArena(regions, 0, 0)->private_root;
+    private_tree->bind_published_root(private_root_slot);
+    const auto initial_private_root =
+        private_root_slot->load(std::memory_order_acquire);
+    assert(initial_private_root != tigonkv::engine::kNullOffset);
+    auto &shared_root_slot = regions.layout().partitions[0].shared_root;
+    shared_tree->bind_published_root(&shared_root_slot);
+    assert(shared_root_slot.load() != tigonkv::engine::kNullOffset);
   for (uint32_t i = 0; i < 400; ++i) {
     regions.BindOwnerPrivateAllocators(0);
     assert(private_tree->insert(Key(i), i));
     regions.BindOwnerPrivateAllocators(1);
     assert(shared_tree->insert(Key(i), i + 1000));
   }
-  const auto split_private_root =
-      private_root_slot.load(std::memory_order_acquire);
+  split_private_root =
+      private_root_slot->load(std::memory_order_acquire);
   assert(split_private_root != tigonkv::engine::kNullOffset);
   assert(split_private_root != initial_private_root);
   assert(shared_root_slot.load() != tigonkv::engine::kNullOffset);
@@ -224,26 +239,16 @@ int main() {
   assert(regions.OwnerPrivateUsedBytes(0) > 0);
   regions.BindOwnerPrivateAllocators(1);
   assert(regions.DynamicHwccUsedBytes(1) > 0);
+  }
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+  // Pool Open already registered both ranges with the zero-ns model; only the
+  // per-line delays need to be raised to observe a non-zero pending delay.
   latency_sim::FixedLatencyConfig latency;
-  latency.enabled = true;
-  latency.foreground_enabled = true;
   latency.swcc_fixed_ns_per_line = 1;
   latency.hwcc_fixed_ns_per_line = 1;
   auto &simulator = latency_sim::GlobalLatencySimulator();
-  const auto binding_config = MakeConfig(kPoolBytes);
-  simulator.RegisterPool(
-      latency_sim::MemoryDomain::kHwcc,
-      static_cast<const std::byte *>(pool.base()) +
-          binding_config.hwcc_offset_bytes,
-      binding_config.hwcc_size_bytes);
-  simulator.RegisterPool(
-      latency_sim::MemoryDomain::kSwcc,
-      static_cast<const std::byte *>(pool.base()) +
-          binding_config.swcc_offset_bytes,
-      binding_config.swcc_size_bytes);
   simulator.Configure(latency);
   uint64_t value = 0;
-#if !defined(LATENCY_SIM_COMPILE_OFF)
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
   regions.BindOwnerPrivateAllocators(0);
   assert(private_tree->lookup(Key(250), value) && value == 250);
@@ -253,33 +258,47 @@ int main() {
   assert(shared_tree->lookup(Key(250), value) && value == 1250);
   assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-#endif
   simulator.Configure(latency_sim::FixedLatencyConfig{});
+#endif
 
   // Collapse the private root after a split.  The only persistent authority
   // must be the owner-private atomic slot, not the process-local wrapper.
+  {
+  tigonkv::engine::mem_access::LatencyScope collapse_scope(
+      latency_sim::ExecutionClass::kForeground);
   regions.BindOwnerPrivateAllocators(0);
   for (uint32_t i = 201; i < 400; ++i)
     assert(private_tree->remove(Key(i)));
   const auto merged_private_root =
-      private_root_slot.load(std::memory_order_acquire);
+      private_root_slot->load(std::memory_order_acquire);
   assert(merged_private_root != tigonkv::engine::kNullOffset);
   assert(merged_private_root != split_private_root);
 
   regions.PublishOwnerInitialized(0);
   regions.PublishOwnerInitialized(1);
   regions.PublishReady();
+  }
   const pid_t child = fork();
   assert(child >= 0);
   if (child == 0) {
     auto attached_pool = tigonkv::engine::DualRegionMappedPool::Open(
         path, MakeConfig(kPoolBytes), false);
     auto &attached_regions = attached_pool.allocator();
+    // The child re-registered its own mapping ranges inside Open; wrapped
+    // lookups below need an explicit scope on this thread.  The child's own
+    // CXL_EBR must live inside the child's registered HWCC range too.
+    tigonkv::engine::mem_access::LatencyScope attached_scope(
+        latency_sim::ExecutionClass::kBackground);
+    // Attach finalizes the static HWCC layout, so the child's EBR is carved
+    // from its owner's dynamic HWCC arena (still inside the registered range).
     attached_regions.BindOwnerPrivateAllocators(0);
-    star::CXL_EBR attached_ebr(2, 1, &attached_regions);
-    attached_ebr.thread_init_ebr_meta(0, 0);
+    void *ebr_storage = attached_regions.Allocate(
+        sizeof(star::CXL_EBR), tigonkv::engine::AllocationDomain::kHwccIndex, 0);
+    star::CXL_EBR *attached_ebr =
+        new (ebr_storage) star::CXL_EBR(2, 1, &attached_regions);
+    attached_ebr->thread_init_ebr_meta(0, 0);
     btreeolc_cxl::TreeNodeAllocation attached_binding{
-        &attached_regions, AllocationDomain::kOwnerPrivateSwcc, 0, &attached_ebr, 0};
+        &attached_regions, AllocationDomain::kOwnerPrivateSwcc, 0, attached_ebr, 0};
     auto &attached_private_root =
         PrivateArena(attached_regions, 0, 0)->private_root;
     if (attached_private_root.load(std::memory_order_acquire) ==
@@ -296,7 +315,7 @@ int main() {
       _exit(2);
     // Peer adopts the HWCC published shared root from the layout slot.
     btreeolc_cxl::TreeNodeAllocation attached_shared_binding{
-        &attached_regions, AllocationDomain::kHwccIndex, 1, &attached_ebr};
+        &attached_regions, AllocationDomain::kHwccIndex, 1, attached_ebr};
     auto &live_slot = attached_regions.layout().partitions[0].shared_root;
     const auto live = live_slot.load();
     if (live == tigonkv::engine::kNullOffset) _exit(3);

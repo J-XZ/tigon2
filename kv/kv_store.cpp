@@ -655,11 +655,13 @@ void ParseStrictLatencyConfig(std::string_view text, std::string_view raw_text,
   if (fixed_member.kind != JsonValueKind::kObject)
     throw std::invalid_argument(
         "config field must be object: tigon_kv.latency_inject.fixed_latency");
-  // The fixed_latency object and all of its six fields are owned by the
+  // The fixed_latency object and all of its three fields are owned by the
   // latency_sim library parser (/tigon_kv/latency_inject/fixed_latency).  This
   // project deliberately checks only the outer presence/uniqueness/type and
   // hands the original JSONC, including comments and trailing commas, to the
-  // library.
+  // library.  Under LATENCY_SIM_COMPILE_OFF no fixed-latency configuration is
+  // parsed (the parser does not exist in that build).
+#if !defined(LATENCY_SIM_COMPILE_OFF)
   try {
     config->hardware_simulation =
         latency_sim::ParseFixedLatencyJsonc(raw_text,
@@ -669,6 +671,7 @@ void ParseStrictLatencyConfig(std::string_view text, std::string_view raw_text,
     throw std::invalid_argument(std::string("invalid fixed latency config: ") +
                                 error.what());
   }
+#endif
 }
 void ParsePartitioningConfig(const std::string &text, Config *config) {
   size_t root_begin = 0;
@@ -883,23 +886,9 @@ void Config::Validate() {
       throw std::invalid_argument(
           "owner migration dynamic HWCC budget underflows to zero");
   }
-  const auto &fixed = hardware_simulation;
-  if (hardware_simulation.enabled) {
-    if (verbose)
-      throw std::invalid_argument(
-        "fixed_latency.enabled=true is incompatible with verbose=true");
-    if (extra_check)
-      throw std::invalid_argument(
-        "fixed_latency.enabled=true is incompatible with extra_check=true");
-#if !defined(TIGONKV_CMAKE_BUILD_TYPE)
-    throw std::invalid_argument(
-        "fixed_latency.enabled=true requires a known RelWithDebInfo build");
-#else
-    if (std::string_view(TIGONKV_CMAKE_BUILD_TYPE) != "RelWithDebInfo")
-      throw std::invalid_argument(
-          "fixed_latency.enabled=true is only supported in RelWithDebInfo builds");
-#endif
-  }
+  // There is no runtime enable gate: the three-field fixed-latency
+  // configuration is validated by the library parser and applied as-is in a
+  // compile-on build.  verbose/extra_check have no latency interaction.
 }
 
 uint32_t Config::PartitionForKey(std::string_view key) const {

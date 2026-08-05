@@ -84,6 +84,10 @@ void RunLayoutOnlyFourVmCase() {
   if (vm0 == 0) {
     try {
       auto pool = tigonkv::engine::DualRegionMappedPool::Open(path, config, true);
+      // Pool Open registered the ranges and scoped its init; the layout
+      // operations below need an explicit scope on this thread.
+      tigonkv::engine::mem_access::LatencyScope scope(
+          latency_sim::ExecutionClass::kBackground);
       pool.allocator().FinalizeStaticHwccLayout();
       pool.allocator().PublishStaticHwccLayout();
       pool.allocator().InitializeOwnerPrivateArenas(0);
@@ -103,6 +107,10 @@ void RunLayoutOnlyFourVmCase() {
     if (child == 0) {
       try {
         auto pool = tigonkv::engine::DualRegionMappedPool::Open(path, config, false);
+        // The attached pool re-registered this process's mapping ranges inside
+        // Open; the owner-arena operations below need an explicit scope.
+        tigonkv::engine::mem_access::LatencyScope scope(
+            latency_sim::ExecutionClass::kBackground);
         pool.allocator().InitializeOwnerPrivateArenas(node);
         pool.allocator().PublishOwnerInitialized(node);
         pool.allocator().WaitUntilReady();
@@ -168,6 +176,11 @@ int main() {
   unlink(path);
   unlink(barrier.c_str());
   unlink((barrier + ".release").c_str());
+
+  // The attaching engine's demuxer keeps polling the transport ring.  Shut it
+  // down now (quiescing the thread and clearing the simulator registrations)
+  // before the later Opens reconfigure the simulator in this same process.
+  vm1_engine.reset();
 
   RunLayoutOnlyFourVmCase();
 

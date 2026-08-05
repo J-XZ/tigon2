@@ -38,9 +38,10 @@ class KVEngine {
   ~KVEngine();
 
   // Explicit quiescent close.  New foreground bindings are refused by the
-  // caller while any worker is owned; Close then stops/join workers, disables
-  // fixed latency, clears process-local protocol/allocator registrations and
-  // finally releases the mapped pool.  It is idempotent after success.
+  // caller while any worker is owned; Close then stops/joins workers, clears
+  // the fixed-latency pool registrations at the quiescent boundary (not a
+  // runtime disable), clears process-local protocol/allocator registrations
+  // and finally releases the mapped pool.  It is idempotent after success.
   void Shutdown();
 
   Status Put(std::string_view key, std::string_view value);

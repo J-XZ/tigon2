@@ -17,8 +17,9 @@ cmake -S . -B build-relwithdebinfo-ninja-clang18-co_off -G Ninja \
 cmake --build build-relwithdebinfo-ninja-clang18-co_off -j2
 ```
 
-默认 `LATENCY_SIM_COMPILE_OFF=OFF`，允许 JSONC 在运行时启用或禁用固定延迟。若要在
-编译期完全移除延迟模拟路径，必须使用独立构建目录：
+默认 `LATENCY_SIM_COMPILE_OFF=OFF`，模拟器被编译进去，配置完成后始终参与计费；
+三字段 `fixed_latency` 中的 `0` 延迟是该域零纳秒模型，不是禁用，也没有运行时
+`enabled` 开关。要在编译期完全移除模拟路径，必须使用独立构建目录：
 
 ```bash
 cmake -S . -B build-relwithdebinfo-ninja-clang18-co_on -G Ninja \
@@ -27,13 +28,15 @@ cmake -S . -B build-relwithdebinfo-ninja-clang18-co_on -G Ninja \
 cmake --build build-relwithdebinfo-ninja-clang18-co_on -j2
 ```
 
-实验封装 `tigonkv_run_ycsb_experiment.sh` 默认生成
-`fixed_latency.enabled=false`；只有显式传入 `--enable-fixed-latency` 才会生成启用配置。
-编译选择只接受精确的 `--latency-sim-compile-off=ON|OFF`，并分别使用上述两个构建目录；
-脚本会在构建目录写入 fixed-latency-only 契约 stamp，`--skip-build` 会校验该 stamp。
+compile-off 构建下 wrapper 编译为原始操作、scope 为 no-op、消费者不解析配置/不注册
+pool/不校准 TSC/不初始化清理 simulator。实验封装 `tigonkv_run_ycsb_experiment.sh`
+只接受精确的 `--latency-sim-compile-off=ON|OFF`，并分别使用上述两个构建目录；脚本会
+在构建目录写入 fixed-latency-only 契约 stamp，`--skip-build` 会校验该 stamp。
+`fixed_latency_nonzero` 元数据按生成配置的
+`swcc_fixed_ns_per_line`/`hwcc_fixed_ns_per_line` 是否非零判定。
 
-先用 `experiment_config.jsonc` 的 `fixed_latency.enabled=false` 生成并回放一轮小
-trace。非零 canary 只在临时副本中设置小的
+先用 `experiment_config.jsonc` 的 `fixed_latency`（零延迟）生成并回放一轮小 trace。
+非零 canary 只在临时副本中设置小的
 `swcc_fixed_ns_per_line`/`hwcc_fixed_ns_per_line`，不把任何访问计数或模拟统计写入
 报告。
 

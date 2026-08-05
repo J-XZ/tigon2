@@ -21,10 +21,15 @@ assert d['tigon_kv']['fixed_key_size'] == 32
 assert d['tigon_kv']['fixed_value_size'] == 32
 assert d['tigon_kv']['cpu_affinity'] is True
 assert 'base_ssh_port' not in d.get('network', {})
-assert d['tigon_kv']['latency_inject']['fixed_latency']['enabled'] is False
+fl = d['tigon_kv']['latency_inject']['fixed_latency']
+assert 'enabled' not in fl
+assert set(fl.keys()) == {'cache_line_bytes', 'swcc_fixed_ns_per_line', 'hwcc_fixed_ns_per_line'}
+assert fl['cache_line_bytes'] == 64
+assert fl['swcc_fixed_ns_per_line'] == 0
+assert fl['hwcc_fixed_ns_per_line'] == 0
 meta=json.load(open(sys.argv[2]))
 assert meta['partition_sample_stride'] == 16
-assert meta['fixed_latency_enabled'] is False
+assert meta['fixed_latency_nonzero'] is False
 assert meta['latency_sim_compile_off'] == 'OFF'
 assert meta['build_dir'].endswith('/build-relwithdebinfo-ninja-clang18-co_off')
 print('generated ycsb config schema ok')

@@ -37,18 +37,23 @@ class LatencyScope {
 class ForegroundScopeSuspension {
  public:
   ForegroundScopeSuspension() {
-    if (!latency_sim::FixedLatencyEnabledFast()) return;
+    // No runtime gate: in a compile-on build the simulator is always active;
+    // in a compile-off build the simulator does not exist and this is inert.
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     if (latency_sim::GlobalLatencySimulator()
             .HasTopLevelScopeForCurrentThread(
                 latency_sim::ExecutionClass::kForeground)) {
       suspended_ = latency_sim::GlobalLatencySimulator()
                        .SuspendScopeAndDelayLater();
     }
+#endif
   }
   ~ForegroundScopeSuspension() {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     if (suspended_)
       latency_sim::GlobalLatencySimulator().ResumeScope(
           latency_sim::ExecutionClass::kForeground);
+#endif
   }
   ForegroundScopeSuspension(const ForegroundScopeSuspension&) = delete;
   ForegroundScopeSuspension& operator=(const ForegroundScopeSuspension&) =

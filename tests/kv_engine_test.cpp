@@ -182,6 +182,11 @@ void RunFocusedG() {
   int peer_status = 0;
   assert(waitpid(peer, &peer_status, 0) == peer);
   assert(WIFEXITED(peer_status) && WEXITSTATUS(peer_status) == 0);
+  // The ring state-machine below touches the published HWCC transport ring;
+  // it runs inside an explicit scope and is torn down before engine.reset().
+  {
+  tigonkv::engine::mem_access::LatencyScope scope(
+      latency_sim::ExecutionClass::kBackground);
   void *root = nullptr;
   star::CXLMemory::wait_and_retrieve_cxl_shared_data(
       star::CXLMemory::cxl_transport_root_index, &root);
@@ -228,6 +233,7 @@ void RunFocusedG() {
     std::this_thread::yield();
   receiver.join();
   assert(delivered.load(std::memory_order_acquire));
+  }
   engine.reset();
   unlink(path_template);
 
@@ -251,7 +257,12 @@ void RunFocusedG() {
   assert(shutdown_refused);
   lifecycle->ReleaseWorker();
   lifecycle->Shutdown();
-  assert(latency_sim::FixedLatencyFeaturesFast() == 0);
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+  // Shutdown clears the pool registrations at the quiescent boundary; the
+  // simulator is left unconfigured with no active scope and zero pending.
+  assert(!latency_sim::GlobalLatencySimulator().HasActiveScopeForCurrentThread());
+  assert(latency_sim::GlobalLatencySimulator().PendingDelayNsForTest() == 0);
+#endif
   assert(!star::CXLMemory::dual_region_allocator_bound());
   assert(star::CXL_EBR::bound_regions() == nullptr);
   auto reopened = tigonkv::engine::KVEngine::Open(
@@ -478,6 +489,8 @@ int main(int argc, char **argv) {
     (void)setrlimit(RLIMIT_CORE, &no_core);
     const auto corrupt_config = ConfigFor(corrupt_template);
     auto engine = tigonkv::engine::KVEngine::Open(corrupt_config, true);
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
     void *root = nullptr;
     star::CXLMemory::wait_and_retrieve_cxl_shared_data(
         star::CXLMemory::cxl_transport_root_index, &root);
@@ -534,6 +547,8 @@ int main(int argc, char **argv) {
     const auto config = ConfigFor(misroute_template, 2, 0);
     auto peer = JoiningPeer(ConfigFor(misroute_template, 2, 1));
     auto engine = tigonkv::engine::KVEngine::Open(config, true);
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
     engine->BindWorker(0);
     std::string wrong_owner_key;
     for (uint32_t i = 0; i < 1000; ++i) {
@@ -582,6 +597,8 @@ int main(int argc, char **argv) {
   const auto single_owner = ConfigFor(path);
   {
     auto engine = tigonkv::engine::KVEngine::Open(single_owner, true);
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
     engine->BindWorker(0);
     assert(star::CXLMemory::bound_owner_shard() == single_owner.node_id);
     {
@@ -662,6 +679,8 @@ int main(int argc, char **argv) {
   }
   {
     auto attached = tigonkv::engine::KVEngine::Open(single_owner, false);
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
     attached->BindWorker(0);
     const auto found = attached->Get(FixedKeyText("persist"));
     assert(found.status.ok() && found.value == FixedValue("value"));
@@ -681,6 +700,8 @@ int main(int argc, char **argv) {
     local_wiring_only.device_path = "/dev/not-used-for-file-backed-test";
     local_wiring_only.network_base_ssh_port += 1;
     auto attached = tigonkv::engine::KVEngine::Open(local_wiring_only, false);
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
     attached->BindWorker(0);
     assert(attached->Get(FixedKeyText("persist")).status.ok());
     attached->ReleaseWorker();
@@ -695,6 +716,8 @@ int main(int argc, char **argv) {
     close(pscan_fd);
     auto pscan_config = ConfigFor(pscan_template);
     auto engine = tigonkv::engine::KVEngine::Open(pscan_config, true);
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
     engine->BindWorker(0);
     uint32_t part = 0;
     std::vector<std::string> owned;
@@ -745,6 +768,8 @@ int main(int argc, char **argv) {
     oracle_config.partition_count = 16;
     SetTestRangePartitioning(&oracle_config);
     auto engine = tigonkv::engine::KVEngine::Open(oracle_config, true);
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
     engine->BindWorker(0);
     std::vector<std::string> keys;
     for (int i = 0; i < 64; ++i) {
@@ -808,6 +833,8 @@ int main(int argc, char **argv) {
       auto bootstrap = JoiningPeer(node_one_config);
       engine = tigonkv::engine::KVEngine::Open(node_zero, true);
     }
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
     engine->BindWorker(0);
     assert(star::CXLMemory::bound_owner_shard() == 0);
     for (const std::string key : {FixedKeyText("H-route"),
@@ -867,6 +894,8 @@ int main(int argc, char **argv) {
     if (child == 0) {
       close(scan_ready[0]);
       auto node_one = tigonkv::engine::KVEngine::Open(node_one_config, false);
+      tigonkv::engine::mem_access::LatencyScope scope(
+          latency_sim::ExecutionClass::kBackground);
       node_one->BindWorker(0);
       if (star::CXLMemory::bound_owner_shard() != 1) _exit(30);
       if (!node_one->Put(owner_one_key, FixedValue("owner-one")).ok()) _exit(1);
@@ -960,6 +989,8 @@ int main(int argc, char **argv) {
       node_one->ReleaseWorker();
       for (uint32_t worker = 0; worker < 1; ++worker) {
         scan_threads.emplace_back([&, worker] {
+          tigonkv::engine::mem_access::LatencyScope thread_scope(
+              latency_sim::ExecutionClass::kBackground);
           node_one->BindWorker(worker);
           while (!start_concurrent_scans.load(std::memory_order_acquire))
             std::this_thread::yield();
@@ -1032,6 +1063,8 @@ int main(int argc, char **argv) {
       node_one->ReleaseWorker();
       for (uint32_t worker = 0; worker < 4; ++worker) {
         cas_threads.emplace_back([&, worker] {
+          tigonkv::engine::mem_access::LatencyScope thread_scope(
+              latency_sim::ExecutionClass::kBackground);
           node_one->BindWorker(worker);
           tigonkv::CasResult result;
           // KVEngine is the one-shot primitive; KVStore is the only
@@ -1150,6 +1183,8 @@ int main(int argc, char **argv) {
       auto cfg = ConfigFor(hist_path);
       cfg.foreground_worker_count_per_vm = 4;
       auto engine = tigonkv::engine::KVEngine::Open(cfg, true);
+      tigonkv::engine::mem_access::LatencyScope scope(
+          latency_sim::ExecutionClass::kBackground);
       engine->BindWorker(0);
       const std::string key = FixedKeyText("hist-private");
       assert(engine->Put(key, FixedValue("v0")).ok());
@@ -1170,6 +1205,8 @@ int main(int argc, char **argv) {
       std::vector<std::thread> readers;
       for (uint32_t w = 1; w < 4; ++w) {
         readers.emplace_back([&, w] {
+          tigonkv::engine::mem_access::LatencyScope thread_scope(
+              latency_sim::ExecutionClass::kBackground);
           engine->BindWorker(w);
           while (!put_done.load(std::memory_order_acquire)) {
             const auto g = get_after_busy(key);
@@ -1214,6 +1251,8 @@ int main(int argc, char **argv) {
       engine->ReleaseWorker();
       for (uint32_t w = 0; w < 4; ++w) {
         casters.emplace_back([&, w] {
+          tigonkv::engine::mem_access::LatencyScope thread_scope(
+              latency_sim::ExecutionClass::kBackground);
           engine->BindWorker(w);
           tigonkv::CasResult r;
           // KVEngine exposes one primitive attempt. A create-race loser may
@@ -1248,6 +1287,8 @@ int main(int argc, char **argv) {
       engine->ReleaseWorker();
       for (uint32_t w = 0; w < kCreateWorkers; ++w) {
         creators.emplace_back([&, w] {
+          tigonkv::engine::mem_access::LatencyScope thread_scope(
+              latency_sim::ExecutionClass::kBackground);
           engine->BindWorker(w);
           for (uint32_t i = 0; i < kCreatesPerWorker; ++i) {
             const std::string key = FixedKeyText(
@@ -1287,6 +1328,8 @@ int main(int argc, char **argv) {
       engine->ReleaseWorker();
       for (uint32_t w = 0; w < kIncWorkers; ++w) {
         inc_threads.emplace_back([&, w] {
+          tigonkv::engine::mem_access::LatencyScope thread_scope(
+              latency_sim::ExecutionClass::kBackground);
           engine->BindWorker(w);
           for (uint32_t i = 0; i < kIncPerWorker; ++i) {
             for (;;) {
@@ -1329,6 +1372,8 @@ int main(int argc, char **argv) {
         auto bootstrap = JoiningPeer(node1_cfg);
         engine0 = tigonkv::engine::KVEngine::Open(node0_cfg, true);
       }
+      tigonkv::engine::mem_access::LatencyScope scope(
+          latency_sim::ExecutionClass::kBackground);
       engine0->BindWorker(0);
 
       const std::string owned0 = FixedKeyText("H-hist-owner0");
@@ -1351,6 +1396,8 @@ int main(int argc, char **argv) {
         close(child_to_parent[0]);
         close(parent_to_child[1]);
         auto engine1 = tigonkv::engine::KVEngine::Open(node1_cfg, false);
+        tigonkv::engine::mem_access::LatencyScope scope(
+            latency_sim::ExecutionClass::kBackground);
         engine1->BindWorker(0);
         // Remote Get → Forward migrate-in → shared authority.
         const auto g1 = engine1->Get(owned0);
@@ -1363,6 +1410,8 @@ int main(int argc, char **argv) {
         std::atomic<bool> shared_bad{false};
         engine1->ReleaseWorker();
         std::thread cas_a([&] {
+          tigonkv::engine::mem_access::LatencyScope thread_scope(
+              latency_sim::ExecutionClass::kBackground);
           engine1->BindWorker(0);
           for (;;) {
             const auto r =
@@ -1381,6 +1430,8 @@ int main(int argc, char **argv) {
           engine1->ReleaseWorker();
         });
         std::thread cas_b([&] {
+          tigonkv::engine::mem_access::LatencyScope thread_scope(
+              latency_sim::ExecutionClass::kBackground);
           engine1->BindWorker(1);
           for (;;) {
             const auto r =

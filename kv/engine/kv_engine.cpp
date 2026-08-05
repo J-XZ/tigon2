@@ -151,12 +151,9 @@ uint64_t SharedLayoutConfigDigest(const Config &config) {
     text("range_upper", config.partition_ranges[partition].upper_key);
   }
   const auto &fixed = config.hardware_simulation;
-  boolean("fixed_latency.enabled", fixed.enabled);
   u64("fixed_latency.cache_line_bytes", fixed.cache_line_bytes);
   decimal("fixed_latency.swcc_fixed_ns_per_line", fixed.swcc_fixed_ns_per_line);
   decimal("fixed_latency.hwcc_fixed_ns_per_line", fixed.hwcc_fixed_ns_per_line);
-  boolean("fixed_latency.foreground_enabled", fixed.foreground_enabled);
-  boolean("fixed_latency.background_enabled", fixed.background_enabled);
   return digest.value();
 }
 
@@ -408,11 +405,12 @@ void KVEngine::Shutdown() {
   rings_ = nullptr;
   ebr_ = nullptr;
 
-  // This is the library's required disabled -> clear-registration boundary;
-  // it happens before the allocator unmaps the registered ranges.
-  auto &simulator = latency_sim::GlobalLatencySimulator();
-  simulator.DisableAtQuiescentBoundary();
-  simulator.ClearPoolRegistrations();
+  // All workers are joined; clear the pool registrations at the quiescent
+  // boundary before the allocator unmaps the registered ranges.  This is a
+  // lifecycle reset, not a runtime disable.
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+  latency_sim::GlobalLatencySimulator().ClearPoolRegistrations();
+#endif
 
   worker_mailboxes_.clear();
   pool_.reset();
@@ -420,7 +418,9 @@ void KVEngine::Shutdown() {
 }
 
 std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
   auto &simulator = latency_sim::GlobalLatencySimulator();
+#endif
   std::unique_ptr<DualRegionMappedPool> pool;
   std::unique_ptr<KVEngine> engine;
   std::unique_ptr<star::SCCManager> scc;
@@ -443,25 +443,32 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
     star::CXL_EBR::clear_dual_region_allocator();
     star::CXLMemory::clear_dual_region_allocator();
     scc.reset();
-    simulator.DisableAtQuiescentBoundary();
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     simulator.ClearPoolRegistrations();
+#endif
     pool.reset();
   };
   try {
     config.Validate();
     auto affinity_cpus = ResolveAffinityCpus(config);
-    // Isolate pool open from any previously enabled simulator state in this
-    // process (tests create sequential stores).  Pool open itself runs with
-    // the gate disabled; fixed latency is enabled below after registration.
+    // Isolate pool open from any previous simulator lifecycle in this process
+    // (tests create sequential stores).  Pool open itself runs before the
+    // registration below; fixed latency is configured after registration.
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     simulator.Configure(latency_sim::FixedLatencyConfig{});
     simulator.ClearPoolRegistrations();
+#endif
     lifecycle_touched = true;
     pool = std::make_unique<DualRegionMappedPool>(
         DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
     MaybeThrowOpenFailpoint("after-pool-mapping");
-  // Register the immutable HWCC/SWCC mapping boundaries before enabling fixed
-  // latency for the rest of startup.  Pool open itself runs with the gate
-  // disabled; every later shared access is validated and scoped.
+  // The pool Open already registered the immutable HWCC/SWCC mapping
+  // boundaries with the 0/0 model; drop that registration and re-apply the
+  // real three-field configuration.  Once configured the simulator stays
+  // active for the whole lifecycle; under LATENCY_SIM_COMPILE_OFF none of this
+  // exists.
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+  simulator.ClearPoolRegistrations();
   const DualRegionConfig region_config = RegionConfig(config);
   simulator.RegisterPool(
       latency_sim::MemoryDomain::kHwcc,
@@ -474,6 +481,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
           region_config.swcc_offset_bytes,
       region_config.swcc_size_bytes);
   simulator.Configure(config.hardware_simulation);
+#endif
   MaybeThrowOpenFailpoint("after-registration");
   mem_access::LatencyScope open_scope(latency_sim::ExecutionClass::kBackground);
   star::CXLMemory::bind_dual_region_allocator(&pool->allocator(), config.node_id);

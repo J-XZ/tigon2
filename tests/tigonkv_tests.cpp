@@ -27,14 +27,6 @@ using namespace tigonkv;
 
 namespace {
 
-bool RelWithDebInfoBuild() {
-#ifdef TIGONKV_CMAKE_BUILD_TYPE
-  return std::string_view(TIGONKV_CMAKE_BUILD_TYPE) == "RelWithDebInfo";
-#else
-  return false;
-#endif
-}
-
 bool ValidateThrows(Config config) {
   try {
     config.Validate();
@@ -188,6 +180,14 @@ int main(int argc, char **argv) {
     RunConfigOnly();
     return 0;
   }
+#if defined(LATENCY_SIM_COMPILE_OFF)
+  // Compile-off: the fixed-latency parser does not exist, so the strict outer
+  // structure of tigon_kv.latency_inject is validated but the three-field
+  // value semantics cannot be exercised here.  The KVStore section below is
+  // still fully covered.
+  Config fractional;
+  (void)fractional;
+#else
   const std::string latency_config_path =
       "/tmp/tigonkv-latency-config-" + std::to_string(getpid()) + ".jsonc";
   std::string base_config_text;
@@ -225,12 +225,12 @@ int main(int argc, char **argv) {
   }
   const Config string_config = Config::FromJsonc(jsonc_string_path);
   assert(string_config.shared_memory_path == "https://example.test/a//b");
-  assert(!string_config.hardware_simulation.enabled);
+  assert(string_config.hardware_simulation.cache_line_bytes == 64);
   std::remove(jsonc_string_path.c_str());
 
   const std::string missing_field_error = [&] {
     std::ofstream output(latency_config_path);
-    output << RemoveJsonFieldLine(base_config_text, "enabled");
+    output << RemoveJsonFieldLine(base_config_text, "cache_line_bytes");
     output.close();
     try {
       (void)Config::FromJsonc(latency_config_path);
@@ -239,21 +239,21 @@ int main(int argc, char **argv) {
     }
     return std::string();
   }();
-  assert(missing_field_error.find(latency_config_path) != std::string::npos);
-  assert(missing_field_error.find("fixed_latency") != std::string::npos);
+  assert(missing_field_error.find("/tigon_kv/latency_inject/fixed_latency") !=
+         std::string::npos);
+  assert(missing_field_error.find("cache_line_bytes") != std::string::npos);
 
   static constexpr std::string_view kRequiredLatencyFields[] = {
-      "fixed_latency", "enabled", "cache_line_bytes",
-      "swcc_fixed_ns_per_line", "hwcc_fixed_ns_per_line",
-      "foreground_enabled", "background_enabled"};
+      "fixed_latency", "cache_line_bytes", "swcc_fixed_ns_per_line",
+      "hwcc_fixed_ns_per_line"};
   for (const std::string_view field : kRequiredLatencyFields) {
     assert(ParseTextThrows(latency_config_path,
                            RemoveJsonFieldLine(base_config_text, field)));
   }
   assert(ParseTextThrows(
       latency_config_path,
-      ReplaceOnce(base_config_text, "\"enabled\": false,\n        \"cache_line_bytes\"",
-                  "\"enabled\": false,\n        \"enabled\": false,\n        \"cache_line_bytes\"")));
+      ReplaceOnce(base_config_text, "\"cache_line_bytes\": 64",
+                  "\"cache_line_bytes\": 64,\n        \"cache_line_bytes\": 64")));
   // Removed module objects and the former delayed-time field are rejected,
   // rather than being silently ignored.
   assert(ParseTextThrows(
@@ -308,51 +308,24 @@ int main(int argc, char **argv) {
                     "\"" + std::string(field) + "\": Infinity")));
   }
 
-  std::string enabled = ReplaceOnce(
-      base_config_text, "\"enabled\": false", "\"enabled\": true");
-  if (RelWithDebInfoBuild()) {
-    const Config parsed_enabled = [&] {
-      std::ofstream output(latency_config_path);
-      output << enabled;
-      output.close();
-      return Config::FromJsonc(latency_config_path);
-    }();
-    assert(parsed_enabled.hardware_simulation.enabled);
-    assert(parsed_enabled.hardware_simulation.foreground_enabled);
-  } else {
-    assert(ParseTextThrows(latency_config_path, enabled));
-  }
-  assert(ParseTextThrows(
-      latency_config_path,
-      ReplaceOnce(enabled, "\"verbose\": false", "\"verbose\": true")));
-  assert(ParseTextThrows(
-      latency_config_path,
-      ReplaceOnce(
-          ReplaceOnce(enabled, "\"verbose\": false", "\"verbose\": true"),
-          "\"network\": {", "\"network\": {\"verbose\": false,")));
-  assert(ParseTextThrows(
-      latency_config_path,
-      ReplaceOnce(enabled, "\"extra_check\": false", "\"extra_check\": true")));
-  {
-    std::string background_only = ReplaceOnce(
-        enabled, "\"foreground_enabled\": true",
-        "\"foreground_enabled\": false");
-    if (RelWithDebInfoBuild()) {
-      const Config parsed_background_only = [&] {
-        std::ofstream output(latency_config_path);
-        output << background_only;
-        output.close();
-        return Config::FromJsonc(latency_config_path);
-      }();
-      assert(!parsed_background_only.hardware_simulation
-                  .foreground_enabled);
-      assert(parsed_background_only.hardware_simulation
-                 .background_enabled);
-    } else {
-      assert(ParseTextThrows(latency_config_path, background_only));
-    }
-  }
+  // A complete three-field fixed-latency object parses and applies: the
+  // per-line delays are honored and the cache-line geometry is kept.  There
+  // is no enabled/foreground_enabled/background_enabled master switch.
+  std::string nonzero = ReplaceOnce(
+      ReplaceOnce(base_config_text, "\"swcc_fixed_ns_per_line\": 0",
+                  "\"swcc_fixed_ns_per_line\": 1.25e0"),
+      "\"hwcc_fixed_ns_per_line\": 0", "\"hwcc_fixed_ns_per_line\": 2.5");
+  const Config parsed_three_field = [&] {
+    std::ofstream output(latency_config_path);
+    output << nonzero;
+    output.close();
+    return Config::FromJsonc(latency_config_path);
+  }();
+  assert(parsed_three_field.hardware_simulation.cache_line_bytes == 64);
+  assert(parsed_three_field.hardware_simulation.swcc_fixed_ns_per_line == 1.25);
+  assert(parsed_three_field.hardware_simulation.hwcc_fixed_ns_per_line == 2.5);
   std::remove(latency_config_path.c_str());
+#endif  // LATENCY_SIM_COMPILE_OFF
 
   Config uneven;
   uneven.size_mb = 64;
@@ -418,23 +391,13 @@ int main(int argc, char **argv) {
   insufficient_cpu.vm_core_count_per_vm = 4;
   assert(ValidateThrows(insufficient_cpu));
   Config gated = config;
-  gated.hardware_simulation.enabled = true;
-  if (RelWithDebInfoBuild()) {
-    gated.verbose = true;
-    assert(ValidateThrows(gated));
-    gated.verbose = false;
-    gated.extra_check = true;
-    assert(ValidateThrows(gated));
-    gated.extra_check = false;
-    gated.hardware_simulation.foreground_enabled = false;
-    gated.hardware_simulation.background_enabled = true;
-    gated.Validate();
-  } else {
-    assert(ValidateThrows(gated));
-  }
-  config.hardware_simulation.enabled = RelWithDebInfoBuild();
-  config.hardware_simulation.foreground_enabled = true;
-  config.hardware_simulation.background_enabled = true;
+  gated.hardware_simulation.cache_line_bytes = 64;
+  gated.hardware_simulation.swcc_fixed_ns_per_line = 1;
+  gated.hardware_simulation.hwcc_fixed_ns_per_line = 1;
+  gated.verbose = true;
+  gated.extra_check = true;
+  gated.Validate();
+  config.hardware_simulation.cache_line_bytes = 64;
   config.hardware_simulation.swcc_fixed_ns_per_line = 1;
   config.hardware_simulation.hwcc_fixed_ns_per_line = 1;
   // HWCC is bounded by the configured physical shared region, not by an

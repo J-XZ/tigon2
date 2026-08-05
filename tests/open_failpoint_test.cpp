@@ -74,14 +74,22 @@ int main() {
     assert(threw);
     std::printf("[open-failpoint] phase=%s threw and rolled back\n", phase);
 
-    // Rollback contract: runtime gate disabled and registrations cleared.
+    // Rollback contract: registrations cleared and no thread-local latency
+    // state remains.  The simulator stays quiescent with zero pending delay.
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     auto &simulator = latency_sim::GlobalLatencySimulator();
-    assert(simulator.feature_mask() == 0);
+    assert(!simulator.HasActiveScopeForCurrentThread());
+    assert(simulator.PendingDelayNsForTest() == 0);
     simulator.ClearPoolRegistrations();
     assert(simulator.PendingDelayNsForTest() == 0);
+#endif
 
-    // Reopen against a different mapping succeeds and stays usable.
+    // Reopen against a different mapping succeeds and stays usable.  Engine
+    // Open registered the ranges and scoped its init; the foreground calls
+    // below need an explicit scope on this thread.
     auto engine = tigonkv::engine::KVEngine::Open(ConfigFor(path_b), true);
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
     engine->BindWorker(0);
     const std::string key(32, 'a');
     const std::string value(128, 'b');

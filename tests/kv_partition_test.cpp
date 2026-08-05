@@ -95,19 +95,28 @@ int main(int argc, char **argv) {
 
   auto pool = tigonkv::engine::DualRegionMappedPool::Open(path, Config(), true);
   auto &regions = pool.allocator();
+  // Pool Open already registered the HWCC/SWCC ranges and scoped its own
+  // init; every wrapped partition/tree access below needs an explicit scope.
+  tigonkv::engine::mem_access::LatencyScope main_scope(
+      latency_sim::ExecutionClass::kForeground);
+  // The CXL_EBR object must live inside the registered HWCC range: production
+  // places it via cxlalloc MISC (kHwccEbr) and its members are charged as
+  // HWCC.  Allocate it from the static HWCC region before finalizing.
+  void *ebr_storage = regions.Allocate(
+      sizeof(star::CXL_EBR), tigonkv::engine::AllocationDomain::kHwccEbr, 0);
+  star::CXL_EBR *ebr = new (ebr_storage) star::CXL_EBR(2, 1, &regions);
   regions.FinalizeStaticHwccLayout();
   regions.PublishStaticHwccLayout();
   regions.InitializeOwnerPrivateArenas(0);
   regions.InitializeOwnerPrivateArenas(1);
   star::CXLMemory memory;
   star::CXLMemory::bind_dual_region_allocator(&regions, 1);
-  star::CXL_EBR ebr(2, 1, &regions);
-  ebr.thread_init_ebr_meta(0, 0);
-  star::global_ebr_meta = &ebr;
+  ebr->thread_init_ebr_meta(0, 0);
+  star::global_ebr_meta = ebr;
   PassthroughScc scc;
   star::scc_manager = &scc;
 
-  tigonkv::engine::KVPartition partition(regions, ebr, 5, 1, false, true);
+  tigonkv::engine::KVPartition partition(regions, *ebr, 5, 1, false, true);
   std::vector<tigonkv::engine::KVPartition *> partitions(8, nullptr);
   partitions[5] = &partition;
   tigonkv::engine::KvMigrationRuntime::Instance().Install(

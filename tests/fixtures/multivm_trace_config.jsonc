@@ -30,12 +30,9 @@
     "extra_check": false,
 "latency_inject": {
       "fixed_latency": {
-        "enabled": false,
         "cache_line_bytes": 64,
         "swcc_fixed_ns_per_line": 0,
-        "hwcc_fixed_ns_per_line": 0,
-        "foreground_enabled": true,
-        "background_enabled": true
+        "hwcc_fixed_ns_per_line": 0
       }
     }
   }
