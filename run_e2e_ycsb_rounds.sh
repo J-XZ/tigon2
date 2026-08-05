@@ -2,6 +2,9 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/tigonkv_build_helpers.sh
+source "$root/scripts/tigonkv_build_helpers.sh"
+build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${TIGONKV_E2E_COMPILE_OFF:-OFF}")
 traces="$root/results/e2e_ycsb_traces"
 config="$root/experiment_config.jsonc"
 logs="$root/results/e2e_ycsb_logs"
@@ -47,8 +50,8 @@ for ((round = 1; round <= rounds; ++round)); do
   echo "TIGONKV_E2E_YCSB_ROUND round=$round" | tee "$round_log"
   round_logs="$logs/round$(printf '%02d' "$round")"
   TIGONKV_YCSB_WORKLOADS=a TIGONKV_VM_COUNT="$vms" TIGONKV_YCSB_THREADS_PER_VM=4 \
-  TIGONKV_E2E_TRACE_RUNNER="${TIGONKV_E2E_TRACE_RUNNER:-$root/build-relwithdebinfo/e2e_trace_runner}" \
-  TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$root/build-relwithdebinfo/cxl_pool_initer}" \
+  TIGONKV_E2E_TRACE_RUNNER="${TIGONKV_E2E_TRACE_RUNNER:-$build/e2e_trace_runner}" \
+  TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$build/cxl_pool_initer}" \
   TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" \
     "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$traces" "$round_logs" 1 a | tee -a "$round_log"
 done

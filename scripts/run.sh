@@ -844,28 +844,14 @@ if [ $# -lt 1 ]; then
 fi
 
 typeset RUN_TYPE=$1
-typeset TIGONKV_BUILD_DIR="$SCRIPT_DIR/../build-relwithdebinfo"
-[ "$LATENCY_SIM_COMPILE_OFF_VALUE" = ON ] &&
-        TIGONKV_BUILD_DIR="$SCRIPT_DIR/../build-relwithdebinfo-compile-off"
+# shellcheck source=scripts/tigonkv_build_helpers.sh
+source "$SCRIPT_DIR/../scripts/tigonkv_build_helpers.sh"
+typeset TIGONKV_BUILD_DIR
+TIGONKV_BUILD_DIR=$(tigonkv_canonical_build_dir "$SCRIPT_DIR/.." RelWithDebInfo "$LATENCY_SIM_COMPILE_OFF_VALUE")
 
 function write_latency_sim_build_contract_stamp {
-        typeset STAMP="$TIGONKV_BUILD_DIR/tigonkv_latency_sim_build_contract.json"
-        python3 - "$STAMP" "$SCRIPT_DIR/.." "$LATENCY_SIM_COMPILE_OFF_VALUE" <<'PY'
-import json, os, sys
-path, source_dir, compile_off = sys.argv[1:]
-payload = {
-    'source_dir': os.path.realpath(source_dir),
-    'build_type': 'RelWithDebInfo',
-    'generator': 'Ninja',
-    'latency_sim_compile_off': compile_off,
-    'contract': 'fixed-latency-only',
-}
-tmp = path + '.tmp'
-with open(tmp, 'w', encoding='utf-8') as output:
-        json.dump(payload, output, indent=2, sort_keys=True)
-        output.write('\n')
-os.replace(tmp, path)
-PY
+        tigonkv_write_build_meta "$TIGONKV_BUILD_DIR" "$SCRIPT_DIR/.." RelWithDebInfo \
+                "$LATENCY_SIM_COMPILE_OFF_VALUE"
         if [ $? -ne 0 ]; then
                 echo "failed to write latency_sim build contract stamp" >&2
                 exit 2

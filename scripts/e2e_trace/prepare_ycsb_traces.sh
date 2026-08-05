@@ -3,7 +3,10 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # shellcheck source=scripts/tigonkv_ycsb_cpp_pin.sh
 source "$root/scripts/tigonkv_ycsb_cpp_pin.sh"
+# shellcheck source=scripts/tigonkv_build_helpers.sh
+source "$root/scripts/tigonkv_build_helpers.sh"
 tigonkv_check_ycsb_cpp_pin
+build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${TIGONKV_E2E_COMPILE_OFF:-OFF}")
 ycsb="$root/thirdparty_libs/YCSB-cpp"
 if [[ ! -x "$ycsb/scripts/generate_cxlkv_trace.sh" ]]; then
   echo "YCSB-cpp submodule is not checked out at $ycsb" >&2
@@ -38,7 +41,7 @@ mkdir -p "$out"
   --request-distribution zipfian \
   --force
 
-splitter=${TIGONKV_YCSB_PARTITION_SPLITS:-"$root/build-relwithdebinfo/ycsb_partition_splits"}
+splitter=${TIGONKV_YCSB_PARTITION_SPLITS:-"$build/ycsb_partition_splits"}
 [[ -x "$splitter" ]] || {
   echo "build ycsb_partition_splits before preparing formal traces: $splitter" >&2
   exit 2

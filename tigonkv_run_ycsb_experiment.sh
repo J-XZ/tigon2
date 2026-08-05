@@ -50,53 +50,36 @@ for n in "$rounds" "$records" "$operations" "$threads" "$timeout" "$shared_size"
 [[ "$latency_sim_compile_off" == ON || "$latency_sim_compile_off" == OFF ]] || {
   echo "--latency-sim-compile-off accepts only ON or OFF" >&2; exit 2;
 }
-build_dir="$root/build-relwithdebinfo"
-[[ "$latency_sim_compile_off" == ON ]] && build_dir="$root/build-relwithdebinfo-compile-off"
+# shellcheck source=scripts/tigonkv_build_helpers.sh
+source "$root/scripts/tigonkv_build_helpers.sh"
+
+# Canonical build directory binds generator, clang-18, build type and
+# compile-off; every entry point derives it from the same helper.
+if ! build_dir=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "$latency_sim_compile_off"); then
+  exit 2
+fi
 build_stamp="$build_dir/tigonkv_latency_sim_build_contract.json"
 
 ensure_build_configured() {
   if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
     cmake -S "$root" -B "$build_dir" -G Ninja \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF="$latency_sim_compile_off"
-  elif ! grep -q "^LATENCY_SIM_COMPILE_OFF:.*=$latency_sim_compile_off$" "$build_dir/CMakeCache.txt"; then
-    echo "$build_dir must be configured with LATENCY_SIM_COMPILE_OFF=$latency_sim_compile_off" >&2
-    exit 2
+  elif ! tigonkv_verify_cmake_cache "$build_dir" RelWithDebInfo "$latency_sim_compile_off"; then
+    echo "tigonkv_ycsb: $build_dir does not match the requested canonical contract; reconfiguring" >&2
+    rm -rf "$build_dir"
+    cmake -S "$root" -B "$build_dir" -G Ninja \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF="$latency_sim_compile_off"
   fi
 }
 
 write_build_contract_stamp() {
-  python3 - "$build_stamp" "$root" "$latency_sim_compile_off" <<'PY'
-import json, os, sys
-path, source_dir, compile_off = sys.argv[1:]
-payload = {
-    'source_dir': source_dir,
-    'build_type': 'RelWithDebInfo',
-    'generator': 'Ninja',
-    'latency_sim_compile_off': compile_off,
-    'contract': 'fixed-latency-only',
-}
-tmp = path + '.tmp'
-with open(tmp, 'w', encoding='utf-8') as output:
-    json.dump(payload, output, indent=2, sort_keys=True)
-    output.write('\n')
-os.replace(tmp, path)
-PY
+  tigonkv_write_build_meta "$build_dir" "$root" RelWithDebInfo \
+    "$latency_sim_compile_off" "$build_dir/ycsb_partition_splits" "$build_dir/e2e_trace_runner"
 }
 
 verify_build_contract_stamp() {
-  [[ -f "$build_stamp" ]] || {
-    echo "missing build contract stamp for --skip-build: $build_stamp" >&2
-    exit 2
-  }
-  python3 - "$build_stamp" "$root" "$latency_sim_compile_off" <<'PY'
-import json, sys
-path, source_dir, compile_off = sys.argv[1:]
-data = json.load(open(path, encoding='utf-8'))
-if data.get('source_dir') != source_dir or data.get('build_type') != 'RelWithDebInfo' or \
-        data.get('generator') != 'Ninja' or data.get('latency_sim_compile_off') != compile_off or \
-        data.get('contract') != 'fixed-latency-only':
-    raise SystemExit(f'build contract stamp mismatch: {path}')
-PY
+  tigonkv_verify_build_meta "$build_dir" "$root" RelWithDebInfo \
+    "$latency_sim_compile_off" "$build_dir/ycsb_partition_splits" "$build_dir/e2e_trace_runner"
 }
 
 # shellcheck source=scripts/tigonkv_ycsb_cpp_pin.sh

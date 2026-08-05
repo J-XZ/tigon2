@@ -47,6 +47,7 @@ latency_sim::MemoryDomain AtomicDomainFor(bool hwcc, bool /*shared_payload*/) {
 template <typename T>
 T FixedLatencyLoadFor(const std::atomic<T> &value, bool hwcc, bool shared_payload,
                  std::memory_order order) {
+  if (!latency_sim::FixedLatencyEnabledFast()) return value.load(order);
   return latency_sim::FixedLatencyAtomicLoad(
       value, order, AtomicDomainFor(hwcc, shared_payload));
 }
@@ -54,6 +55,10 @@ T FixedLatencyLoadFor(const std::atomic<T> &value, bool hwcc, bool shared_payloa
 template <typename T>
 void FixedLatencyStoreFor(std::atomic<T> &value, T desired, bool hwcc,
                      bool shared_payload, std::memory_order order) {
+  if (!latency_sim::FixedLatencyEnabledFast()) {
+    value.store(desired, order);
+    return;
+  }
   latency_sim::FixedLatencyAtomicStore(
       value, desired, order, AtomicDomainFor(hwcc, shared_payload));
 }
@@ -61,6 +66,7 @@ void FixedLatencyStoreFor(std::atomic<T> &value, T desired, bool hwcc,
 template <typename T>
 T FixedLatencyFetchAddFor(std::atomic<T> &value, T operand, bool hwcc,
                      bool shared_payload, std::memory_order order) {
+  if (!latency_sim::FixedLatencyEnabledFast()) return value.fetch_add(operand, order);
   return latency_sim::FixedLatencyAtomicFetchAdd(
       value, operand, order, AtomicDomainFor(hwcc, shared_payload));
 }
@@ -69,6 +75,8 @@ template <typename T>
 bool FixedLatencyCasWeakFor(std::atomic<T> &value, T &expected, T desired,
                        bool hwcc, bool shared_payload,
                        std::memory_order success, std::memory_order failure) {
+  if (!latency_sim::FixedLatencyEnabledFast())
+    return value.compare_exchange_weak(expected, desired, success, failure);
   return latency_sim::FixedLatencyAtomicCompareExchangeWeak(
       value, expected, desired, success, failure,
       AtomicDomainFor(hwcc, shared_payload));
@@ -216,6 +224,7 @@ RegionAllocator RegionAllocator::AttachWithExternalHeader(
 
 void RegionAllocator::RecordMetadataRead(const void *address,
                                          uint64_t bytes) const {
+  if (!latency_sim::FixedLatencyEnabledFast()) return;
   if (control_is_hwcc_)
     mem_access::HwccRead(address, bytes);
   else
@@ -224,6 +233,7 @@ void RegionAllocator::RecordMetadataRead(const void *address,
 
 void RegionAllocator::RecordMetadataWrite(const void *address,
                                           uint64_t bytes) const {
+  if (!latency_sim::FixedLatencyEnabledFast()) return;
   if (control_is_hwcc_)
     mem_access::HwccWrite(address, bytes);
   else
@@ -232,6 +242,7 @@ void RegionAllocator::RecordMetadataWrite(const void *address,
 
 void RegionAllocator::RecordBlockMetadataRead(const void *address,
                                               uint64_t bytes) const {
+  if (!latency_sim::FixedLatencyEnabledFast()) return;
   if (block_is_hwcc_)
     mem_access::HwccRead(address, bytes);
   else if (block_is_shared_payload_)
@@ -242,6 +253,7 @@ void RegionAllocator::RecordBlockMetadataRead(const void *address,
 
 void RegionAllocator::RecordBlockMetadataWrite(const void *address,
                                                uint64_t bytes) const {
+  if (!latency_sim::FixedLatencyEnabledFast()) return;
   if (block_is_hwcc_)
     mem_access::HwccWrite(address, bytes);
   else if (block_is_shared_payload_)

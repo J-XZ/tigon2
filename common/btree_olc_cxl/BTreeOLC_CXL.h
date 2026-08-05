@@ -158,6 +158,7 @@ class TreeAccessScope {
 };
 
 inline void RecordTreeDataRead(const void *address, uint64_t bytes) {
+	if (!latency_sim::FixedLatencyEnabledFast()) return;
 	if (TreeAccessIsHwcc)
 		tigonkv::engine::mem_access::HwccRead(address, bytes);
 	else
@@ -165,6 +166,7 @@ inline void RecordTreeDataRead(const void *address, uint64_t bytes) {
 }
 
 inline void RecordTreeDataWrite(const void *address, uint64_t bytes) {
+	if (!latency_sim::FixedLatencyEnabledFast()) return;
 	if (TreeAccessIsHwcc)
 		tigonkv::engine::mem_access::HwccWrite(address, bytes);
 	else
@@ -173,6 +175,7 @@ inline void RecordTreeDataWrite(const void *address, uint64_t bytes) {
 
 template <typename T>
 inline T TreeAtomicLoad(const std::atomic<T> &value, std::memory_order order) {
+	if (!latency_sim::FixedLatencyEnabledFast()) return value.load(order);
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicLoad(
 	                 value, order, latency_sim::MemoryDomain::kHwcc)
@@ -183,6 +186,10 @@ inline T TreeAtomicLoad(const std::atomic<T> &value, std::memory_order order) {
 template <typename T>
 inline void TreeAtomicStore(std::atomic<T> &value, T desired,
                             std::memory_order order) {
+	if (!latency_sim::FixedLatencyEnabledFast()) {
+		value.store(desired, order);
+		return;
+	}
 	if (TreeAccessIsHwcc)
 		latency_sim::FixedLatencyAtomicStore(
 		    value, desired, order, latency_sim::MemoryDomain::kHwcc);
@@ -196,6 +203,8 @@ template <typename T>
 inline bool TreeAtomicCompareExchangeStrong(
     std::atomic<T> &value, T &expected, T desired,
     std::memory_order success, std::memory_order failure) {
+	if (!latency_sim::FixedLatencyEnabledFast())
+		return value.compare_exchange_strong(expected, desired, success, failure);
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicCompareExchangeStrong(
 	                 value, expected, desired, success, failure,
@@ -209,6 +218,8 @@ template <typename T>
 inline bool TreeAtomicCompareExchangeWeak(
     std::atomic<T> &value, T &expected, T desired,
     std::memory_order success, std::memory_order failure) {
+	if (!latency_sim::FixedLatencyEnabledFast())
+		return value.compare_exchange_weak(expected, desired, success, failure);
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicCompareExchangeWeak(
 	                 value, expected, desired, success, failure,
@@ -221,6 +232,8 @@ inline bool TreeAtomicCompareExchangeWeak(
 template <typename T>
 inline T TreeAtomicFetchAdd(std::atomic<T> &value, T operand,
                             std::memory_order order) {
+	if (!latency_sim::FixedLatencyEnabledFast())
+		return value.fetch_add(operand, order);
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicFetchAdd(
 	                 value, operand, order, latency_sim::MemoryDomain::kHwcc)
@@ -232,6 +245,8 @@ inline T TreeAtomicFetchAdd(std::atomic<T> &value, T operand,
 template <typename T>
 inline T TreeAtomicFetchSub(std::atomic<T> &value, T operand,
                             std::memory_order order) {
+	if (!latency_sim::FixedLatencyEnabledFast())
+		return value.fetch_sub(operand, order);
 	return TreeAccessIsHwcc
 	           ? latency_sim::FixedLatencyAtomicFetchSub(
 	                 value, operand, order, latency_sim::MemoryDomain::kHwcc)
@@ -246,6 +261,7 @@ inline T TreeAtomicFetchSub(std::atomic<T> &value, T operand,
 inline void RecordTreeAccess(const TreeNodeAllocation &allocation, const void *page,
                              bool write) {
 	if (page == nullptr) return;
+	if (!latency_sim::FixedLatencyEnabledFast()) return;
 	constexpr uint64_t kNodeMetadataBytes = 64;
 	if (allocation.domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc) {
 		if (write) tigonkv::engine::mem_access::PrivateWrite(page, kNodeMetadataBytes);

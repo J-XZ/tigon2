@@ -6,11 +6,29 @@ tigonkv_e2e_multivm_root() {
   cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
 }
 
+# shellcheck source=../scripts/tigonkv_build_helpers.sh
+source "$(tigonkv_e2e_multivm_root)/scripts/tigonkv_build_helpers.sh"
+
 tigonkv_e2e_multivm_preflight() {
-  local root build
+  local root build compile_off
   root=$(tigonkv_e2e_multivm_root)
-  build=${TIGONKV_E2E_BINARY_DIR:-$root/build-relwithdebinfo}
+  compile_off="${TIGONKV_E2E_COMPILE_OFF:-OFF}"
+  if ! build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "$compile_off"); then
+    exit 2
+  fi
+  if [[ -n "${TIGONKV_E2E_BINARY_DIR:-}" ]]; then
+    build="$TIGONKV_E2E_BINARY_DIR"
+  else
+    # A prebuilt canonical directory must match the requested contract; a
+    # stale `build-relwithdebinfo` from an older scheme is never reused.
+    if [[ -d "$build/CMakeFiles" ]] && \
+        ! tigonkv_verify_cmake_cache "$build" RelWithDebInfo "$compile_off"; then
+      echo "tigonkv_e2e_multivm: $build does not match the canonical contract" >&2
+      exit 2
+    fi
+  fi
   export TIGONKV_E2E_BINARY_DIR="$build"
+  export TIGONKV_E2E_COMPILE_OFF="$compile_off"
   export TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$build/cxl_pool_initer}"
   export TIGONKV_E2E_TRACE_RUNNER="${TIGONKV_E2E_TRACE_RUNNER:-$build/e2e_trace_runner}"
   # Multi-VM e2e_08/09 require fixed_value_size=1000. Default to the e2e overlay

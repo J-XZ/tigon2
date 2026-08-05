@@ -11,20 +11,20 @@
 生产 fixed-latency build 使用 RelWithDebInfo：
 
 ```bash
-cmake -S . -B build-relwithdebinfo -G Ninja \
+cmake -S . -B build-relwithdebinfo-ninja-clang18-co_off -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DLATENCY_SIM_COMPILE_OFF=OFF
-cmake --build build-relwithdebinfo -j2
+cmake --build build-relwithdebinfo-ninja-clang18-co_off -j2
 ```
 
 默认 `LATENCY_SIM_COMPILE_OFF=OFF`，允许 JSONC 在运行时启用或禁用固定延迟。若要在
 编译期完全移除延迟模拟路径，必须使用独立构建目录：
 
 ```bash
-cmake -S . -B build-relwithdebinfo-compile-off -G Ninja \
+cmake -S . -B build-relwithdebinfo-ninja-clang18-co_on -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DLATENCY_SIM_COMPILE_OFF=ON
-cmake --build build-relwithdebinfo-compile-off -j2
+cmake --build build-relwithdebinfo-ninja-clang18-co_on -j2
 ```
 
 实验封装 `tigonkv_run_ycsb_experiment.sh` 默认生成

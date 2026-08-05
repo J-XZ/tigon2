@@ -26,7 +26,7 @@ meta=json.load(open(sys.argv[2]))
 assert meta['partition_sample_stride'] == 16
 assert meta['fixed_latency_enabled'] is False
 assert meta['latency_sim_compile_off'] == 'OFF'
-assert meta['build_dir'].endswith('/build-relwithdebinfo')
+assert meta['build_dir'].endswith('/build-relwithdebinfo-ninja-clang18-co_off')
 print('generated ycsb config schema ok')
 PY
 # Ensure VM scripts still derive ports/backing from the generated config.

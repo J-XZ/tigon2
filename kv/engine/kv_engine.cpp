@@ -32,6 +32,23 @@
 namespace tigonkv::engine {
 namespace {
 
+// Test-only Open failpoints: KVEngine::Open() throws at the named phase so the
+// rollback path (workers joined, gate disabled, registrations cleared,
+// allocator/EBR/SCC bindings cleared, mapping released) can be verified
+// deterministically.  Compiled out of release (NDEBUG) production builds.
+#ifndef NDEBUG
+void MaybeThrowOpenFailpoint(const char *phase) {
+  const char *target = std::getenv("TIGONKV_TEST_OPEN_FAILPOINT");
+  if (target != nullptr && target[0] != '\0' &&
+      std::strcmp(target, phase) == 0) {
+    throw std::runtime_error(std::string("tigonkv: injected Open failpoint at ")
+                             + phase);
+  }
+}
+#else
+void MaybeThrowOpenFailpoint(const char *phase) { (void)phase; }
+#endif
+
 // Shared layout identity.  This deliberately hashes parsed canonical fields,
 // not JSON spelling or node-local wiring: every attaching VM must agree on
 // routing, persistent layout and latency contract before it dereferences an
@@ -441,6 +458,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
     lifecycle_touched = true;
     pool = std::make_unique<DualRegionMappedPool>(
         DualRegionMappedPool::Open(config.shared_memory_path, RegionConfig(config), reset));
+    MaybeThrowOpenFailpoint("after-pool-mapping");
   // Register the immutable HWCC/SWCC mapping boundaries before enabling fixed
   // latency for the rest of startup.  Pool open itself runs with the gate
   // disabled; every later shared access is validated and scoped.
@@ -456,6 +474,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
           region_config.swcc_offset_bytes,
       region_config.swcc_size_bytes);
   simulator.Configure(config.hardware_simulation);
+  MaybeThrowOpenFailpoint("after-registration");
   mem_access::LatencyScope open_scope(latency_sim::ExecutionClass::kBackground);
   star::CXLMemory::bind_dual_region_allocator(&pool->allocator(), config.node_id);
   star::MPSCRingBuffer *rings = nullptr;
@@ -592,6 +611,7 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
     engine->partitions_.emplace_back(std::make_unique<KVPartition>(
         engine->pool_->allocator(), *engine->ebr_, partition,
         engine->OwnerForPartition(partition), true, materialize_private));
+    MaybeThrowOpenFailpoint("during-partition-init");
   }
   if (star::CXLMemory::bound_owner_shard() != config.node_id)
     throw std::runtime_error(
@@ -650,7 +670,10 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
       config.node_id, config.partition_count, hw_budget);
   // Clock tracker nodes persist in owner-private SWCC; attach
   // does not rebuild a process-heap tracker (§11.14).
+  MaybeThrowOpenFailpoint("during-worker-start");
+  MaybeThrowOpenFailpoint("before-demuxer");
   engine->StartInboundDemuxer();
+  MaybeThrowOpenFailpoint("after-demuxer");
   return engine;
   } catch (...) {
     rollback();

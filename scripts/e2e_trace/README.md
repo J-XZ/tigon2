@@ -47,11 +47,11 @@ For cxlkv-style multi-VM e2e08/e2e09, use
 `scripts/e2e/run_guest_e2e_workflows.sh`. It launches one independent process per VM
 and four worker threads per process by default, with e2e08 phases
 `fill/read` and e2e09 phases `fill/update/read`. The default binary
-directory is `build-relwithdebinfo` (CTest / guest scripts), and each round starts with a
+directory is `build-relwithdebinfo-ninja-clang18-co_off` (CTest / guest scripts), and each round starts with a
 fresh shared-pool reset. Rebuild after engine changes:
 
 ```sh
-cmake --build build-relwithdebinfo -j"$(nproc)"
+cmake --build build-relwithdebinfo-ninja-clang18-co_off -j"$(nproc)"
 ```
 
 Legacy alias `build-rel` is not the formal path.

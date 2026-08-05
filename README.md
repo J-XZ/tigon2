@@ -79,24 +79,27 @@ Release:        -O3 -march=native，编译和最终链接均 -flto=full，保留
 `-DTIGONKV_ENABLE_FRAME_POINTERS=ON`（仅对项目自有目标生效）。
 
 ```bash
-# 默认可运行时配置（显式 OFF 等价于不传）
-cmake -S . -B build-relwithdebinfo -G Ninja \
+# 默认可运行时配置（显式 OFF 等价于不传）。规范构建目录
+# build-<buildtype>-ninja-clang18-co_<on|off> 由
+# scripts/tigonkv_build_helpers.sh::tigonkv_canonical_build_dir 统一计算，
+# 绑定 generator、clang-18、build type 和 compile-off。
+cmake -S . -B build-relwithdebinfo-ninja-clang18-co_off -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DLATENCY_SIM_COMPILE_OFF=OFF
-cmake --build build-relwithdebinfo -j2
-ctest --test-dir build-relwithdebinfo -E '^e2e_' --output-on-failure -j1
+cmake --build build-relwithdebinfo-ninja-clang18-co_off -j2
+ctest --test-dir build-relwithdebinfo-ninja-clang18-co_off -E '^e2e_' --output-on-failure -j1
 
-cmake -S . -B build-debug -G Ninja \
+cmake -S . -B build-debug-ninja-clang18-co_off -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
   -DLATENCY_SIM_COMPILE_OFF=OFF
-cmake --build build-debug -j2
-ctest --test-dir build-debug -E '^e2e_' --output-on-failure -j1
+cmake --build build-debug-ninja-clang18-co_off -j2
+ctest --test-dir build-debug-ninja-clang18-co_off -E '^e2e_' --output-on-failure -j1
 
 # 编译期完全移除：独立 build 目录，不得与默认 build 混用
-cmake -S . -B build-relwithdebinfo-compile-off -G Ninja \
+cmake -S . -B build-relwithdebinfo-ninja-clang18-co_on -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DLATENCY_SIM_COMPILE_OFF=ON
-cmake --build build-relwithdebinfo-compile-off -j2
+cmake --build build-relwithdebinfo-ninja-clang18-co_on -j2
 ```
 
 固定延迟定向测试是 `latency_modes_test`；禁用热路径对照是

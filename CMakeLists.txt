@@ -85,6 +85,8 @@ add_executable(kv_engine_test tests/kv_engine_test.cpp)
 target_link_libraries(kv_engine_test PRIVATE tigonkv glog)
 add_executable(kv_startup_test tests/kv_startup_test.cpp)
 target_link_libraries(kv_startup_test PRIVATE tigonkv glog)
+add_executable(open_failpoint_test tests/open_failpoint_test.cpp)
+target_link_libraries(open_failpoint_test PRIVATE tigonkv glog)
 add_executable(scc_protocol_test tests/scc_protocol_test.cpp tests/scc_test_backend.cpp)
 add_executable(kv_shared_protocol_test tests/kv_shared_protocol_test.cpp)
 target_link_libraries(kv_shared_protocol_test PRIVATE tigonkv glog)
@@ -113,6 +115,7 @@ set(TIGONKV_PROJECT_TARGETS
   kv_partition_test
   kv_engine_test
   kv_startup_test
+  open_failpoint_test
   scc_protocol_test
   kv_shared_protocol_test
   region_allocator_test
@@ -140,6 +143,7 @@ set(TIGONKV_ISA_REQUIRED_TARGETS
   kv_partition_test
   kv_engine_test
   kv_startup_test
+  open_failpoint_test
   kv_shared_protocol_test
 )
 foreach(TIGONKV_TARGET IN LISTS TIGONKV_ISA_REQUIRED_TARGETS)
@@ -173,6 +177,7 @@ add_test(NAME btree_binding_test COMMAND btree_binding_test)
 add_test(NAME kv_partition_test COMMAND kv_partition_test)
 add_test(NAME kv_engine_test COMMAND kv_engine_test)
 add_test(NAME kv_startup_test COMMAND kv_startup_test)
+add_test(NAME open_failpoint_test COMMAND open_failpoint_test)
 add_test(NAME scc_protocol_test COMMAND scc_protocol_test)
 add_test(NAME kv_shared_protocol_test COMMAND kv_shared_protocol_test)
 add_test(NAME region_allocator_test COMMAND region_allocator_test)
