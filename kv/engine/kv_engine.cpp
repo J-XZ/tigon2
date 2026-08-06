@@ -1568,20 +1568,42 @@ void KVEngine::PollTransport() {
   mem_access::ForegroundScopeSuspension suspend_foreground;
 #if !defined(LATENCY_SIM_COMPILE_OFF)
   if (TlsDeferTransportSettlementDepth > 0) {
-    // Deferred mode (remote delete critical state): the foreground scope is
-    // suspended by the cooperative wait.  Resume it as a background-class
-    // scope so the poll's wrapped accesses accumulate into the single
-    // deferred segment, then suspend it again instead of settling: no
-    // busy-wait happens while the caller still holds the row's write lock /
-    // invalid state.  The merged deferred budget settles exactly once at the
-    // outermost scope exit, after the delete commit/rollback released the
-    // lock and the SCC guards.
+    // Deferred mode (remote delete critical state): route the poll's budget
+    // into the single deferred segment instead of settling, so no busy-wait
+    // happens while the caller still holds the row's write lock / invalid
+    // state; the merged deferred budget settles exactly once at the outermost
+    // scope exit, after the delete commit/rollback released the lock and the
+    // SCC guards.  The latency_sim model has one suspension slot per thread:
+    //   - already suspended (the cooperative foreground wait): resume it as a
+    //     background-class scope, poll, suspend again;
+    //   - an active top-level scope of any class (e.g. a background facade):
+    //     suspend it first, run the poll, suspend, then restore the original
+    //     class, so the enclosing scope settles the deferred budget at its
+    //     own (safe) exit.
     auto &simulator = latency_sim::GlobalLatencySimulator();
+    auto &state = latency_sim::detail::g_thread_state;
+    const bool was_suspended = simulator.ScopeSuspendedForTest();
+    if (!was_suspended) {
+      if (state.scope_depth == 0 ||
+          !simulator.SuspendScopeAndDelayLater()) {
+        // No suspendable enclosing scope: run the poll in a plain nested
+        // background scope (unreachable for the delete path, which charges
+        // its prepare work in an enclosing scope before the critical state).
+        latency_sim::ScopeGuard background_scope(
+            latency_sim::ExecutionClass::kBackground);
+        PollTransportImpl();
+        return;
+      }
+    }
+    const auto outer_class = state.scope_class;
     simulator.ResumeScope(latency_sim::ExecutionClass::kBackground);
     PollTransportImpl();
     if (!simulator.SuspendScopeAndDelayLater())
       TransportFatal(config_.node_id, "poll_defer",
                      "deferred transport poll has no suspendable scope");
+    if (!was_suspended) {
+      simulator.ResumeScope(outer_class);
+    }
     return;
   }
 #endif

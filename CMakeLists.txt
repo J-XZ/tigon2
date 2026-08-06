@@ -116,6 +116,8 @@ set(TIGONKV_PROJECT_TARGETS
   e2e_trace_runner
   ycsb_partition_splits
   latency_modes_test
+  ring_latency_test
+  remote_delete_latency_test
   kv_layout_test
   btree_binding_test
   kv_partition_test
