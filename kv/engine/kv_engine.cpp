@@ -901,14 +901,16 @@ Status KVEngine::Delete(std::string_view key) {
       FinalizeRemoteDelete(
           mailbox, fixed_key, route.owner, route.partition_id, locked_row,
           sequence, Status::Error(StatusCode::kCorruption,
-                                  "remote delete transport exception"));
+                                  "remote delete transport exception"),
+          /*allow_pending_cancel=*/true);
       RetireOperation(mailbox);
       mailbox.operation = {};
       throw;
     }
+    const bool allow_pending_cancel = deleted.code == StatusCode::kTimeout;
     return FinalizeRemoteDelete(mailbox, fixed_key, route.owner,
                                 route.partition_id, locked_row, sequence,
-                                std::move(deleted));
+                                std::move(deleted), allow_pending_cancel);
   }
   try {
     EbrOperationScope ebr_scope(ebr_);
@@ -1390,7 +1392,8 @@ Status KVEngine::FinalizeRemoteDelete(WorkerMailbox &mailbox,
                                       const FixedKey &key, uint32_t owner,
                                       uint32_t partition_id,
                                       RegionOffset target_row,
-                                      uint64_t sequence, Status result) {
+                                      uint64_t sequence, Status result,
+                                      bool allow_pending_cancel) {
   const uint32_t worker_id = static_cast<uint32_t>(TlsForegroundWorkerId);
   auto &control = pool_->allocator().layout()
                       .remote_delete_controls[config_.node_id][worker_id];
@@ -1400,17 +1403,23 @@ Status KVEngine::FinalizeRemoteDelete(WorkerMailbox &mailbox,
     TransportFatal(config_.node_id, "remote_delete_finalize",
                    "control identity changed before requester finalization");
 
-  if (state == RemoteDeleteControlState::kPending &&
-      control.CompareExchange(RemoteDeleteControlState::kPending,
-                              RemoteDeleteControlState::kCancelled)) {
-    {
-      EbrOperationScope ebr_scope(ebr_);
-      partitions_[partition_id]->AbortRemoteDelete(target_row, config_.node_id);
-    }
-    if (!control.AcknowledgeAndClear(RemoteDeleteControlState::kCancelled))
+  if (state == RemoteDeleteControlState::kPending) {
+    if (!allow_pending_cancel)
       TransportFatal(config_.node_id, "remote_delete_finalize",
-                     "cancelled control slot could not be acknowledged");
-    return result;
+                     "remote delete response arrived before owner claim");
+    if (!control.CompareExchange(RemoteDeleteControlState::kPending,
+                                 RemoteDeleteControlState::kCancelled)) {
+      state = control.LoadState();
+    } else {
+      {
+        EbrOperationScope ebr_scope(ebr_);
+        partitions_[partition_id]->AbortRemoteDelete(target_row, config_.node_id);
+      }
+      if (!control.AcknowledgeAndClear(RemoteDeleteControlState::kCancelled))
+        TransportFatal(config_.node_id, "remote_delete_finalize",
+                       "cancelled control slot could not be acknowledged");
+      return result;
+    }
   }
 
   state = control.LoadState();
@@ -1422,6 +1431,15 @@ Status KVEngine::FinalizeRemoteDelete(WorkerMailbox &mailbox,
       state == RemoteDeleteControlState::kAcknowledged)
     TransportFatal(config_.node_id, "remote_delete_finalize",
                    "remote delete control slot was reused early");
+  if ((state == RemoteDeleteControlState::kDeleted && !result.ok() &&
+       result.code != StatusCode::kTimeout) ||
+      (state == RemoteDeleteControlState::kRejected &&
+       result.code != StatusCode::kBusy && result.code != StatusCode::kTimeout) ||
+      (state == RemoteDeleteControlState::kFailed &&
+       result.code != StatusCode::kCorruption &&
+       result.code != StatusCode::kTimeout))
+    TransportFatal(config_.node_id, "remote_delete_finalize",
+                   "remote delete response disagrees with control terminal");
   if (!control.AcknowledgeAndClear(state))
     TransportFatal(config_.node_id, "remote_delete_finalize",
                    "remote delete terminal acknowledgement failed");

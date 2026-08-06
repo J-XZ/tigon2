@@ -452,6 +452,22 @@ int main() {
         mailbox->retired_remote_deletes[0] = {
             true, kOwner, mailbox->operation.partition_id, stale_sequence,
             mailbox->operation.target_row};
+        {
+          tigonkv::engine::mem_access::LatencyScope owner_scope(
+              latency_sim::ExecutionClass::kBackground);
+          auto &busy_control = engine->pool_->allocator().layout()
+              .remote_delete_controls[kRequester][0];
+          assert(busy_control.CompareExchange(
+              tigonkv::engine::RemoteDeleteControlState::kPending,
+              tigonkv::engine::RemoteDeleteControlState::kExecuting));
+          engine->VisiblePartition(busy_key)->AbortRemoteDelete(
+              mailbox->operation.target_row, kRequester);
+          busy_control.PublishError(
+              tigonkv::engine::RemoteDeleteControlError::kRejected);
+          assert(busy_control.CompareExchange(
+              tigonkv::engine::RemoteDeleteControlState::kExecuting,
+              tigonkv::engine::RemoteDeleteControlState::kRejected));
+        }
         auto stale_message = std::make_unique<star::Message>();
         stale_message->set_source_node_id(kOwner);
         stale_message->set_dest_node_id(kRequester);

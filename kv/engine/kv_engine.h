@@ -156,7 +156,8 @@ class KVEngine {
   Status FinalizeRemoteDelete(WorkerMailbox &mailbox, const FixedKey &key,
                               uint32_t owner, uint32_t partition_id,
                               RegionOffset target_row, uint64_t sequence,
-                              Status result);
+                              Status result,
+                              bool allow_pending_cancel = false);
   Status AwaitResponse(WorkerMailbox &mailbox);
   void DispatchMessage(star::Message &message, WorkerMailbox &mailbox);
   void ServeTransportRequest(star::Message &message,
