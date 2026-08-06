@@ -199,11 +199,8 @@ watch_phase_progress() {
   return 1
 }
 
-for ((round = 1; round <= rounds; round++)); do
-  for workload in $workloads; do
-    wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
-    pool_reset
-    for phase in load run; do
+run_ycsb_phase() {
+  local round=$1 wl=$2 phase=$3
       # Ensure no orphaned guest runner from a prior stalled phase.
       for ((vm = 0; vm < vm_count; vm++)); do
         kill_guest_runners "$vm" >/dev/null 2>&1
@@ -266,6 +263,22 @@ for ((round = 1; round <= rounds; round++)); do
         }
       done
       echo "TIGONKV_GUEST_YCSB round=$round workload=$wl phase=$phase pass"
-    done
+}
+
+for ((round = 1; round <= rounds; round++)); do
+  read -r -a selected_workloads <<<"$workloads"
+  [[ "${#selected_workloads[@]}" -gt 0 ]] || {
+    echo "at least one YCSB workload is required" >&2
+    exit 2
+  }
+  # Load once per round, then run every selected workload against the same
+  # populated dataset. Selecting A and E must not silently perform a second
+  # load/reset between them.
+  first_workload=$(printf '%s' "${selected_workloads[0]}" | tr '[:upper:]' '[:lower:]')
+  pool_reset
+  run_ycsb_phase "$round" "$first_workload" load
+  for workload in "${selected_workloads[@]}"; do
+    wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
+    run_ycsb_phase "$round" "$wl" run
   done
 done
