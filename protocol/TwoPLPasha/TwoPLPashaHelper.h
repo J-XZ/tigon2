@@ -331,6 +331,40 @@ retry:
         // under the same latch and clears it as the single linearization
         // point; the requester's Pending -> Cancelled rollback CASes this bit
         // away, so exactly one of owner-delete or requester-cancel wins.
+        //
+        // Remote-delete mailbox state machine (single HWCC atomic word bit
+        // WRITE_LOCK_BIT_OFFSET plus the SWCC SCC valid flag and ref count):
+        //
+        //   State     | writer   | CAS pre-state      | row visible | requester
+        //              |          |                    |             | may rollback
+        //   ----------+----------+--------------------+-------------+------------
+        //   Empty     | -        | -                  | valid=1     | n/a
+        //   Pending   | requester| Empty (set bit,    | valid=0     | YES (only
+        //              |          | clear valid, +ref)|             | this state)
+        //   Cancelled | requester| Pending (restore   | valid=1     | NO (already
+        //              |          | valid, clear bit, |             | terminal)
+        //              |          | -ref)             |             |
+        //   Executing | owner    | Pending (shared    | deleting/   | NO (hard
+        //   /Deleted  |          | delete step checks | deleted     | fail)
+        //              |          | bit under latch,  |             |
+        //              |          | clears it as the  |             |
+        //              |          | linearization)    |             |
+        //
+        // Slot reuse: the requester's request carries a monotonically
+        // increasing sequence that the response echoes; a stale response for
+        // an older sequence is dropped (kv_engine.cpp ConsumeTransportResponse)
+        // and never consumes the next request's slot.
+        //
+        // The two races this table resolves:
+        //  * cancel CAS wins before owner claim: the owner's shared delete
+        //    step re-checks the bit under the same latch and sees it cleared,
+        //    so it refuses to delete (Busy/terminal) and the row stays in the
+        //    requester's restored state.
+        //  * owner claim wins before the requester deadline: the bit is
+        //    cleared by the owner's linearized delete, so the requester's
+        //    rollback hard fails instead of resurrecting a deleted row, and
+        //    any late success response carries the old sequence and is
+        //    dropped.
         bool requester_holds_write_lock()
         {
                 return (load_atomic_word(std::memory_order_acquire) &
