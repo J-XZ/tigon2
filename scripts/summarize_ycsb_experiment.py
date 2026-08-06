@@ -124,7 +124,11 @@ for row in rows:
 for round_id in range(1, int(meta['rounds']) + 1):
     for workload in workloads:
         for stage in ('load', 'run'):
-            items = groups.get((round_id, workload, stage), [])
+            # A round has one shared load, named after the first selected
+            # workload by the guest runner, followed by one run per selected
+            # workload. Do not require a duplicate load for every workload.
+            case_workload = workloads[0] if stage == 'load' else workload
+            items = groups.get((round_id, case_workload, stage), [])
             if (len(items) != vm_count or
                     {item['node'] for item in items} != set(range(vm_count))):
                 raise SystemExit(
