@@ -354,19 +354,22 @@ int main() {
   simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 64);
   assert(simulator.PendingDelayNsForTest() == 9);
-  assert(simulator.SuspendScopeAndDelayLater());
+  const std::uint64_t foreground_generation =
+      simulator.SuspendScopeAndDelayLater();
+  assert(foreground_generation != 0);
   assert(!simulator.HasActiveScopeForCurrentThread());
   assert(simulator.PendingDelayNsForTest() == 0);
   simulator.BeginScope(latency_sim::ExecutionClass::kBackground);
   simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64);
   assert(simulator.PendingDelayNsForTest() == 9);
-  assert(!simulator.SuspendScopeAndDelayLater());  // one suspension at a time
+  assert(simulator.SuspendScopeAndDelayLater() == 0);  // one suspension at a time
   assert(simulator.HasActiveScopeForCurrentThread());
   simulator.EndScopeAndDelay();  // temporary scope settles its own 9 (swcc)
   assert(!simulator.HasActiveScopeForCurrentThread());
   assert(simulator.PendingDelayNsForTest() == 0);
-  simulator.ResumeScope(latency_sim::ExecutionClass::kForeground);
+  simulator.ResumeScope(latency_sim::ExecutionClass::kForeground,
+                        foreground_generation);
   assert(simulator.HasActiveScopeForCurrentThread());
   simulator.EndScopeAndDelay();  // settles the deferred 9 (hwcc) exactly once
   assert(!simulator.HasActiveScopeForCurrentThread());

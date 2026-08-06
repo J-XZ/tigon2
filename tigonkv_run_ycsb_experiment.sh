@@ -91,9 +91,9 @@ generated_config="$out_dir/configs/experiment_config_ycsb_4vm.jsonc"
 parent_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo nogit)
 gitlink=$(tigonkv_latency_sim_gitlink "$root")
 source_state=$(tigonkv_source_state "$root")
-python3 - "$base_config" "$generated_config" "$shared_size" "$shared_numa" "$rounds" "$records" "$operations" "$threads" "$workloads" "$sample_stride" "$latency_sim_compile_off" "$build_dir" "$parent_sha" "$gitlink" "$source_state" <<'PY'
+python3 - "$base_config" "$generated_config" "$shared_size" "$shared_numa" "$rounds" "$records" "$operations" "$threads" "$workloads" "$sample_stride" "$latency_sim_compile_off" "$build_dir" "$parent_sha" "$gitlink" "$source_state" "$root" <<'PY'
 import hashlib, json, os, sys
-src, dst, size, numa, rounds, records, ops, threads, workloads, sample_stride, compile_off, build_dir, parent_sha, gitlink, source_state = sys.argv[1:]
+src, dst, size, numa, rounds, records, ops, threads, workloads, sample_stride, compile_off, build_dir, parent_sha, gitlink, source_state, root = sys.argv[1:]
 text=open(src, encoding='utf-8').read()
 
 def strip_jsonc(value):
@@ -145,7 +145,7 @@ d['tigon_kv']['fixed_value_size']=32
 json.dump(d, open(dst, 'w', encoding='utf-8'), indent=2)
 selected=workloads.split(',')
 fixed_latency=lat['fixed_latency']
-meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'operation_count_semantics':'logical_ycsb_requests_before_update_expansion','vm_count':4,'foreground_workers_per_vm':4,'demuxer_threads_per_vm':1,'kv_threads_per_vm':5,'affinity':'distinct_allowed_cpus','threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'generated_config_sha256':hashlib.sha256(open(dst,'rb').read()).hexdigest(),'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32,'partition_sample_stride':int(sample_stride),'fixed_latency':{'cache_line_bytes':fixed_latency['cache_line_bytes'],'swcc_fixed_ns_per_line':fixed_latency['swcc_fixed_ns_per_line'],'hwcc_fixed_ns_per_line':fixed_latency['hwcc_fixed_ns_per_line']},'fixed_latency_nonzero':fixed_latency['swcc_fixed_ns_per_line'] != 0 or fixed_latency['hwcc_fixed_ns_per_line'] != 0,'latency_sim_compile_off':compile_off,'build_dir':build_dir,'parent_sha':parent_sha,'latency_sim_gitlink':gitlink,'source_state':source_state,'reproduce_command':f'cmake -S {src!r} -B {build_dir!r} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF={compile_off}'}
+meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'operation_count_semantics':'logical_ycsb_requests_before_update_expansion','vm_count':4,'foreground_workers_per_vm':4,'demuxer_threads_per_vm':1,'kv_threads_per_vm':5,'affinity':'distinct_allowed_cpus','threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'generated_config_sha256':hashlib.sha256(open(dst,'rb').read()).hexdigest(),'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32,'partition_sample_stride':int(sample_stride),'fixed_latency':{'cache_line_bytes':fixed_latency['cache_line_bytes'],'swcc_fixed_ns_per_line':fixed_latency['swcc_fixed_ns_per_line'],'hwcc_fixed_ns_per_line':fixed_latency['hwcc_fixed_ns_per_line']},'fixed_latency_nonzero':fixed_latency['swcc_fixed_ns_per_line'] != 0 or fixed_latency['hwcc_fixed_ns_per_line'] != 0,'latency_sim_compile_off':compile_off,'build_dir':build_dir,'parent_sha':parent_sha,'latency_sim_gitlink':gitlink,'source_state':source_state,'reproduce_command':f'cmake -S {root!r} -B {build_dir!r} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF={compile_off}'}
 json.dump(meta, open(dst.rsplit('/',1)[0] + '/../run_meta.json', 'w', encoding='utf-8'), indent=2, sort_keys=True)
 PY
 echo "TIGONKV_YCSB_PREPARED out_dir=$out_dir config=$generated_config workloads=$workloads"
@@ -229,8 +229,9 @@ for name, value in zip('abcde', (a, b, c, d, e)):
         values['workload' + name] = int(value)
 meta['replayed_trace_operations'] = values
 # Persist binary/config/trace hashes so the run stays reproducible after any
-# cleanup: the ycsb_partition_splits binary, the generated experiment config
-# and every generated trace file.
+# cleanup: the actually executed e2e_trace_runner binary, the auxiliary
+# ycsb_partition_splits binary, the generated experiment config and every
+# generated trace file.
 import hashlib
 def sha256_of(path):
     digest = hashlib.sha256()
@@ -240,7 +241,10 @@ def sha256_of(path):
     return digest.hexdigest()
 binary = meta['build_dir'] + '/ycsb_partition_splits'
 if os.path.isfile(binary):
-    meta['binary_sha256'] = sha256_of(binary)
+    meta['ycsb_partition_splits_sha256'] = sha256_of(binary)
+runner = meta['build_dir'] + '/e2e_trace_runner'
+if os.path.isfile(runner):
+    meta['e2e_trace_runner_sha256'] = sha256_of(runner)
 config_path = meta.get('generated_config', '')
 if config_path and os.path.isfile(config_path):
     meta['generated_config_sha256'] = sha256_of(config_path)

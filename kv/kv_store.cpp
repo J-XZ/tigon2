@@ -769,6 +769,8 @@ Config Config::FromJsonc(const std::string &path) {
     if (!JsonNumberInObject(text, "vm", "ssh_base_port", &c.network_base_ssh_port))
       JsonNumber(text, "base_ssh_port", &c.network_base_ssh_port);
     JsonNumber(text, "timeout_sec", &c.sync_timeout_sec);
+    JsonNumber(text, "transport_response_timeout_ms",
+               &c.transport_response_timeout_ms);
     JsonNumber(text, "foreground_worker_count_per_vm", &c.foreground_worker_count_per_vm);
     JsonNumber(text, "partition_count", &c.partition_count);
     JsonNumber(text, "fixed_key_size", &c.fixed_key_size);
@@ -812,6 +814,7 @@ void Config::Validate() {
       fixed_key_size == 0 || fixed_key_size > kMaxKey ||
       fixed_value_size > kMaxValue || shared_memory_numa_node < -1 || vm_numa_node < -1 ||
       network_base_ssh_port == 0 || sync_timeout_sec == 0 || foreground_worker_count_per_vm == 0 ||
+      transport_response_timeout_ms == 0 ||
       foreground_worker_count_per_vm > star::CXL_EBR::max_thread_num ||
       foreground_worker_count_per_vm > 255 ||
       vm_count > star::CXL_EBR::max_coordinator_num)

@@ -27,6 +27,10 @@ enum class StatusCode {
   // Transient concurrency conflict. Callers may retry without treating it as
   // protocol corruption or changing worker concurrency.
   kBusy,
+  // A cooperative transport response was not received within
+  // Config::transport_response_timeout_ms.  Remote operations roll back their
+  // intermediate row state and return this error.
+  kTimeout,
 };
 
 struct Status {
@@ -133,6 +137,11 @@ struct Config {
   int32_t vm_numa_node = 0;
   uint32_t network_base_ssh_port = 2200;
   uint32_t sync_timeout_sec = 60;
+  // Bounded cooperative-wait deadline for a remote RPC response.  A missing
+  // owner (crash/partition/disconnect) must fail with kTimeout instead of
+  // busy-looping forever; remote operations roll back their intermediate
+  // state on timeout.
+  uint32_t transport_response_timeout_ms = 60000;
   uint32_t foreground_worker_count_per_vm = 1;
   uint32_t node_id = 0;
   uint32_t partition_count = 16;

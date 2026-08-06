@@ -8,15 +8,24 @@
 // and head/tail/count/ready transitions, with the original wrapper memory
 // orders) is asserted unchanged.
 //
-// Line model (ring object 64-byte aligned, entry_struct_size=64, entry_num=8):
-//   ctor header: 3 header writes + 1 entries-offset read        = 4 lines
-//   per entry  : ready store + metadata write + payload memset = 3 lines
-//   enqueue    : 2 header reads + count/tail fetch-add + payload
-//                write + metadata write + ready store           = 7 lines
-//   dequeue    : 2 header reads + size() (1 read + 2 loads) +
-//                head load + ready spin + metadata read + data
-//                read + metadata write + ready store + head
-//                store + count fetch-sub                       = 13 lines
+// Line model, derived from the actual per-access implementation (ring object
+// 64-byte aligned, entry_struct_size=64, entry_num=8, one cache line per
+// wrapped access):
+//   ctor header: 7 wrapped stores (3 size fields + 3 atomics +
+//                entries offset)                              = 7 lines
+//   per entry  : ready store + metadata memset + payload
+//                memset                                       = 3 lines
+//   enqueue    : 4 header loads + count/tail fetch-add +
+//                payload copy + 2 metadata stores + ready
+//                store                                        = 10 lines
+//   dequeue    : 4 header loads + head/tail loads + ready
+//                load + 2 metadata loads + payload copy +
+//                2 metadata stores + ready store + head
+//                store + count fetch-sub                      = 15 lines
+// A 2-line payload (70 bytes) charges one extra line in both enqueue and
+// dequeue, which catches both whole-entry-envelope overcharging (fixed line
+// count regardless of payload) and per-entry undercharging (payload always
+// charged once).
 #include "common/CXLMemory.h"
 #include "common/MPSCRingBuffer.h"
 #include "kv/engine/mem_access.h"
@@ -116,10 +125,11 @@ int main() {
 
   constexpr uint64_t kEntryStructSize = 64;
   constexpr uint64_t kEntryNum = 8;
-  constexpr uint64_t kCtorHeaderLines = 4;
+  constexpr uint64_t kCtorHeaderLines = 7;
   constexpr uint64_t kCtorEntryLines = 3;
-  constexpr uint64_t kEnqueueLines = 7;
-  constexpr uint64_t kDequeueLines = 13;
+  constexpr uint64_t kEnqueueLines = 10;
+  constexpr uint64_t kDequeueLines = 15;
+  constexpr uint64_t kSizeLines = 2;
 
   star::MPSCRingBuffer *ring = nullptr;
   {
@@ -190,6 +200,102 @@ int main() {
     tigonkv::engine::mem_access::LatencyScope scope(
         latency_sim::ExecutionClass::kBackground);
     assert(ring->size() == 0);  // head/tail/count transitions intact
+  }
+  {
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
+    // size() charges exactly the two real head/tail wrapped loads; a fake
+    // header read would push the delta past kSizeLines.
+    const uint64_t before_size = sim.PendingDelayNsForTest();
+    assert(ring->size() == 0);
+    const uint64_t size_delta = sim.PendingDelayNsForTest() - before_size;
+    assert(size_delta == kSizeLines);
+  }
+  {
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
+    // Header accessors return one real wrapped load each.
+    const uint64_t before = sim.PendingDelayNsForTest();
+    assert(ring->get_entry_num() == kEntryNum);
+    assert(sim.PendingDelayNsForTest() - before == 1);
+    const uint64_t before_size = sim.PendingDelayNsForTest();
+    assert(ring->get_entry_size() == kEntryStructSize - 9);
+    assert(sim.PendingDelayNsForTest() - before_size == 1);
+  }
+
+  // Multi-line payload on a 128-byte-entry ring: 70 bytes covers two cache
+  // lines, so enqueue/dequeue must charge one additional line each over the
+  // single-line payload (catches envelope approximation and per-entry
+  // under-charging).  The deltas are asserted relative to the same ring's
+  // single-line baseline so the per-access model stays the source of truth.
+  char wide[70];
+  std::memset(wide, 0x5A, sizeof(wide));
+  star::MPSCRingBuffer *wide_ring = nullptr;
+  {
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
+    const uint64_t before_alloc = sim.PendingDelayNsForTest();
+    void *wide_probe = star::cxl_memory.cxlalloc_malloc_wrapper(
+        sizeof(star::MPSCRingBuffer),
+        star::CXLMemory::TRANSPORT_ALLOCATION);
+    const uint64_t alloc_charge = sim.PendingDelayNsForTest() - before_alloc;
+    void *wide_storage = star::cxl_memory.cxlalloc_malloc_wrapper(
+        sizeof(star::MPSCRingBuffer),
+        star::CXLMemory::TRANSPORT_ALLOCATION);
+    const uint64_t before_ctor = sim.PendingDelayNsForTest();
+    wide_ring = new (wide_storage) star::MPSCRingBuffer(128, 4);
+    const uint64_t ctor_delta =
+        sim.PendingDelayNsForTest() - before_ctor - alloc_charge;
+    // 128-byte entries: the 119-byte payload memset covers two lines, so each
+    // entry charges ready(1) + metadata(1) + payload(2) = 4 lines.
+    assert(ctor_delta == kCtorHeaderLines + 4 * (kCtorEntryLines + 1));
+  }
+  {
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
+    const uint64_t before_small = sim.PendingDelayNsForTest();
+    assert(wide_ring->enqueue(wide, 5));
+    const uint64_t small_enqueue_delta =
+        sim.PendingDelayNsForTest() - before_small;
+    assert(small_enqueue_delta == kEnqueueLines);
+    char small_out[128]{};
+    const uint64_t before_small_deq = sim.PendingDelayNsForTest();
+    assert(wide_ring->dequeue(small_out, sizeof(small_out)) == 5);
+    const uint64_t small_dequeue_delta =
+        sim.PendingDelayNsForTest() - before_small_deq;
+    assert(small_dequeue_delta == kDequeueLines);
+    assert(std::memcmp(small_out, wide, 5) == 0);
+
+    const uint64_t before_wide = sim.PendingDelayNsForTest();
+    assert(wide_ring->enqueue(wide, sizeof(wide)));
+    const uint64_t wide_enqueue_delta =
+        sim.PendingDelayNsForTest() - before_wide;
+    assert(wide_enqueue_delta == small_enqueue_delta + 1);
+    char wide_out[128]{};
+    const uint64_t before_wide_deq = sim.PendingDelayNsForTest();
+    assert(wide_ring->dequeue(wide_out, sizeof(wide_out)) == sizeof(wide));
+    const uint64_t wide_dequeue_delta =
+        sim.PendingDelayNsForTest() - before_wide_deq;
+    assert(wide_dequeue_delta == small_dequeue_delta + 1);
+    assert(std::memcmp(wide_out, wide, sizeof(wide)) == 0);
+  }
+  {
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
+    // A second full cycle charges identically: no residual metadata, no
+    // duplicated head/tail/count transitions.
+    const uint64_t before_enqueue = sim.PendingDelayNsForTest();
+    assert(ring->enqueue(payload, sizeof(payload)));
+    const uint64_t enqueue_delta =
+        sim.PendingDelayNsForTest() - before_enqueue;
+    assert(enqueue_delta == kEnqueueLines);
+    char second_out[256]{};
+    const uint64_t before_dequeue = sim.PendingDelayNsForTest();
+    assert(ring->dequeue(second_out, sizeof(second_out)) == sizeof(payload));
+    const uint64_t dequeue_delta =
+        sim.PendingDelayNsForTest() - before_dequeue;
+    assert(dequeue_delta == kDequeueLines);
+    assert(std::memcmp(second_out, payload, sizeof(payload)) == 0);
   }
 
   latency_sim::detail::SetDelaySpinBackendForTest(nullptr);

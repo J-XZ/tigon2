@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Short machine-readable host-validation manifest for TigonKV V5.
+#
+# For each of the four necessary build variants (Debug/RelWithDebInfo x
+# compile-on/compile-off) it records the build command, the non-VM CTest
+# summary, key binary hashes and, for the compile-off variants, the ELF
+# forbidden-symbol audit.  Deliberately no full logs: the build directories
+# and this script are the reproducible entry points.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=scripts/tigonkv_build_helpers.sh
+source "$root/scripts/tigonkv_build_helpers.sh"
+
+out="${TIGONKV_HOST_MANIFEST_OUT:-$root/exp_data/host_validation_manifest.json}"
+mkdir -p "$(dirname "$out")"
+
+parent_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo nogit)
+gitlink=$(tigonkv_latency_sim_gitlink "$root")
+source_state=$(tigonkv_source_state "$root")
+
+declare -A manifest
+
+run_variant() {
+  local build_type="$1" compile_off="$2"
+  local co
+  co="$(printf '%s' "$compile_off" | tr '[:upper:]' '[:lower:]')"
+  local build_dir
+  build_dir="$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off")"
+  local key="$build_type-co_$co"
+
+  local configure="cmake -S '$root' -B '$build_dir' -G Ninja -DCMAKE_BUILD_TYPE=$build_type -DLATENCY_SIM_COMPILE_OFF=$compile_off"
+  cmake -S "$root" -B "$build_dir" -G Ninja \
+    -DCMAKE_BUILD_TYPE="$build_type" -DLATENCY_SIM_COMPILE_OFF="$compile_off"
+  cmake --build "$build_dir" -j"${CXLKV_BUILD_JOBS:-$(nproc)}"
+
+  local ctest_log ctest_status passed failed
+  ctest_log=$(mktemp)
+  set +e
+  ctest --test-dir "$build_dir" \
+    -E 'e2e_08_test|e2e_09_test|e2e_ycsb_test|e2e_ycsb_entrypoints_test' \
+    --output-on-failure >"$ctest_log" 2>&1
+  ctest_status=$?
+  set -e
+  passed=$(grep -oE '[0-9]+ tests passed' "$ctest_log" | awk '{print $1}' || echo 0)
+  failed=$(grep -oE '[0-9]+ tests failed' "$ctest_log" | awk '{print $1}' || echo 0)
+  if grep -qE 'tests failed out of' "$ctest_log"; then
+    summary="$(grep -E 'tests passed|tests failed' "$ctest_log" | tail -1 | sed 's/^ *//')"
+  else
+    summary="no summary (ctest exit=$ctest_status)"
+  fi
+  rm -f "$ctest_log"
+
+  local binary_args=()
+  for name in unit_tests e2e_08 e2e_09 e2e_trace_runner \
+              ycsb_partition_splits hardware_sim_disabled_benchmark; do
+    if [[ -x "$build_dir/$name" ]]; then
+      binary_args+=("$name=$(sha256sum "$build_dir/$name" | awk '{print $1}')")
+    fi
+  done
+
+  local elf_audit="not-applicable"
+  if [[ "$compile_off" == ON ]]; then
+    elf_audit="clean"
+    for name in e2e_08 e2e_09 e2e_trace_runner unit_tests; do
+      if [[ -x "$build_dir/$name" ]]; then
+        if nm -C "$build_dir/$name" 2>/dev/null | grep -qE \
+          'LatencySimulator|GlobalLatencySimulator|g_thread_state|CalibrateTsc|TicksForDelayNs|RoundDelayPsToNs|DelaySpinNs|HardFail|ParseFixedLatencyJsonc|LoadFixedLatencyJsoncFile|RegisterPool|ClearPoolRegistrations|BeginScope|EndScopeAndDelay|ChargeRange|ValidateRange|AddLines|SuspendScopeAndDelayLater|ResumeScope'; then
+          elf_audit="FAIL:$name"
+          break
+        fi
+      fi
+    done
+  fi
+
+  manifest["$key"]="$(
+    python3 - "$build_type" "$compile_off" "$configure" "$summary" \
+      "$passed" "$failed" "$ctest_status" "$elf_audit" "${binary_args[@]}" <<'PY'
+import json, sys
+build_type, compile_off, configure, summary = sys.argv[1:5]
+passed, failed, status, elf_audit = sys.argv[5:9]
+binaries = {}
+for token in sys.argv[9:]:
+    name, _, digest = token.partition("=")
+    binaries[name] = digest
+print(json.dumps({
+    "build_type": build_type,
+    "latency_sim_compile_off": compile_off,
+    "build_command": configure,
+    "ctest_summary": summary,
+    "ctest_passed": int(passed),
+    "ctest_failed": int(failed),
+    "ctest_exit": int(status),
+    "compile_off_elf_audit": elf_audit,
+    "binaries": binaries,
+}, sort_keys=True))
+PY
+  )"
+}
+
+run_variant Debug OFF
+run_variant Debug ON
+run_variant RelWithDebInfo OFF
+run_variant RelWithDebInfo ON
+
+python3 - "$out" "$parent_sha" "$gitlink" "$source_state" "${manifest[@]}" <<'PY'
+import json, os, sys
+out, parent_sha, gitlink, source_state = sys.argv[1:5]
+variants = {}
+for key in sys.argv[5:]:
+    data = json.loads(key)
+    variants[data["build_type"] + "-co_" +
+             data["latency_sim_compile_off"].lower()] = data
+payload = {
+    "parent_sha": parent_sha,
+    "latency_sim_gitlink": gitlink,
+    "source_state": source_state,
+    "variants": variants,
+}
+tmp = out + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2, sort_keys=True)
+    f.write("\n")
+json.load(open(tmp, encoding="utf-8"))
+os.replace(tmp, out)
+PY
+
+echo "host validation manifest written to $out"

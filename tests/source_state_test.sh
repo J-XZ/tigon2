@@ -75,7 +75,18 @@ sub_untracked=$(tigonkv_source_state "$parent")
 }
 rm -f "$parent/thirdparty_libs/latency_sim/src/untracked_probe.cc"
 
-# 6. Ignored build products (build dirs, ccache, temp logs) must not change
+# 6. Staged submodule change (the gitlink itself is untouched).
+echo "// sub staged" > "$parent/thirdparty_libs/latency_sim/AGENTS.md.tmp_probe"
+git -C "$parent/thirdparty_libs/latency_sim" add AGENTS.md.tmp_probe
+sub_staged=$(tigonkv_source_state "$parent")
+[[ "$sub_staged" != "$base" ]] || {
+  echo "FAIL: staged submodule change did not change source state" >&2
+  exit 1
+}
+git -C "$parent/thirdparty_libs/latency_sim" reset --quiet AGENTS.md.tmp_probe
+rm -f "$parent/thirdparty_libs/latency_sim/AGENTS.md.tmp_probe"
+
+# 7. Ignored build products (build dirs, ccache, temp logs) must not change
 #    the state: they are reproducible artifacts, not source.
 mkdir -p "$parent/build-relwithdebinfo-ninja-clang18-co_off"
 touch "$parent/build-relwithdebinfo-ninja-clang18-co_off/probe.o"

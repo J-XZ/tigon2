@@ -18,6 +18,7 @@ Exit code 0 = stable/no regression, 1 = regression found.
 import argparse
 import hashlib
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -60,14 +61,133 @@ def git_rev():
         return "unknown"
 
 
-def git_submodule_sha():
+def git_repo_clean(repo="."):
+    """Parent tracked/staged/untracked state must be completely clean."""
     try:
-        out = subprocess.run(["git", "submodule", "status",
-                              "thirdparty_libs/latency_sim"],
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=repo,
                              capture_output=True, text=True, check=True)
-        return out.stdout.split()[0]
-    except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
-        return "unknown"
+        return out.stdout.strip() == ""
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def provenance():
+    """Records parent HEAD, index gitlink, submodule checkout and source state
+    that the benchmark binaries were built from, verifying reproducibility."""
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"],
+                              capture_output=True, text=True,
+                              check=True).stdout.strip()
+        index_gitlink = subprocess.run(
+            ["git", "rev-parse", "HEAD:thirdparty_libs/latency_sim"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        sub_checkout = subprocess.run(
+            ["git", "-C", "thirdparty_libs/latency_sim", "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        sub_status_raw = subprocess.run(
+            ["git", "submodule", "status", "thirdparty_libs/latency_sim"],
+            capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    sub_status = sub_status_raw.strip()
+    status_parts = sub_status.split()
+    prefix = sub_status_raw[0] if sub_status_raw else "?"
+    status_sha = status_parts[0] if status_parts else ""
+    sub_clean = git_repo_clean("thirdparty_libs/latency_sim")
+    source_state = "unknown"
+    try:
+        out = subprocess.run(
+            ["bash", "-c",
+             'source "$1/scripts/tigonkv_build_helpers.sh"; '
+             'tigonkv_source_state "$1"', "_",
+             os.getcwd()],
+            capture_output=True, text=True, check=True)
+        source_state = out.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        pass
+    return {
+        "parent_head": head,
+        "index_gitlink": index_gitlink,
+        "submodule_checkout": sub_checkout,
+        "submodule_status_prefix": prefix,
+        "submodule_status_sha": status_sha,
+        "submodule_clean": sub_clean,
+        "parent_clean": git_repo_clean("."),
+        "source_state": source_state,
+    }
+
+
+def provenance_ok(prov):
+    if prov is None:
+        return False
+    if not prov["parent_clean"]:
+        print("FAIL: parent repo has tracked/staged/untracked changes; "
+              "benchmarks must run from a clean final commit")
+        return False
+    if not prov["submodule_clean"]:
+        print("FAIL: latency_sim submodule checkout is dirty")
+        return False
+    if prov["submodule_status_prefix"] != " ":
+        print("FAIL: latency_sim submodule status prefix is '" +
+              prov["submodule_status_prefix"] + "' (expected clean ' ')")
+        return False
+    if prov["index_gitlink"] != prov["submodule_checkout"]:
+        print("FAIL: index gitlink " + prov["index_gitlink"] +
+              " != submodule checkout " + prov["submodule_checkout"])
+        return False
+    if prov["submodule_status_sha"] != prov["submodule_checkout"]:
+        print("FAIL: submodule status sha " + prov["submodule_status_sha"] +
+              " != submodule checkout " + prov["submodule_checkout"])
+        return False
+    return True
+
+
+def find_cmake_cache(binary):
+    path = os.path.abspath(binary)
+    while True:
+        cache = os.path.join(path, "CMakeCache.txt")
+        if os.path.exists(cache):
+            return cache
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+def read_cache_value(cache, key):
+    try:
+        with open(cache, "r") as f:
+            for line in f:
+                if line.startswith(key + ":"):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def variant_cache(binary, expect_compile_off):
+    """Records compiler/build type/LTO/compile-off cache values and verifies
+    the compile-off flag matches the binary variant."""
+    cache = find_cmake_cache(binary)
+    if cache is None:
+        print("FAIL: cannot locate CMakeCache.txt for " + binary)
+        return None
+    compile_off = read_cache_value(cache, "LATENCY_SIM_COMPILE_OFF")
+    if compile_off is None:
+        compile_off = "OFF"
+    expect = "ON" if expect_compile_off else "OFF"
+    if compile_off != expect:
+        print("FAIL: " + cache + " LATENCY_SIM_COMPILE_OFF=" + compile_off +
+              " but the binary is the " + expect + " variant")
+        return None
+    return {
+        "cache": cache,
+        "cmake_build_type": read_cache_value(cache, "CMAKE_BUILD_TYPE"),
+        "cxx_compiler": read_cache_value(cache, "CMAKE_CXX_COMPILER"),
+        "latency_sim_enable_lto": read_cache_value(
+            cache, "LATENCY_SIM_ENABLE_LTO"),
+        "latency_sim_compile_off": compile_off,
+    }
 
 
 def run_once(binary, cpu):
@@ -132,11 +252,25 @@ def main():
 
     if args.samples < 5:
         parser.error("--samples must be at least 5")
+    prov = provenance()
+    if not provenance_ok(prov):
+        print("FAIL: provenance preconditions not met")
+        return 1
+    on_cache = variant_cache(args.on, expect_compile_off=False)
+    off_cache = variant_cache(args.off, expect_compile_off=True)
+    if on_cache is None or off_cache is None:
+        print("FAIL: benchmark variant cache preconditions not met")
+        return 1
+
     report = {
         "command": " ".join(sys.argv),
         "cpu": args.cpu,
         "commit": git_rev(),
-        "latency_sim_gitlink": git_submodule_sha(),
+        "provenance": prov,
+        "variant_caches": {
+            "compile_on": on_cache,
+            "compile_off": off_cache,
+        },
         "binaries": {
             "compile_on": {"path": args.on, "sha256": sha256_of(args.on)},
             "compile_off": {"path": args.off, "sha256": sha256_of(args.off)},

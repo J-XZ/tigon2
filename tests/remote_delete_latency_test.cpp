@@ -10,9 +10,12 @@
 // counts deterministic.  Row state (write lock, valid flag, ref count) is
 // asserted restored on the rollback path.
 #include "common/CXLMemory.h"
+#include "common/Message.h"
 #include "kv/engine/kv_partition.h"
+#include "kv/engine/kv_types_layout.h"
 #include "kv/engine/mem_access.h"
 #include "kv/engine/region_allocator.h"
+#include "protocol/TwoPLPasha/TwoPLPashaMessage.h"
 #include "protocol/TwoPLPasha/TwoPLPashaHelper.h"
 
 // The rollback test drives PrepareRemoteDelete/AbortRemoteDelete through a
@@ -74,6 +77,17 @@ std::size_t RequesterSettlements() {
   for (const auto &entry : g_settlements)
     if (entry.first == g_requester_thread) ++count;
   return count;
+}
+
+// Last settlement recorded on the requester thread.  The inbound demuxer
+// thread legitimately appends its own per-iteration settlements, so the
+// global back of the list is not stable.
+std::uint64_t LastRequesterSettlementNs() {
+  std::lock_guard<std::mutex> lock(g_settlements_mutex);
+  std::uint64_t last = 0;
+  for (const auto &entry : g_settlements)
+    if (entry.first == g_requester_thread) last = entry.second;
+  return last;
 }
 
 void ClearSettlements() {
@@ -187,13 +201,36 @@ class OwnerPeer {
   }
 
   ~OwnerPeer() {
-    close(stop_pipe_[1]);
+    if (stop_pipe_[1] >= 0) {
+      close(stop_pipe_[1]);
+      stop_pipe_[1] = -1;
+    }
+    JoinIfRunning();
+  }
+
+  // Stops the owner's polling loop and joins it.  After this the owner never
+  // acks anything, so a requester operation that still awaits must resolve
+  // through an injected response or the control-plane timeout.
+  void StopAndJoin() {
+    if (stop_pipe_[1] >= 0) {
+      close(stop_pipe_[1]);
+      stop_pipe_[1] = -1;
+    }
     int status = 0;
     assert(waitpid(child_, &status, 0) == child_);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    child_ = -1;
   }
 
  private:
+  void JoinIfRunning() {
+    if (child_ > 0) {
+      int status = 0;
+      assert(waitpid(child_, &status, 0) == child_);
+      assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+      child_ = -1;
+    }
+  }
   int stop_pipe_[2];
   pid_t child_;
 };
@@ -212,9 +249,12 @@ int main() {
   close(fd);
   const std::string path(path_template);
   const auto config = ConfigFor(path);
-  OwnerPeer peer(config);
 
   {
+    // The owner peer is scoped with its requester engine: once this block
+    // ends the owner is joined, so later blocks can never receive a real
+    // owner ack (the Busy/timeout tests rely on that).
+    OwnerPeer peer(config);
     auto engine = tigonkv::engine::KVEngine::Open(config, true);
     const std::string remote_key = OwnerKey(kOwner, 0);
     {
@@ -262,11 +302,7 @@ int main() {
     // settle their own normal-mode budgets on the same thread, so only the
     // last settlement carries the merged deferred budget.
     assert(RequesterSettlements() >= 1);
-    {
-      std::lock_guard<std::mutex> lock(g_settlements_mutex);
-      const auto last = g_settlements.back();
-      assert(last.first == g_requester_thread && last.second > 0);
-    }
+    assert(LastRequesterSettlementNs() > 0);
     ClearSettlements();
 
     // 2. Rollback path: prepare the delete of a second remote row and abort
@@ -315,6 +351,123 @@ int main() {
       assert(restored.status.ok() &&
              restored.value == FixedValue("rollback-me"));
     }
+    engine->ReleaseWorker();
+  }
+  {
+    // Owner Busy / error ack: the owner responds Busy (or a dispatch error is
+    // surfaced as a non-ok result), the delete rolls the row back, the lock is
+    // released, the valid flag is restored and the budgets settle exactly
+    // once at the facade exit.  A real polling owner acks the seeds, then
+    // stops polling so no real delete ack can race the injected Busy response
+    // (or the timeout below).
+    auto config_busy = config;
+    config_busy.transport_response_timeout_ms = 300;
+    OwnerPeer busy_peer(config_busy);
+    auto engine = tigonkv::engine::KVEngine::Open(config_busy, true);
+    const std::string busy_key = OwnerKey(kOwner, 8192);
+    const std::string timeout_key = OwnerKey(kOwner, 12288);
+    {
+      tigonkv::engine::mem_access::LatencyScope facade(
+          latency_sim::ExecutionClass::kForeground);
+      engine->BindWorker(0);
+      assert(engine->Put(busy_key, FixedValue("busy-me")).ok());
+      assert(engine->Put(timeout_key, FixedValue("timeout-me")).ok());
+    }
+    busy_peer.StopAndJoin();
+    {
+      tigonkv::engine::mem_access::LatencyScope facade(
+          latency_sim::ExecutionClass::kForeground);
+      {
+        std::lock_guard<std::mutex> lock(g_settlements_mutex);
+        g_settlements.clear();
+      }
+      auto *mailbox = engine->worker_mailboxes_[0].get();
+      // Inject a Busy owner response while the delete is awaiting.
+      std::thread responder([&] {
+        while (mailbox->operation.expected_response_type == 0)
+          std::this_thread::yield();
+        auto message = std::make_unique<star::Message>();
+        message->set_source_node_id(kOwner);
+        message->set_dest_node_id(kRequester);
+        star::TwoPLPashaMessageHandler::append_remote_delete_response(
+            *message, tigonkv::engine::kSingleTableId,
+            mailbox->operation.partition_id,
+            star::RemoteDeleteOutcome::Busy, 0);
+        mailbox->inbox.push(message.release());
+      });
+      const auto status = engine->Delete(busy_key);
+      responder.join();
+      assert(status.code == tigonkv::StatusCode::kBusy);
+      assert(RequesterSettlements() == 0);  // nothing settled inside the critical state
+      ClearSettlements();
+      // The row is restored and readable through the normal path.
+      const auto restored = engine->Get(busy_key);
+      assert(restored.status.ok() &&
+             restored.value == FixedValue("busy-me"));
+    }
+    assert(RequesterSettlements() >= 1);  // merged budget settled at the facade exit
+    assert(LastRequesterSettlementNs() > 0);
+    ClearSettlements();
+
+    // Timeout / lost owner: no ack arrives within the bounded control-plane
+    // deadline, the delete times out and rolls the row back; nothing is left
+    // stranded (lock, valid flag, budgets).
+    {
+      tigonkv::engine::mem_access::LatencyScope facade(
+          latency_sim::ExecutionClass::kForeground);
+      {
+        std::lock_guard<std::mutex> lock(g_settlements_mutex);
+        g_settlements.clear();
+      }
+      const auto status = engine->Delete(timeout_key);
+      assert(status.code == tigonkv::StatusCode::kTimeout);
+      const auto restored = engine->Get(timeout_key);
+      assert(restored.status.ok() &&
+             restored.value == FixedValue("timeout-me"));
+    }
+    // Transport/dispatch exception inside a deferred poll: the RAII poll
+    // guard must restore the thread scope state even when the poll body
+    // throws, and the merged deferred budget must settle exactly once at the
+    // outermost facade exit (never inside the critical state).
+    {
+      tigonkv::engine::mem_access::LatencyScope facade(
+          latency_sim::ExecutionClass::kForeground);
+      latency_sim::GlobalLatencySimulator().ChargeRange(
+          latency_sim::MemoryDomain::kHwcc,
+          latency_sim::AccessKind::kRead,
+          static_cast<const std::byte *>(engine->pool_->base()) +
+              config_busy.hwcc_offset_mb * 1024ull * 1024ull,
+          64);
+      {
+        std::lock_guard<std::mutex> lock(g_settlements_mutex);
+        g_settlements.clear();
+      }
+      {
+        tigonkv::engine::mem_access::ForegroundScopeSuspension
+            suspend_foreground;
+        tigonkv::engine::mem_access::DeferTransportSettlement
+            defer_settlement;
+        try {
+          tigonkv::engine::mem_access::DeferredTransportPollScope poll_scope;
+          throw std::runtime_error("dispatch exception");
+        } catch (const std::runtime_error &) {
+        }
+        // The poll scope destructor restored the suspended state.
+        assert(latency_sim::GlobalLatencySimulator()
+                   .ScopeSuspendedForTest());
+        assert(RequesterSettlements() == 0);
+      }
+      // The foreground suspension destructor restored the active foreground
+      // scope with its original class/depth.
+      assert(latency_sim::GlobalLatencySimulator()
+                 .HasTopLevelScopeForCurrentThread(
+                     latency_sim::ExecutionClass::kForeground));
+      assert(RequesterSettlements() == 0);
+    }
+    // Exactly one settlement at the facade exit, carrying the merged deferred
+    // budget (no loss, no duplication).
+    assert(RequesterSettlements() == 1);
+    assert(LastRequesterSettlementNs() == 1);
     engine->ReleaseWorker();
   }
   UninstallBackend();

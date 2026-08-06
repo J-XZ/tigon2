@@ -8,9 +8,10 @@ trap 'rm -rf "$tmp"' EXIT
 "$root/tigonkv_run_ycsb_experiment.sh" --out-dir "$tmp/out" --record-count 10 --operation-count 10 --rounds 1 --workloads a --sample-stride 16 --prepare-only --skip-trace-gen
 test -s "$tmp/out/configs/experiment_config_ycsb_4vm.jsonc"
 test -s "$tmp/out/run_meta.json"
-python3 - "$tmp/out/configs/experiment_config_ycsb_4vm.jsonc" "$tmp/out/run_meta.json" <<'PY'
+python3 - "$tmp/out/configs/experiment_config_ycsb_4vm.jsonc" "$tmp/out/run_meta.json" "$root" <<'PY'
 import json, sys
 d=json.load(open(sys.argv[1]))
+root=sys.argv[3]
 assert d['shared_memory']['path'] == '/mnt/xz_shared_mem'
 assert d['shared_memory']['numa_node'] == [1]
 assert d['vm']['numa_node'] == [0]
@@ -42,6 +43,9 @@ assert re.fullmatch(r'[0-9a-f]{40}', meta['parent_sha']), meta['parent_sha']
 assert re.fullmatch(r'[0-9a-f]{40}', meta['latency_sim_gitlink']), meta['latency_sim_gitlink']
 assert len(meta['source_state'].split(':')) == 5, meta['source_state']
 assert 'generated_config_sha256' in meta and len(meta['generated_config_sha256']) == 64
+assert meta['reproduce_command'] == (
+    "cmake -S " + repr(root) + " -B " + repr(meta['build_dir']) +
+    " -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF=OFF")
 print('generated ycsb config schema ok')
 PY
 # Ensure VM scripts still derive ports/backing from the generated config.

@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <thread>
 #include <charconv>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
@@ -178,13 +179,6 @@ thread_local uint64_t *TlsWorkerMaxTid = nullptr;
 // a response) must therefore reuse the outer entry rather than manufacture a
 // second operation boundary.
 thread_local uint32_t TlsEbrOperationDepth = 0;
-
-// While non-zero, PollTransport defers its background settlement instead of
-// busy-waiting: the caller is inside a row-level critical state (remote
-// delete with the row write_locked and valid cleared), so the accumulated
-// transport budget must settle only at the outermost scope exit, after the
-// commit/rollback releases the lock and the SCC guards.
-thread_local int TlsDeferTransportSettlementDepth = 0;
 
 class EbrOperationScope {
  public:
@@ -881,14 +875,14 @@ Status KVEngine::Delete(std::string_view key) {
     // budget, and every transport poll defers its settlement into the same
     // deferred segment, so everything settles exactly once at the outermost
     // scope exit, after the lock and SCC guards are released.  Cooperative
-    // transport processing itself is unchanged.
-    ++TlsDeferTransportSettlementDepth;
+    // transport processing itself is unchanged.  The RAII guard releases the
+    // defer mode on every return, including exceptions from Forward.
+    mem_access::DeferTransportSettlement defer_settlement;
     Status deleted;
     try {
       deleted = Forward(star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST, key, {}, route.partition_id,
                         route.owner);
     } catch (...) {
-      --TlsDeferTransportSettlementDepth;
       // Exception safety: restore the row so the lock is never stranded, then
       // unwind; the deferred budgets settle at the outermost scope exit.
       try {
@@ -897,7 +891,6 @@ Status KVEngine::Delete(std::string_view key) {
       }
       throw;
     }
-    --TlsDeferTransportSettlementDepth;
     // A successful owner callback consumes the requester write/ref pin with
     // the retired row.  On an unsuccessful ack it is still live and must be
     // restored before the facade retries.
@@ -1467,9 +1460,21 @@ Status KVEngine::RequestMigrate(std::string_view key) {
 }
 
 Status KVEngine::AwaitResponse(WorkerMailbox &mailbox) {
+  // Bounded cooperative wait: a lost owner (crash, partition, disconnect)
+  // must surface as a timeout so the remote operation can roll back its
+  // intermediate row state instead of busy-looping forever.
+  const auto deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(config_.transport_response_timeout_ms);
   while (!mailbox.operation.done) {
     PollTransport();
-    if (!mailbox.operation.done) std::this_thread::yield();
+    if (mailbox.operation.done) break;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      mailbox.operation = {};
+      return Status::Error(StatusCode::kTimeout,
+                           "transport response timeout");
+    }
+    std::this_thread::yield();
   }
   const Status result = mailbox.operation.result;
   mailbox.operation = {};
@@ -1567,45 +1572,15 @@ void KVEngine::PollTransport() {
   // been destroyed.  The suspension then restores the foreground scope.
   mem_access::ForegroundScopeSuspension suspend_foreground;
 #if !defined(LATENCY_SIM_COMPILE_OFF)
-  if (TlsDeferTransportSettlementDepth > 0) {
-    // Deferred mode (remote delete critical state): route the poll's budget
-    // into the single deferred segment instead of settling, so no busy-wait
-    // happens while the caller still holds the row's write lock / invalid
-    // state; the merged deferred budget settles exactly once at the outermost
-    // scope exit, after the delete commit/rollback released the lock and the
-    // SCC guards.  The latency_sim model has one suspension slot per thread:
-    //   - already suspended (the cooperative foreground wait): resume it as a
-    //     background-class scope, poll, suspend again;
-    //   - an active top-level scope of any class (e.g. a background facade):
-    //     suspend it first, run the poll, suspend, then restore the original
-    //     class, so the enclosing scope settles the deferred budget at its
-    //     own (safe) exit.
-    auto &simulator = latency_sim::GlobalLatencySimulator();
-    auto &state = latency_sim::detail::g_thread_state;
-    const bool was_suspended = simulator.ScopeSuspendedForTest();
-    if (!was_suspended) {
-      if (state.scope_depth == 0 ||
-          !simulator.SuspendScopeAndDelayLater()) {
-        // No suspendable enclosing scope: run the poll in a plain nested
-        // background scope (unreachable for the delete path, which charges
-        // its prepare work in an enclosing scope before the critical state).
-        latency_sim::ScopeGuard background_scope(
-            latency_sim::ExecutionClass::kBackground);
-        PollTransportImpl();
-        return;
-      }
-    }
-    const auto outer_class = state.scope_class;
-    simulator.ResumeScope(latency_sim::ExecutionClass::kBackground);
-    PollTransportImpl();
-    if (!simulator.SuspendScopeAndDelayLater())
-      TransportFatal(config_.node_id, "poll_defer",
-                     "deferred transport poll has no suspendable scope");
-    if (!was_suspended) {
-      simulator.ResumeScope(outer_class);
-    }
-    return;
-  }
+  // Deferred mode (remote delete critical state): the RAII guard routes the
+  // poll's budget into the single deferred segment instead of settling, so no
+  // busy-wait happens while the caller still holds the row's write lock /
+  // invalid state; the merged deferred budget settles exactly once at the
+  // outermost scope exit, after the delete commit/rollback released the lock
+  // and the SCC guards.  The guard is exception-safe: a throwing poll body
+  // still restores the thread's scope state before the exception propagates
+  // to the delete rollback path.
+  mem_access::DeferredTransportPollScope deferred_poll;
 #endif
   latency_sim::ScopeGuard background_scope(
       latency_sim::ExecutionClass::kBackground);
