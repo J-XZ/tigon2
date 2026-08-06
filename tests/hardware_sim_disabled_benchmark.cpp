@@ -1,25 +1,34 @@
-// Fixed-latency overhead benchmark for the real TigonKV adapters, run as two
+// Fixed-latency overhead benchmark for the real TigonKV paths, run as two
 // independent binaries selected by the build (no runtime mode argument):
 //   compile-on + 0ns   (default build)   prints variant=compile_on_zero
 //   compile-off        (LATENCY_SIM_COMPILE_OFF=ON)   prints variant=compile_off
 //
-// Every case drives the actual project call site (B+Tree domain/atomic
-// helper, the real RegionAllocator metadata adapter, transport and
-// shared-payload bulk), not a stand-in helper, so the measured subject is the
-// code the engine really runs.  All measured addresses lie inside the two
-// registered pool ranges (one HWCC + one SWCC) and the wrapped loops run
-// inside an explicit mem_access::LatencyScope.  The primary comparison is the
-// same wrapped code under a 0/0 fixed-latency model (compile-on) versus the
-// raw compile-off build; a raw (unwrapped) baseline on the same addresses is
-// also reported for the cases that have one.  In a compile-on build the
-// simulator is always active once configured, so the wrapped path is the only
-// runtime variant (compile-off wrappers compile to the raw operations).
+// Every case drives the actual project call site on addresses inside the two
+// registered pool ranges of a real in-process KVEngine mapping: typed/atomic,
+// the B+Tree domain/atomic adapters, a live RegionAllocator, a REAL
+// MPSCRingBuffer construction/enqueue/dequeue, the REAL TwoPLPasha SCC
+// write-through bulk (64B/256B over the SWCC shared payload) and the real
+// short KV Put/Get/Delete/Scan facade.  The primary comparison is the same
+// wrapped code under a 0/0 fixed-latency model (compile-on) versus the raw
+// compile-off build.  In a compile-on build the simulator is always active
+// once configured, so the wrapped path is the only runtime variant.
 #include <latency_sim/config.h>
 #include <latency_sim/simulator.h>
+#include "common/CXLMemory.h"
+#include "common/MPSCRingBuffer.h"
+#include "kv/engine/kv_partition.h"
 #include "kv/engine/mem_access.h"
 #include "kv/engine/region_allocator.h"
 #include "common/btree_olc_cxl/BTreeOLC_CXL.h"
+#include "protocol/TwoPLPasha/TwoPLPashaHelper.h"
 #include "tests/latency_test_support.h"
+
+// The benchmark needs the engine's mapped pool base to re-register its ranges
+// while the KV cases run (the component cases register the benchmark pool's
+// ranges); the pool handle is private, so access is relaxed for this TU only.
+#define private public
+#include "kv/engine/kv_engine.h"
+#undef private
 
 #include <algorithm>
 #include <array>
@@ -31,29 +40,273 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <sched.h>
+#include <string>
 #include <string_view>
-#include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 
 namespace {
 
 constexpr uint64_t kIterations = 200'000;
+constexpr uint64_t kKvIterations = 2'000;
 constexpr size_t kSamples = 9;
-constexpr size_t kPoolBytes = 8 * 1024 * 1024;
-constexpr size_t kAllocRegionBytes = 4 * 1024 * 1024;
+constexpr uint32_t kFixedKeySize = 32;
+constexpr uint32_t kFixedValueSize = 32;
+constexpr uint64_t kEntryStructSize = 64;
+constexpr uint64_t kRingEntries = 8;
 
-// The registered HWCC/SWCC pool buffers.  Every measured address comes from
-// one of these two ranges.
-std::byte *g_hwcc = nullptr;
-std::byte *g_swcc = nullptr;
+tigonkv::engine::DualRegionConfig MakePoolConfig(uint64_t bytes) {
+  tigonkv::engine::DualRegionConfig config;
+  config.total_pool_bytes = bytes;
+  config.hwcc_size_bytes = 32 * 1024 * 1024;
+  config.swcc_offset_bytes = config.hwcc_size_bytes;
+  config.swcc_size_bytes = bytes - config.swcc_offset_bytes;
+  config.config_hash = 0xabcd;
+  config.vm_count = 1;
+  config.partition_count = 8;
+  config.fixed_key_size = kFixedKeySize;
+  config.fixed_value_size = kFixedValueSize;
+  return config;
+}
 
-using Runner = uint64_t (*)(bool wrapped);
+tigonkv::Config MakeEngineConfig(const std::string &path) {
+  tigonkv::Config config;
+  config.shared_memory_path = path;
+  config.size_mb = 64;
+  config.hwcc_offset_mb = 0;
+  config.hwcc_size_mb = 32;
+  config.swcc_offset_mb = 32;
+  config.swcc_size_mb = 32;
+  config.hw_cc_budget_mb = 32;
+  config.vm_count = 1;
+  config.node_id = 0;
+  config.partition_count = 8;
+  config.fixed_key_size = kFixedKeySize;
+  config.fixed_value_size = kFixedValueSize;
+  config.foreground_worker_count_per_vm = 1;
+  config.transport_ring_total_mb = 1;
+  config.partition_ranges.clear();
+  std::string lower;
+  for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
+    std::string upper;
+    if (partition + 1 != config.partition_count)
+      upper.assign(1, static_cast<char>((partition + 1) * 256 /
+                                        config.partition_count));
+    config.partition_ranges.push_back({lower, upper});
+    lower = std::move(upper);
+  }
+  config.Validate();
+  return config;
+}
 
-// Ordinary HwccRead/HwccWrite: one 8-byte slot touched on a covered HWCC line.
-uint64_t RunOrdinary(bool wrapped) {
-  auto *values = reinterpret_cast<uint64_t *>(g_hwcc);
+std::string BenchKey(uint64_t i) {
+  char text[32];
+  const int count = std::snprintf(text, sizeof(text), "bk%08llu",
+                                  static_cast<unsigned long long>(i));
+  std::string fixed(text, static_cast<size_t>(count));
+  fixed.resize(kFixedKeySize, ' ');
+  return fixed;
+}
+
+std::string BenchValue(std::string_view text) {
+  std::string value(text);
+  value.resize(kFixedValueSize, ' ');
+  return value;
+}
+
+// The real production allocation entry point used by the engine itself
+// (TRANSPORT/METADATA/DATA map to kTransport/kHwccMetadata/kSharedPayloadSwcc).
+void *BenchAlloc(uint64_t bytes, int category) {
+  return star::cxl_memory.cxlalloc_malloc_wrapper(bytes, category);
+}
+
+// Two real mappings: a benchmark pool (whose static layout is never
+// finalized, so TRANSPORT-domain allocations stay legal) that owns every
+// component-case buffer, and a vm_count=1 KVEngine over a separate backing
+// file that owns the short KV facade cases.  The engine's Open registers its
+// own ranges and installs the real SCC manager.  Each case runs with exactly
+// the ranges of the pool it touches registered (the latency_sim contract has
+// one registered range per domain).
+class BenchmarkEngine {
+ public:
+  BenchmarkEngine() {
+    char bench_template[] = "/tmp/tigonkv-bench-pool-XXXXXX";
+    int fd = mkstemp(bench_template);
+    assert(fd >= 0);
+    close(fd);
+    bench_path_ = bench_template;
+    char engine_template[] = "/tmp/tigonkv-bench-engine-XXXXXX";
+    fd = mkstemp(engine_template);
+    assert(fd >= 0);
+    close(fd);
+    engine_path_ = engine_template;
+
+    // The benchmark pool Open registers its own ranges (0/0) and runs its
+    // init inside its own scope.  Then bind its allocator and allocate every
+    // component buffer (including the transport-domain ring) inside the
+    // registered HWCC/SWCC ranges, under an explicit scope.
+    bench_pool_ = std::make_unique<tigonkv::engine::DualRegionMappedPool>(
+        tigonkv::engine::DualRegionMappedPool::Open(
+            bench_path_, MakePoolConfig(64ull << 20), true));
+    {
+      tigonkv::engine::mem_access::LatencyScope scope(
+          latency_sim::ExecutionClass::kBackground);
+      star::CXLMemory::bind_dual_region_allocator(&bench_pool_->allocator(), 0);
+      AllocateComponentBuffers();
+      star::CXLMemory::clear_dual_region_allocator();
+    }
+    // The engine open clears and re-registers its own ranges, initializes
+    // the owner's shared-payload (SWCC) allocator and installs the real SCC
+    // manager.  The SCC smeta/payload buffers must come from THIS allocator
+    // (the shared SWCC allocator is only initialized by the owner).
+    engine_ = tigonkv::engine::KVEngine::Open(MakeEngineConfig(engine_path_),
+                                              true);
+    engine_->BindWorker(0);
+    engine_pool_ = engine_->pool_.get();
+    engine_allocator_ = &engine_pool_->allocator();
+    {
+      tigonkv::engine::mem_access::LatencyScope scope(
+          latency_sim::ExecutionClass::kBackground);
+      star::CXLMemory::bind_dual_region_allocator(engine_allocator_, 0);
+      scc_payload_ = new (BenchAlloc(4096, star::CXLMemory::DATA_ALLOCATION))
+          star::TwoPLPashaSharedDataSCC;
+      scc_smeta_ = new (BenchAlloc(sizeof(star::TwoPLPashaMetadataShared),
+                                   star::CXLMemory::METADATA_ALLOCATION))
+          star::TwoPLPashaMetadataShared(scc_payload_);
+      star::CXLMemory::clear_dual_region_allocator();
+    }
+  }
+
+  ~BenchmarkEngine() {
+    engine_->ReleaseWorker();
+    engine_->Shutdown();
+    unlink(bench_path_.c_str());
+    unlink(engine_path_.c_str());
+  }
+
+  tigonkv::engine::KVEngine &engine() { return *engine_; }
+
+  // Switch the registered ranges and the allocator binding to the pool the
+  // next case touches.  Quiescent: no scope is active across the switch.  The
+  // engine's inbound demuxer thread continuously charges the engine's ring,
+  // so it is stopped while the component cases register the benchmark pool's
+  // ranges and restarted when the engine pools are re-registered.
+  void UseComponentPools() {
+    engine_->StopInboundDemuxer();
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    auto &sim = latency_sim::GlobalLatencySimulator();
+    sim.ClearPoolRegistrations();
+    RegisterRanges(sim, bench_pool_->base(), bench_pool_config_);
+#endif
+    star::CXLMemory::bind_dual_region_allocator(&bench_pool_->allocator(), 0);
+  }
+
+  void UseEnginePools() {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    auto &sim = latency_sim::GlobalLatencySimulator();
+    sim.ClearPoolRegistrations();
+    RegisterRanges(sim, engine_pool_->base(), engine_pool_config_);
+#endif
+    star::CXLMemory::bind_dual_region_allocator(engine_allocator_, 0);
+    engine_->StartInboundDemuxer();
+  }
+
+  uint64_t *typed_values() const { return typed_values_; }
+  void *atomic_storage() const { return atomic_storage_; }
+  uint64_t *btree_nodes() const { return btree_nodes_; }
+  void *btree_counter_storage() const { return btree_counter_storage_; }
+  void *allocator_region() const { return allocator_region_; }
+  tigonkv::engine::DomainCounter *allocator_counter() const {
+    return allocator_counter_;
+  }
+  void *ring_storage() const { return ring_storage_; }
+  void *ring_construct_storage() const { return ring_construct_storage_; }
+  star::TwoPLPashaSharedDataSCC *scc_payload() const { return scc_payload_; }
+  star::TwoPLPashaMetadataShared *scc_smeta() const { return scc_smeta_; }
+
+ private:
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+  static void RegisterRanges(
+      latency_sim::LatencySimulator &sim, void *base,
+      const tigonkv::engine::DualRegionConfig &config) {
+    sim.RegisterPool(latency_sim::MemoryDomain::kHwcc,
+                     static_cast<const std::byte *>(base) +
+                         config.hwcc_offset_bytes,
+                     config.hwcc_size_bytes);
+    sim.RegisterPool(latency_sim::MemoryDomain::kSwcc,
+                     static_cast<const std::byte *>(base) +
+                         config.swcc_offset_bytes,
+                     config.swcc_size_bytes);
+    latency_sim::FixedLatencyConfig zero;
+    zero.cache_line_bytes = 64;
+    zero.swcc_fixed_ns_per_line = 0.0;
+    zero.hwcc_fixed_ns_per_line = 0.0;
+    sim.Configure(zero);
+  }
+#endif
+
+  void AllocateComponentBuffers() {
+    // All buffers below are allocated through the real allocator while the
+    // benchmark pool's ranges are registered and an explicit scope is active.
+    typed_values_ = static_cast<uint64_t *>(BenchAlloc(
+        4096, star::CXLMemory::TRANSPORT_ALLOCATION));
+    atomic_storage_ = BenchAlloc(64, star::CXLMemory::TRANSPORT_ALLOCATION);
+    btree_nodes_ = static_cast<uint64_t *>(BenchAlloc(
+        4096, star::CXLMemory::TRANSPORT_ALLOCATION));
+    btree_counter_storage_ =
+        BenchAlloc(64, star::CXLMemory::TRANSPORT_ALLOCATION);
+    allocator_region_ = BenchAlloc(
+        kIterations / 8 * 128, star::CXLMemory::TRANSPORT_ALLOCATION);
+    allocator_counter_ = static_cast<tigonkv::engine::DomainCounter *>(
+        BenchAlloc(sizeof(tigonkv::engine::DomainCounter),
+                   star::CXLMemory::TRANSPORT_ALLOCATION));
+    ring_storage_ = BenchAlloc(sizeof(star::MPSCRingBuffer),
+                               star::CXLMemory::TRANSPORT_ALLOCATION);
+    ring_construct_storage_ =
+        BenchAlloc(sizeof(star::MPSCRingBuffer),
+                   star::CXLMemory::TRANSPORT_ALLOCATION);
+  }
+
+  std::string bench_path_;
+  std::string engine_path_;
+  std::unique_ptr<tigonkv::engine::DualRegionMappedPool> bench_pool_;
+  tigonkv::engine::DualRegionConfig bench_pool_config_ = MakePoolConfig(64ull << 20);
+  tigonkv::engine::DualRegionConfig engine_pool_config_ = [] {
+    tigonkv::engine::DualRegionConfig config;
+    config.total_pool_bytes = 64ull << 20;
+    config.hwcc_size_bytes = 32ull << 20;
+    config.swcc_offset_bytes = 32ull << 20;
+    config.swcc_size_bytes = 32ull << 20;
+    config.config_hash = 0xabcd;
+    config.vm_count = 1;
+    config.partition_count = 8;
+    config.fixed_key_size = kFixedKeySize;
+    config.fixed_value_size = kFixedValueSize;
+    return config;
+  }();
+  std::unique_ptr<tigonkv::engine::KVEngine> engine_;
+  tigonkv::engine::DualRegionMappedPool *engine_pool_ = nullptr;
+  tigonkv::engine::DualRegionAllocator *engine_allocator_ = nullptr;
+
+  uint64_t *typed_values_ = nullptr;
+  void *atomic_storage_ = nullptr;
+  uint64_t *btree_nodes_ = nullptr;
+  void *btree_counter_storage_ = nullptr;
+  void *allocator_region_ = nullptr;
+  tigonkv::engine::DomainCounter *allocator_counter_ = nullptr;
+  void *ring_storage_ = nullptr;
+  void *ring_construct_storage_ = nullptr;
+  star::TwoPLPashaSharedDataSCC *scc_payload_ = nullptr;
+  star::TwoPLPashaMetadataShared *scc_smeta_ = nullptr;
+};
+
+using Runner = uint64_t (*)(bool wrapped, BenchmarkEngine &bench);
+
+// Ordinary HwccRead/HwccWrite on a real allocator-owned HWCC slot.
+uint64_t RunOrdinary(bool wrapped, BenchmarkEngine &bench) {
+  auto *values = bench.typed_values();
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
     auto &value = values[i & 255u];
@@ -67,9 +320,9 @@ uint64_t RunOrdinary(bool wrapped) {
   return checksum ^ values[0];
 }
 
-// Atomic fetch/load on a real std::atomic inside the HWCC pool.
-uint64_t RunAtomic(bool wrapped) {
-  auto *value = new (g_hwcc) std::atomic<uint64_t>{0};
+// Atomic fetch/load on a real std::atomic inside the HWCC range.
+uint64_t RunAtomic(bool wrapped, BenchmarkEngine &bench) {
+  auto *value = new (bench.atomic_storage()) std::atomic<uint64_t>{0};
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
     checksum += wrapped
@@ -87,12 +340,11 @@ uint64_t RunAtomic(bool wrapped) {
 }
 
 // Real B+Tree domain/atomic adapters (btreeolc_cxl::RecordTreeDataRead and
-// TreeAtomicFetchAdd).  TreeAccessIsHwcc defaults to HWCC, and both the node
-// array and the counter live inside the registered HWCC pool.
-uint64_t RunBtreeDomainAdapter(bool wrapped) {
-  auto *nodes = reinterpret_cast<uint64_t *>(g_hwcc);
+// TreeAtomicFetchAdd); the node array and the counter live in HWCC.
+uint64_t RunBtreeDomainAdapter(bool wrapped, BenchmarkEngine &bench) {
+  auto *nodes = bench.btree_nodes();
   auto *counter =
-      new (g_hwcc + 4096) std::atomic<uint64_t>{0};
+      new (bench.btree_counter_storage()) std::atomic<uint64_t>{0};
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
     auto &node = nodes[(i * 17) & 255u];
@@ -108,17 +360,13 @@ uint64_t RunBtreeDomainAdapter(bool wrapped) {
   return checksum;
 }
 
-// The REAL RegionAllocator path: a live RegionAllocator constructed over the
-// HWCC pool (control_is_hwcc=true) drives its private
-// RecordMetadata{Read,Write} / RecordBlockMetadata{Read,Write} adapters and
-// real Allocate/Free.  This path always wraps; there is no raw variant.
-uint64_t RunAllocator(bool wrapped) {
+// The REAL RegionAllocator path over a HWCC-owned region.
+uint64_t RunAllocator(bool wrapped, BenchmarkEngine &bench) {
   (void)wrapped;
-  auto *region = g_hwcc;
-  auto *counter = new (g_hwcc + kAllocRegionBytes)
-      tigonkv::engine::DomainCounter;
+  auto *region = bench.allocator_region();
+  auto *counter = bench.allocator_counter();
   auto allocator = tigonkv::engine::RegionAllocator::Initialize(
-      region, kAllocRegionBytes, 2, 0, /*control_is_hwcc=*/true,
+      region, kIterations / 8 * 128, 2, 0, /*control_is_hwcc=*/true,
       /*block_is_hwcc=*/true);
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
@@ -133,33 +381,78 @@ uint64_t RunAllocator(bool wrapped) {
   return checksum;
 }
 
-// Transport adapter: TransportRead/Write route to HwccRead/HwccWrite.
-uint64_t RunTransportAdapter(bool wrapped) {
-  auto *ring = reinterpret_cast<uint64_t *>(g_hwcc);
+// The REAL MPSC transport ring: a live MPSCRingBuffer constructed in the
+// registered HWCC range; every enqueue/dequeue runs the real reservation,
+// ready and head/tail/count protocol.
+uint64_t RunRingEnqueueDequeue(bool wrapped, BenchmarkEngine &bench) {
+  (void)wrapped;
+  star::MPSCRingBuffer *ring =
+      new (bench.ring_storage()) star::MPSCRingBuffer(kEntryStructSize,
+                                                      kRingEntries);
+  char payload[] = "ring";
+  char output[256]{};
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
-    auto &slot = ring[(i * 7) & 127u];
-    if (wrapped)
-      tigonkv::engine::mem_access::TransportRead(&slot, sizeof(slot));
-    const uint64_t message = slot + i;
-    if (wrapped)
-      tigonkv::engine::mem_access::TransportWrite(&slot, sizeof(slot));
-    slot = message;
-    checksum += message;
+    assert(ring->enqueue(payload, sizeof(payload)));
+    checksum += ring->dequeue(output, sizeof(output));
+  }
+  assert(std::memcmp(output, payload, sizeof(payload)) == 0);
+  return checksum;
+}
+
+// The REAL MPSC ring construction path (allocation + header/entry init).
+uint64_t RunRingConstruct(bool wrapped, BenchmarkEngine &bench) {
+  (void)wrapped;
+  auto *ring = new (bench.ring_construct_storage())
+      star::MPSCRingBuffer(kEntryStructSize, 4);
+  return ring->get_entry_num() + ring->get_entry_size();
+}
+
+// The REAL TwoPLPasha SCC write-through bulk (64B/256B) over a real smeta
+// and a real SWCC shared payload: SharedPayloadRead/Write charges adjacent to
+// the actual do_read/do_write/finish_write calls, exactly like production.
+uint64_t RunSccBulk(bool wrapped, BenchmarkEngine &bench, uint64_t bytes) {
+  (void)wrapped;
+  auto *payload = bench.scc_payload();
+  auto *smeta = bench.scc_smeta();
+  star::scc_manager->init_scc_metadata(smeta, 0);
+  std::array<char, 256> src{};
+  std::array<char, 256> dst{};
+  uint64_t checksum = 0;
+  for (uint64_t i = 0; i < kIterations; ++i) {
+    src[0] = static_cast<char>(i);
+    tigonkv::engine::mem_access::SharedPayloadWrite(payload->data, bytes);
+    star::scc_manager->do_write(smeta, 0, payload->data, src.data(), bytes);
+    star::scc_manager->finish_write(smeta, 0, payload, bytes);
+    tigonkv::engine::mem_access::SharedPayloadRead(payload->data, bytes);
+    star::scc_manager->do_read(smeta, 0, dst.data(), payload->data, bytes);
+    checksum += dst[0];
   }
   return checksum;
 }
 
-// Shared-payload bulk: SharedPayloadRead covers a 4 KiB SWCC payload block.
-uint64_t RunBulk(bool wrapped) {
-  auto *payload = reinterpret_cast<uint64_t *>(g_swcc);
+uint64_t RunSccBulk64(bool wrapped, BenchmarkEngine &bench) {
+  return RunSccBulk(wrapped, bench, 64);
+}
+
+uint64_t RunSccBulk256(bool wrapped, BenchmarkEngine &bench) {
+  return RunSccBulk(wrapped, bench, 256);
+}
+
+// Real short KV facade: Put/Get/Delete/Scan through the engine.
+uint64_t RunKvOps(bool wrapped, BenchmarkEngine &bench) {
+  (void)wrapped;
   uint64_t checksum = 0;
-  for (uint64_t i = 0; i < kIterations; ++i) {
-    if (wrapped)
-      tigonkv::engine::mem_access::SharedPayloadRead(
-          payload, 512 * sizeof(uint64_t));
-    payload[i & 511u] += i;
-    checksum += payload[(i + 31) & 511u];
+  const std::string end = BenchKey(512);
+  for (uint64_t i = 0; i < kKvIterations; ++i) {
+    const std::string key = BenchKey(i % 512);
+    if (!bench.engine().Put(key, BenchValue("v")).ok()) std::abort();
+    const auto got = bench.engine().Get(key);
+    if (!got.status.ok() || got.value != BenchValue("v")) std::abort();
+    const auto scan = bench.engine().Scan(key, end, 4);
+    if (!scan.status.ok() || scan.items.empty()) std::abort();
+    if (!bench.engine().Delete(key).ok()) std::abort();
+    checksum += got.value[0];
   }
   return checksum;
 }
@@ -178,25 +471,27 @@ Summary Summarize(std::vector<double> values) {
           values[p95_index]};
 }
 
-double Measure(Runner runner, bool wrapped, uint64_t *sink) {
+double Measure(Runner runner, bool wrapped, uint64_t iterations,
+               uint64_t *sink, BenchmarkEngine &bench) {
   const auto begin = std::chrono::steady_clock::now();
   if (wrapped) {
     // The explicit scope is required by the always-active compile-on
     // simulator; in a compile-off build the scope is a no-op.
     tigonkv::engine::mem_access::LatencyScope scope(
         latency_sim::ExecutionClass::kForeground);
-    *sink ^= runner(true);
+    *sink ^= runner(true, bench);
   } else {
-    *sink ^= runner(false);
+    *sink ^= runner(false, bench);
   }
   const auto end = std::chrono::steady_clock::now();
   return static_cast<double>(
              std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
                  .count()) /
-         kIterations;
+         static_cast<double>(iterations);
 }
 
-void Report(std::string_view name, Runner runner, bool has_raw) {
+void Report(std::string_view name, Runner runner, bool has_raw,
+            uint64_t iterations, BenchmarkEngine &bench) {
   std::vector<double> raw;
   std::vector<double> wrapped;
   raw.reserve(kSamples);
@@ -205,8 +500,8 @@ void Report(std::string_view name, Runner runner, bool has_raw) {
   for (size_t sample = 0; sample < kSamples; ++sample) {
     // Interleave raw and wrapped baselines on the same addresses so drift in
     // one half of the process does not become a fake mode comparison.
-    if (has_raw) raw.push_back(Measure(runner, false, &sink));
-    wrapped.push_back(Measure(runner, true, &sink));
+    if (has_raw) raw.push_back(Measure(runner, false, iterations, &sink, bench));
+    wrapped.push_back(Measure(runner, true, iterations, &sink, bench));
   }
   const Summary wrapped_summary = Summarize(wrapped);
   if (has_raw) {
@@ -244,46 +539,27 @@ int main(int argc, char **argv) {
       std::perror("sched_setaffinity");
   }
 
-  void *hwcc_map = mmap(nullptr, kPoolBytes, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  void *swcc_map = mmap(nullptr, kPoolBytes, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  assert(hwcc_map != MAP_FAILED && swcc_map != MAP_FAILED);
-  g_hwcc = static_cast<std::byte *>(hwcc_map);
-  g_swcc = static_cast<std::byte *>(swcc_map);
-  std::memset(g_hwcc, 0, kPoolBytes);
-  std::memset(g_swcc, 0, kPoolBytes);
-
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-  // Compile-on: register exactly one HWCC + one SWCC range and apply the 0/0
-  // fixed-latency model.  Once configured the simulator is always active, so
-  // the wrapped loops below run inside a scope on these same ranges.  The
-  // RAII pools stay registered for the whole measurement.
-  latency_sim::FixedLatencyConfig zero;
-  zero.cache_line_bytes = 64;
-  zero.swcc_fixed_ns_per_line = 0.0;
-  zero.hwcc_fixed_ns_per_line = 0.0;
-  tigonkv::test::ScopedLatencyPools pools(g_swcc, kPoolBytes, g_hwcc,
-                                          kPoolBytes, zero);
-#endif
-
-  std::printf(
-      "variant=%s cpu=%d samples=%zu iterations=%llu\n",
+  std::printf("variant=%s cpu=%d samples=%zu iterations=%llu kv_iterations=%llu\n",
 #if defined(LATENCY_SIM_COMPILE_OFF)
-      "compile_off",
+              "compile_off",
 #else
-      "compile_on_zero",
+              "compile_on_zero",
 #endif
-      cpu, kSamples, static_cast<unsigned long long>(kIterations));
+              cpu, kSamples, static_cast<unsigned long long>(kIterations),
+              static_cast<unsigned long long>(kKvIterations));
 
-  Report("ordinary", RunOrdinary, true);
-  Report("atomic_fetch_load", RunAtomic, true);
-  Report("btree_domain_atomic", RunBtreeDomainAdapter, true);
-  Report("allocator", RunAllocator, false);
-  Report("transport", RunTransportAdapter, true);
-  Report("bulk_shared_payload", RunBulk, true);
-
-  munmap(g_hwcc, kPoolBytes);
-  munmap(g_swcc, kPoolBytes);
+  BenchmarkEngine bench;
+  bench.UseComponentPools();
+  Report("typed_load_store", RunOrdinary, true, kIterations, bench);
+  Report("atomic_cas", RunAtomic, true, kIterations, bench);
+  Report("btree_domain_atomic", RunBtreeDomainAdapter, true, kIterations, bench);
+  Report("allocator", RunAllocator, false, kIterations, bench);
+  Report("ring_enqueue_dequeue", RunRingEnqueueDequeue, false, kIterations,
+         bench);
+  Report("ring_construct", RunRingConstruct, false, 1, bench);
+  bench.UseEnginePools();
+  Report("scc_bulk_64", RunSccBulk64, false, kIterations, bench);
+  Report("scc_bulk_256", RunSccBulk256, false, kIterations, bench);
+  Report("kv_put_get_delete_scan", RunKvOps, false, kKvIterations, bench);
   return 0;
 }

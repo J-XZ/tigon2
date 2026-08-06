@@ -103,6 +103,8 @@ add_executable(cxl_pool_initer tools/cxl_pool_initer.cpp)
 add_executable(hardware_sim_disabled_benchmark
                tests/hardware_sim_disabled_benchmark.cpp)
 target_link_libraries(hardware_sim_disabled_benchmark PRIVATE tigonkv)
+target_compile_options(hardware_sim_disabled_benchmark PRIVATE
+                       -mclflushopt -mclwb)
 
 # Every project-owned C/C++ target receives the mode-consistent optimization
 # and LTO policy (audit list: nothing below may bypass the policy).
