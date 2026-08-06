@@ -39,6 +39,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <sys/wait.h>
 #include <thread>
@@ -486,6 +487,15 @@ int main() {
             star::RemoteDeleteOutcome::Busy, 0, mailbox->operation.target_row,
             mailbox->operation.sequence);
         mailbox->inbox.push(message.release());
+        auto duplicate = std::make_unique<star::Message>();
+        duplicate->set_source_node_id(kOwner);
+        duplicate->set_dest_node_id(kRequester);
+        star::TwoPLPashaMessageHandler::append_remote_delete_response(
+            *duplicate, tigonkv::engine::kSingleTableId,
+            mailbox->operation.partition_id,
+            star::RemoteDeleteOutcome::Busy, 0, mailbox->operation.target_row,
+            mailbox->operation.sequence);
+        mailbox->inbox.push(duplicate.release());
       });
       const auto status = engine->Delete(busy_key);
       responder.join();
@@ -560,6 +570,19 @@ int main() {
     // budget (no loss, no duplication).
     assert(RequesterSettlements() == 1);
     assert(LastRequesterSettlementNs() == 1);
+    // A sequence may be allocated at UINT64_MAX exactly once, but the next
+    // allocation must fail instead of wrapping into a reusable identity.
+    auto *mailbox = engine->worker_mailboxes_[0].get();
+    mailbox->next_operation_sequence = UINT64_MAX;
+    assert(engine->ReserveOperationSequence(*mailbox) == UINT64_MAX);
+    assert(mailbox->next_operation_sequence == 0);
+    bool sequence_exhausted = false;
+    try {
+      (void)engine->ReserveOperationSequence(*mailbox);
+    } catch (const std::overflow_error &) {
+      sequence_exhausted = true;
+    }
+    assert(sequence_exhausted);
     engine->ReleaseWorker();
   }
   UninstallBackend();
