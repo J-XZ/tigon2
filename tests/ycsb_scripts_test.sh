@@ -31,11 +31,12 @@ assert fl['hwcc_fixed_ns_per_line'] == 0
 meta=json.load(open(sys.argv[2]))
 assert meta['partition_sample_stride'] == 16
 assert meta['fixed_latency_nonzero'] is False
-assert meta['fixed_latency'] == {
+expected_fl = {
     'cache_line_bytes': 64,
     'swcc_fixed_ns_per_line': 0,
     'hwcc_fixed_ns_per_line': 0,
 }
+assert meta['fixed_latency'] == expected_fl
 assert meta['latency_sim_compile_off'] == 'OFF'
 assert meta['build_dir'].endswith('/build-relwithdebinfo-ninja-clang18-co_off')
 import re
@@ -43,9 +44,14 @@ assert re.fullmatch(r'[0-9a-f]{40}', meta['parent_sha']), meta['parent_sha']
 assert re.fullmatch(r'[0-9a-f]{40}', meta['latency_sim_gitlink']), meta['latency_sim_gitlink']
 assert len(meta['source_state'].split(':')) == 5, meta['source_state']
 assert 'generated_config_sha256' in meta and len(meta['generated_config_sha256']) == 64
-assert meta['reproduce_command'] == (
-    "cmake -S " + repr(root) + " -B " + repr(meta['build_dir']) +
-    " -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF=OFF")
+reproduce = meta['reproduce_command']
+assert reproduce.startswith('bash ' + repr(root) +
+                            '/tigonkv_run_ycsb_experiment.sh')
+assert '--rounds' in reproduce and '--record-count' in reproduce
+assert '--operation-count' in reproduce and '--threads-per-node' in reproduce
+assert '--workloads' in reproduce and '--shared-size-mb' in reproduce
+assert '--latency-sim-compile-off=OFF' in reproduce
+assert 'cmake -S' not in reproduce
 print('generated ycsb config schema ok')
 PY
 # Ensure VM scripts still derive ports/backing from the generated config.

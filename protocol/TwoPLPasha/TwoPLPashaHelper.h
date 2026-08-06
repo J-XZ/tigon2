@@ -325,6 +325,18 @@ retry:
                 clear_bit(WRITE_LOCK_BIT_OFFSET);
         }
 
+        // True when the requester still holds the write-lock bit (Pending
+        // state of the remote-delete protocol).  Only meaningful under the
+        // smeta latch.  The owner's shared delete step re-checks this bit
+        // under the same latch and clears it as the single linearization
+        // point; the requester's Pending -> Cancelled rollback CASes this bit
+        // away, so exactly one of owner-delete or requester-cancel wins.
+        bool requester_holds_write_lock()
+        {
+                return (load_atomic_word(std::memory_order_acquire) &
+                        (1ull << WRITE_LOCK_BIT_OFFSET)) != 0;
+        }
+
         bool is_data_modified_since_moved_in()
         {
                 return is_bit_set(is_data_modified_since_moved_in_bit_index);
@@ -1462,11 +1474,23 @@ class TwoPLPashaHelper {
                 if (smeta == nullptr || scc_manager == nullptr)
                         throw std::invalid_argument("null remote delete rollback row");
                 smeta->lock();
-                DCHECK(smeta->is_write_locked());
+                // Only the Pending -> Cancelled transition may roll back.
+                // Once the owner claimed (cleared the write-lock bit) or
+                // published Deleted, rolling back would resurrect a row the
+                // owner already deleted (double fact).  That is a hard
+                // protocol error, never a silent restore.
+                if (!smeta->requester_holds_write_lock()) {
+                        smeta->unlock();
+                        throw std::runtime_error(
+                            "remote delete rollback raced owner claim: owner "
+                            "already transitioned Pending -> Executing/Deleted");
+                }
                 auto *payload = smeta->get_scc_data();
                 scc_manager->prepare_read(smeta, host_id, payload,
                                           scc_header_bytes);
                 payload->set_flag(TwoPLPashaSharedDataSCC::valid_flag_index);
+                // Pending -> Cancelled: publish the cancellation by clearing
+                // the write-lock bit with the restored valid flag.
                 smeta->clear_write_locked();
                 scc_manager->finish_write(smeta, host_id, payload,
                                           scc_header_bytes);

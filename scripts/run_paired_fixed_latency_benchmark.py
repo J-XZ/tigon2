@@ -26,6 +26,14 @@ import sys
 
 EXPANSION_SAMPLES = 9
 
+# Exact build attributes every benchmark binary must carry.  The driver
+# refuses to run (and refuses to PASS) when a binary's CMake cache or recorded
+# build meta cannot prove clang-18 + RelWithDebInfo + full LTO + the matching
+# compile mode, or when the binary is stale relative to the current source.
+REQUIRED_CXX_COMPILER = "clang++-18"
+REQUIRED_BUILD_TYPE = "RelWithDebInfo"
+REQUIRED_LTO = "ON"
+
 # compile-on+0ns extra overhead targets (ns/op), relative to compile-off.
 # The SCC and KV cases include real flush/coherence work whose wall time is
 # dominated by the protocol itself; only a stable median regression beyond a
@@ -166,12 +174,17 @@ def read_cache_value(cache, key):
 
 
 def variant_cache(binary, expect_compile_off):
-    """Records compiler/build type/LTO/compile-off cache values and verifies
-    the compile-off flag matches the binary variant."""
+    """Records compiler/build type/LTO/compile-off cache values and enforces
+    the exact production profile (clang-18, RelWithDebInfo, LTO ON) plus the
+    compile-off flag matching the binary variant.  A stale or mismatched
+    binary is rejected instead of being reported as PASS."""
     cache = find_cmake_cache(binary)
     if cache is None:
         print("FAIL: cannot locate CMakeCache.txt for " + binary)
         return None
+    cmake_build_type = read_cache_value(cache, "CMAKE_BUILD_TYPE")
+    cxx_compiler = read_cache_value(cache, "CMAKE_CXX_COMPILER")
+    enable_lto = read_cache_value(cache, "LATENCY_SIM_ENABLE_LTO")
     compile_off = read_cache_value(cache, "LATENCY_SIM_COMPILE_OFF")
     if compile_off is None:
         compile_off = "OFF"
@@ -180,14 +193,62 @@ def variant_cache(binary, expect_compile_off):
         print("FAIL: " + cache + " LATENCY_SIM_COMPILE_OFF=" + compile_off +
               " but the binary is the " + expect + " variant")
         return None
+    problems = []
+    if cxx_compiler is None or REQUIRED_CXX_COMPILER not in (cxx_compiler or ""):
+        problems.append("compiler=" + str(cxx_compiler) + " (want " +
+                        REQUIRED_CXX_COMPILER + ")")
+    if cmake_build_type != REQUIRED_BUILD_TYPE:
+        problems.append("build_type=" + str(cmake_build_type) + " (want " +
+                        REQUIRED_BUILD_TYPE + ")")
+    if enable_lto != REQUIRED_LTO:
+        problems.append("LTO=" + str(enable_lto) + " (want " +
+                        REQUIRED_LTO + ")")
+    if problems:
+        print("FAIL: " + cache + " does not prove the required build "
+              "attributes: " + "; ".join(problems))
+        return None
     return {
         "cache": cache,
-        "cmake_build_type": read_cache_value(cache, "CMAKE_BUILD_TYPE"),
-        "cxx_compiler": read_cache_value(cache, "CMAKE_CXX_COMPILER"),
-        "latency_sim_enable_lto": read_cache_value(
-            cache, "LATENCY_SIM_ENABLE_LTO"),
+        "cmake_build_type": cmake_build_type,
+        "cxx_compiler": cxx_compiler,
+        "latency_sim_enable_lto": enable_lto,
         "latency_sim_compile_off": compile_off,
     }
+
+
+def build_meta_ok(binary, current_head, current_gitlink):
+    """Verifies the recorded tigonkv_build_meta.json proves the binary was
+    built from the current final candidate: the binary hash must match the
+    recorded hash and the meta's source-state head and latency_sim gitlink
+    must equal the current values."""
+    binary_abs = os.path.abspath(binary)
+    build_dir = os.path.dirname(binary_abs)
+    meta_path = os.path.join(build_dir, "tigonkv_build_meta.json")
+    if not os.path.isfile(meta_path):
+        print("FAIL: missing build meta for " + binary + ": " + meta_path)
+        return False
+    try:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as error:
+        print("FAIL: cannot read build meta " + meta_path + ": " + str(error))
+        return False
+    recorded = meta.get("binaries", {}).get(binary_abs)
+    if recorded != sha256_of(binary):
+        print("FAIL: " + binary + " hash does not match its build meta "
+              "(stale binary?)")
+        return False
+    source_state = meta.get("source_state", "")
+    if not source_state.startswith(current_head + ":"):
+        print("FAIL: " + binary + " build meta source-state head " +
+              source_state.split(":")[0] + " != current " + current_head)
+        return False
+    if meta.get("latency_sim_gitlink") != current_gitlink:
+        print("FAIL: " + binary + " build meta gitlink " +
+              str(meta.get("latency_sim_gitlink")) + " != current " +
+              current_gitlink)
+        return False
+    return True
 
 
 def run_once(binary, cpu):
@@ -261,6 +322,12 @@ def main():
     if on_cache is None or off_cache is None:
         print("FAIL: benchmark variant cache preconditions not met")
         return 1
+    for binary in (args.on, args.off):
+        if not build_meta_ok(binary, prov["parent_head"],
+                             prov["index_gitlink"]):
+            print("FAIL: benchmark binary is not proven to be built from the "
+                  "current final candidate: " + binary)
+            return 1
 
     report = {
         "command": " ".join(sys.argv),

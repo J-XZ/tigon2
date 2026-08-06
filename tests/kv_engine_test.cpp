@@ -143,21 +143,23 @@ void RunFocusedG() {
   two_pieces.set_dest_node_id(0);
   two_pieces.set_worker_id(0);
   star::TwoPLPashaMessageFactory::new_remote_delete_message(
-      two_pieces, 0, 3, key.data(), key.size());
+      two_pieces, 0, 3, key.data(), key.size(), 7);
   star::TwoPLPashaMessageFactory::new_remote_delete_message(
-      two_pieces, 0, 3, key.data(), key.size());
+      two_pieces, 0, 3, key.data(), key.size(), 8);
   assert(two_pieces.get_message_count() == 2);
   // Remote delete completion is a framed status response: owner-side
   // contention is retryable and must not be reported as a malformed request.
   star::Message busy_delete_response;
   star::TwoPLPashaMessageHandler::append_remote_delete_response(
-      busy_delete_response, 0, 3, star::RemoteDeleteOutcome::Busy, 0);
+      busy_delete_response, 0, 3, star::RemoteDeleteOutcome::Busy, 0, 7);
   star::RemoteDeleteOutcome delete_outcome{};
   uint32_t delete_key_offset = 99;
+  uint64_t delete_sequence = 0;
   assert(star::TwoPLPashaMessageHandler::decode_remote_delete_response(
-      *busy_delete_response.begin(), delete_outcome, delete_key_offset));
+      *busy_delete_response.begin(), delete_outcome, delete_key_offset,
+      delete_sequence));
   assert(delete_outcome == star::RemoteDeleteOutcome::Busy &&
-         delete_key_offset == 0);
+         delete_key_offset == 0 && delete_sequence == 7);
   // Initialize two owner arenas so the second published transport ring is
   // idle in this process; the parent demuxer consumes only ring 0.
   char path_template[] = "/tmp/tigonkv-engine-g-XXXXXX";
@@ -169,6 +171,13 @@ void RunFocusedG() {
   const pid_t peer = fork();
   assert(peer >= 0);
   if (peer == 0) {
+    // fork() inherits the parent's thread-local latency state (including the
+    // lifecycle generation and any active scope depth).  The V6 lifecycle
+    // guards treat a stale TLS generation as a hard error, so reset the
+    // inherited TLS before opening a fresh engine in the child.
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    latency_sim::detail::g_thread_state = {};
+#endif
     for (;;) {
       try {
         (void)tigonkv::engine::KVEngine::Open(node1_config, false);
@@ -292,6 +301,10 @@ class JoiningPeer {
     child_ = fork();
     assert(child_ >= 0);
     if (child_ == 0) {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    latency_sim::detail::g_thread_state = {};
+#endif
+
       close(stop_pipe_[1]);
       assert(fcntl(stop_pipe_[0], F_SETFL,
                    fcntl(stop_pipe_[0], F_GETFL) | O_NONBLOCK) == 0);
@@ -485,6 +498,10 @@ int main(int argc, char **argv) {
   const pid_t corrupt_child = fork();
   assert(corrupt_child >= 0);
   if (corrupt_child == 0) {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    latency_sim::detail::g_thread_state = {};
+#endif
+
     const rlimit no_core{0, 0};
     (void)setrlimit(RLIMIT_CORE, &no_core);
     const auto corrupt_config = ConfigFor(corrupt_template);
@@ -517,6 +534,10 @@ int main(int argc, char **argv) {
     const pid_t binding_child = fork();
     assert(binding_child >= 0);
     if (binding_child == 0) {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    latency_sim::detail::g_thread_state = {};
+#endif
+
       const rlimit no_core{0, 0};
       (void)setrlimit(RLIMIT_CORE, &no_core);
       auto engine = tigonkv::engine::KVEngine::Open(
@@ -542,6 +563,10 @@ int main(int argc, char **argv) {
   const pid_t misroute_child = fork();
   assert(misroute_child >= 0);
   if (misroute_child == 0) {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    latency_sim::detail::g_thread_state = {};
+#endif
+
     const rlimit no_core{0, 0};
     (void)setrlimit(RLIMIT_CORE, &no_core);
     const auto config = ConfigFor(misroute_template, 2, 0);
@@ -892,6 +917,10 @@ int main(int argc, char **argv) {
     const pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    latency_sim::detail::g_thread_state = {};
+#endif
+
       close(scan_ready[0]);
       auto node_one = tigonkv::engine::KVEngine::Open(node_one_config, false);
       tigonkv::engine::mem_access::LatencyScope scope(
@@ -1393,6 +1422,10 @@ int main(int argc, char **argv) {
       const pid_t child = fork();
       assert(child >= 0);
       if (child == 0) {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+    latency_sim::detail::g_thread_state = {};
+#endif
+
         close(child_to_parent[0]);
         close(parent_to_child[1]);
         auto engine1 = tigonkv::engine::KVEngine::Open(node1_cfg, false);

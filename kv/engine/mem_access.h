@@ -111,11 +111,13 @@ class DeferredTransportPollScope {
     auto &state = latency_sim::detail::g_thread_state;
     if (state.scope_suspended) {
       // The enclosing scope is already suspended (cooperative foreground
-      // wait): resume it as a background scope; on exit suspend it again.
+      // wait): resume it with its original class so the V6 resume contract
+      // (resume class must match the suspended scope class) holds; the poll
+      // still charges into the deferred segment, and on exit suspend it
+      // again.
       was_suspended_ = true;
       generation_ = state.generation;
-      simulator.ResumeScope(latency_sim::ExecutionClass::kBackground,
-                            generation_);
+      simulator.ResumeScope(state.suspended_scope_class, generation_);
       return;
     }
     if (state.scope_depth != 0) {

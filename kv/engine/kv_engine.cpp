@@ -1425,7 +1425,7 @@ Status KVEngine::Forward(star::TwoPLPashaMessage type, std::string_view key,
     case star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST:
       star::TwoPLPashaMessageFactory::new_remote_delete_message(
           message, kSingleTableId, partition_id, fixed_key.bytes,
-          config_.fixed_key_size);
+          config_.fixed_key_size, sequence);
       expected_response = static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE);
       break;
     case star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN:
@@ -1437,8 +1437,9 @@ Status KVEngine::Forward(star::TwoPLPashaMessage type, std::string_view key,
           star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN);
       break;
   }
-  mailbox.operation = {expected_response, owner, partition_id, false,
-                       Status::Error(StatusCode::kCorruption, "missing RPC response")};
+  mailbox.operation = {expected_response, owner, partition_id, sequence, false,
+                       Status::Error(StatusCode::kCorruption,
+                                     "missing RPC response")};
   SendTransportMessage(message);
   message.clear_message_pieces();
   // The request phase ends immediately after the transport publication.  The
@@ -1690,9 +1691,15 @@ void KVEngine::ConsumeTransportResponse(star::Message &message,
   uint32_t key_offset = 0;
   if (piece.get_message_type() == static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE)) {
     star::RemoteDeleteOutcome delete_outcome{};
+    uint64_t response_sequence = 0;
     if (!star::TwoPLPashaMessageHandler::decode_remote_delete_response(
-            piece, delete_outcome, key_offset) || key_offset != 0)
+            piece, delete_outcome, key_offset, response_sequence) ||
+        key_offset != 0)
       TransportFatal(config_.node_id, "response", "malformed remote delete response");
+    // Late/stale responses are identified by request identity and dropped
+    // without consuming the next request's slot.
+    if (response_sequence != operation.sequence)
+      return;
     operation.result = delete_outcome == star::RemoteDeleteOutcome::Deleted
                            ? Status::Ok()
                            : Status::Error(StatusCode::kBusy,

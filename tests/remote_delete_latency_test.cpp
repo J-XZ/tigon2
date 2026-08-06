@@ -343,6 +343,39 @@ int main() {
     }
     assert(RequesterSettlements() == 1);  // exactly one settlement per scope
     ClearSettlements();
+    // 3. Owner claim wins the race: once the owner has linearized the delete
+    //    (write-lock bit cleared under the smeta latch), a late requester
+    //    rollback must hard fail instead of resurrecting a deleted row.
+    const std::string claimed_key = OwnerKey(kOwner, 16384);
+    {
+      tigonkv::engine::mem_access::LatencyScope facade(
+          latency_sim::ExecutionClass::kForeground);
+      assert(engine->Put(claimed_key, FixedValue("claimed-me")).ok());
+    }
+    auto *claimed_partition = engine->VisiblePartition(claimed_key);
+    assert(claimed_partition != nullptr);
+    star::TwoPLPashaMetadataShared *claimed_row = nullptr;
+    {
+      tigonkv::engine::mem_access::LatencyScope scope(
+          latency_sim::ExecutionClass::kBackground);
+      assert(claimed_partition->PrepareRemoteDelete(
+                 claimed_key, kRequester, &claimed_row, true) ==
+             tigonkv::engine::SharedAccessState::kDone);
+      assert(claimed_row != nullptr && claimed_row->is_write_locked());
+      // Simulate the owner's linearized delete: under the latch, the owner
+      // consumes the requester write-lock bit as Pending -> Executing/Deleted.
+      claimed_row->lock();
+      claimed_row->clear_write_locked();
+      claimed_row->unlock();
+      bool rolled_back = false;
+      try {
+        claimed_partition->AbortRemoteDelete(claimed_row, kRequester);
+      } catch (const std::runtime_error &) {
+        rolled_back = true;
+      }
+      assert(rolled_back);
+    }
+    ClearSettlements();
     // The restored row is readable again through the normal path.
     {
       tigonkv::engine::mem_access::LatencyScope facade(
@@ -382,17 +415,30 @@ int main() {
         g_settlements.clear();
       }
       auto *mailbox = engine->worker_mailboxes_[0].get();
-      // Inject a Busy owner response while the delete is awaiting.
+      // Stale-response idempotence: a late response for an older request
+      // identity must be dropped, not consumed as this request's response.
+      // Inject it first, then the matching Busy response; the delete must
+      // complete only on the matching sequence.
       std::thread responder([&] {
         while (mailbox->operation.expected_response_type == 0)
           std::this_thread::yield();
+        const uint64_t stale_sequence = mailbox->operation.sequence + 7;
+        auto stale_message = std::make_unique<star::Message>();
+        stale_message->set_source_node_id(kOwner);
+        stale_message->set_dest_node_id(kRequester);
+        star::TwoPLPashaMessageHandler::append_remote_delete_response(
+            *stale_message, tigonkv::engine::kSingleTableId,
+            mailbox->operation.partition_id,
+            star::RemoteDeleteOutcome::Deleted, 0, stale_sequence);
+        mailbox->inbox.push(stale_message.release());
         auto message = std::make_unique<star::Message>();
         message->set_source_node_id(kOwner);
         message->set_dest_node_id(kRequester);
         star::TwoPLPashaMessageHandler::append_remote_delete_response(
             *message, tigonkv::engine::kSingleTableId,
             mailbox->operation.partition_id,
-            star::RemoteDeleteOutcome::Busy, 0);
+            star::RemoteDeleteOutcome::Busy, 0,
+            mailbox->operation.sequence);
         mailbox->inbox.push(message.release());
       });
       const auto status = engine->Delete(busy_key);

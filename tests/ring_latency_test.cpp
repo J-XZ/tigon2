@@ -27,7 +27,9 @@
 // count regardless of payload) and per-entry undercharging (payload always
 // charged once).
 #include "common/CXLMemory.h"
+#include "common/BufferedReader.h"
 #include "common/MPSCRingBuffer.h"
+#include "protocol/TwoPLPasha/TwoPLPashaMessage.h"
 #include "kv/engine/mem_access.h"
 #include "kv/engine/region_allocator.h"
 #include "tests/latency_test_support.h"
@@ -296,6 +298,42 @@ int main() {
         sim.PendingDelayNsForTest() - before_dequeue;
     assert(dequeue_delta == kDequeueLines);
     assert(std::memcmp(second_out, payload, sizeof(payload)) == 0);
+  }
+
+  {
+    // Real demux path: BufferedReader::next_message() pulls through recv(),
+    // which is exactly the size()+dequeue() combination the demuxer uses.
+    // The combined ledger must equal size-lines + dequeue-lines with no
+    // missed or duplicated charge between the two.
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kBackground);
+    star::Message frame;
+    const auto frame_size = star::TwoPLPashaMessageFactory::
+        new_data_migration_message(
+            frame, 0, 3, payload, sizeof(payload), /*transaction_id=*/1,
+            /*key_offset=*/0);
+    (void)frame_size;
+    const uint64_t before_send = sim.PendingDelayNsForTest();
+    assert(wide_ring->send(frame.get_raw_ptr(), frame.data.size()));
+    const uint64_t send_delta = sim.PendingDelayNsForTest() - before_send;
+    // The 81-byte frame covers two entry lines on the 128-byte-entry ring:
+    // enqueue charges kEnqueueLines + 1.
+    assert(send_delta == kEnqueueLines + 1);
+
+    star::BufferedReader reader(*wide_ring);
+    const uint64_t before_recv = sim.PendingDelayNsForTest();
+    auto message = reader.next_message();
+    const uint64_t recv_delta = sim.PendingDelayNsForTest() - before_recv;
+    // recv() must equal size() + dequeue() exactly: the combination must not
+    // double-charge size() nor skip dequeue metadata.  size() was measured
+    // separately above (kSizeLines == 2); a standalone dequeue of the same
+    // two-line-payload entry charges kDequeueLines + 1.  The demux
+    // combination is therefore kSizeLines + kDequeueLines + 1 with no missed
+    // or duplicated line.
+    assert(recv_delta == kSizeLines + kDequeueLines + 1);
+    assert(message != nullptr);
+    assert(message->get_message_count() == 1);
+    assert(reader.get_read_call_cnt() == 1);
   }
 
   latency_sim::detail::SetDelaySpinBackendForTest(nullptr);

@@ -91,6 +91,31 @@ generated_config="$out_dir/configs/experiment_config_ycsb_4vm.jsonc"
 parent_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo nogit)
 gitlink=$(tigonkv_latency_sim_gitlink "$root")
 source_state=$(tigonkv_source_state "$root")
+if [[ "$prepare_only" != true ]]; then
+  # Formal runs require a clean final candidate: a dirty parent or submodule
+  # would make the recorded source-state unreproducible.
+  if ! git -C "$root" status --porcelain | grep -q .; then
+    parent_clean=true
+  else
+    parent_clean=false
+  fi
+  if ! git -C "$root/thirdparty_libs/latency_sim" status --porcelain \
+      | grep -q .; then
+    submodule_clean=true
+  else
+    submodule_clean=false
+  fi
+  sub_checkout=$(git -C "$root/thirdparty_libs/latency_sim" rev-parse HEAD \
+    2>/dev/null || echo nogit)
+  if [[ "$parent_clean" != true || "$submodule_clean" != true || \
+        "$gitlink" != "$sub_checkout" ]]; then
+    echo "tigonkv_ycsb: formal run requires clean parent + clean latency_sim "
+         "submodule + index gitlink == checkout (parent_clean=$parent_clean "
+         "submodule_clean=$submodule_clean gitlink=$gitlink "
+         "checkout=$sub_checkout)" >&2
+    exit 2
+  fi
+fi
 python3 - "$base_config" "$generated_config" "$shared_size" "$shared_numa" "$rounds" "$records" "$operations" "$threads" "$workloads" "$sample_stride" "$latency_sim_compile_off" "$build_dir" "$parent_sha" "$gitlink" "$source_state" "$root" <<'PY'
 import hashlib, json, os, sys
 src, dst, size, numa, rounds, records, ops, threads, workloads, sample_stride, compile_off, build_dir, parent_sha, gitlink, source_state, root = sys.argv[1:]
@@ -145,7 +170,12 @@ d['tigon_kv']['fixed_value_size']=32
 json.dump(d, open(dst, 'w', encoding='utf-8'), indent=2)
 selected=workloads.split(',')
 fixed_latency=lat['fixed_latency']
-meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'operation_count_semantics':'logical_ycsb_requests_before_update_expansion','vm_count':4,'foreground_workers_per_vm':4,'demuxer_threads_per_vm':1,'kv_threads_per_vm':5,'affinity':'distinct_allowed_cpus','threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'generated_config_sha256':hashlib.sha256(open(dst,'rb').read()).hexdigest(),'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32,'partition_sample_stride':int(sample_stride),'fixed_latency':{'cache_line_bytes':fixed_latency['cache_line_bytes'],'swcc_fixed_ns_per_line':fixed_latency['swcc_fixed_ns_per_line'],'hwcc_fixed_ns_per_line':fixed_latency['hwcc_fixed_ns_per_line']},'fixed_latency_nonzero':fixed_latency['swcc_fixed_ns_per_line'] != 0 or fixed_latency['hwcc_fixed_ns_per_line'] != 0,'latency_sim_compile_off':compile_off,'build_dir':build_dir,'parent_sha':parent_sha,'latency_sim_gitlink':gitlink,'source_state':source_state,'reproduce_command':f'cmake -S {root!r} -B {build_dir!r} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF={compile_off}'}
+meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'operation_count_semantics':'logical_ycsb_requests_before_update_expansion','vm_count':4,'foreground_workers_per_vm':4,'demuxer_threads_per_vm':1,'kv_threads_per_vm':5,'affinity':'distinct_allowed_cpus','threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'generated_config_sha256':hashlib.sha256(open(dst,'rb').read()).hexdigest(),'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32,'partition_sample_stride':int(sample_stride),'fixed_latency':{'cache_line_bytes':fixed_latency['cache_line_bytes'],'swcc_fixed_ns_per_line':fixed_latency['swcc_fixed_ns_per_line'],'hwcc_fixed_ns_per_line':fixed_latency['hwcc_fixed_ns_per_line']},'fixed_latency_nonzero':fixed_latency['swcc_fixed_ns_per_line'] != 0 or fixed_latency['hwcc_fixed_ns_per_line'] != 0,'latency_sim_compile_off':compile_off,'build_dir':build_dir,'parent_sha':parent_sha,'latency_sim_gitlink':gitlink,'source_state':source_state,'reproduce_command':f'bash {root!r}/tigonkv_run_ycsb_experiment.sh '
+                           f'--rounds {rounds!r} --record-count {records!r} '
+                           f'--operation-count {ops!r} --threads-per-node {threads!r} '
+                           f'--workloads {workloads!r} --out-dir {os.path.dirname(os.path.dirname(dst))!r} '
+                           f'--shared-size-mb {size!r} --latency-sim-compile-off={compile_off} '
+                           f'--sample-stride {sample_stride!r}'}
 json.dump(meta, open(dst.rsplit('/',1)[0] + '/../run_meta.json', 'w', encoding='utf-8'), indent=2, sort_keys=True)
 PY
 echo "TIGONKV_YCSB_PREPARED out_dir=$out_dir config=$generated_config workloads=$workloads"

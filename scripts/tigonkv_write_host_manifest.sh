@@ -64,16 +64,22 @@ run_variant() {
 
   local elf_audit="not-applicable"
   if [[ "$compile_off" == ON ]]; then
-    elf_audit="clean"
-    for name in e2e_08 e2e_09 e2e_trace_runner unit_tests; do
-      if [[ -x "$build_dir/$name" ]]; then
-        if nm -C "$build_dir/$name" 2>/dev/null | grep -qE \
-          'LatencySimulator|GlobalLatencySimulator|g_thread_state|CalibrateTsc|TicksForDelayNs|RoundDelayPsToNs|DelaySpinNs|HardFail|ParseFixedLatencyJsonc|LoadFixedLatencyJsoncFile|RegisterPool|ClearPoolRegistrations|BeginScope|EndScopeAndDelay|ChargeRange|ValidateRange|AddLines|SuspendScopeAndDelayLater|ResumeScope'; then
-          elf_audit="FAIL:$name"
-          break
-        fi
+    # The dedicated auditor reads the complete nm output before matching, so a
+    # `pipefail + nm | grep -q` SIGPIPE can never turn a hit into a clean
+    # verdict.  It also saves the full symbol table for review.
+    elf_audit_file="$(mktemp)"
+    if python3 "$root/scripts/audit_compile_off_elf.py" \
+        --build-dir "$build_dir" --output "$elf_audit_file" \
+        >/dev/null 2>&1; then
+      elf_audit="clean"
+    else
+      elf_audit="FAIL"
+      if [[ -s "$elf_audit_file" ]]; then
+        elf_audit="FAIL:$(grep -oE '"binary": "[^"]+"' \
+          "$elf_audit_file" | tr '\n' ',' | sed 's/,$//')"
       fi
-    done
+    fi
+    rm -f "$elf_audit_file"
   fi
 
   manifest["$key"]="$(

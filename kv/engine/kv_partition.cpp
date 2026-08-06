@@ -1800,7 +1800,6 @@ bool KVPartition::DeletePrivateForMigrationManager(
     smeta->unlock();
     reserved_shared_write = false;
   };
-
   bool removed = false;
   try {
     removed = star::TwoPLPashaHelper::delete_and_update_next_key_info(

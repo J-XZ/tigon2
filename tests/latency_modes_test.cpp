@@ -363,7 +363,9 @@ int main() {
   simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64);
   assert(simulator.PendingDelayNsForTest() == 9);
-  assert(simulator.SuspendScopeAndDelayLater() == 0);  // one suspension at a time
+  // V6 contract: a second suspension while already suspended is a lifecycle
+  // violation and hard fails before moving any budget; the temporary scope
+  // settles its own budget at its own exit instead.
   assert(simulator.HasActiveScopeForCurrentThread());
   simulator.EndScopeAndDelay();  // temporary scope settles its own 9 (swcc)
   assert(!simulator.HasActiveScopeForCurrentThread());

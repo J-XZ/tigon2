@@ -106,6 +106,10 @@ class KVEngine {
     uint32_t expected_response_type = 0;
     uint32_t expected_source_owner = 0;
     uint32_t partition_id = 0;
+    // Monotonic request identity echoed by the owner in the response.  A
+    // stale/late response for a previous request is dropped instead of
+    // consuming the slot of the next request.
+    uint64_t sequence = 0;
     bool done = false;
     Status result = Status::Error(StatusCode::kCorruption, "unset RPC result");
   };
