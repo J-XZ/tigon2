@@ -28,10 +28,13 @@ run_variant() {
   local build_dir
   build_dir="$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off")"
   local key="$build_type-co_$co"
+  local c cxx
+  read -r c cxx <<<"$(tigonkv_compiler_paths)"
 
-  local configure="cmake -S '$root' -B '$build_dir' -G Ninja -DCMAKE_BUILD_TYPE=$build_type -DLATENCY_SIM_COMPILE_OFF=$compile_off"
+  local configure="cmake -S '$root' -B '$build_dir' -G Ninja -DCMAKE_BUILD_TYPE=$build_type -DCMAKE_C_COMPILER=$c -DCMAKE_CXX_COMPILER=$cxx -DLATENCY_SIM_COMPILE_OFF=$compile_off"
   cmake -S "$root" -B "$build_dir" -G Ninja \
-    -DCMAKE_BUILD_TYPE="$build_type" -DLATENCY_SIM_COMPILE_OFF="$compile_off"
+    -DCMAKE_BUILD_TYPE="$build_type" -DCMAKE_C_COMPILER="$c" \
+    -DCMAKE_CXX_COMPILER="$cxx" -DLATENCY_SIM_COMPILE_OFF="$compile_off"
   cmake --build "$build_dir" -j"${CXLKV_BUILD_JOBS:-$(nproc)}"
 
   local ctest_log ctest_status passed failed
