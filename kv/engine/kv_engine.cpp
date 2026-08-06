@@ -179,6 +179,13 @@ thread_local uint64_t *TlsWorkerMaxTid = nullptr;
 // second operation boundary.
 thread_local uint32_t TlsEbrOperationDepth = 0;
 
+// While non-zero, PollTransport defers its background settlement instead of
+// busy-waiting: the caller is inside a row-level critical state (remote
+// delete with the row write_locked and valid cleared), so the accumulated
+// transport budget must settle only at the outermost scope exit, after the
+// commit/rollback releases the lock and the SCC guards.
+thread_local int TlsDeferTransportSettlementDepth = 0;
+
 class EbrOperationScope {
  public:
   explicit EbrOperationScope(star::CXL_EBR *ebr) : ebr_(ebr) {
@@ -867,8 +874,30 @@ Status KVEngine::Delete(std::string_view key) {
       return Status::Error(StatusCode::kNotFound, "key not found");
     if (prepared != SharedAccessState::kDone)
       return Status::Error(StatusCode::kBusy, "remote delete shared row busy");
-    const Status deleted = Forward(star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST, key, {}, route.partition_id,
-                                   route.owner);
+    // The row is now write_locked with valid cleared (the critical
+    // intermediate state).  Until the owner ack commits the delete or the
+    // rollback restores the row, no latency busy-wait may happen on this
+    // thread: the cooperative wait inside Forward suspends the foreground
+    // budget, and every transport poll defers its settlement into the same
+    // deferred segment, so everything settles exactly once at the outermost
+    // scope exit, after the lock and SCC guards are released.  Cooperative
+    // transport processing itself is unchanged.
+    ++TlsDeferTransportSettlementDepth;
+    Status deleted;
+    try {
+      deleted = Forward(star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST, key, {}, route.partition_id,
+                        route.owner);
+    } catch (...) {
+      --TlsDeferTransportSettlementDepth;
+      // Exception safety: restore the row so the lock is never stranded, then
+      // unwind; the deferred budgets settle at the outermost scope exit.
+      try {
+        route.partition->AbortRemoteDelete(locked_row, config_.node_id);
+      } catch (...) {
+      }
+      throw;
+    }
+    --TlsDeferTransportSettlementDepth;
     // A successful owner callback consumes the requester write/ref pin with
     // the retired row.  On an unsuccessful ack it is still live and must be
     // restored before the facade retries.
@@ -1537,6 +1566,25 @@ void KVEngine::PollTransport() {
   // let the background guard settle only after each narrowed EBR dispatch has
   // been destroyed.  The suspension then restores the foreground scope.
   mem_access::ForegroundScopeSuspension suspend_foreground;
+#if !defined(LATENCY_SIM_COMPILE_OFF)
+  if (TlsDeferTransportSettlementDepth > 0) {
+    // Deferred mode (remote delete critical state): the foreground scope is
+    // suspended by the cooperative wait.  Resume it as a background-class
+    // scope so the poll's wrapped accesses accumulate into the single
+    // deferred segment, then suspend it again instead of settling: no
+    // busy-wait happens while the caller still holds the row's write lock /
+    // invalid state.  The merged deferred budget settles exactly once at the
+    // outermost scope exit, after the delete commit/rollback released the
+    // lock and the SCC guards.
+    auto &simulator = latency_sim::GlobalLatencySimulator();
+    simulator.ResumeScope(latency_sim::ExecutionClass::kBackground);
+    PollTransportImpl();
+    if (!simulator.SuspendScopeAndDelayLater())
+      TransportFatal(config_.node_id, "poll_defer",
+                     "deferred transport poll has no suspendable scope");
+    return;
+  }
+#endif
   latency_sim::ScopeGuard background_scope(
       latency_sim::ExecutionClass::kBackground);
   PollTransportImpl();

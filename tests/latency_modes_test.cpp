@@ -62,7 +62,9 @@ void ThrowsOnEarlyExit(TestBuffers *buffers) {
 
 // The V4 lifecycle allows Configure only while unconfigured with BOTH ranges
 // registered, so every delay change is a sequential reopen at a quiescent
-// boundary: clear -> register the two ranges -> configure.
+// boundary: clear -> register the two ranges -> configure.  Compile-on only
+// (the simulator does not exist in a compile-off build).
+#if !defined(LATENCY_SIM_COMPILE_OFF)
 void ReopenWith(TestBuffers *buffers, const latency_sim::FixedLatencyConfig &config) {
   auto &simulator = latency_sim::GlobalLatencySimulator();
   simulator.ClearPoolRegistrations();
@@ -70,6 +72,7 @@ void ReopenWith(TestBuffers *buffers, const latency_sim::FixedLatencyConfig &con
   simulator.RegisterPool(latency_sim::MemoryDomain::kHwcc, buffers->hwcc, kPage);
   simulator.Configure(config);
 }
+#endif
 
 #if !defined(LATENCY_SIM_COMPILE_OFF)
 // Deterministic delay backend: makes scope-exit settlement a no-op so the

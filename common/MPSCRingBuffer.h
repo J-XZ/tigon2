@@ -37,24 +37,42 @@ class MPSCRingBuffer {
                     cxl_memory.cxlalloc_malloc_wrapper(
                         entry_struct_size * entry_num,
                         CXLMemory::TRANSPORT_ALLOCATION));
-                // Construction writes the ring header (offset/length fields and
-                // the head/tail/count atomics) and every entry's metadata and
-                // payload into HWCC.  Charge each real contiguous range exactly
-                // once; the surrounding KVEngine::Open background scope is the
-                // settlement boundary.  Wrappers are raw operations in a
-                // compile-off build.
+                // Construction writes the ring header (offset/length fields,
+                // the head/tail/count atomics and the entries offset) and every
+                // entry's ready atomic, offset/length metadata and payload
+                // memset into HWCC.  Each real shared access is charged
+                // individually by the actual covered lines, adjacent to the
+                // operation that writes it (no whole-entry envelope
+                // approximation, no double charge); the surrounding
+                // KVEngine::Open background scope is the settlement boundary.
+                // Wrappers are raw operations in a compile-off build.
                 tigonkv::engine::mem_access::TransportWrite(
                     &this->entry_struct_size, sizeof(entry_num) * 3);
                 tigonkv::engine::mem_access::TransportWrite(
                     &head, sizeof(head) * 3);
+                tigonkv::engine::mem_access::TransportWrite(
+                    &entries_buffer_offset, sizeof(entries_buffer_offset));
+                // entries() performs one real shared-header read of
+                // entries_buffer_offset; the pointer is computed once for the
+                // whole init loop, so exactly one read is charged.
+                tigonkv::engine::mem_access::TransportRead(
+                    &entries_buffer_offset, sizeof(entries_buffer_offset));
+                char *const entries_buffer = entries();
                 for (int i = 0; i < entry_num; i++) {
-                        Entry *entry = reinterpret_cast<Entry *>(entries() + i * entry_struct_size);
-                        entry->is_ready = 0;
+                        Entry *entry = reinterpret_cast<Entry *>(
+                            entries_buffer + i * entry_struct_size);
+                        tigonkv::engine::mem_access::HwccAtomicStore(
+                            entry->is_ready, uint8_t{0},
+                            std::memory_order_seq_cst);
+                        tigonkv::engine::mem_access::TransportWrite(
+                            &entry->remaining_size,
+                            sizeof(entry->remaining_size) +
+                                sizeof(entry->dequeue_offset));
                         entry->remaining_size = 0;
                         entry->dequeue_offset = 0;
-                        memset(entry->data, 0, entry_data_size);
                         tigonkv::engine::mem_access::TransportWrite(
-                            entry, entry_struct_size);
+                            entry->data, entry_data_size);
+                        memset(entry->data, 0, entry_data_size);
                 }
         }
 

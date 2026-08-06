@@ -39,7 +39,7 @@ assert meta['latency_sim_compile_off'] == 'OFF'
 assert meta['build_dir'].endswith('/build-relwithdebinfo-ninja-clang18-co_off')
 import re
 assert re.fullmatch(r'[0-9a-f]{40}', meta['parent_sha']), meta['parent_sha']
-assert meta['latency_sim_gitlink'].startswith(('+', '-', ' ')), meta['latency_sim_gitlink']
+assert re.fullmatch(r'[0-9a-f]{40}', meta['latency_sim_gitlink']), meta['latency_sim_gitlink']
 assert len(meta['source_state'].split(':')) == 5, meta['source_state']
 assert 'generated_config_sha256' in meta and len(meta['generated_config_sha256']) == 64
 print('generated ycsb config schema ok')

@@ -75,6 +75,10 @@ target_link_libraries(e2e_trace_runner PRIVATE tigonkv)
 add_executable(ycsb_partition_splits tools/ycsb_partition_splits.cpp)
 add_executable(latency_modes_test tests/latency_modes_test.cpp)
 target_link_libraries(latency_modes_test PRIVATE tigonkv)
+add_executable(ring_latency_test tests/ring_latency_test.cpp)
+target_link_libraries(ring_latency_test PRIVATE tigonkv)
+add_executable(remote_delete_latency_test tests/remote_delete_latency_test.cpp)
+target_link_libraries(remote_delete_latency_test PRIVATE tigonkv)
 add_executable(kv_layout_test tests/kv_layout_test.cpp)
 target_link_libraries(kv_layout_test PRIVATE tigonkv)
 add_executable(btree_binding_test tests/btree_binding_test.cpp)
@@ -139,6 +143,8 @@ set(TIGONKV_ISA_REQUIRED_TARGETS
   e2e_08
   e2e_09
   e2e_trace_runner
+  ring_latency_test
+  remote_delete_latency_test
   kv_layout_test
   kv_partition_test
   kv_engine_test
@@ -172,6 +178,8 @@ set_tests_properties(e2e_08_test e2e_09_test e2e_ycsb_test
 set_tests_properties(e2e_08_test e2e_09_test e2e_ycsb_test PROPERTIES
   ENVIRONMENT "TIGONKV_E2E_BINARY_DIR=${CMAKE_BINARY_DIR}")
 add_test(NAME latency_modes_test COMMAND latency_modes_test)
+add_test(NAME ring_latency_test COMMAND ring_latency_test)
+add_test(NAME remote_delete_latency_test COMMAND remote_delete_latency_test)
 add_test(NAME kv_layout_test COMMAND kv_layout_test)
 add_test(NAME btree_binding_test COMMAND btree_binding_test)
 add_test(NAME kv_partition_test COMMAND kv_partition_test)
