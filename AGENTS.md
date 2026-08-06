@@ -85,7 +85,8 @@ pool/不校准 TSC/不初始化与清理 simulator，compile-off ELF 不含 simu
 parser 符号；OFF（默认）则模拟器被
 编译进去，配置完成后始终参与。私有 `TIGONKV_DISABLE_HARDWARE_SIMULATION` 已删除。
 固定延迟公共实现来自固定子模块 `thirdparty_libs/latency_sim`
-（gitlink `e6f167b2b7d10e26eaa7780ff17510befff7e28e`，与 cxlkv/sidle 完全一致），
+（当前 gitlink `76dc6ac6a8418820e13b7affc25ca163ee16e29c`，与 cxlkv/sidle 完全一致；
+V6 完成时三个消费者再统一更新到新的公共 final SHA），
 本仓只保留 `mem_access.h` 薄适配、生命周期与 scope 分类。
 
 ## 修改和验证
