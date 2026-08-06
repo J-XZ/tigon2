@@ -96,10 +96,13 @@ void TestCrossProcessFreeRejected() {
           DomainCounter;
   tigonkv::test::ScopedLatencyPools pools(mapping.base, kBytes, mapping.base,
                                           kBytes);
-  tigonkv::engine::mem_access::LatencyScope scope(
-      latency_sim::ExecutionClass::kForeground);
   auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2, 0, true, true);
-  void *block = allocator.Allocate(100, AllocationDomain::kHwccMetadata, counter, 0);
+  void *block = nullptr;
+  {
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kForeground);
+    block = allocator.Allocate(100, AllocationDomain::kHwccMetadata, counter, 0);
+  }
   const RegionOffset offset = allocator.ToOffset(block);
   const pid_t child = fork();
   assert(child >= 0);
@@ -134,7 +137,11 @@ void TestCrossProcessFreeRejected() {
   int status = 0;
   assert(waitpid(child, &status, 0) == child);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-  allocator.Free(block, 100, AllocationDomain::kHwccMetadata, counter, 0, 0);
+  {
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kForeground);
+    allocator.Free(block, 100, AllocationDomain::kHwccMetadata, counter, 0, 0);
+  }
   assert(counter->used_bytes.load() == 0);
 }
 
@@ -422,21 +429,25 @@ void TestMappedPoolAttach() {
   auto parent = DualRegionMappedPool::Open(path, config, true);
   // Pool Open registered both ranges and scoped its init; the allocator work
   // below needs an explicit scope on each thread.
-  tigonkv::engine::mem_access::LatencyScope parent_scope(
-      latency_sim::ExecutionClass::kForeground);
-  parent.allocator().FinalizeStaticHwccLayout();
-  parent.allocator().PublishStaticHwccLayout();
-  parent.allocator().InitializeOwnerPrivateArenas(0);
-  parent.allocator().InitializeOwnerPrivateArenas(1);
-  parent.allocator().BindOwnerPrivateAllocators(0);
-  auto *payload = static_cast<char *>(parent.allocator().Allocate(
-      64, AllocationDomain::kSharedPayloadSwcc, 0));
-  std::memcpy(payload, "mapped-payload", 15);
-  const uint64_t payload_offset =
-      parent.allocator().EncodeSharedPayloadOffset(payload, 0);
-  parent.allocator().PublishOwnerInitialized(0);
-  parent.allocator().PublishOwnerInitialized(1);
-  parent.allocator().PublishReady();
+  char *payload = nullptr;
+  uint64_t payload_offset = 0;
+  {
+    tigonkv::engine::mem_access::LatencyScope parent_scope(
+        latency_sim::ExecutionClass::kForeground);
+    parent.allocator().FinalizeStaticHwccLayout();
+    parent.allocator().PublishStaticHwccLayout();
+    parent.allocator().InitializeOwnerPrivateArenas(0);
+    parent.allocator().InitializeOwnerPrivateArenas(1);
+    parent.allocator().BindOwnerPrivateAllocators(0);
+    payload = static_cast<char *>(parent.allocator().Allocate(
+        64, AllocationDomain::kSharedPayloadSwcc, 0));
+    std::memcpy(payload, "mapped-payload", 15);
+    payload_offset =
+        parent.allocator().EncodeSharedPayloadOffset(payload, 0);
+    parent.allocator().PublishOwnerInitialized(0);
+    parent.allocator().PublishOwnerInitialized(1);
+    parent.allocator().PublishReady();
+  }
   const pid_t child = fork();
   assert(child >= 0);
   if (child == 0) {
@@ -458,7 +469,12 @@ void TestMappedPoolAttach() {
   int status = 0;
   assert(waitpid(child, &status, 0) == child);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-  parent.allocator().Free(payload, 64, AllocationDomain::kSharedPayloadSwcc, 0, 0);
+  {
+    tigonkv::engine::mem_access::LatencyScope parent_scope(
+        latency_sim::ExecutionClass::kForeground);
+    parent.allocator().Free(payload, 64, AllocationDomain::kSharedPayloadSwcc,
+                            0, 0);
+  }
   unlink(path);
 }
 
