@@ -119,13 +119,20 @@ class KVPartition {
                                     int64_t delta, int64_t *value,
                                     bool record_clock_access = true);
   // Original REMOTE_DELETE requester half: hold the shared write lock and
-  // ref while publishing invalid; owner deletion consumes both on success.
+  // ref while publishing invalid; return only the stable HWCC metadata offset
+  // so rollback never retains a pointer that the owner may retire.
   SharedAccessState PrepareRemoteDelete(
       std::string_view key, uint32_t host_id,
-      star::TwoPLPashaMetadataShared **locked_row,
+      RegionOffset *locked_row,
       bool record_clock_access = true);
-  void AbortRemoteDelete(star::TwoPLPashaMetadataShared *locked_row,
+  void AbortRemoteDelete(RegionOffset locked_row,
                          uint32_t host_id);
+  // Owner half after the stable control slot has made the exact claim.  The
+  // target offset is validated before the existing migration callback can
+  // alter local adjacency or retire the row.
+  star::RowOutcome DeleteRemoteClaimed(std::string_view key,
+                                       RegionOffset target_row,
+                                       uint32_t requester_id);
   // Owner DATA_MIGRATION analogue: move_row_in(inc_ref=false). Returns Ok on
   // SUCCESS or FAIL_ALREADY_IN_CXL, NotFound if absent, OutOfMemory otherwise.
   // When non-null, *moved_in is set true only on fresh SUCCESS.

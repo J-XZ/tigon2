@@ -714,15 +714,26 @@ SharedAccessState KVPartition::PutShared(std::string_view key, uint32_t host_id,
 
 SharedAccessState KVPartition::PrepareRemoteDelete(
     std::string_view key, uint32_t host_id,
-    star::TwoPLPashaMetadataShared **locked_row,
+    RegionOffset *locked_row,
     bool record_clock_access) {
   if (locked_row == nullptr)
     throw std::invalid_argument("null remote delete lock output");
-  *locked_row = nullptr;
+  *locked_row = kNullOffset;
+  const FixedKey fixed_key = MakeKey(key);
+  RegionOffset target_row = kNullOffset;
+  if (!LookupSharedReference(fixed_key, &target_row) ||
+      target_row == kNullOffset)
+    return SharedAccessState::kMissing;
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   const SharedAccessState pin =
-      TryPinShared(MakeKey(key), &smeta, record_clock_access);
+      TryPinShared(fixed_key, &smeta, record_clock_access);
   if (pin != SharedAccessState::kDone) return pin;
+  const RegionOffset resolved_row =
+      regions_.ToDynamicHwccOffset(smeta, owner_shard_);
+  if (resolved_row != target_row) {
+    star::TwoPLPashaHelper::release_migrated_row(smeta);
+    return SharedAccessState::kRetry;
+  }
   const auto prepared = star::TwoPLPashaHelper::prepare_remote_delete(
       smeta, host_id, SharedSccBytes(0));
   if (prepared != star::RowOutcome::kDone) {
@@ -731,15 +742,31 @@ SharedAccessState KVPartition::PrepareRemoteDelete(
                ? SharedAccessState::kMissing
                : SharedAccessState::kRetry;
   }
-  *locked_row = smeta;
+  *locked_row = target_row;
   return SharedAccessState::kDone;
 }
 
-void KVPartition::AbortRemoteDelete(
-    star::TwoPLPashaMetadataShared *locked_row, uint32_t host_id) {
-  if (locked_row == nullptr) return;
+void KVPartition::AbortRemoteDelete(RegionOffset locked_row, uint32_t host_id) {
+  if (locked_row == kNullOffset) return;
+  auto *smeta = SharedMetadataFromOffset(locked_row);
   star::TwoPLPashaHelper::abort_remote_delete(
-      locked_row, host_id, SharedSccBytes(0));
+      smeta, host_id, SharedSccBytes(0));
+}
+
+star::RowOutcome KVPartition::DeleteRemoteClaimed(std::string_view key,
+                                                  RegionOffset target_row,
+                                                  uint32_t requester_id) {
+  (void)requester_id;
+  const FixedKey fixed_key = MakeKey(key);
+  RegionOffset indexed_row = kNullOffset;
+  if (!LookupSharedReference(fixed_key, &indexed_row) ||
+      indexed_row != target_row)
+    throw std::runtime_error("remote delete control target no longer indexes key");
+  if (star::migration_manager == nullptr || private_table_ == nullptr)
+    throw std::runtime_error("remote delete owner runtime is unavailable");
+  const bool deleted = star::migration_manager->delete_specific_row_and_move_out(
+      private_table_.get(), &fixed_key, /*is_delete_local=*/false);
+  return deleted ? star::RowOutcome::kDone : star::RowOutcome::kBusy;
 }
 
 SharedAccessState KVPartition::CompareExchangeShared(

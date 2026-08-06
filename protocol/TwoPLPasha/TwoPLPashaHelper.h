@@ -325,52 +325,6 @@ retry:
                 clear_bit(WRITE_LOCK_BIT_OFFSET);
         }
 
-        // True when the requester still holds the write-lock bit (Pending
-        // state of the remote-delete protocol).  Only meaningful under the
-        // smeta latch.  The owner's shared delete step re-checks this bit
-        // under the same latch and clears it as the single linearization
-        // point; the requester's Pending -> Cancelled rollback CASes this bit
-        // away, so exactly one of owner-delete or requester-cancel wins.
-        //
-        // Remote-delete mailbox state machine (single HWCC atomic word bit
-        // WRITE_LOCK_BIT_OFFSET plus the SWCC SCC valid flag and ref count):
-        //
-        //   State     | writer   | CAS pre-state      | row visible | requester
-        //              |          |                    |             | may rollback
-        //   ----------+----------+--------------------+-------------+------------
-        //   Empty     | -        | -                  | valid=1     | n/a
-        //   Pending   | requester| Empty (set bit,    | valid=0     | YES (only
-        //              |          | clear valid, +ref)|             | this state)
-        //   Cancelled | requester| Pending (restore   | valid=1     | NO (already
-        //              |          | valid, clear bit, |             | terminal)
-        //              |          | -ref)             |             |
-        //   Executing | owner    | Pending (shared    | deleting/   | NO (hard
-        //   /Deleted  |          | delete step checks | deleted     | fail)
-        //              |          | bit under latch,  |             |
-        //              |          | clears it as the  |             |
-        //              |          | linearization)    |             |
-        //
-        // Slot reuse: the requester's request carries a monotonically
-        // increasing sequence that the response echoes; a stale response for
-        // an older sequence is dropped (kv_engine.cpp ConsumeTransportResponse)
-        // and never consumes the next request's slot.
-        //
-        // The two races this table resolves:
-        //  * cancel CAS wins before owner claim: the owner's shared delete
-        //    step re-checks the bit under the same latch and sees it cleared,
-        //    so it refuses to delete (Busy/terminal) and the row stays in the
-        //    requester's restored state.
-        //  * owner claim wins before the requester deadline: the bit is
-        //    cleared by the owner's linearized delete, so the requester's
-        //    rollback hard fails instead of resurrecting a deleted row, and
-        //    any late success response carries the old sequence and is
-        //    dropped.
-        bool requester_holds_write_lock()
-        {
-                return (load_atomic_word(std::memory_order_acquire) &
-                        (1ull << WRITE_LOCK_BIT_OFFSET)) != 0;
-        }
-
         bool is_data_modified_since_moved_in()
         {
                 return is_bit_set(is_data_modified_since_moved_in_bit_index);
@@ -1508,16 +1462,13 @@ class TwoPLPashaHelper {
                 if (smeta == nullptr || scc_manager == nullptr)
                         throw std::invalid_argument("null remote delete rollback row");
                 smeta->lock();
-                // Only the Pending -> Cancelled transition may roll back.
-                // Once the owner claimed (cleared the write-lock bit) or
-                // published Deleted, rolling back would resurrect a row the
-                // owner already deleted (double fact).  That is a hard
-                // protocol error, never a silent restore.
-                if (!smeta->requester_holds_write_lock()) {
+                // The stable HWCC control slot decides whether requester
+                // rollback is legal.  This row-level check is only the final
+                // invariant: a claimed/deleted row must never be resurrected.
+                if (!smeta->is_write_locked()) {
                         smeta->unlock();
                         throw std::runtime_error(
-                            "remote delete rollback raced owner claim: owner "
-                            "already transitioned Pending -> Executing/Deleted");
+                            "remote delete rollback found a non-pending row");
                 }
                 auto *payload = smeta->get_scc_data();
                 scc_manager->prepare_read(smeta, host_id, payload,

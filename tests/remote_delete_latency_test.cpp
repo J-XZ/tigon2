@@ -317,7 +317,12 @@ int main() {
     }
     auto *partition = engine->VisiblePartition(rollback_key);
     assert(partition != nullptr);
-    star::TwoPLPashaMetadataShared *locked_row = nullptr;
+    tigonkv::engine::RegionOffset locked_row =
+        tigonkv::engine::kNullOffset;
+    auto &rollback_control = engine->pool_->allocator().layout()
+        .remote_delete_controls[kRequester][0];
+    const auto rollback_fixed_key =
+        tigonkv::engine::FixedKey::From(rollback_key, kFixedKeySize);
     ClearSettlements();
     {
       tigonkv::engine::mem_access::LatencyScope scope(
@@ -325,10 +330,12 @@ int main() {
       assert(partition->PrepareRemoteDelete(rollback_key, kRequester,
                                             &locked_row, true) ==
              tigonkv::engine::SharedAccessState::kDone);
-      assert(locked_row != nullptr);
-      assert(locked_row->is_write_locked());
-      const auto *payload = locked_row->get_scc_data();
-      assert(!payload->get_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index));
+      assert(locked_row != tigonkv::engine::kNullOffset);
+      assert(rollback_control.PublishPending(
+          kRequester, 0, partition->partition_id(), 1, locked_row,
+          rollback_fixed_key));
+      assert(rollback_control.LoadState() ==
+             tigonkv::engine::RemoteDeleteControlState::kPending);
     }
     assert(RequesterSettlements() == 1);  // exactly one settlement per scope
     ClearSettlements();
@@ -336,10 +343,12 @@ int main() {
     {
       tigonkv::engine::mem_access::LatencyScope scope(
           latency_sim::ExecutionClass::kBackground);
+      assert(rollback_control.CompareExchange(
+          tigonkv::engine::RemoteDeleteControlState::kPending,
+          tigonkv::engine::RemoteDeleteControlState::kCancelled));
       partition->AbortRemoteDelete(locked_row, kRequester);
-      assert(!locked_row->is_write_locked());
-      const auto *payload = locked_row->get_scc_data();
-      assert(payload->get_flag(star::TwoPLPashaSharedDataSCC::valid_flag_index));
+      assert(rollback_control.AcknowledgeAndClear(
+          tigonkv::engine::RemoteDeleteControlState::kCancelled));
     }
     assert(RequesterSettlements() == 1);  // exactly one settlement per scope
     ClearSettlements();
@@ -354,26 +363,43 @@ int main() {
     }
     auto *claimed_partition = engine->VisiblePartition(claimed_key);
     assert(claimed_partition != nullptr);
-    star::TwoPLPashaMetadataShared *claimed_row = nullptr;
+    tigonkv::engine::RegionOffset claimed_row =
+        tigonkv::engine::kNullOffset;
+    auto &claimed_control = engine->pool_->allocator().layout()
+        .remote_delete_controls[kRequester][0];
+    const auto claimed_fixed_key =
+        tigonkv::engine::FixedKey::From(claimed_key, kFixedKeySize);
     {
       tigonkv::engine::mem_access::LatencyScope scope(
           latency_sim::ExecutionClass::kBackground);
       assert(claimed_partition->PrepareRemoteDelete(
                  claimed_key, kRequester, &claimed_row, true) ==
              tigonkv::engine::SharedAccessState::kDone);
-      assert(claimed_row != nullptr && claimed_row->is_write_locked());
-      // Simulate the owner's linearized delete: under the latch, the owner
-      // consumes the requester write-lock bit as Pending -> Executing/Deleted.
-      claimed_row->lock();
-      claimed_row->clear_write_locked();
-      claimed_row->unlock();
-      bool rolled_back = false;
-      try {
-        claimed_partition->AbortRemoteDelete(claimed_row, kRequester);
-      } catch (const std::runtime_error &) {
-        rolled_back = true;
-      }
-      assert(rolled_back);
+      assert(claimed_row != tigonkv::engine::kNullOffset);
+      assert(claimed_control.PublishPending(
+          kRequester, 0, claimed_partition->partition_id(), 2, claimed_row,
+          claimed_fixed_key));
+      // Owner claim is a control-slot fact, independent of the row write bit.
+      assert(claimed_control.CompareExchange(
+          tigonkv::engine::RemoteDeleteControlState::kPending,
+          tigonkv::engine::RemoteDeleteControlState::kExecuting));
+      assert(!claimed_control.CompareExchange(
+          tigonkv::engine::RemoteDeleteControlState::kPending,
+          tigonkv::engine::RemoteDeleteControlState::kCancelled));
+      assert(claimed_control.LoadState() ==
+             tigonkv::engine::RemoteDeleteControlState::kExecuting);
+    }
+    // The owner may reject an unmodified claimed row and perform the only
+    // legal cleanup; the requester must never call Abort after Executing.
+    {
+      tigonkv::engine::mem_access::LatencyScope scope(
+          latency_sim::ExecutionClass::kBackground);
+      claimed_partition->AbortRemoteDelete(claimed_row, kRequester);
+      assert(claimed_control.CompareExchange(
+          tigonkv::engine::RemoteDeleteControlState::kExecuting,
+          tigonkv::engine::RemoteDeleteControlState::kRejected));
+      assert(claimed_control.AcknowledgeAndClear(
+          tigonkv::engine::RemoteDeleteControlState::kRejected));
     }
     ClearSettlements();
     // The restored row is readable again through the normal path.
@@ -423,13 +449,17 @@ int main() {
         while (mailbox->operation.expected_response_type == 0)
           std::this_thread::yield();
         const uint64_t stale_sequence = mailbox->operation.sequence + 7;
+        mailbox->retired_remote_deletes[0] = {
+            true, kOwner, mailbox->operation.partition_id, stale_sequence,
+            mailbox->operation.target_row};
         auto stale_message = std::make_unique<star::Message>();
         stale_message->set_source_node_id(kOwner);
         stale_message->set_dest_node_id(kRequester);
         star::TwoPLPashaMessageHandler::append_remote_delete_response(
             *stale_message, tigonkv::engine::kSingleTableId,
             mailbox->operation.partition_id,
-            star::RemoteDeleteOutcome::Deleted, 0, stale_sequence);
+            star::RemoteDeleteOutcome::Deleted, 0,
+            mailbox->operation.target_row, stale_sequence);
         mailbox->inbox.push(stale_message.release());
         auto message = std::make_unique<star::Message>();
         message->set_source_node_id(kOwner);
@@ -437,7 +467,7 @@ int main() {
         star::TwoPLPashaMessageHandler::append_remote_delete_response(
             *message, tigonkv::engine::kSingleTableId,
             mailbox->operation.partition_id,
-            star::RemoteDeleteOutcome::Busy, 0,
+            star::RemoteDeleteOutcome::Busy, 0, mailbox->operation.target_row,
             mailbox->operation.sequence);
         mailbox->inbox.push(message.release());
       });

@@ -44,11 +44,14 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // v26: same single-flight semantics (v25 multi-slot experiment dropped).
 // v28: all configured HWCC bytes are available to the business allocator
 // after ordinary layout metadata; no hidden simulation prefix is persistent.
-constexpr uint32_t kSharedLayoutVersion = 28;
+// v29: remote Delete identity/state is stored in stable HWCC control slots,
+// independent of the target row's retirement lifetime.
+constexpr uint32_t kSharedLayoutVersion = 29;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
 constexpr uint32_t kMaxAllocatorShards = 64;
+constexpr uint32_t kMaxForegroundWorkers = 256;
 
 // Frozen architecture contract (Scan原始Tigon对齐修改方案.md §11.1 / §14.1).
 // Formal KV API and wire protocol accept exactly one logical table; partitions
@@ -187,6 +190,114 @@ struct FixedKeyComparator {
   }
 };
 
+enum class RemoteDeleteControlState : uint32_t {
+  kEmpty = 0,
+  kPending,
+  kCancelled,
+  kExecuting,
+  kDeleted,
+  kRejected,
+  kFailed,
+  kAcknowledged,
+};
+
+enum class RemoteDeleteControlError : uint32_t {
+  kNone = 0,
+  kRejected,
+  kOwnerFailure,
+  kTargetMismatch,
+};
+
+// One stable cross-VM control record per requester mailbox.  It is deliberately
+// independent of the shared row and contains no process virtual address.
+//
+// Transition table (the state word is the publication/claim CAS):
+//
+//   Empty      -> Pending       requester writes identity, CAS; row prepared
+//   Pending    -> Cancelled     requester exact CAS; requester may restore row
+//   Pending    -> Executing     owner exact identity CAS; requester may not touch row
+//   Executing  -> Deleted       owner after row retirement
+//   Executing  -> Rejected      owner after restoring an unmodified row
+//   Executing  -> Failed        owner after a defined safe rollback
+//   terminal   -> Acknowledged  requester consumes matching terminal response
+//   Acknowledged-> Empty        requester clears the slot for the next sequence
+//
+// Only Pending is rollback-capable.  Every transition after the owner claim is
+// terminal with respect to the requester; slot reuse is possible only after
+// Acknowledged -> Empty and a new identity is published.
+struct alignas(64) RemoteDeleteControlSlot {
+  std::atomic<uint32_t> state{
+      static_cast<uint32_t>(RemoteDeleteControlState::kEmpty)};
+  std::atomic<uint32_t> error_code{
+      static_cast<uint32_t>(RemoteDeleteControlError::kNone)};
+  uint32_t requester_node_id = UINT32_MAX;
+  uint32_t requester_worker_id = UINT32_MAX;
+  uint32_t partition_id = UINT32_MAX;
+  uint32_t reserved = 0;
+  uint64_t sequence = 0;
+  RegionOffset target_row = kNullOffset;
+  FixedKey target_key{};
+
+  RemoteDeleteControlState LoadState(
+      std::memory_order order = std::memory_order_acquire) const {
+    return static_cast<RemoteDeleteControlState>(
+        mem_access::HwccAtomicLoad(state, order));
+  }
+
+  bool Matches(uint32_t requester_node, uint32_t requester_worker,
+               uint32_t partition, uint64_t request_sequence,
+               RegionOffset row, const FixedKey &key) const {
+    return requester_node_id == requester_node &&
+           requester_worker_id == requester_worker &&
+           partition_id == partition && sequence == request_sequence &&
+           target_row == row && target_key.Compare(key) == 0;
+  }
+
+  bool PublishPending(uint32_t requester_node, uint32_t requester_worker,
+                      uint32_t partition, uint64_t request_sequence,
+                      RegionOffset row, const FixedKey &key) {
+    if (LoadState() != RemoteDeleteControlState::kEmpty) return false;
+    requester_node_id = requester_node;
+    requester_worker_id = requester_worker;
+    partition_id = partition;
+    reserved = 0;
+    sequence = request_sequence;
+    target_row = row;
+    target_key = key;
+    mem_access::HwccAtomicStore(
+        error_code, static_cast<uint32_t>(RemoteDeleteControlError::kNone),
+        std::memory_order_relaxed);
+    mem_access::HwccWrite(this, sizeof(*this));
+    uint32_t expected = static_cast<uint32_t>(RemoteDeleteControlState::kEmpty);
+    return mem_access::HwccAtomicCompareExchangeStrong(
+        state, expected,
+        static_cast<uint32_t>(RemoteDeleteControlState::kPending),
+        std::memory_order_release, std::memory_order_acquire);
+  }
+
+  bool CompareExchange(RemoteDeleteControlState expected,
+                        RemoteDeleteControlState desired) {
+    uint32_t raw_expected = static_cast<uint32_t>(expected);
+    return mem_access::HwccAtomicCompareExchangeStrong(
+        state, raw_expected, static_cast<uint32_t>(desired),
+        std::memory_order_acq_rel, std::memory_order_acquire);
+  }
+
+  void PublishError(RemoteDeleteControlError error) {
+    mem_access::HwccAtomicStore(error_code, static_cast<uint32_t>(error),
+                                std::memory_order_release);
+  }
+
+  bool AcknowledgeAndClear(RemoteDeleteControlState terminal) {
+    if (!CompareExchange(terminal,
+                         RemoteDeleteControlState::kAcknowledged))
+      return false;
+    return CompareExchange(RemoteDeleteControlState::kAcknowledged,
+                            RemoteDeleteControlState::kEmpty);
+  }
+};
+static_assert(alignof(RemoteDeleteControlSlot) == 64);
+
 // Offset-adapted form of the original TableBTreeOLC::ValueStruct. The lmeta
 // storage itself is defined once in the TwoPLPasha helper and is specialized
 // there for RegionOffset references.
@@ -256,6 +367,9 @@ struct alignas(64) SharedLayoutHeader {
   std::array<OwnerDynamicArenaDescriptor, kMaxAllocatorShards>
       owner_dynamic_arenas{};
   std::array<PartitionDirectoryEntry, kMaxPartitions> partitions{};
+  std::array<std::array<RemoteDeleteControlSlot, kMaxForegroundWorkers>,
+             kMaxAllocatorShards>
+      remote_delete_controls{};
   std::array<DomainCounter, kAllocationDomainCount> domains{};
 };
 

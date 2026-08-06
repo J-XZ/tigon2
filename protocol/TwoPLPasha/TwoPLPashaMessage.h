@@ -51,6 +51,7 @@ enum class RemoteInsertOutcome : uint8_t {
 enum class RemoteDeleteOutcome : uint8_t {
         Deleted = 0,
         Busy = 1,
+        Failed = 2,
 };
 
 enum class MigrationResponseOutcome : uint8_t {
@@ -77,11 +78,11 @@ class TwoPLPashaMessageFactory {
         }
         static std::size_t remote_delete_request_size(std::size_t key_size) {
                 return MessagePiece::get_header_size() + key_size +
-                       sizeof(uint64_t);
+                       sizeof(uint64_t) + sizeof(uint64_t);
         }
         static std::size_t remote_delete_response_size() {
                 return MessagePiece::get_header_size() + sizeof(uint8_t) +
-                       sizeof(uint32_t) + sizeof(uint64_t);
+                       sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t);
         }
         static std::size_t bool_key_offset_response_size() {
                 return MessagePiece::get_header_size() + sizeof(bool) +
@@ -196,7 +197,8 @@ class TwoPLPashaMessageFactory {
 
         static std::size_t new_remote_delete_message(
                 Message &message, std::size_t table_id, std::size_t partition_id,
-                const void *key, std::size_t key_size, uint64_t request_sequence)
+                const void *key, std::size_t key_size, uint64_t target_row,
+                uint64_t request_sequence)
 	{
 		auto message_size = remote_delete_request_size(key_size);
 		auto message_piece_header = MessagePiece::construct_message_piece_header(
@@ -205,17 +207,12 @@ class TwoPLPashaMessageFactory {
 		Encoder encoder(message.data);
 		encoder << message_piece_header;
 		encoder.write_n_bytes(key, key_size);
-		encoder << request_sequence;
+		encoder << target_row << request_sequence;
 		message.flush();
 		message.set_gen_time(Time::now());
 		return message_size;
 	}
 
-        static std::size_t new_remote_delete_message(Message &message, ITable &table, const void *key)
-	{
-		return new_remote_delete_message(message, table.tableID(),
-		    table.partitionID(), key, table.key_size(), 0);
-	}
 };
 
 class TwoPLPashaMessageHandler {
@@ -271,17 +268,20 @@ class TwoPLPashaMessageHandler {
         static bool remote_delete_request_handler(
                 MessagePiece inputPiece, Message &responseMessage, ITable &table,
                 std::size_t key_size,
-                const std::function<RemoteDeleteOutcome(const void *)> &delete_row)
+                const std::function<RemoteDeleteOutcome(const void *, uint64_t,
+                                                         uint64_t)> &delete_row)
         {
                 const char *key = nullptr;
+                uint64_t target_row = 0;
                 uint64_t request_sequence = 0;
                 if (!decode_remote_delete_request(inputPiece, key_size, key,
-                                                  request_sequence))
+                                                  target_row, request_sequence))
                         return false;
-                const RemoteDeleteOutcome outcome = delete_row(key);
+                const RemoteDeleteOutcome outcome =
+                    delete_row(key, target_row, request_sequence);
                 append_remote_delete_response(responseMessage, table.tableID(),
                     table.partitionID(), outcome, /*key_offset=*/0,
-                    request_sequence);
+                    target_row, request_sequence);
                 return true;
         }
 
@@ -350,7 +350,7 @@ class TwoPLPashaMessageHandler {
 
         static bool decode_remote_delete_request(
                 MessagePiece piece, std::size_t key_size, const char *&key,
-                uint64_t &request_sequence)
+                uint64_t &target_row, uint64_t &request_sequence)
         {
                 if (piece.get_message_type() != static_cast<uint32_t>(
                             TwoPLPashaMessage::REMOTE_DELETE_REQUEST) ||
@@ -361,7 +361,7 @@ class TwoPLPashaMessageHandler {
                 key = input.data();
                 input.remove_prefix(key_size);
                 Decoder decoder(input);
-                decoder >> request_sequence;
+                decoder >> target_row >> request_sequence;
                 return decoder.size() == 0;
         }
 
@@ -444,7 +444,8 @@ class TwoPLPashaMessageHandler {
 
         static bool decode_remote_delete_response(
                 MessagePiece piece, RemoteDeleteOutcome &outcome,
-                uint32_t &key_offset, uint64_t &request_sequence)
+                uint32_t &key_offset, uint64_t &target_row,
+                uint64_t &request_sequence)
         {
                 if (piece.get_message_type() != static_cast<uint32_t>(
                             TwoPLPashaMessage::REMOTE_DELETE_RESPONSE) ||
@@ -453,10 +454,13 @@ class TwoPLPashaMessageHandler {
                         return false;
                 Decoder decoder(piece.toStringPiece());
                 uint8_t raw = 0;
-                decoder >> raw >> key_offset >> request_sequence;
-                if (decoder.size() != 0 || raw > 1) return false;
-                outcome = raw == 0 ? RemoteDeleteOutcome::Deleted
-                                   : RemoteDeleteOutcome::Busy;
+                decoder >> raw >> key_offset >> target_row >> request_sequence;
+                if (decoder.size() != 0 || raw > 2) return false;
+                switch (raw) {
+                        case 0: outcome = RemoteDeleteOutcome::Deleted; break;
+                        case 1: outcome = RemoteDeleteOutcome::Busy; break;
+                        case 2: outcome = RemoteDeleteOutcome::Failed; break;
+                }
                 return true;
         }
 
@@ -524,7 +528,7 @@ class TwoPLPashaMessageHandler {
         static void append_remote_delete_response(
                 Message &message, std::size_t table_id, std::size_t partition_id,
                 RemoteDeleteOutcome outcome, uint32_t key_offset,
-                uint64_t request_sequence)
+                uint64_t target_row, uint64_t request_sequence)
         {
                 const auto size =
                     TwoPLPashaMessageFactory::remote_delete_response_size();
@@ -535,11 +539,15 @@ class TwoPLPashaMessageHandler {
                 switch (outcome) {
                         case RemoteDeleteOutcome::Deleted:
                                 encoder << uint8_t{0} << key_offset
-                                        << request_sequence;
+                                        << target_row << request_sequence;
                                 message.flush(); return;
                         case RemoteDeleteOutcome::Busy:
                                 encoder << uint8_t{1} << key_offset
-                                        << request_sequence;
+                                        << target_row << request_sequence;
+                                message.flush(); return;
+                        case RemoteDeleteOutcome::Failed:
+                                encoder << uint8_t{2} << key_offset
+                                        << target_row << request_sequence;
                                 message.flush(); return;
                 }
                 LOG(FATAL) << "unknown remote delete response outcome";
@@ -998,18 +1006,14 @@ class TwoPLPashaMessageHandler {
 		DCHECK(table_id == table.tableID());
 		DCHECK(partition_id == table.partitionID());
 		auto key_size = table.key_size();
-		auto value_size = table.value_size();
-
-		/*
-		 * The structure of a remote delete request: (primary key)
-		 */
-
-		auto stringPiece = inputPiece.toStringPiece();
-
-		DCHECK(inputPiece.get_message_length() == MessagePiece::get_header_size() + key_size);
-
-		// get the key
-		const void *key = stringPiece.data();
+		const char *key = nullptr;
+		uint64_t target_row = 0;
+		uint64_t request_sequence = 0;
+		if (!decode_remote_delete_request(inputPiece, key_size, key, target_row,
+		                                  request_sequence))
+			return;
+		(void)target_row;
+		(void)request_sequence;
 
                 // delete the key and untrack it if necessary
                 migration_manager->delete_specific_row_and_move_out(&table, key, false);

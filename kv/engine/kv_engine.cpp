@@ -850,7 +850,7 @@ Status KVEngine::Delete(std::string_view key) {
                          "internal max sentinel is reserved");
   const KeyRoute route = RouteForKey(key);
   if (!route.owned_by_this_node) {
-    star::TwoPLPashaMetadataShared *locked_row = nullptr;
+    RegionOffset locked_row = kNullOffset;
     const auto prepare_delete = [&](bool record_clock_access = true) {
       EbrOperationScope ebr_scope(ebr_);
       return route.partition->PrepareRemoteDelete(key, config_.node_id,
@@ -868,36 +868,47 @@ Status KVEngine::Delete(std::string_view key) {
       return Status::Error(StatusCode::kNotFound, "key not found");
     if (prepared != SharedAccessState::kDone)
       return Status::Error(StatusCode::kBusy, "remote delete shared row busy");
-    // The row is now write_locked with valid cleared (the critical
-    // intermediate state).  Until the owner ack commits the delete or the
-    // rollback restores the row, no latency busy-wait may happen on this
-    // thread: the cooperative wait inside Forward suspends the foreground
-    // budget, and every transport poll defers its settlement into the same
-    // deferred segment, so everything settles exactly once at the outermost
-    // scope exit, after the lock and SCC guards are released.  Cooperative
-    // transport processing itself is unchanged.  The RAII guard releases the
-    // defer mode on every return, including exceptions from Forward.
-    mem_access::DeferTransportSettlement defer_settlement;
-    Status deleted;
+    // The row is now prepared, but the stable HWCC control slot is the only
+    // Pending/Executing authority.  The requester never keeps a row pointer
+    // across the RPC or timeout boundary.
+    WorkerMailbox &mailbox = CurrentMailbox();
+    const uint32_t worker_id = static_cast<uint32_t>(TlsForegroundWorkerId);
+    const FixedKey fixed_key = FixedKey::From(key, config_.fixed_key_size);
+    uint64_t sequence = 0;
     try {
-      deleted = Forward(star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST, key, {}, route.partition_id,
-                        route.owner);
+      sequence = ReserveOperationSequence(mailbox);
     } catch (...) {
-      // Exception safety: restore the row so the lock is never stranded, then
-      // unwind; the deferred budgets settle at the outermost scope exit.
-      try {
-        route.partition->AbortRemoteDelete(locked_row, config_.node_id);
-      } catch (...) {
-      }
+      EbrOperationScope ebr_scope(ebr_);
+      route.partition->AbortRemoteDelete(locked_row, config_.node_id);
       throw;
     }
-    // A successful owner callback consumes the requester write/ref pin with
-    // the retired row.  On an unsuccessful ack it is still live and must be
-    // restored before the facade retries.
-    if (!deleted.ok()) {
+    auto &control = pool_->allocator().layout()
+                        .remote_delete_controls[config_.node_id][worker_id];
+    if (!control.PublishPending(config_.node_id, worker_id, route.partition_id,
+                                sequence, locked_row, fixed_key)) {
+      EbrOperationScope ebr_scope(ebr_);
       route.partition->AbortRemoteDelete(locked_row, config_.node_id);
+      return Status::Error(StatusCode::kBusy,
+                           "remote delete control slot is not empty");
     }
-    return deleted;
+    mem_access::DeferTransportSettlement defer_settlement;
+    Status deleted = Status::Error(StatusCode::kCorruption,
+                                   "remote delete did not complete");
+    try {
+      deleted = Forward(star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST, key, {}, route.partition_id,
+                        route.owner, {}, 0, locked_row, sequence);
+    } catch (...) {
+      FinalizeRemoteDelete(
+          mailbox, fixed_key, route.owner, route.partition_id, locked_row,
+          sequence, Status::Error(StatusCode::kCorruption,
+                                  "remote delete transport exception"));
+      RetireOperation(mailbox);
+      mailbox.operation = {};
+      throw;
+    }
+    return FinalizeRemoteDelete(mailbox, fixed_key, route.owner,
+                                route.partition_id, locked_row, sequence,
+                                std::move(deleted));
   }
   try {
     EbrOperationScope ebr_scope(ebr_);
@@ -1338,6 +1349,87 @@ KVEngine::WorkerMailbox &KVEngine::CurrentMailbox() {
   return *worker_mailboxes_[worker];
 }
 
+uint64_t KVEngine::ReserveOperationSequence(WorkerMailbox &mailbox) {
+  const uint64_t sequence = mailbox.next_operation_sequence;
+  if (sequence == 0)
+    throw std::overflow_error("transport operation sequence exhausted");
+  mailbox.next_operation_sequence =
+      sequence == UINT64_MAX ? 0 : sequence + 1;
+  return sequence;
+}
+
+void KVEngine::RetireOperation(WorkerMailbox &mailbox) {
+  const auto &operation = mailbox.operation;
+  if (operation.expected_response_type != static_cast<uint32_t>(
+          star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE) ||
+      operation.sequence == 0)
+    return;
+  auto &retired =
+      mailbox.retired_remote_deletes[mailbox.next_retired_remote_delete];
+  retired = {true, operation.expected_source_owner, operation.partition_id,
+             operation.sequence, operation.target_row};
+  mailbox.next_retired_remote_delete =
+      (mailbox.next_retired_remote_delete + 1) %
+      kRetiredRemoteDeleteCapacity;
+}
+
+bool KVEngine::IsRetiredRemoteDelete(
+    const WorkerMailbox &mailbox,
+    const RemoteDeleteIdentity &identity) const {
+  for (const auto &retired : mailbox.retired_remote_deletes) {
+    if (retired.valid && retired.source_owner == identity.source_owner &&
+        retired.partition_id == identity.partition_id &&
+        retired.sequence == identity.sequence &&
+        retired.target_row == identity.target_row)
+      return true;
+  }
+  return false;
+}
+
+Status KVEngine::FinalizeRemoteDelete(WorkerMailbox &mailbox,
+                                      const FixedKey &key, uint32_t owner,
+                                      uint32_t partition_id,
+                                      RegionOffset target_row,
+                                      uint64_t sequence, Status result) {
+  const uint32_t worker_id = static_cast<uint32_t>(TlsForegroundWorkerId);
+  auto &control = pool_->allocator().layout()
+                      .remote_delete_controls[config_.node_id][worker_id];
+  auto state = control.LoadState();
+  if (!control.Matches(config_.node_id, worker_id, partition_id, sequence,
+                       target_row, key))
+    TransportFatal(config_.node_id, "remote_delete_finalize",
+                   "control identity changed before requester finalization");
+
+  if (state == RemoteDeleteControlState::kPending &&
+      control.CompareExchange(RemoteDeleteControlState::kPending,
+                              RemoteDeleteControlState::kCancelled)) {
+    {
+      EbrOperationScope ebr_scope(ebr_);
+      partitions_[partition_id]->AbortRemoteDelete(target_row, config_.node_id);
+    }
+    if (!control.AcknowledgeAndClear(RemoteDeleteControlState::kCancelled))
+      TransportFatal(config_.node_id, "remote_delete_finalize",
+                     "cancelled control slot could not be acknowledged");
+    return result;
+  }
+
+  state = control.LoadState();
+  if (state == RemoteDeleteControlState::kPending ||
+      state == RemoteDeleteControlState::kExecuting)
+    TransportFatal(config_.node_id, "remote_delete_finalize",
+                   "remote delete has no stable terminal state");
+  if (state == RemoteDeleteControlState::kEmpty ||
+      state == RemoteDeleteControlState::kAcknowledged)
+    TransportFatal(config_.node_id, "remote_delete_finalize",
+                   "remote delete control slot was reused early");
+  if (!control.AcknowledgeAndClear(state))
+    TransportFatal(config_.node_id, "remote_delete_finalize",
+                   "remote delete terminal acknowledgement failed");
+  (void)mailbox;
+  (void)owner;
+  return result;
+}
+
 void KVEngine::RequireBoundWorker() const {
   if (TlsForegroundWorkerId < 0 ||
       static_cast<uint32_t>(TlsForegroundWorkerId) >= worker_mailboxes_.size()) {
@@ -1384,7 +1476,9 @@ void KVEngine::SendTransportMessage(star::Message &message) {
 Status KVEngine::Forward(star::TwoPLPashaMessage type, std::string_view key,
                          std::string_view value, uint32_t partition_id,
                          uint32_t owner, std::string_view scan_max,
-                         uint64_t scan_limit) {
+                         uint64_t scan_limit,
+                         RegionOffset remote_delete_target,
+                         uint64_t forced_sequence) {
   if (owner >= config_.vm_count || partition_id >= config_.partition_count)
     return Status::Error(StatusCode::kInvalidArgument, "invalid RPC route");
   if (partition_id >= partitions_.size() ||
@@ -1394,7 +1488,15 @@ Status KVEngine::Forward(star::TwoPLPashaMessage type, std::string_view key,
   WorkerMailbox &mailbox = CurrentMailbox();
   if (mailbox.operation.expected_response_type != 0)
     TransportFatal(config_.node_id, "forward", "reentrant foreground RPC");
-  const uint64_t sequence = mailbox.next_operation_sequence++;
+  const uint64_t sequence = forced_sequence == 0
+                                ? ReserveOperationSequence(mailbox)
+                                : forced_sequence;
+  if (forced_sequence != 0 &&
+      type != star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST)
+    TransportFatal(config_.node_id, "forward", "forced sequence on non-delete RPC");
+  if (type == star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST &&
+      remote_delete_target == kNullOffset)
+    TransportFatal(config_.node_id, "forward", "remote delete has null target row");
   const FixedKey fixed_key = FixedKey::From(key, config_.fixed_key_size);
   FixedKey fixed_scan_max{};
   if (type == star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN)
@@ -1425,7 +1527,7 @@ Status KVEngine::Forward(star::TwoPLPashaMessage type, std::string_view key,
     case star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST:
       star::TwoPLPashaMessageFactory::new_remote_delete_message(
           message, kSingleTableId, partition_id, fixed_key.bytes,
-          config_.fixed_key_size, sequence);
+          config_.fixed_key_size, remote_delete_target, sequence);
       expected_response = static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE);
       break;
     case star::TwoPLPashaMessage::DATA_MIGRATION_REQUEST_FOR_SCAN:
@@ -1437,9 +1539,17 @@ Status KVEngine::Forward(star::TwoPLPashaMessage type, std::string_view key,
           star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN);
       break;
   }
-  mailbox.operation = {expected_response, owner, partition_id, sequence, false,
-                       Status::Error(StatusCode::kCorruption,
-                                     "missing RPC response")};
+  mailbox.operation.expected_response_type = expected_response;
+  mailbox.operation.expected_source_owner = owner;
+  mailbox.operation.partition_id = partition_id;
+  mailbox.operation.sequence = sequence;
+  mailbox.operation.target_row =
+      type == star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST
+          ? remote_delete_target
+          : kNullOffset;
+  mailbox.operation.done = false;
+  mailbox.operation.result = Status::Error(StatusCode::kCorruption,
+                                            "missing RPC response");
   SendTransportMessage(message);
   message.clear_message_pieces();
   // The request phase ends immediately after the transport publication.  The
@@ -1471,6 +1581,7 @@ Status KVEngine::AwaitResponse(WorkerMailbox &mailbox) {
     PollTransport();
     if (mailbox.operation.done) break;
     if (std::chrono::steady_clock::now() >= deadline) {
+      RetireOperation(mailbox);
       mailbox.operation = {};
       return Status::Error(StatusCode::kTimeout,
                            "transport response timeout");
@@ -1478,6 +1589,7 @@ Status KVEngine::AwaitResponse(WorkerMailbox &mailbox) {
     std::this_thread::yield();
   }
   const Status result = mailbox.operation.result;
+  RetireOperation(mailbox);
   mailbox.operation = {};
   return result;
 }
@@ -1683,29 +1795,52 @@ void KVEngine::ConsumeTransportResponse(star::Message &message,
                                         star::MessagePiece piece,
                                         WorkerMailbox &mailbox) {
   auto &operation = mailbox.operation;
+  uint32_t key_offset = 0;
+  const uint32_t remote_delete_response = static_cast<uint32_t>(
+      star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE);
+  if (piece.get_message_type() == remote_delete_response) {
+    star::RemoteDeleteOutcome delete_outcome{};
+    uint64_t response_target_row = kNullOffset;
+    uint64_t response_sequence = 0;
+    if (!star::TwoPLPashaMessageHandler::decode_remote_delete_response(
+            piece, delete_outcome, key_offset, response_target_row,
+            response_sequence) ||
+        key_offset != 0)
+      TransportFatal(config_.node_id, "response", "malformed remote delete response");
+
+    const RemoteDeleteIdentity identity{
+        true, static_cast<uint32_t>(message.get_source_node_id()),
+        piece.get_partition_id(), response_sequence, response_target_row};
+    // Decode first, then consult the bounded retired ledger.  This is what
+    // makes a confirmed old response harmless when the mailbox is empty, is
+    // serving another route, or is waiting for a different operation type.
+    if (IsRetiredRemoteDelete(mailbox, identity))
+      return;
+    if (operation.expected_response_type != remote_delete_response ||
+        operation.done || piece.get_partition_id() != operation.partition_id ||
+        message.get_source_node_id() != operation.expected_source_owner ||
+        response_sequence != operation.sequence ||
+        response_target_row != operation.target_row)
+      TransportFatal(config_.node_id, "response",
+                     "unexpected remote delete response identity");
+    operation.result = delete_outcome == star::RemoteDeleteOutcome::Deleted
+                           ? Status::Ok()
+                           : delete_outcome == star::RemoteDeleteOutcome::Busy
+                                 ? Status::Error(StatusCode::kBusy,
+                                                 "owner delete busy")
+                                 : Status::Error(StatusCode::kCorruption,
+                                                 "owner remote delete failed");
+    operation.done = true;
+    return;
+  }
+
   if (operation.expected_response_type == 0 || operation.done ||
       piece.get_message_type() != operation.expected_response_type ||
       piece.get_partition_id() != operation.partition_id ||
       message.get_source_node_id() != operation.expected_source_owner)
     TransportFatal(config_.node_id, "response", "unexpected response for worker operation");
-  uint32_t key_offset = 0;
-  if (piece.get_message_type() == static_cast<uint32_t>(star::TwoPLPashaMessage::REMOTE_DELETE_RESPONSE)) {
-    star::RemoteDeleteOutcome delete_outcome{};
-    uint64_t response_sequence = 0;
-    if (!star::TwoPLPashaMessageHandler::decode_remote_delete_response(
-            piece, delete_outcome, key_offset, response_sequence) ||
-        key_offset != 0)
-      TransportFatal(config_.node_id, "response", "malformed remote delete response");
-    // Late/stale responses are identified by request identity and dropped
-    // without consuming the next request's slot.
-    if (response_sequence != operation.sequence)
-      return;
-    operation.result = delete_outcome == star::RemoteDeleteOutcome::Deleted
-                           ? Status::Ok()
-                           : Status::Error(StatusCode::kBusy,
-                                           "owner delete busy");
-  } else if (piece.get_message_type() == static_cast<uint32_t>(
-                 star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN)) {
+  if (piece.get_message_type() == static_cast<uint32_t>(
+          star::TwoPLPashaMessage::DATA_MIGRATION_RESPONSE_FOR_SCAN)) {
     bool success = false;
     if (!star::TwoPLPashaMessageHandler::decode_scan_migration_response(
             piece, success, key_offset) || key_offset != 0)
@@ -1882,19 +2017,75 @@ void KVEngine::ServeTransportRequest(star::Message &message,
     const bool framed = star::TwoPLPashaMessageHandler::
         remote_delete_request_handler(
             piece, response, *table, config_.fixed_key_size,
-            [this, &message, piece, table](const void *raw_key) {
+            [this, &message, piece](const void *raw_key, uint64_t target_row,
+                                    uint64_t request_sequence) {
               const std::string_view key(
                   static_cast<const char *>(raw_key), config_.fixed_key_size);
               auto *partition = OwnedPartition(key);
-              if (partition == nullptr || star::migration_manager == nullptr)
+              if (partition == nullptr || star::migration_manager == nullptr ||
+                  target_row == kNullOffset ||
+                  message.get_source_node_id() >= kMaxAllocatorShards ||
+                  message.get_worker_id() >= kMaxForegroundWorkers)
                 TransportFatal(config_.node_id, "request",
                                "delete delivered to non-owner", &message);
               const FixedKey fixed_key = FixedKey::From(
                   key, config_.fixed_key_size);
-              return star::migration_manager->delete_specific_row_and_move_out(
-                         table, &fixed_key, /*is_delete_local=*/false)
-                         ? star::RemoteDeleteOutcome::Deleted
-                         : star::RemoteDeleteOutcome::Busy;
+              auto &control = pool_->allocator().layout().remote_delete_controls
+                  [message.get_source_node_id()][message.get_worker_id()];
+              const RemoteDeleteControlState control_state = control.LoadState();
+              if (!control.Matches(
+                      message.get_source_node_id(), message.get_worker_id(),
+                      piece.get_partition_id(), request_sequence, target_row,
+                      fixed_key))
+                return star::RemoteDeleteOutcome::Busy;
+              if (control_state != RemoteDeleteControlState::kPending ||
+                  !control.CompareExchange(
+                      RemoteDeleteControlState::kPending,
+                      RemoteDeleteControlState::kExecuting))
+                return star::RemoteDeleteOutcome::Busy;
+              try {
+                const star::RowOutcome outcome = partition->DeleteRemoteClaimed(
+                    key, target_row, message.get_source_node_id());
+                if (outcome == star::RowOutcome::kDone) {
+                  if (!control.CompareExchange(
+                          RemoteDeleteControlState::kExecuting,
+                          RemoteDeleteControlState::kDeleted))
+                    ProtocolFatal(config_.node_id, "request",
+                                  "remote delete terminal publish failed",
+                                  &message);
+                  return star::RemoteDeleteOutcome::Deleted;
+                }
+                if (outcome == star::RowOutcome::kBusy) {
+                  // The owner still owns the exact requester pin and has not
+                  // entered adjacency mutation; restore it before publishing
+                  // Rejected so the requester never rolls back a terminal row.
+                  partition->AbortRemoteDelete(target_row,
+                                                message.get_source_node_id());
+                  control.PublishError(RemoteDeleteControlError::kRejected);
+                  if (!control.CompareExchange(
+                          RemoteDeleteControlState::kExecuting,
+                          RemoteDeleteControlState::kRejected))
+                    ProtocolFatal(config_.node_id, "request",
+                                  "remote delete rejection publish failed",
+                                  &message);
+                  return star::RemoteDeleteOutcome::Busy;
+                }
+                ProtocolFatal(config_.node_id, "request",
+                              "unknown remote delete owner outcome", &message);
+              } catch (...) {
+                // A post-claim exception is not a requester rollback case.
+                // Publish Failed as the durable explanation, then stop this
+                // process rather than continuing with an unknown row state.
+                control.PublishError(RemoteDeleteControlError::kOwnerFailure);
+                if (!control.CompareExchange(
+                        RemoteDeleteControlState::kExecuting,
+                        RemoteDeleteControlState::kFailed))
+                  ProtocolFatal(config_.node_id, "request",
+                                "remote delete failure publish failed",
+                                &message);
+                ProtocolFatal(config_.node_id, "request",
+                              "remote delete owner callback failed", &message);
+              }
             });
     if (!framed)
       TransportFatal(config_.node_id, "request",

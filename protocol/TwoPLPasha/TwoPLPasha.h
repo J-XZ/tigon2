@@ -474,7 +474,11 @@ template <class Database> class TwoPLPasha {
                                                 DCHECK(cxl_row != nullptr);
                                                 twopl_pasha_global_helper->remote_modify_tuple_valid_bit(cxl_row, false);
                                                 // TwoPLPashaHelper::decrease_reference_count_via_ptr(cxl_row);
-                                                txn.network_size += MessageFactoryType::new_remote_delete_message(*messages[coordinatorID], *table, scan_results[i].key);
+                                                txn.network_size += MessageFactoryType::new_remote_delete_message(
+                                                    *messages[coordinatorID], table->tableID(),
+                                                    table->partitionID(), scan_results[i].key,
+                                                    table->key_size(), /*target_row=*/0,
+                                                    /*request_sequence=*/0);
                                         }
                                 }
                         }

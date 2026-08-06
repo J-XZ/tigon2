@@ -9,6 +9,8 @@
 
 #include <memory>
 #include <atomic>
+#include <array>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 #include <string_view>
@@ -99,7 +101,9 @@ class KVEngine {
   Status Forward(star::TwoPLPashaMessage type, std::string_view key,
                  std::string_view value,
                  uint32_t partition_id, uint32_t owner,
-                 std::string_view scan_max = {}, uint64_t scan_limit = 0);
+                 std::string_view scan_max = {}, uint64_t scan_limit = 0,
+                 RegionOffset remote_delete_target = kNullOffset,
+                 uint64_t forced_sequence = 0);
   // TwoPLPasha DATA_MIGRATION: ask owner to move_row_in, then requester CXL-accesses.
   Status RequestMigrate(std::string_view key);
   struct OperationContext {
@@ -110,9 +114,18 @@ class KVEngine {
     // stale/late response for a previous request is dropped instead of
     // consuming the slot of the next request.
     uint64_t sequence = 0;
+    RegionOffset target_row = kNullOffset;
     bool done = false;
     Status result = Status::Error(StatusCode::kCorruption, "unset RPC result");
   };
+  struct RemoteDeleteIdentity {
+    bool valid = false;
+    uint32_t source_owner = 0;
+    uint32_t partition_id = 0;
+    uint64_t sequence = 0;
+    RegionOffset target_row = kNullOffset;
+  };
+  static constexpr size_t kRetiredRemoteDeleteCapacity = 64;
   struct WorkerMailbox {
     star::LockfreeQueue<star::Message *> inbox;
     // Original Executor-shaped per-destination buffers. A foreground worker
@@ -124,6 +137,9 @@ class KVEngine {
     std::vector<std::unique_ptr<star::Message>> deferred_requests;
     OperationContext operation;
     uint64_t next_operation_sequence = 1;
+    std::array<RemoteDeleteIdentity, kRetiredRemoteDeleteCapacity>
+        retired_remote_deletes{};
+    size_t next_retired_remote_delete = 0;
   };
   // A foreground worker is the sole writer to its slot. Keep protocol-path
   // diagnostics out of the shared/global RMW path just like facade counters.
@@ -133,6 +149,14 @@ class KVEngine {
     star::CXL_EBR::EBRMetaLocal ebr_meta{};
   };
   WorkerMailbox &CurrentMailbox();
+  uint64_t ReserveOperationSequence(WorkerMailbox &mailbox);
+  void RetireOperation(WorkerMailbox &mailbox);
+  bool IsRetiredRemoteDelete(const WorkerMailbox &mailbox,
+                             const RemoteDeleteIdentity &identity) const;
+  Status FinalizeRemoteDelete(WorkerMailbox &mailbox, const FixedKey &key,
+                              uint32_t owner, uint32_t partition_id,
+                              RegionOffset target_row, uint64_t sequence,
+                              Status result);
   Status AwaitResponse(WorkerMailbox &mailbox);
   void DispatchMessage(star::Message &message, WorkerMailbox &mailbox);
   void ServeTransportRequest(star::Message &message,

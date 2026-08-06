@@ -143,23 +143,26 @@ void RunFocusedG() {
   two_pieces.set_dest_node_id(0);
   two_pieces.set_worker_id(0);
   star::TwoPLPashaMessageFactory::new_remote_delete_message(
-      two_pieces, 0, 3, key.data(), key.size(), 7);
+      two_pieces, 0, 3, key.data(), key.size(), 0x1234, 7);
   star::TwoPLPashaMessageFactory::new_remote_delete_message(
-      two_pieces, 0, 3, key.data(), key.size(), 8);
+      two_pieces, 0, 3, key.data(), key.size(), 0x5678, 8);
   assert(two_pieces.get_message_count() == 2);
   // Remote delete completion is a framed status response: owner-side
   // contention is retryable and must not be reported as a malformed request.
   star::Message busy_delete_response;
   star::TwoPLPashaMessageHandler::append_remote_delete_response(
-      busy_delete_response, 0, 3, star::RemoteDeleteOutcome::Busy, 0, 7);
+      busy_delete_response, 0, 3, star::RemoteDeleteOutcome::Busy, 0,
+      0x1234, 7);
   star::RemoteDeleteOutcome delete_outcome{};
   uint32_t delete_key_offset = 99;
+  uint64_t delete_target_row = 0;
   uint64_t delete_sequence = 0;
   assert(star::TwoPLPashaMessageHandler::decode_remote_delete_response(
       *busy_delete_response.begin(), delete_outcome, delete_key_offset,
-      delete_sequence));
+      delete_target_row, delete_sequence));
   assert(delete_outcome == star::RemoteDeleteOutcome::Busy &&
-         delete_key_offset == 0 && delete_sequence == 7);
+         delete_key_offset == 0 && delete_target_row == 0x1234 &&
+         delete_sequence == 7);
   // Initialize two owner arenas so the second published transport ring is
   // idle in this process; the parent demuxer consumes only ring 0.
   char path_template[] = "/tmp/tigonkv-engine-g-XXXXXX";
