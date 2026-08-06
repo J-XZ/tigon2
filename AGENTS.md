@@ -85,7 +85,7 @@ pool/不校准 TSC/不初始化与清理 simulator，compile-off ELF 不含 simu
 parser 符号；OFF（默认）则模拟器被
 编译进去，配置完成后始终参与。私有 `TIGONKV_DISABLE_HARDWARE_SIMULATION` 已删除。
 固定延迟公共实现来自固定子模块 `thirdparty_libs/latency_sim`
-（当前 gitlink `de84259bdfa344a26bb0a6248536326fbd37dad7`，与 cxlkv/sidle 完全一致），
+（V7 final gitlink `8e0a1d07d08a158fe52a6b03544c5d54a86d74f6`，与 cxlkv/sidle 完全一致），
 本仓只保留 `mem_access.h` 薄适配、生命周期与 scope 分类。
 
 ## 修改和验证
@@ -100,9 +100,18 @@ parser 符号；OFF（默认）则模拟器被
   `/mnt/xz_vm_storage` 与 `/mnt/xz_shared_mem`，再创建本项目自己的干净 4VM。
 - 默认只跑一轮无延迟代表性 trace 和一个小型非零固定延迟 canary；固定 canary 不导出
   访问计数，不输出模拟统计。
+- Remote Delete 使用稳定 HWCC control slot 记录 requester/worker/partition/sequence/
+  target-row identity；只有 `Pending -> Executing` 的精确 CAS 能 claim，requester 只可在
+  `Pending -> Cancelled` 成功时回滚，owner 终态必须先发布再回送 response。迟到 response
+  先解码 identity，再按有界 retired ledger 精确丢弃；未知/冲突 frame hard-fail。
 - 临时命令输出可以放入 `/tmp`，但交接结论和复查所需信息必须写入仓库当前状态文档
   或 `/root/code` 下的持久任务目录；仓库内文档保持短且描述
   当前实现，不追加无限增长日志。
+
+V7 completion evidence is under `/root/code/latency_sim_v7_artifacts/tigon2/`. The
+parent final SHA is recorded in `final.sha`; the public dependency SHA must equal both
+that file and the committed submodule gitlink. Historical V5/V6 artifact directories
+are not current evidence.
 
 ## Git 与数据
 
