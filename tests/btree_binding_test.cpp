@@ -6,6 +6,7 @@
 #undef NDEBUG
 #endif
 #include <cassert>
+#include <cstddef>
 #include <cstdio>
 #include <string>
 #include <sys/wait.h>
@@ -241,12 +242,24 @@ int main() {
   assert(regions.DynamicHwccUsedBytes(1) > 0);
   }
 #if !defined(LATENCY_SIM_COMPILE_OFF)
-  // Pool Open already registered both ranges with the zero-ns model; only the
-  // per-line delays need to be raised to observe a non-zero pending delay.
+  // Pool Open already registered both ranges with the zero-ns model.  Raise
+  // the per-line delays through a quiescent reopen (clear -> register the same
+  // two ranges -> configure), since Configure is only legal while unconfigured
+  // with both ranges registered.
   latency_sim::FixedLatencyConfig latency;
   latency.swcc_fixed_ns_per_line = 1;
   latency.hwcc_fixed_ns_per_line = 1;
+  const auto pool_config = MakeConfig(kPoolBytes);
   auto &simulator = latency_sim::GlobalLatencySimulator();
+  simulator.ClearPoolRegistrations();
+  simulator.RegisterPool(
+      latency_sim::MemoryDomain::kHwcc,
+      static_cast<const std::byte *>(pool.base()) + pool_config.hwcc_offset_bytes,
+      pool_config.hwcc_size_bytes);
+  simulator.RegisterPool(
+      latency_sim::MemoryDomain::kSwcc,
+      static_cast<const std::byte *>(pool.base()) + pool_config.swcc_offset_bytes,
+      pool_config.swcc_size_bytes);
   simulator.Configure(latency);
   uint64_t value = 0;
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
@@ -258,7 +271,6 @@ int main() {
   assert(shared_tree->lookup(Key(250), value) && value == 1250);
   assert(simulator.PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
-  simulator.Configure(latency_sim::FixedLatencyConfig{});
 #endif
 
   // Collapse the private root after a split.  The only persistent authority

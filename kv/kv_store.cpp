@@ -638,6 +638,15 @@ void ParseStrictLatencyConfig(std::string_view text, std::string_view raw_text,
   config->extra_check =
       ParseStrictBool(text, extra_check, "tigon_kv.extra_check");
 
+  // The latency_inject object and its fixed_latency child are owned by the
+  // latency_sim library parser (/tigon_kv/latency_inject/fixed_latency).  In
+  // a compile-on build the project checks only the outer
+  // presence/uniqueness/type and hands the original JSONC, including comments
+  // and trailing commas, to the library; the three fields are parsed and
+  // validated exclusively by the library.  Under LATENCY_SIM_COMPILE_OFF the
+  // parser does not exist, no fixed-latency configuration is parsed at all,
+  // and the outer latency_inject object is not required either.
+#if !defined(LATENCY_SIM_COMPILE_OFF)
   const auto &latency =
       RequireUniqueMember(tigon_members, "latency_inject", "tigon_kv");
   if (latency.kind != JsonValueKind::kObject)
@@ -655,13 +664,6 @@ void ParseStrictLatencyConfig(std::string_view text, std::string_view raw_text,
   if (fixed_member.kind != JsonValueKind::kObject)
     throw std::invalid_argument(
         "config field must be object: tigon_kv.latency_inject.fixed_latency");
-  // The fixed_latency object and all of its three fields are owned by the
-  // latency_sim library parser (/tigon_kv/latency_inject/fixed_latency).  This
-  // project deliberately checks only the outer presence/uniqueness/type and
-  // hands the original JSONC, including comments and trailing commas, to the
-  // library.  Under LATENCY_SIM_COMPILE_OFF no fixed-latency configuration is
-  // parsed (the parser does not exist in that build).
-#if !defined(LATENCY_SIM_COMPILE_OFF)
   try {
     config->hardware_simulation =
         latency_sim::ParseFixedLatencyJsonc(raw_text,

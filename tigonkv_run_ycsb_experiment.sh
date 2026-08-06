@@ -88,9 +88,12 @@ done
 if [[ -z "$out_dir" ]]; then out_dir="$root/exp_data/ycsb_tigonkv_$(date -u +%Y%m%dT%H%M%SZ)"; fi
 mkdir -p "$out_dir" "$out_dir/configs" "$out_dir/traces" "$out_dir/round_logs"
 generated_config="$out_dir/configs/experiment_config_ycsb_4vm.jsonc"
-python3 - "$base_config" "$generated_config" "$shared_size" "$shared_numa" "$rounds" "$records" "$operations" "$threads" "$workloads" "$sample_stride" "$latency_sim_compile_off" "$build_dir" <<'PY'
-import json, os, sys
-src, dst, size, numa, rounds, records, ops, threads, workloads, sample_stride, compile_off, build_dir = sys.argv[1:]
+parent_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo nogit)
+gitlink=$(tigonkv_latency_sim_gitlink "$root")
+source_state=$(tigonkv_source_state "$root")
+python3 - "$base_config" "$generated_config" "$shared_size" "$shared_numa" "$rounds" "$records" "$operations" "$threads" "$workloads" "$sample_stride" "$latency_sim_compile_off" "$build_dir" "$parent_sha" "$gitlink" "$source_state" <<'PY'
+import hashlib, json, os, sys
+src, dst, size, numa, rounds, records, ops, threads, workloads, sample_stride, compile_off, build_dir, parent_sha, gitlink, source_state = sys.argv[1:]
 text=open(src, encoding='utf-8').read()
 
 def strip_jsonc(value):
@@ -142,7 +145,7 @@ d['tigon_kv']['fixed_value_size']=32
 json.dump(d, open(dst, 'w', encoding='utf-8'), indent=2)
 selected=workloads.split(',')
 fixed_latency=lat['fixed_latency']
-meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'operation_count_semantics':'logical_ycsb_requests_before_update_expansion','vm_count':4,'foreground_workers_per_vm':4,'demuxer_threads_per_vm':1,'kv_threads_per_vm':5,'affinity':'distinct_allowed_cpus','threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32,'partition_sample_stride':int(sample_stride),'fixed_latency':{'cache_line_bytes':fixed_latency['cache_line_bytes'],'swcc_fixed_ns_per_line':fixed_latency['swcc_fixed_ns_per_line'],'hwcc_fixed_ns_per_line':fixed_latency['hwcc_fixed_ns_per_line']},'fixed_latency_nonzero':fixed_latency['swcc_fixed_ns_per_line'] != 0 or fixed_latency['hwcc_fixed_ns_per_line'] != 0,'latency_sim_compile_off':compile_off,'build_dir':build_dir,'reproduce_command':f'cmake -S {src!r} -B {build_dir!r} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF={compile_off}'}
+meta={'rounds':int(rounds),'record_count':int(records),'operation_count':int(ops),'operation_count_semantics':'logical_ycsb_requests_before_update_expansion','vm_count':4,'foreground_workers_per_vm':4,'demuxer_threads_per_vm':1,'kv_threads_per_vm':5,'affinity':'distinct_allowed_cpus','threads_per_node':int(threads),'workloads':selected,'base_config':src,'generated_config':dst,'generated_config_sha256':hashlib.sha256(open(dst,'rb').read()).hexdigest(),'ycsb_e':'enabled' if 'e' in selected else 'unused','fixed_key_size':32,'fixed_value_size':32,'partition_sample_stride':int(sample_stride),'fixed_latency':{'cache_line_bytes':fixed_latency['cache_line_bytes'],'swcc_fixed_ns_per_line':fixed_latency['swcc_fixed_ns_per_line'],'hwcc_fixed_ns_per_line':fixed_latency['hwcc_fixed_ns_per_line']},'fixed_latency_nonzero':fixed_latency['swcc_fixed_ns_per_line'] != 0 or fixed_latency['hwcc_fixed_ns_per_line'] != 0,'latency_sim_compile_off':compile_off,'build_dir':build_dir,'parent_sha':parent_sha,'latency_sim_gitlink':gitlink,'source_state':source_state,'reproduce_command':f'cmake -S {src!r} -B {build_dir!r} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF={compile_off}'}
 json.dump(meta, open(dst.rsplit('/',1)[0] + '/../run_meta.json', 'w', encoding='utf-8'), indent=2, sort_keys=True)
 PY
 echo "TIGONKV_YCSB_PREPARED out_dir=$out_dir config=$generated_config workloads=$workloads"
@@ -225,6 +228,30 @@ for name, value in zip('abcde', (a, b, c, d, e)):
     if value:
         values['workload' + name] = int(value)
 meta['replayed_trace_operations'] = values
+# Persist binary/config/trace hashes so the run stays reproducible after any
+# cleanup: the ycsb_partition_splits binary, the generated experiment config
+# and every generated trace file.
+import hashlib
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 16), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+binary = meta['build_dir'] + '/ycsb_partition_splits'
+if os.path.isfile(binary):
+    meta['binary_sha256'] = sha256_of(binary)
+config_path = meta.get('generated_config', '')
+if config_path and os.path.isfile(config_path):
+    meta['generated_config_sha256'] = sha256_of(config_path)
+trace_root = os.path.dirname(os.path.dirname(config_path)) + '/traces'
+trace_hashes = {}
+for root_dir, _dirs, files in os.walk(trace_root):
+    for name in sorted(files):
+        if name.endswith('.txt'):
+            rel = os.path.relpath(os.path.join(root_dir, name), trace_root)
+            trace_hashes[rel] = sha256_of(os.path.join(root_dir, name))
+meta['trace_sha256'] = trace_hashes
 tmp = path + '.tmp'
 with open(tmp, 'w', encoding='utf-8') as output:
     json.dump(meta, output, indent=2, sort_keys=True)

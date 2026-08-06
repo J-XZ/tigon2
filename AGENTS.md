@@ -70,18 +70,23 @@ transport 用 `mem_access::ForegroundScopeSuspension` 挂起前台 scope，在 b
 scope 中运行，绝不在 EBR/OLC/allocator/ring/SCC 发布存活时 busy-wait。
 
 `DualRegionMappedPool::Open` 注册不可变的 HWCC/SWCC range，并在 scope 内完成 pool
-init；`KVEngine::Open` 清空注册后重新应用真实三字段策略；shutdown 在静默边界清空
+init；`KVEngine::Open` 清空注册后重新应用真实三字段策略（Configure 只允许
+unconfigured 态且两个 range 均已注册）；shutdown 在静默边界清空
 注册（生命周期复位，不是运行时 disable）。`MPSCRingBuffer` 构造把 ring header
-（offset/length 字段与 head/tail/count 原子）和每个 entry 的 metadata + payload 作为
-真实 HWCC 写收费，每个连续 range 恰好一次。
+（offset/length 字段与 head/tail/count 原子和 entries 偏移）和每个 entry 的 ready
+原子、metadata + payload 作为真实 HWCC 访问按各自覆盖行收费，每个连续 range 恰好
+一次，不以整 entry envelope 粗略替代；远程 Delete 在 write_locked/invalid 中间态
+存活期间前台预算 suspend/defer，transport 的 background 结算推迟到 commit/rollback
+与锁和 SCC guard 释放之后。
 
 `LATENCY_SIM_COMPILE_OFF=ON` 是唯一无模拟代码方式：wrapper 编译为原始操作、scope 为
-no-op、消费者不解析 fixed-latency 配置/不注册 pool/不校准 TSC/不初始化与清理
-simulator，compile-off ELF 不含 simulator/TLS/TSC/parser 符号；OFF（默认）则模拟器被
+no-op、消费者不解析 fixed-latency 配置（也不要求配置中存在该外层对象）/不注册
+pool/不校准 TSC/不初始化与清理 simulator，compile-off ELF 不含 simulator/TLS/TSC/
+parser 符号；OFF（默认）则模拟器被
 编译进去，配置完成后始终参与。私有 `TIGONKV_DISABLE_HARDWARE_SIMULATION` 已删除。
 固定延迟公共实现来自固定子模块 `thirdparty_libs/latency_sim`
-（gitlink `3ed024f79f0f51f8180b887c8324024cc6536406`），本仓只保留 `mem_access.h`
-薄适配、生命周期与 scope 分类。
+（gitlink `e6f167b2b7d10e26eaa7780ff17510befff7e28e`，与 cxlkv/sidle 完全一致），
+本仓只保留 `mem_access.h` 薄适配、生命周期与 scope 分类。
 
 ## 修改和验证
 
