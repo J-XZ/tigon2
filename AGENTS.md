@@ -95,7 +95,8 @@ simulator，compile-off ELF 不含 simulator/TLS/TSC/parser 符号；OFF（默�
   `/mnt/xz_vm_storage` 与 `/mnt/xz_shared_mem`，再创建本项目自己的干净 4VM。
 - 默认只跑一轮无延迟代表性 trace 和一个小型非零固定延迟 canary；固定 canary 不导出
   访问计数，不输出模拟统计。
-- 施工记录写入 `/tmp/fixed-latency-only-cleanup-tigon2.md`，仓库内文档保持短且描述
+- 临时命令输出可以放入 `/tmp`，但交接结论和复查所需信息必须写入仓库当前状态文档
+  或 `/root/code` 下的持久任务目录；仓库内文档保持短且描述
   当前实现，不追加无限增长日志。
 
 ## Git 与数据

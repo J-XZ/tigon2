@@ -98,9 +98,7 @@ git -C "$root" ls-files --others --exclude-standard -z 2>/dev/null \
   # binary.  Hash each submodule's own tracked/index/untracked source state
   # too, so reuse is refused unless every relevant submodule is clean.
   submodule="$(git -C "$root" submodule status --recursive 2>/dev/null \
-    | while IFS= read -r line; do
-        path="${line#* }"
-        path="${path#* }"
+    | while read -r _sha path _description; do
         if [ -d "$root/$path" ]; then
           git -C "$root/$path" diff --no-ext-diff --binary 2>/dev/null
           git -C "$root/$path" diff --cached --no-ext-diff --binary 2>/dev/null

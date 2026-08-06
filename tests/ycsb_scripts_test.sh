@@ -30,6 +30,11 @@ assert fl['hwcc_fixed_ns_per_line'] == 0
 meta=json.load(open(sys.argv[2]))
 assert meta['partition_sample_stride'] == 16
 assert meta['fixed_latency_nonzero'] is False
+assert meta['fixed_latency'] == {
+    'cache_line_bytes': 64,
+    'swcc_fixed_ns_per_line': 0,
+    'hwcc_fixed_ns_per_line': 0,
+}
 assert meta['latency_sim_compile_off'] == 'OFF'
 assert meta['build_dir'].endswith('/build-relwithdebinfo-ninja-clang18-co_off')
 print('generated ycsb config schema ok')

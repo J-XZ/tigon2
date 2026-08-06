@@ -455,7 +455,6 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
     // (tests create sequential stores).  Pool open itself runs before the
     // registration below; fixed latency is configured after registration.
 #if !defined(LATENCY_SIM_COMPILE_OFF)
-    simulator.Configure(latency_sim::FixedLatencyConfig{});
     simulator.ClearPoolRegistrations();
 #endif
     lifecycle_touched = true;

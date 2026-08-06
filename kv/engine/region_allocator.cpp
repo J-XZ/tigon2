@@ -1520,7 +1520,6 @@ DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,
 #if !defined(LATENCY_SIM_COMPILE_OFF)
     {
       auto &simulator = latency_sim::GlobalLatencySimulator();
-      simulator.Configure({});
       simulator.ClearPoolRegistrations();
       simulator.RegisterPool(
           latency_sim::MemoryDomain::kHwcc,
