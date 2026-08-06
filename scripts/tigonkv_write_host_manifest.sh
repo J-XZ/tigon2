@@ -37,6 +37,19 @@ run_variant() {
     -DCMAKE_CXX_COMPILER="$cxx" -DLATENCY_SIM_COMPILE_OFF="$compile_off"
   cmake --build "$build_dir" -j"${CXLKV_BUILD_JOBS:-$(nproc)}"
 
+  # Record the build contract (parent HEAD, source-state, gitlink and every
+  # key binary hash) so later benchmark/provenance drivers can prove the
+  # binaries were built from the current final candidate.
+  local meta_bins=()
+  for name in unit_tests e2e_08 e2e_09 e2e_trace_runner \
+              ycsb_partition_splits hardware_sim_disabled_benchmark; do
+    if [[ -x "$build_dir/$name" ]]; then
+      meta_bins+=("$build_dir/$name")
+    fi
+  done
+  tigonkv_write_build_meta "$build_dir" "$root" "$build_type" \
+    "$compile_off" "${meta_bins[@]}"
+
   local ctest_log ctest_status passed failed
   ctest_log=$(mktemp)
   set +e
