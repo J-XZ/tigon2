@@ -42,10 +42,10 @@ run_variant() {
     --output-on-failure >"$ctest_log" 2>&1
   ctest_status=$?
   set -e
-  passed=$(grep -oE '[0-9]+ tests passed' "$ctest_log" | awk '{print $1}' || echo 0)
-  failed=$(grep -oE '[0-9]+ tests failed' "$ctest_log" | awk '{print $1}' || echo 0)
-  if grep -qE 'tests failed out of' "$ctest_log"; then
-    summary="$(grep -E 'tests passed|tests failed' "$ctest_log" | tail -1 | sed 's/^ *//')"
+  passed=$(grep -oE '[0-9]+% tests passed' "$ctest_log" | head -1 | grep -oE '^[0-9]+' || echo 0)
+  failed=$(grep -oE '[0-9]+ tests failed' "$ctest_log" | tail -1 | grep -oE '^[0-9]+' || echo 0)
+  if grep -qE '[0-9]+% tests passed' "$ctest_log"; then
+    summary="$(grep -E '[0-9]+% tests passed' "$ctest_log" | tail -1 | sed 's/^ *//')"
   else
     summary="no summary (ctest exit=$ctest_status)"
   fi
