@@ -187,6 +187,7 @@ if [[ "$skip_trace_gen" != true ]]; then
   # then per-workload run traces named workloada/b/...
   "$generator" \
     --output-dir "$out_dir/traces" \
+    --build-dir "$out_dir/ycsb-cpp-build" \
     --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workloadc" \
     --run-name workloadc \
     --phase load \
@@ -216,6 +217,7 @@ if [[ "$skip_trace_gen" != true ]]; then
   for workload in "${selected[@]}"; do
     args=(
       --output-dir "$out_dir/traces"
+      --build-dir "$out_dir/ycsb-cpp-build"
       --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workload$workload"
       --run-name "workload${workload}"
       --phase run
