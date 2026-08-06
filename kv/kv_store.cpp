@@ -63,7 +63,7 @@ Status RunWithBusyRetry(KVStore *store, RuntimeStats *runtime, Op &&op) {
 
 // Remove JSONC comments only outside JSON strings.  The project parser uses
 // the result for its outer-schema checks, while latency_sim receives the
-// untouched JSONC below so it remains the sole owner of fixed_latency's six
+// untouched JSONC below so it remains the sole owner of fixed_latency's three
 // fields.  A regexp cannot distinguish `//` in a URL or a string value from a
 // line comment.
 std::string StripJsonComments(std::string_view input) {
