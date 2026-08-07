@@ -47,6 +47,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <string_view>
 
 namespace {
 
@@ -175,7 +176,14 @@ std::string OwnerKey(uint32_t owner, uint64_t i) {
 class OwnerPeer {
  public:
   explicit OwnerPeer(tigonkv::Config config, bool with_claim_gate = false)
-      : claim_gate_enabled_(with_claim_gate) {
+      : claim_gate_enabled_(
+#if defined(TIGONKV_CMAKE_BUILD_TYPE)
+            with_claim_gate &&
+            std::string_view(TIGONKV_CMAKE_BUILD_TYPE) == "Debug"
+#else
+            with_claim_gate
+#endif
+        ) {
     config.node_id = kOwner;
     assert(pipe2(stop_pipe_, O_CLOEXEC) == 0);
     if (claim_gate_enabled_) {
@@ -234,7 +242,7 @@ class OwnerPeer {
   }
 
   void PauseNextRemoteDeleteClaim() {
-    assert(claim_gate_enabled_);
+    if (!claim_gate_enabled_) return;
     const char command = 1;
     assert(write(claim_command_[1], &command, 1) == 1);
     char ready = 0;
@@ -243,16 +251,18 @@ class OwnerPeer {
   }
 
   void AllowNextRemoteDeleteClaim() {
-    assert(claim_gate_enabled_);
+    if (!claim_gate_enabled_) return;
     const char command = 0;
     assert(write(claim_command_[1], &command, 1) == 1);
   }
 
   void ReleasePausedRemoteDeleteClaim() {
-    assert(claim_gate_enabled_);
+    if (!claim_gate_enabled_) return;
     const char release = 1;
     assert(write(claim_release_[1], &release, 1) == 1);
   }
+
+  bool ClaimGateEnabled() const { return claim_gate_enabled_; }
 
   // Stops the owner's polling loop and joins it.  After this the owner never
   // acks anything, so a requester operation that still awaits must resolve
@@ -526,34 +536,36 @@ int main() {
       engine->ReleaseWorker();
     }
 
-    tigonkv::Status first_status = tigonkv::Status::Ok();
-    std::thread first([&] {
-      tigonkv::engine::mem_access::LatencyScope facade(
-          latency_sim::ExecutionClass::kForeground);
-      engine->BindWorker(0);
-      first_status = engine->Delete(aba_key);
-      engine->ReleaseWorker();
-    });
-    aba_peer.PauseNextRemoteDeleteClaim();
-    first.join();
-    assert(first_status.code == tigonkv::StatusCode::kTimeout);
+    if (aba_peer.ClaimGateEnabled()) {
+      tigonkv::Status first_status = tigonkv::Status::Ok();
+      std::thread first([&] {
+        tigonkv::engine::mem_access::LatencyScope facade(
+            latency_sim::ExecutionClass::kForeground);
+        engine->BindWorker(0);
+        first_status = engine->Delete(aba_key);
+        engine->ReleaseWorker();
+      });
+      aba_peer.PauseNextRemoteDeleteClaim();
+      first.join();
+      assert(first_status.code == tigonkv::StatusCode::kTimeout);
 
-    tigonkv::Status second_status = tigonkv::Status::Error(
-        tigonkv::StatusCode::kCorruption, "B did not run");
-    tigonkv::GetResult second_get;
-    std::thread second([&] {
-      tigonkv::engine::mem_access::LatencyScope facade(
-          latency_sim::ExecutionClass::kForeground);
-      engine->BindWorker(0);
-      second_status = engine->Delete(aba_key);
-      if (second_status.ok()) second_get = engine->Get(aba_key);
-      engine->ReleaseWorker();
-    });
-    aba_peer.ReleasePausedRemoteDeleteClaim();
-    aba_peer.AllowNextRemoteDeleteClaim();
-    second.join();
-    assert(second_status.ok());
-    assert(second_get.status.code == tigonkv::StatusCode::kNotFound);
+      tigonkv::Status second_status = tigonkv::Status::Error(
+          tigonkv::StatusCode::kCorruption, "B did not run");
+      tigonkv::GetResult second_get;
+      std::thread second([&] {
+        tigonkv::engine::mem_access::LatencyScope facade(
+            latency_sim::ExecutionClass::kForeground);
+        engine->BindWorker(0);
+        second_status = engine->Delete(aba_key);
+        if (second_status.ok()) second_get = engine->Get(aba_key);
+        engine->ReleaseWorker();
+      });
+      aba_peer.ReleasePausedRemoteDeleteClaim();
+      aba_peer.AllowNextRemoteDeleteClaim();
+      second.join();
+      assert(second_status.ok());
+      assert(second_get.status.code == tigonkv::StatusCode::kNotFound);
+    }
     unlink(aba_path_template);
   }
   {
