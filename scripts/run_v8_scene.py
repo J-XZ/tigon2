@@ -324,7 +324,8 @@ class Scene:
 
     def append_node_results(self) -> None:
         if self.spec.get("ycsb"):
-            roots = [self.workflow_log / "round1-workloade-run"]
+            roots = [self.scene_dir / "ycsb_work" / "round_logs" /
+                     "round1-workloade-run"]
         else:
             roots = [self.workflow_log / "round1" / f"e2e_{self.spec['suite']}" / "read"]
         root = roots[0]
