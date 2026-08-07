@@ -46,7 +46,9 @@ constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
 // after ordinary layout metadata; no hidden simulation prefix is persistent.
 // v29: remote Delete identity/state is stored in stable HWCC control slots,
 // independent of the target row's retirement lifetime.
-constexpr uint32_t kSharedLayoutVersion = 29;
+// v30: remote Delete control uses one tag+state atomic word; identity fields
+// are published and consumed through HWCC wrappers.
+constexpr uint32_t kSharedLayoutVersion = 30;
 constexpr size_t kMaxFixedKeyBytes = 32;
 constexpr size_t kRootSlotCount = 8;
 constexpr size_t kMaxPartitions = 256;
@@ -190,6 +192,12 @@ struct FixedKeyComparator {
   }
 };
 
+constexpr unsigned kRemoteDeleteStateBits = 8;
+constexpr uint64_t kRemoteDeleteStateMask =
+    (uint64_t{1} << kRemoteDeleteStateBits) - 1;
+constexpr uint64_t kRemoteDeleteMaxTag =
+    UINT64_MAX >> kRemoteDeleteStateBits;
+
 enum class RemoteDeleteControlState : uint32_t {
   kEmpty = 0,
   kPending,
@@ -208,10 +216,24 @@ enum class RemoteDeleteControlError : uint32_t {
   kTargetMismatch,
 };
 
+struct RemoteDeleteIdentitySnapshot {
+  uint32_t requester_node_id = UINT32_MAX;
+  uint32_t requester_worker_id = UINT32_MAX;
+  uint32_t partition_id = UINT32_MAX;
+  uint64_t sequence = 0;
+  RegionOffset target_row = kNullOffset;
+  FixedKey target_key{};
+};
+
+struct RemoteDeleteControlSnapshot {
+  uint64_t tag = 0;
+  RemoteDeleteControlState state = RemoteDeleteControlState::kEmpty;
+};
+
 // One stable cross-VM control record per requester mailbox.  It is deliberately
 // independent of the shared row and contains no process virtual address.
 //
-// Transition table (the state word is the publication/claim CAS):
+// Transition table (the tag+state word is the publication/claim CAS):
 //
 //   Empty      -> Pending       requester writes identity, CAS; row prepared
 //   Pending    -> Cancelled     requester exact CAS; requester may restore row
@@ -226,60 +248,93 @@ enum class RemoteDeleteControlError : uint32_t {
 // terminal with respect to the requester; slot reuse is possible only after
 // Acknowledged -> Empty and a new identity is published.
 struct alignas(64) RemoteDeleteControlSlot {
-  std::atomic<uint32_t> state{
-      static_cast<uint32_t>(RemoteDeleteControlState::kEmpty)};
+  std::atomic<uint64_t> control_word{0};
   std::atomic<uint32_t> error_code{
       static_cast<uint32_t>(RemoteDeleteControlError::kNone)};
   uint32_t requester_node_id = UINT32_MAX;
   uint32_t requester_worker_id = UINT32_MAX;
   uint32_t partition_id = UINT32_MAX;
-  uint32_t reserved = 0;
   uint64_t sequence = 0;
   RegionOffset target_row = kNullOffset;
   FixedKey target_key{};
 
-  RemoteDeleteControlState LoadState(
-      std::memory_order order = std::memory_order_acquire) const {
-    return static_cast<RemoteDeleteControlState>(
-        mem_access::HwccAtomicLoad(state, order));
+  static constexpr uint64_t Encode(uint64_t tag,
+                                   RemoteDeleteControlState state) {
+    return (tag << kRemoteDeleteStateBits) |
+           static_cast<uint32_t>(state);
   }
 
-  bool Matches(uint32_t requester_node, uint32_t requester_worker,
-               uint32_t partition, uint64_t request_sequence,
-               RegionOffset row, const FixedKey &key) const {
-    return requester_node_id == requester_node &&
-           requester_worker_id == requester_worker &&
-           partition_id == partition && sequence == request_sequence &&
-           target_row == row && target_key.Compare(key) == 0;
+  static constexpr uint64_t Tag(uint64_t word) {
+    return word >> kRemoteDeleteStateBits;
+  }
+
+  static constexpr RemoteDeleteControlState State(uint64_t word) {
+    return static_cast<RemoteDeleteControlState>(word &
+                                                  kRemoteDeleteStateMask);
+  }
+
+  RemoteDeleteControlSnapshot LoadControl(
+      std::memory_order order = std::memory_order_acquire) const {
+    const uint64_t word = mem_access::HwccAtomicLoad(control_word, order);
+    return {Tag(word), State(word)};
+  }
+
+  RemoteDeleteIdentitySnapshot LoadIdentity() const {
+    RemoteDeleteIdentitySnapshot identity;
+    identity.requester_node_id = mem_access::HwccLoad(&requester_node_id);
+    identity.requester_worker_id = mem_access::HwccLoad(&requester_worker_id);
+    identity.partition_id = mem_access::HwccLoad(&partition_id);
+    identity.sequence = mem_access::HwccLoad(&sequence);
+    identity.target_row = mem_access::HwccLoad(&target_row);
+    identity.target_key = mem_access::HwccLoad(&target_key);
+    return identity;
+  }
+
+  static bool Matches(const RemoteDeleteIdentitySnapshot &identity,
+                      uint32_t requester_node, uint32_t requester_worker,
+                      uint32_t partition, uint64_t request_sequence,
+                      RegionOffset row, const FixedKey &key) {
+    return identity.requester_node_id == requester_node &&
+           identity.requester_worker_id == requester_worker &&
+           identity.partition_id == partition &&
+           identity.sequence == request_sequence &&
+           identity.target_row == row && identity.target_key.Compare(key) == 0;
   }
 
   bool PublishPending(uint32_t requester_node, uint32_t requester_worker,
                       uint32_t partition, uint64_t request_sequence,
                       RegionOffset row, const FixedKey &key) {
-    if (LoadState() != RemoteDeleteControlState::kEmpty) return false;
-    requester_node_id = requester_node;
-    requester_worker_id = requester_worker;
-    partition_id = partition;
-    reserved = 0;
-    sequence = request_sequence;
-    target_row = row;
-    target_key = key;
+    const RemoteDeleteControlSnapshot previous =
+        LoadControl(std::memory_order_acquire);
+    if (previous.state != RemoteDeleteControlState::kEmpty ||
+        request_sequence == 0 || request_sequence <= previous.tag ||
+        request_sequence > kRemoteDeleteMaxTag)
+      return false;
+    mem_access::HwccStore(&requester_node_id, requester_node);
+    mem_access::HwccStore(&requester_worker_id, requester_worker);
+    mem_access::HwccStore(&partition_id, partition);
+    mem_access::HwccStore(&sequence, request_sequence);
+    mem_access::HwccStore(&target_row, row);
+    mem_access::HwccStore(&target_key, key);
     mem_access::HwccAtomicStore(
         error_code, static_cast<uint32_t>(RemoteDeleteControlError::kNone),
         std::memory_order_relaxed);
-    mem_access::HwccWrite(this, sizeof(*this));
-    uint32_t expected = static_cast<uint32_t>(RemoteDeleteControlState::kEmpty);
+    uint64_t expected = Encode(previous.tag,
+                               RemoteDeleteControlState::kEmpty);
     return mem_access::HwccAtomicCompareExchangeStrong(
-        state, expected,
-        static_cast<uint32_t>(RemoteDeleteControlState::kPending),
+        control_word, expected,
+        Encode(request_sequence, RemoteDeleteControlState::kPending),
         std::memory_order_release, std::memory_order_acquire);
   }
 
-  bool CompareExchange(RemoteDeleteControlState expected,
-                        RemoteDeleteControlState desired) {
-    uint32_t raw_expected = static_cast<uint32_t>(expected);
+  // Every protocol CAS carries both the generation tag and expected state.
+  // There is intentionally no state-only production overload.
+  bool CompareExchange(uint64_t expected_tag,
+                       RemoteDeleteControlState expected,
+                       RemoteDeleteControlState desired) {
+    uint64_t raw_expected = Encode(expected_tag, expected);
     return mem_access::HwccAtomicCompareExchangeStrong(
-        state, raw_expected, static_cast<uint32_t>(desired),
+        control_word, raw_expected, Encode(expected_tag, desired),
         std::memory_order_acq_rel, std::memory_order_acquire);
   }
 
@@ -288,14 +343,24 @@ struct alignas(64) RemoteDeleteControlSlot {
                                 std::memory_order_release);
   }
 
-  bool AcknowledgeAndClear(RemoteDeleteControlState terminal) {
-    if (!CompareExchange(terminal,
+  bool AcknowledgeAndClear(uint64_t tag,
+                           RemoteDeleteControlState terminal) {
+    if (!CompareExchange(tag, terminal,
                          RemoteDeleteControlState::kAcknowledged))
       return false;
-    return CompareExchange(RemoteDeleteControlState::kAcknowledged,
+    return CompareExchange(tag, RemoteDeleteControlState::kAcknowledged,
                             RemoteDeleteControlState::kEmpty);
   }
 };
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+              "remote delete control word must be lock-free");
+static_assert(kRemoteDeleteMaxTag >= UINT32_MAX,
+              "remote delete generation space is too small");
+static_assert(static_cast<uint32_t>(RemoteDeleteControlState::kAcknowledged) <=
+              kRemoteDeleteStateMask);
+static_assert(offsetof(RemoteDeleteControlSlot, control_word) == 0);
+static_assert(offsetof(RemoteDeleteControlSlot, error_code) == sizeof(uint64_t));
+static_assert(sizeof(RemoteDeleteControlSlot) % 64 == 0);
 static_assert(alignof(RemoteDeleteControlSlot) == 64);
 
 // Offset-adapted form of the original TableBTreeOLC::ValueStruct. The lmeta

@@ -34,7 +34,9 @@
 #endif
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -63,6 +65,7 @@ std::mutex g_settlements_mutex;
 std::thread::id g_requester_thread;
 
 void InstallRecordingBackend() {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
   g_settlements.clear();
   g_requester_thread = std::this_thread::get_id();
   latency_sim::detail::SetDelaySpinBackendForTest(
@@ -70,6 +73,7 @@ void InstallRecordingBackend() {
         std::lock_guard<std::mutex> lock(g_settlements_mutex);
         g_settlements.emplace_back(std::this_thread::get_id(), ns);
       });
+#endif
 }
 
 std::size_t RequesterSettlements() {
@@ -97,7 +101,9 @@ void ClearSettlements() {
 }
 
 void UninstallBackend() {
+#if !defined(LATENCY_SIM_COMPILE_OFF)
   latency_sim::detail::SetDelaySpinBackendForTest(nullptr);
+#endif
 }
 
 latency_sim::FixedLatencyConfig OneNanosecondPerLine() {
@@ -168,13 +174,25 @@ std::string OwnerKey(uint32_t owner, uint64_t i) {
 // are acked by a real owner.
 class OwnerPeer {
  public:
-  explicit OwnerPeer(tigonkv::Config config) {
+  explicit OwnerPeer(tigonkv::Config config, bool with_claim_gate = false)
+      : claim_gate_enabled_(with_claim_gate) {
     config.node_id = kOwner;
     assert(pipe2(stop_pipe_, O_CLOEXEC) == 0);
+    if (claim_gate_enabled_) {
+      assert(pipe(claim_command_) == 0);
+      assert(pipe(claim_ready_) == 0);
+      assert(pipe(claim_release_) == 0);
+      SetClaimGateEnvironment();
+    }
     child_ = fork();
     assert(child_ >= 0);
     if (child_ == 0) {
       close(stop_pipe_[1]);
+      if (claim_gate_enabled_) {
+        close(claim_command_[1]);
+        close(claim_ready_[0]);
+        close(claim_release_[1]);
+      }
       assert(fcntl(stop_pipe_[0], F_SETFL,
                    fcntl(stop_pipe_[0], F_GETFL) | O_NONBLOCK) == 0);
       std::unique_ptr<tigonkv::engine::KVEngine> engine;
@@ -199,6 +217,11 @@ class OwnerPeer {
       _exit(0);
     }
     close(stop_pipe_[0]);
+    if (claim_gate_enabled_) {
+      close(claim_command_[0]);
+      close(claim_ready_[1]);
+      close(claim_release_[0]);
+    }
   }
 
   ~OwnerPeer() {
@@ -207,6 +230,28 @@ class OwnerPeer {
       stop_pipe_[1] = -1;
     }
     JoinIfRunning();
+    CloseClaimGate();
+  }
+
+  void PauseNextRemoteDeleteClaim() {
+    assert(claim_gate_enabled_);
+    const char command = 1;
+    assert(write(claim_command_[1], &command, 1) == 1);
+    char ready = 0;
+    assert(read(claim_ready_[0], &ready, 1) == 1);
+    assert(ready == 1);
+  }
+
+  void AllowNextRemoteDeleteClaim() {
+    assert(claim_gate_enabled_);
+    const char command = 0;
+    assert(write(claim_command_[1], &command, 1) == 1);
+  }
+
+  void ReleasePausedRemoteDeleteClaim() {
+    assert(claim_gate_enabled_);
+    const char release = 1;
+    assert(write(claim_release_[1], &release, 1) == 1);
   }
 
   // Stops the owner's polling loop and joins it.  After this the owner never
@@ -232,16 +277,38 @@ class OwnerPeer {
       child_ = -1;
     }
   }
+
+  void SetClaimGateEnvironment() {
+    assert(setenv("TIGONKV_TEST_REMOTE_DELETE_CLAIM_COMMAND_FD",
+                  std::to_string(claim_command_[0]).c_str(), 1) == 0);
+    assert(setenv("TIGONKV_TEST_REMOTE_DELETE_CLAIM_READY_FD",
+                  std::to_string(claim_ready_[1]).c_str(), 1) == 0);
+    assert(setenv("TIGONKV_TEST_REMOTE_DELETE_CLAIM_RELEASE_FD",
+                  std::to_string(claim_release_[0]).c_str(), 1) == 0);
+  }
+
+  void CloseClaimGate() {
+    if (!claim_gate_enabled_) return;
+    close(claim_command_[1]);
+    close(claim_ready_[0]);
+    close(claim_release_[1]);
+    assert(unsetenv("TIGONKV_TEST_REMOTE_DELETE_CLAIM_COMMAND_FD") == 0);
+    assert(unsetenv("TIGONKV_TEST_REMOTE_DELETE_CLAIM_READY_FD") == 0);
+    assert(unsetenv("TIGONKV_TEST_REMOTE_DELETE_CLAIM_RELEASE_FD") == 0);
+    claim_gate_enabled_ = false;
+  }
+
   int stop_pipe_[2];
   pid_t child_;
+  bool claim_gate_enabled_ = false;
+  int claim_command_[2] = {-1, -1};
+  int claim_ready_[2] = {-1, -1};
+  int claim_release_[2] = {-1, -1};
 };
 
 }  // namespace
 
 int main() {
-#if defined(LATENCY_SIM_COMPILE_OFF)
-  return 0;
-#else
   InstallRecordingBackend();
 
   char path_template[] = "/tmp/tigonkv-rd-latency-XXXXXX";
@@ -285,7 +352,9 @@ int main() {
       // every transport poll deferred its settlement, so no busy-wait ever
       // occurred while the row was write_locked/invalid (the demuxer thread's
       // own receive settlements are unrelated and allowed).
+#if !defined(LATENCY_SIM_COMPILE_OFF)
       assert(RequesterSettlements() == 0);
+#endif
       ClearSettlements();
 
       const auto gone = engine->Get(remote_key);
@@ -302,8 +371,10 @@ int main() {
     // the delete and rollback were long over; the later in-facade operations
     // settle their own normal-mode budgets on the same thread, so only the
     // last settlement carries the merged deferred budget.
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     assert(RequesterSettlements() >= 1);
     assert(LastRequesterSettlementNs() > 0);
+#endif
     ClearSettlements();
 
     // 2. Rollback path: prepare the delete of a second remote row and abort
@@ -320,10 +391,13 @@ int main() {
     assert(partition != nullptr);
     tigonkv::engine::RegionOffset locked_row =
         tigonkv::engine::kNullOffset;
+    uint64_t rollback_tag = 0;
     auto &rollback_control = engine->pool_->allocator().layout()
         .remote_delete_controls[kRequester][0];
     const auto rollback_fixed_key =
         tigonkv::engine::FixedKey::From(rollback_key, kFixedKeySize);
+    const uint64_t rollback_sequence =
+        engine->ReserveOperationSequence(*engine->worker_mailboxes_[0]);
     ClearSettlements();
     {
       tigonkv::engine::mem_access::LatencyScope scope(
@@ -333,25 +407,32 @@ int main() {
              tigonkv::engine::SharedAccessState::kDone);
       assert(locked_row != tigonkv::engine::kNullOffset);
       assert(rollback_control.PublishPending(
-          kRequester, 0, partition->partition_id(), 1, locked_row,
-          rollback_fixed_key));
-      assert(rollback_control.LoadState() ==
+          kRequester, 0, partition->partition_id(), rollback_sequence,
+          locked_row, rollback_fixed_key));
+      rollback_tag = rollback_control.LoadControl().tag;
+      assert(rollback_control.LoadControl().state ==
              tigonkv::engine::RemoteDeleteControlState::kPending);
     }
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     assert(RequesterSettlements() == 1);  // exactly one settlement per scope
+#endif
     ClearSettlements();
     ClearSettlements();
     {
       tigonkv::engine::mem_access::LatencyScope scope(
           latency_sim::ExecutionClass::kBackground);
       assert(rollback_control.CompareExchange(
+          rollback_tag,
           tigonkv::engine::RemoteDeleteControlState::kPending,
           tigonkv::engine::RemoteDeleteControlState::kCancelled));
       partition->AbortRemoteDelete(locked_row, kRequester);
       assert(rollback_control.AcknowledgeAndClear(
+          rollback_tag,
           tigonkv::engine::RemoteDeleteControlState::kCancelled));
     }
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     assert(RequesterSettlements() == 1);  // exactly one settlement per scope
+#endif
     ClearSettlements();
     // 3. Owner claim wins the race: once the owner has linearized the delete
     //    (write-lock bit cleared under the smeta latch), a late requester
@@ -366,10 +447,13 @@ int main() {
     assert(claimed_partition != nullptr);
     tigonkv::engine::RegionOffset claimed_row =
         tigonkv::engine::kNullOffset;
+    uint64_t claimed_tag = 0;
     auto &claimed_control = engine->pool_->allocator().layout()
         .remote_delete_controls[kRequester][0];
     const auto claimed_fixed_key =
         tigonkv::engine::FixedKey::From(claimed_key, kFixedKeySize);
+    const uint64_t claimed_sequence =
+        engine->ReserveOperationSequence(*engine->worker_mailboxes_[0]);
     {
       tigonkv::engine::mem_access::LatencyScope scope(
           latency_sim::ExecutionClass::kBackground);
@@ -378,16 +462,19 @@ int main() {
              tigonkv::engine::SharedAccessState::kDone);
       assert(claimed_row != tigonkv::engine::kNullOffset);
       assert(claimed_control.PublishPending(
-          kRequester, 0, claimed_partition->partition_id(), 2, claimed_row,
-          claimed_fixed_key));
+          kRequester, 0, claimed_partition->partition_id(), claimed_sequence,
+          claimed_row, claimed_fixed_key));
+      claimed_tag = claimed_control.LoadControl().tag;
       // Owner claim is a control-slot fact, independent of the row write bit.
       assert(claimed_control.CompareExchange(
+          claimed_tag,
           tigonkv::engine::RemoteDeleteControlState::kPending,
           tigonkv::engine::RemoteDeleteControlState::kExecuting));
       assert(!claimed_control.CompareExchange(
+          claimed_tag,
           tigonkv::engine::RemoteDeleteControlState::kPending,
           tigonkv::engine::RemoteDeleteControlState::kCancelled));
-      assert(claimed_control.LoadState() ==
+      assert(claimed_control.LoadControl().state ==
              tigonkv::engine::RemoteDeleteControlState::kExecuting);
     }
     // The owner may reject an unmodified claimed row and perform the only
@@ -397,9 +484,11 @@ int main() {
           latency_sim::ExecutionClass::kBackground);
       claimed_partition->AbortRemoteDelete(claimed_row, kRequester);
       assert(claimed_control.CompareExchange(
+          claimed_tag,
           tigonkv::engine::RemoteDeleteControlState::kExecuting,
           tigonkv::engine::RemoteDeleteControlState::kRejected));
       assert(claimed_control.AcknowledgeAndClear(
+          claimed_tag,
           tigonkv::engine::RemoteDeleteControlState::kRejected));
     }
     ClearSettlements();
@@ -412,6 +501,60 @@ int main() {
              restored.value == FixedValue("rollback-me"));
     }
     engine->ReleaseWorker();
+  }
+  {
+    // Production ABA interleaving: the owner is paused immediately before
+    // the exact claim CAS for A.  A times out and cancels, the same requester
+    // worker publishes B for the same row, and only then is the owner allowed
+    // to resume.  A's CAS must fail against Pending(tagB); B must complete
+    // through the real forked transport path.
+    char aba_path_template[] = "/tmp/tigonkv-rd-aba-XXXXXX";
+    const int aba_fd = mkstemp(aba_path_template);
+    assert(aba_fd >= 0);
+    close(aba_fd);
+    auto config_aba = config;
+    config_aba.shared_memory_path = aba_path_template;
+    config_aba.transport_response_timeout_ms = 1000;
+    OwnerPeer aba_peer(config_aba, true);
+    auto engine = tigonkv::engine::KVEngine::Open(config_aba, true);
+    const std::string aba_key = OwnerKey(kOwner, 24576);
+    {
+      tigonkv::engine::mem_access::LatencyScope facade(
+          latency_sim::ExecutionClass::kForeground);
+      engine->BindWorker(0);
+      assert(engine->Put(aba_key, FixedValue("aba-me")).ok());
+      engine->ReleaseWorker();
+    }
+
+    tigonkv::Status first_status = tigonkv::Status::Ok();
+    std::thread first([&] {
+      tigonkv::engine::mem_access::LatencyScope facade(
+          latency_sim::ExecutionClass::kForeground);
+      engine->BindWorker(0);
+      first_status = engine->Delete(aba_key);
+      engine->ReleaseWorker();
+    });
+    aba_peer.PauseNextRemoteDeleteClaim();
+    first.join();
+    assert(first_status.code == tigonkv::StatusCode::kTimeout);
+
+    tigonkv::Status second_status = tigonkv::Status::Error(
+        tigonkv::StatusCode::kCorruption, "B did not run");
+    tigonkv::GetResult second_get;
+    std::thread second([&] {
+      tigonkv::engine::mem_access::LatencyScope facade(
+          latency_sim::ExecutionClass::kForeground);
+      engine->BindWorker(0);
+      second_status = engine->Delete(aba_key);
+      if (second_status.ok()) second_get = engine->Get(aba_key);
+      engine->ReleaseWorker();
+    });
+    aba_peer.ReleasePausedRemoteDeleteClaim();
+    aba_peer.AllowNextRemoteDeleteClaim();
+    second.join();
+    assert(second_status.ok());
+    assert(second_get.status.code == tigonkv::StatusCode::kNotFound);
+    unlink(aba_path_template);
   }
   {
     // Owner Busy / error ack: the owner responds Busy (or a dispatch error is
@@ -458,7 +601,9 @@ int main() {
               latency_sim::ExecutionClass::kBackground);
           auto &busy_control = engine->pool_->allocator().layout()
               .remote_delete_controls[kRequester][0];
+          const auto busy_tag = mailbox->operation.sequence;
           assert(busy_control.CompareExchange(
+              busy_tag,
               tigonkv::engine::RemoteDeleteControlState::kPending,
               tigonkv::engine::RemoteDeleteControlState::kExecuting));
           engine->VisiblePartition(busy_key)->AbortRemoteDelete(
@@ -466,6 +611,7 @@ int main() {
           busy_control.PublishError(
               tigonkv::engine::RemoteDeleteControlError::kRejected);
           assert(busy_control.CompareExchange(
+              busy_tag,
               tigonkv::engine::RemoteDeleteControlState::kExecuting,
               tigonkv::engine::RemoteDeleteControlState::kRejected));
         }
@@ -500,15 +646,19 @@ int main() {
       const auto status = engine->Delete(busy_key);
       responder.join();
       assert(status.code == tigonkv::StatusCode::kBusy);
+#if !defined(LATENCY_SIM_COMPILE_OFF)
       assert(RequesterSettlements() == 0);  // nothing settled inside the critical state
+#endif
       ClearSettlements();
       // The row is restored and readable through the normal path.
       const auto restored = engine->Get(busy_key);
       assert(restored.status.ok() &&
              restored.value == FixedValue("busy-me"));
     }
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     assert(RequesterSettlements() >= 1);  // merged budget settled at the facade exit
     assert(LastRequesterSettlementNs() > 0);
+#endif
     ClearSettlements();
 
     // Timeout / lost owner: no ack arrives within the bounded control-plane
@@ -527,6 +677,7 @@ int main() {
       assert(restored.status.ok() &&
              restored.value == FixedValue("timeout-me"));
     }
+#if !defined(LATENCY_SIM_COMPILE_OFF)
     // Transport/dispatch exception inside a deferred poll: the RAII poll
     // guard must restore the thread scope state even when the poll body
     // throws, and the merged deferred budget must settle exactly once at the
@@ -570,11 +721,14 @@ int main() {
     // budget (no loss, no duplication).
     assert(RequesterSettlements() == 1);
     assert(LastRequesterSettlementNs() == 1);
+#endif
     // A sequence may be allocated at UINT64_MAX exactly once, but the next
     // allocation must fail instead of wrapping into a reusable identity.
     auto *mailbox = engine->worker_mailboxes_[0].get();
-    mailbox->next_operation_sequence = UINT64_MAX;
-    assert(engine->ReserveOperationSequence(*mailbox) == UINT64_MAX);
+    mailbox->next_operation_sequence =
+        tigonkv::engine::kRemoteDeleteMaxTag;
+    assert(engine->ReserveOperationSequence(*mailbox) ==
+           tigonkv::engine::kRemoteDeleteMaxTag);
     assert(mailbox->next_operation_sequence == 0);
     bool sequence_exhausted = false;
     try {
@@ -589,5 +743,4 @@ int main() {
   unlink(path_template);
   std::printf("remote_delete_latency_test ok\n");
   return 0;
-#endif
 }
