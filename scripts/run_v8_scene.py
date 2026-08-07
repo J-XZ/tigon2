@@ -174,7 +174,7 @@ class Scene:
 
     def build_for(self, compile_off: str) -> Path:
         suffix = "co_on" if compile_off == "ON" else "co_off"
-        return self.repo / "build-relwithdebinfo-ninja-clang18-" + suffix
+        return self.repo / ("build-relwithdebinfo-ninja-clang18-" + suffix)
 
     def make_config(self) -> Path:
         source = self.repo / str(self.spec["config"])
