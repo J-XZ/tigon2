@@ -6,8 +6,10 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "tools/tigonkv_build_identity_query.h"
 
 int main(int argc, char **argv) {
+  if (tigonkv::PrintBuildIdentityJsonIfRequested(argc, argv)) return 0;
   if (argc != 3) { std::cerr << "usage: cxl_pool_initer PATH SIZE_MB\n"; return 2; }
   const uint64_t bytes = std::stoull(argv[2]) * 1024ULL * 1024ULL;
   int fd = open(argv[1], O_RDWR | O_CREAT, 0660);
