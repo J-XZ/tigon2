@@ -7,6 +7,14 @@ latency_sim_compile_off=OFF
 latency_sim_compile_off_seen=false
 skip_build=false; skip_vm_init=false; skip_trace_gen=false; prepare_only=false
 sample_stride=64
+ycsb_cpp_build_dir=""
+
+cleanup_ycsb_cpp_build() {
+  if [[ -n "$ycsb_cpp_build_dir" && -d "$ycsb_cpp_build_dir" ]]; then
+    rm -rf -- "$ycsb_cpp_build_dir"
+  fi
+}
+trap cleanup_ycsb_cpp_build EXIT
 usage() { cat <<'EOF'
 usage: tigonkv_run_ycsb_experiment.sh [options]
   --rounds N --record-count N --operation-count N --threads-per-node N
@@ -87,6 +95,7 @@ for workload in "${selected[@]}"; do
 done
 if [[ -z "$out_dir" ]]; then out_dir="$root/exp_data/ycsb_tigonkv_$(date -u +%Y%m%dT%H%M%SZ)"; fi
 mkdir -p "$out_dir" "$out_dir/configs" "$out_dir/traces" "$out_dir/round_logs"
+ycsb_cpp_build_dir=$(mktemp -d /tmp/tigonkv-ycsb-cpp-build-XXXXXX)
 generated_config="$out_dir/configs/experiment_config_ycsb_4vm.jsonc"
 parent_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo nogit)
 gitlink=$(tigonkv_latency_sim_gitlink "$root")
@@ -187,7 +196,7 @@ if [[ "$skip_trace_gen" != true ]]; then
   # then per-workload run traces named workloada/b/...
   "$generator" \
     --output-dir "$out_dir/traces" \
-    --build-dir "$out_dir/ycsb-cpp-build" \
+    --build-dir "$ycsb_cpp_build_dir" \
     --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workloadc" \
     --run-name workloadc \
     --phase load \
@@ -217,7 +226,7 @@ if [[ "$skip_trace_gen" != true ]]; then
   for workload in "${selected[@]}"; do
     args=(
       --output-dir "$out_dir/traces"
-      --build-dir "$out_dir/ycsb-cpp-build"
+      --build-dir "$ycsb_cpp_build_dir"
       --workload "$root/thirdparty_libs/YCSB-cpp/workloads/workload$workload"
       --run-name "workload${workload}"
       --phase run

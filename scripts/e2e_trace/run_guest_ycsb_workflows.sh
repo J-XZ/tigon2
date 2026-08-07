@@ -82,7 +82,9 @@ sync_guest_runtime() {
 
 tigonkv_assert_host_test_isolated
 tigonkv_assert_qemu_group expected
-sync_guest_runtime
+if [[ "${TIGONKV_V8_SKIP_SYNC:-0}" != 1 ]]; then
+  sync_guest_runtime
+fi
 
 sync_traces() {
   local round=$1 workload=$2 phase=$3 vm worker trace remote_dir wl
@@ -249,8 +251,15 @@ run_ycsb_phase() {
         echo "guest stall/timeout: round=$round workload=$wl phase=$phase" >&2
         exit 1
       fi
-      for pid in "${pids[@]}"; do
-        if ! wait "$pid"; then fail=1; fi
+      for ((vm = 0; vm < vm_count; vm++)); do
+        node_status=0
+        if wait "${pids[$vm]}"; then
+          :
+        else
+          node_status=$?
+          fail=1
+        fi
+        printf '%s\n' "$node_status" >"$phase_log/vm${vm}.exit"
       done
       (( fail == 0 )) || {
         echo "guest ssh/timeout failed: round=$round workload=$wl phase=$phase" >&2

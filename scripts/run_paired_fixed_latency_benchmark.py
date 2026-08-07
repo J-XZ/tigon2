@@ -23,6 +23,7 @@ import re
 import statistics
 import subprocess
 import sys
+import shutil
 
 EXPANSION_SAMPLES = 9
 
@@ -216,7 +217,7 @@ def variant_cache(binary, expect_compile_off):
     }
 
 
-def build_meta_ok(binary, current_head, current_gitlink):
+def build_meta_ok(binary, current_source_state, current_gitlink):
     """Verifies the recorded tigonkv_build_meta.json proves the binary was
     built from the current final candidate: the binary hash must match the
     recorded hash and the meta's source-state head and latency_sim gitlink
@@ -239,9 +240,9 @@ def build_meta_ok(binary, current_head, current_gitlink):
               "(stale binary?)")
         return False
     source_state = meta.get("source_state", "")
-    if not source_state.startswith(current_head + ":"):
-        print("FAIL: " + binary + " build meta source-state head " +
-              source_state.split(":")[0] + " != current " + current_head)
+    if source_state != current_source_state:
+        print("FAIL: " + binary + " build meta source-state is not exactly "
+              "the current source state")
         return False
     if meta.get("latency_sim_gitlink") != current_gitlink:
         print("FAIL: " + binary + " build meta gitlink " +
@@ -302,6 +303,61 @@ def evaluate(on_samples, off_samples):
     return results, expand
 
 
+def formal_clean_build(root, binary_on, binary_off, jobs):
+    """Reconfigure and clean-build both formal benchmark variants.
+
+    The normal driver remains usable with prebuilt, proven binaries.  The
+    formal V8 invocation opts into this path so it cannot accidentally measure
+    a stale build directory: CMake is rerun with the exact variant contract,
+    the benchmark target is clean-built, and fresh build metadata is written
+    from the resulting binary before provenance validation.
+    """
+    root = os.path.abspath(root)
+    try:
+        status = subprocess.run(["git", "-C", root, "status", "--porcelain"],
+                                capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        print("FAIL: cannot inspect formal build source tree: " + str(error))
+        return False
+    if status.stdout.strip():
+        print("FAIL: formal clean build requires a clean source tree")
+        return False
+    c = shutil.which("clang-18")
+    cxx = shutil.which("clang++-18")
+    if not c or not cxx:
+        print("FAIL: formal clean build requires clang-18/clang++-18")
+        return False
+    variants = ((binary_on, "OFF"), (binary_off, "ON"))
+    for binary, compile_off in variants:
+        build_dir = os.path.dirname(os.path.abspath(binary))
+        configure = [
+            "cmake", "-S", root, "-B", build_dir, "-G", "Ninja",
+            "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+            "-DCMAKE_C_COMPILER=" + c,
+            "-DCMAKE_CXX_COMPILER=" + cxx,
+            "-DLATENCY_SIM_COMPILE_OFF=" + compile_off,
+        ]
+        try:
+            subprocess.run(configure, check=True)
+            subprocess.run([
+                "cmake", "--build", build_dir, "--clean-first",
+                "--target", "hardware_sim_disabled_benchmark", "-j",
+                str(jobs),
+            ], check=True)
+            subprocess.run([
+                "bash", "-c",
+                'source "$1/scripts/tigonkv_build_helpers.sh"; '
+                'tigonkv_write_build_meta "$2" "$1" "$3" "$4" "$5"',
+                "_", root, build_dir, "RelWithDebInfo", compile_off,
+                os.path.abspath(binary),
+            ], check=True)
+        except (subprocess.CalledProcessError, OSError) as error:
+            print("FAIL: formal clean build failed for " + binary + ": " +
+                  str(error))
+            return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--on", required=True)
@@ -309,10 +365,18 @@ def main():
     parser.add_argument("--cpu", type=int, default=0)
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--formal-root", default=None,
+                        help="reconfigure and clean-build both variants first")
+    parser.add_argument("--build-jobs", type=int, default=1)
     args = parser.parse_args()
 
     if args.samples < 5:
         parser.error("--samples must be at least 5")
+    if args.build_jobs < 1:
+        parser.error("--build-jobs must be positive")
+    if args.formal_root is not None and not formal_clean_build(
+            args.formal_root, args.on, args.off, args.build_jobs):
+        return 1
     prov = provenance()
     if not provenance_ok(prov):
         print("FAIL: provenance preconditions not met")
@@ -323,7 +387,7 @@ def main():
         print("FAIL: benchmark variant cache preconditions not met")
         return 1
     for binary in (args.on, args.off):
-        if not build_meta_ok(binary, prov["parent_head"],
+        if not build_meta_ok(binary, prov["source_state"],
                              prov["index_gitlink"]):
             print("FAIL: benchmark binary is not proven to be built from the "
                   "current final candidate: " + binary)

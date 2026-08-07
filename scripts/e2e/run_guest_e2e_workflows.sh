@@ -155,8 +155,15 @@ run_phase() {
     sleep 0.05
   done
   local failed=0
-  for pid in "${pids[@]}"; do
-    wait "$pid" || failed=1
+  for ((vm = 0; vm < vm_count; vm++)); do
+    local node_status=0
+    if wait "${pids[$vm]}"; then
+      :
+    else
+      node_status=$?
+      failed=1
+    fi
+    printf '%s\n' "$node_status" >"$phase_dir/vm${vm}.exit"
   done
   if (( failed )); then
     echo "phase command failed: suite=$suite round=$round phase=$phase" >&2
@@ -237,7 +244,9 @@ for suite in $suites; do
     *) echo "unsupported suite: $suite" >&2; exit 2 ;;
   esac
   [[ -x "$binary_dir/e2e_${suite}" ]] || { echo "missing $binary_dir/e2e_${suite}" >&2; exit 2; }
-  sync_guest_binary "$suite"
+  if [[ "${TIGONKV_V8_SKIP_SYNC:-0}" != 1 ]]; then
+    sync_guest_binary "$suite"
+  fi
   for ((round = 1; round <= rounds; round++)); do
     reset_pool
     run_init "$suite" "$round"
