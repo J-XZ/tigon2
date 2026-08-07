@@ -88,11 +88,7 @@ PY
 )"
   # Compatibility alias used by some guest/orchestration scripts.
   TIGONKV_VM_SSH_BASE_PORT=${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}
-  if [[ "$TIGONKV_SHARED_PATH" == "/mnt/xz_shared_mem" || "$TIGONKV_SHARED_PATH" == "/mnt/xz_shared_mem/" || -d "$TIGONKV_SHARED_PATH" || "$TIGONKV_SHARED_PATH" == */ ]]; then
-    TIGONKV_SHARED_BACKING="${TIGONKV_SHARED_PATH%/}/ivshmem_shared_mem"
-  else
-    TIGONKV_SHARED_BACKING="$TIGONKV_SHARED_PATH"
-  fi
+  TIGONKV_SHARED_BACKING="${TIGONKV_SHARED_PATH%/}/ivshmem_shared_mem"
 }
 
 tigonkv_validate_vm_config() {
