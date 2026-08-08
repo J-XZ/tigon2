@@ -33,7 +33,7 @@ compile-on（默认）下模拟器被编译进去，配置完成后始终参与�
 是唯一无模拟代码方式——wrapper 编译为原始操作、scope 为 no-op、消费者不解析配置/
 不注册 pool/不校准 TSC/不初始化清理 simulator。固定延迟公共实现来自固定 Git 子模块
 `thirdparty_libs/latency_sim`（最终 gitlink
-`29df0f0a4b59e96c28e84755b4159e6a4e6feaf4`，`my-work` 分支）；Tigon 的改动只在
+`46454dcc4f5b80d30d793a2d3d3db698aad33aab`，`my-work` 分支）；Tigon 的改动只在
 `my-work` 分支本地提交，不 push。
 详细规则见 [硬件模拟当前实现.md](硬件模拟当前实现.md)。
 
