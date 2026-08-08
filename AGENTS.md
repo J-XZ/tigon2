@@ -85,7 +85,7 @@ no-op、消费者不解析 fixed-latency 配置（也不要求配置中存在该
 pool/不校准 TSC/不初始化与清理 simulator；OFF（默认）则模拟器被
 编译进去，配置完成后始终参与。私有 `TIGONKV_DISABLE_HARDWARE_SIMULATION` 已删除。
 固定延迟公共实现来自固定子模块 `thirdparty_libs/latency_sim`
-（最终 gitlink `46454dcc4f5b80d30d793a2d3d3db698aad33aab`），
+（最终 gitlink `a15cc4ee4d6d79057dc8f44f2f3467a3158de637`），
 本仓只保留 `mem_access.h` 薄适配、生命周期与 scope 分类。
 
 ## 修改和验证
@@ -93,12 +93,14 @@ pool/不校准 TSC/不初始化与清理 simulator；OFF（默认）则模拟器
 - 先用 `rg` 审计源码、配置和文档，再修改最小必要路径；保留真实 SCC flush/invalidate、
   Clock、OLC、EBR、业务 runtime/memory stats。
 - 每个改动至少跑 Debug/RelWithDebInfo × compile-on/compile-off clean build、所有非 VM
-  CTest、固定延迟定向测试和 disabled benchmark。固定延迟测试必须覆盖 line geometry、
+  CTest、固定延迟定向测试和 disabled benchmark。任何 Valgrind/latencycheck 检查只能在
+  独立 Debug+O0 构建中进行；固定延迟测试必须覆盖 line geometry、
   重复访问、原子成功/失败、nested scope、前后台隔离、RAII 早返回和旧配置拒绝。
 - VM 测试只能使用本仓库的 `tigonkv_kill_vms.sh`、`tigonkv_init_vms.sh`、镜像、配置、
   二进制和 trace。测试前停止并核对所有项目的 QEMU/ivshmem/PID，清空上一项目的
   `/mnt/xz_vm_storage` 与 `/mnt/xz_shared_mem`，再创建本项目自己的干净 4VM。
-- 默认只跑一轮无延迟代表性 trace 和一个小型非零固定延迟 canary；固定 canary 不导出
+- 本轮消费者验收只跑一轮 E2E08 checker 和最小必要定向测试；首次 mismatch 立即中止，
+  不追加多轮运行修复业务插桩缺口。固定 canary 不导出
   访问计数，不输出模拟统计。
 - Remote Delete 使用稳定 HWCC control slot 记录 requester/worker/partition/sequence/
   target-row identity；只有 `Pending -> Executing` 的精确 CAS 能 claim，requester 只可在

@@ -33,7 +33,7 @@ compile-on（默认）下模拟器被编译进去，配置完成后始终参与�
 是唯一无模拟代码方式——wrapper 编译为原始操作、scope 为 no-op、消费者不解析配置/
 不注册 pool/不校准 TSC/不初始化清理 simulator。固定延迟公共实现来自固定 Git 子模块
 `thirdparty_libs/latency_sim`（最终 gitlink
-`46454dcc4f5b80d30d793a2d3d3db698aad33aab`，`my-work` 分支）；Tigon 的改动只在
+`a15cc4ee4d6d79057dc8f44f2f3467a3158de637`，`my-work` 分支）；Tigon 的改动只在
 `my-work` 分支本地提交，不 push。
 详细规则见 [硬件模拟当前实现.md](硬件模拟当前实现.md)。
 
@@ -80,9 +80,9 @@ Release:        -O3 -march=native，编译和最终链接均 -flto=full，保留
 
 ```bash
 # 默认可运行时配置（显式 OFF 等价于不传）。规范构建目录
-# build-<buildtype>-ninja-clang18-co_<on|off> 由
+# build-<buildtype>-ninja-clang18-co_<on|off>-check_<on|off> 由
 # scripts/tigonkv_build_helpers.sh::tigonkv_canonical_build_dir 统一计算，
-# 绑定 generator、clang-18、build type 和 compile-off。
+# 绑定 generator、clang-18、build type、compile-off 和 checker。
 cmake -S . -B build-relwithdebinfo-ninja-clang18-co_off -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DLATENCY_SIM_COMPILE_OFF=OFF
@@ -100,6 +100,14 @@ cmake -S . -B build-relwithdebinfo-ninja-clang18-co_on -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DLATENCY_SIM_COMPILE_OFF=ON
 cmake --build build-relwithdebinfo-ninja-clang18-co_on -j2
+
+# latencycheck 只允许独立的 Debug+O0 consumer；不得用 RelWithDebInfo/Release。
+# clang-18 checker 额外使用 DWARF-4 以兼容 Valgrind 3.18.1。
+cmake -S . -B build-debug-ninja-clang18-co_off-check_on -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DLATENCY_SIM_COMPILE_OFF=OFF \
+  -DLATENCY_SIM_VALGRIND_CHECK=ON
+cmake --build build-debug-ninja-clang18-co_off-check_on --target e2e_08 cxl_pool_initer -j2
 ```
 
 固定延迟定向测试是 `latency_modes_test`；Remote Delete 协议测试是
@@ -108,6 +116,9 @@ cmake --build build-relwithdebinfo-ninja-clang18-co_on -j2
 上的真实 adapter 路径（typed/atomic、B+Tree domain/atomic、真实 RegionAllocator、
 transport ring、shared-payload bulk）。正式 fixed-latency 运行使用
 `RelWithDebInfo`、`verbose=false`、`extra_check=false` 和成功 TSC 校准。
+
+本轮四仓库任务对消费者只执行一轮 E2E08 和最小必要定向测试；checker 首次发现
+mismatch 时立即终止同轮 guest，不为追求 `CHECK_CLEAN` 追加多轮修复业务插桩缺口。
 
 4VM trace 入口和 YCSB 约定见 [YCSB指南.md](YCSB指南.md)。正式报告应披露
 `foreground=4 + demuxer=1`、NUMA/容量、固定延迟参数、trace、计时窗口以及本地
