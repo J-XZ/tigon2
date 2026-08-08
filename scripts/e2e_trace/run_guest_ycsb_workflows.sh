@@ -82,9 +82,7 @@ sync_guest_runtime() {
 
 tigonkv_assert_host_test_isolated
 tigonkv_assert_qemu_group expected
-if [[ "${TIGONKV_V8_SKIP_SYNC:-0}" != 1 ]]; then
-  sync_guest_runtime
-fi
+sync_guest_runtime
 
 sync_traces() {
   local round=$1 workload=$2 phase=$3 vm worker trace remote_dir wl

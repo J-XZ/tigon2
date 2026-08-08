@@ -20,6 +20,8 @@
     "core_count_per_vm": 8,
     "mem_size_mb_per_vm": 2048,
     "storage_path": "/mnt/xz_vm_storage",
+    "first_ip": "192.168.100.2",
+    "bridge_tap_ip": "192.168.100.1",
     "numa_node": [0],
     "ssh_base_port": 10022,
     "copy_root_img": true,
@@ -29,6 +31,45 @@
     "sriov_nic": "",
     "outside_nic": ""
   },
-  "sync": { "timeout_sec": 60 },
-  "e2e": { "foreground_worker_count_per_vm": 4 }
+  "sync": {
+    "timeout_sec": 180,
+    "vm_ssh_user": "root",
+    "vm_direct_ssh_port": 22,
+    "host_rsync_dest": "",
+    "host_ssh_port": 22,
+    "host_ssh_extra": "-o StrictHostKeyChecking=no",
+    "project_root_on_targets": "",
+    "vm_ssh_extra": "-o StrictHostKeyChecking=no"
+  },
+  "e2e": { "foreground_worker_count_per_vm": 4 },
+  "tigon_kv": {
+    "partition_count": 4,
+    "partitioning": {
+      "strategy": "range",
+      "ranges": [
+        {"lower_key": "", "upper_key": "user14220323216640105059        "},
+        {"lower_key": "user14220323216640105059        ", "upper_key": "user18310210416256665431        "},
+        {"lower_key": "user18310210416256665431        ", "upper_key": "user5631359636275897216         "},
+        {"lower_key": "user5631359636275897216         ", "upper_key": ""}
+      ]
+    },
+    "fixed_key_size": 32,
+    "fixed_value_size": 32,
+    "hw_cc_budget_mb": 1024,
+    "owner_private_swcc_fraction": 0.35,
+    "migration_policy": "Clock",
+    "when_to_move_out": "OnDemand",
+    "scc_mechanism": "WriteThrough",
+    "transport_ring_total_mb": 16,
+    "verbose": false,
+    "extra_check": false,
+    "cpu_affinity": true,
+    "latency_inject": {
+      "fixed_latency": {
+        "cache_line_bytes": 64,
+        "swcc_fixed_ns_per_line": 0,
+        "hwcc_fixed_ns_per_line": 0
+      }
+    }
+  }
 }

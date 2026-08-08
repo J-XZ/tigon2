@@ -50,13 +50,12 @@ void MaybeThrowOpenFailpoint(const char *phase) {
 void MaybeThrowOpenFailpoint(const char *phase) { (void)phase; }
 #endif
 
-// Narrow Debug-only transport barrier used by the remote-delete race test.
-// Release/RelWithDebInfo builds contain no hook or environment branch.  The
-// test process supplies one command byte per owner claim: 0 continues, 1
-// publishes a ready byte and waits for the release byte.  The barrier is
-// inherited across fork, so it coordinates the real owner request path rather
-// than a test-only copy of the state machine.
-#ifndef NDEBUG
+// Narrow environment-only transport barrier used by the remote-delete race
+// test.  The test process supplies one command byte per owner claim: 0
+// continues, 1 publishes a ready byte and waits for the release byte.  The
+// barrier is inherited across fork, so it coordinates the real owner request
+// path rather than a test-only copy of the state machine.  It is compiled in
+// every build so RelWithDebInfo exercises the same protocol interleaving.
 void MaybePauseRemoteDeleteBeforeClaim() {
   const char *command_text =
       std::getenv("TIGONKV_TEST_REMOTE_DELETE_CLAIM_COMMAND_FD");
@@ -101,9 +100,40 @@ void MaybePauseRemoteDeleteBeforeClaim() {
     std::abort();
   }
 }
-#else
-inline void MaybePauseRemoteDeleteBeforeClaim() {}
-#endif
+
+struct RemoteDeleteTestOperationRecord {
+  uint32_t partition_id = 0;
+  uint32_t reserved = 0;
+  uint64_t sequence = 0;
+  RegionOffset target_row = kNullOffset;
+};
+
+void MaybePublishRemoteDeleteOperationForTest(uint32_t partition_id,
+                                              uint64_t sequence,
+                                              RegionOffset target_row) {
+  const char *fd_text =
+      std::getenv("TIGONKV_TEST_REMOTE_DELETE_RESPONSE_FD");
+  if (fd_text == nullptr || fd_text[0] == '\0') return;
+  const int fd = std::atoi(fd_text);
+  if (fd < 0) {
+    std::fprintf(stderr, "remote delete response descriptor is invalid\n");
+    std::abort();
+  }
+  const RemoteDeleteTestOperationRecord record{partition_id, 0, sequence,
+                                               target_row};
+  const auto *bytes = reinterpret_cast<const char *>(&record);
+  size_t written = 0;
+  while (written < sizeof(record)) {
+    const ssize_t count = ::write(fd, bytes + written, sizeof(record) - written);
+    if (count > 0) {
+      written += static_cast<size_t>(count);
+      continue;
+    }
+    if (count < 0 && errno == EINTR) continue;
+    std::fprintf(stderr, "remote delete response record write failed\n");
+    std::abort();
+  }
+}
 
 // Shared layout identity.  This deliberately hashes parsed canonical fields,
 // not JSON spelling or node-local wiring: every attaching VM must agree on
@@ -1737,6 +1767,9 @@ Status KVEngine::Forward(star::TwoPLPashaMessage type, std::string_view key,
   mailbox.operation.done = false;
   mailbox.operation.result = Status::Error(StatusCode::kCorruption,
                                             "missing RPC response");
+  if (type == star::TwoPLPashaMessage::REMOTE_DELETE_REQUEST)
+    MaybePublishRemoteDeleteOperationForTest(partition_id, sequence,
+                                             remote_delete_target);
   SendTransportMessage(message);
   message.clear_message_pieces();
   // The request phase ends immediately after the transport publication.  The

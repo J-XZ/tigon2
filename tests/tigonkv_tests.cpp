@@ -6,7 +6,6 @@
 #include <latency_sim/scope.h>
 #include <latency_sim/simulator.h>
 #include "kv/engine/kv_types_layout.h"
-#include "tools/tigonkv_build_identity_query.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -175,7 +174,6 @@ void RunConfigOnly() {
 }
 
 int main(int argc, char **argv) {
-  if (tigonkv::PrintBuildIdentityJsonIfRequested(argc, argv)) return 0;
   if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--config-only"))
     return 2;
   if (argc == 2) {

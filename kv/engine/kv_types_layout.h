@@ -18,7 +18,7 @@ namespace tigonkv::engine {
 // process virtual addresses. Zero is reserved as the null offset.
 using RegionOffset = uint64_t;
 constexpr RegionOffset kNullOffset = 0;
-constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;  // TIGONKV8
+constexpr uint64_t kSharedLayoutMagic = 0x5449474f4e4b5638ULL;
 // v9: allocator metadata accounting is split by its physical HWCC/SWCC pool.
 // v10: remote Scan validates concurrent shared removals without persistent pins.
 // v11: the Scan generation also covers logical-key insertion/deletion.

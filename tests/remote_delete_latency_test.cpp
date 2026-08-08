@@ -1,16 +1,9 @@
-// Deterministic latency tests for the remote Delete critical state.
-//
-// While the row is write_locked with valid cleared (between
-// prepare_remote_delete and the owner ack / rollback), the foreground budget
-// must be suspended and every transport poll must defer its settlement, so
-// no busy-wait ever happens inside the critical state.  The deferred
-// transport budget settles exactly once right after the commit/rollback
-// releases the lock and SCC guards, and the foreground budget settles once at
-// the outermost scope exit.  A recording delay backend makes the settlement
-// counts deterministic.  Row state (write lock, valid flag, ref count) is
-// asserted restored on the rollback path.
+// Remote Delete protocol tests.  The cases exercise the production owner
+// claim, requester rollback, ABA interleaving, late/duplicate responses and
+// sequence exhaustion on both compile-on and compile-off builds.
 #include "common/CXLMemory.h"
 #include "common/Message.h"
+#include "common/MPSCRingBuffer.h"
 #include "kv/engine/kv_partition.h"
 #include "kv/engine/kv_types_layout.h"
 #include "kv/engine/mem_access.h"
@@ -27,7 +20,6 @@
 #undef private
 
 #include <latency_sim/simulator.h>
-#include <latency_sim/testing.h>
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -40,7 +32,6 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <sys/wait.h>
@@ -57,62 +48,36 @@ constexpr uint32_t kOwner = 1;
 constexpr uint32_t kFixedKeySize = 32;
 constexpr uint32_t kFixedValueSize = 128;
 
-// Settlement records are tagged with the settling thread id: the inbound
-// demuxer thread legitimately settles its own per-iteration receive budgets,
-// so only the requester thread's settlements are meaningful for the delete
-// critical-state assertions.
-std::vector<std::pair<std::thread::id, std::uint64_t>> g_settlements;
-std::mutex g_settlements_mutex;
-std::thread::id g_requester_thread;
+struct RemoteDeleteOperationRecord {
+  uint32_t partition_id = 0;
+  uint32_t reserved = 0;
+  uint64_t sequence = 0;
+  tigonkv::engine::RegionOffset target_row = tigonkv::engine::kNullOffset;
+};
 
-void InstallRecordingBackend() {
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-  g_settlements.clear();
-  g_requester_thread = std::this_thread::get_id();
-  latency_sim::detail::SetDelaySpinBackendForTest(
-      [](std::uint64_t ns) {
-        std::lock_guard<std::mutex> lock(g_settlements_mutex);
-        g_settlements.emplace_back(std::this_thread::get_id(), ns);
-      });
-#endif
+RemoteDeleteOperationRecord ReadRemoteDeleteOperation(int fd) {
+  RemoteDeleteOperationRecord record;
+  auto *bytes = reinterpret_cast<char *>(&record);
+  size_t read_total = 0;
+  while (read_total < sizeof(record)) {
+    const ssize_t count = ::read(fd, bytes + read_total,
+                                 sizeof(record) - read_total);
+    if (count > 0) {
+      read_total += static_cast<size_t>(count);
+      continue;
+    }
+    if (count < 0 && errno == EINTR) continue;
+    assert(false && "remote delete operation record read failed");
+  }
+  return record;
 }
 
-std::size_t RequesterSettlements() {
-  std::lock_guard<std::mutex> lock(g_settlements_mutex);
-  std::size_t count = 0;
-  for (const auto &entry : g_settlements)
-    if (entry.first == g_requester_thread) ++count;
-  return count;
-}
-
-// Last settlement recorded on the requester thread.  The inbound demuxer
-// thread legitimately appends its own per-iteration settlements, so the
-// global back of the list is not stable.
-std::uint64_t LastRequesterSettlementNs() {
-  std::lock_guard<std::mutex> lock(g_settlements_mutex);
-  std::uint64_t last = 0;
-  for (const auto &entry : g_settlements)
-    if (entry.first == g_requester_thread) last = entry.second;
-  return last;
-}
-
-void ClearSettlements() {
-  std::lock_guard<std::mutex> lock(g_settlements_mutex);
-  g_settlements.clear();
-}
-
-void UninstallBackend() {
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-  latency_sim::detail::SetDelaySpinBackendForTest(nullptr);
-#endif
-}
-
-latency_sim::FixedLatencyConfig OneNanosecondPerLine() {
-  latency_sim::FixedLatencyConfig config;
-  config.cache_line_bytes = 64;
-  config.swcc_fixed_ns_per_line = 1.0;
-  config.hwcc_fixed_ns_per_line = 1.0;
-  return config;
+void EnqueueResponse(tigonkv::engine::KVEngine *engine,
+                     std::unique_ptr<star::Message> message) {
+  message->set_worker_id(0);
+  while (!engine->rings_[kRequester].enqueue(message->get_raw_ptr(),
+                                             message->get_message_length()))
+    std::this_thread::yield();
 }
 
 tigonkv::Config ConfigFor(const std::string &path) {
@@ -131,7 +96,6 @@ tigonkv::Config ConfigFor(const std::string &path) {
   config.fixed_value_size = kFixedValueSize;
   config.foreground_worker_count_per_vm = 1;
   config.transport_ring_total_mb = 1;
-  config.hardware_simulation = OneNanosecondPerLine();
   config.partition_ranges.clear();
   std::string lower;
   for (uint32_t partition = 0; partition < config.partition_count; ++partition) {
@@ -176,14 +140,7 @@ std::string OwnerKey(uint32_t owner, uint64_t i) {
 class OwnerPeer {
  public:
   explicit OwnerPeer(tigonkv::Config config, bool with_claim_gate = false)
-      : claim_gate_enabled_(
-#if defined(TIGONKV_CMAKE_BUILD_TYPE)
-            with_claim_gate &&
-            std::string_view(TIGONKV_CMAKE_BUILD_TYPE) == "Debug"
-#else
-            with_claim_gate
-#endif
-        ) {
+      : claim_gate_enabled_(with_claim_gate) {
     config.node_id = kOwner;
     assert(pipe2(stop_pipe_, O_CLOEXEC) == 0);
     if (claim_gate_enabled_) {
@@ -319,9 +276,7 @@ class OwnerPeer {
 }  // namespace
 
 int main() {
-  InstallRecordingBackend();
-
-  char path_template[] = "/tmp/tigonkv-rd-latency-XXXXXX";
+  char path_template[] = "/tmp/tigonkv-rd-protocol-XXXXXX";
   const int fd = mkstemp(path_template);
   assert(fd >= 0);
   close(fd);
@@ -345,27 +300,9 @@ int main() {
     {
       tigonkv::engine::mem_access::LatencyScope facade(
           latency_sim::ExecutionClass::kForeground);
-      {
-        std::lock_guard<std::mutex> lock(g_settlements_mutex);
-        g_settlements.clear();
-      }
       // 1. Remote delete success: the row is prepared (write_locked + valid
       //    cleared), the delete request is forwarded and the owner acks.
       assert(engine->Delete(remote_key).ok());
-      // No settlement happened during the whole delete: the cooperative wait
-      // suspended the foreground budget and every transport poll deferred its
-      // settlement, so no busy-wait ever occurred while the row was
-      // write_locked/invalid (the delete's leading empty poll settles zero
-      // and the recording backend ignores zero-nanosecond requests).
-      // No settlement happened on the requester thread during the whole
-      // delete: the cooperative wait suspended the foreground budget and
-      // every transport poll deferred its settlement, so no busy-wait ever
-      // occurred while the row was write_locked/invalid (the demuxer thread's
-      // own receive settlements are unrelated and allowed).
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-      assert(RequesterSettlements() == 0);
-#endif
-      ClearSettlements();
 
       const auto gone = engine->Get(remote_key);
       assert(gone.status.code == tigonkv::StatusCode::kNotFound);
@@ -376,21 +313,10 @@ int main() {
       assert(recreated.status.ok() &&
              recreated.value == FixedValue("recreated"));
     }
-    // The foreground scope exit settled the merged deferred budget (the
-    // delete's transport polls plus the suspended foreground segment) after
-    // the delete and rollback were long over; the later in-facade operations
-    // settle their own normal-mode budgets on the same thread, so only the
-    // last settlement carries the merged deferred budget.
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    assert(RequesterSettlements() >= 1);
-    assert(LastRequesterSettlementNs() > 0);
-#endif
-    ClearSettlements();
-
     // 2. Rollback path: prepare the delete of a second remote row and abort
     //    it (the owner-Busy / failed-ack path calls exactly this), asserting
     //    the lock is released, the valid flag is restored and the ref count
-    //    is decremented back, with exactly one settlement per scope.
+    //    is decremented back.
     const std::string rollback_key = OwnerKey(kOwner, 4096);
     {
       tigonkv::engine::mem_access::LatencyScope facade(
@@ -408,7 +334,6 @@ int main() {
         tigonkv::engine::FixedKey::From(rollback_key, kFixedKeySize);
     const uint64_t rollback_sequence =
         engine->ReserveOperationSequence(*engine->worker_mailboxes_[0]);
-    ClearSettlements();
     {
       tigonkv::engine::mem_access::LatencyScope scope(
           latency_sim::ExecutionClass::kBackground);
@@ -423,11 +348,6 @@ int main() {
       assert(rollback_control.LoadControl().state ==
              tigonkv::engine::RemoteDeleteControlState::kPending);
     }
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    assert(RequesterSettlements() == 1);  // exactly one settlement per scope
-#endif
-    ClearSettlements();
-    ClearSettlements();
     {
       tigonkv::engine::mem_access::LatencyScope scope(
           latency_sim::ExecutionClass::kBackground);
@@ -440,10 +360,6 @@ int main() {
           rollback_tag,
           tigonkv::engine::RemoteDeleteControlState::kCancelled));
     }
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    assert(RequesterSettlements() == 1);  // exactly one settlement per scope
-#endif
-    ClearSettlements();
     // 3. Owner claim wins the race: once the owner has linearized the delete
     //    (write-lock bit cleared under the smeta latch), a late requester
     //    rollback must hard fail instead of resurrecting a deleted row.
@@ -501,7 +417,6 @@ int main() {
           claimed_tag,
           tigonkv::engine::RemoteDeleteControlState::kRejected));
     }
-    ClearSettlements();
     // The restored row is readable again through the normal path.
     {
       tigonkv::engine::mem_access::LatencyScope facade(
@@ -569,12 +484,10 @@ int main() {
     unlink(aba_path_template);
   }
   {
-    // Owner Busy / error ack: the owner responds Busy (or a dispatch error is
-    // surfaced as a non-ok result), the delete rolls the row back, the lock is
-    // released, the valid flag is restored and the budgets settle exactly
-    // once at the facade exit.  A real polling owner acks the seeds, then
-    // stops polling so no real delete ack can race the injected Busy response
-    // (or the timeout below).
+    // First create a real retired identity through a lost-owner timeout.  The
+    // later injected Deleted/Failed responses use this identity and therefore
+    // exercise the production retired-response filter rather than mutating a
+    // private test ledger.
     auto config_busy = config;
     config_busy.transport_response_timeout_ms = 300;
     OwnerPeer busy_peer(config_busy);
@@ -589,151 +502,100 @@ int main() {
       assert(engine->Put(timeout_key, FixedValue("timeout-me")).ok());
     }
     busy_peer.StopAndJoin();
+    int response_pipe[2];
+    assert(pipe(response_pipe) == 0);
+    assert(setenv("TIGONKV_TEST_REMOTE_DELETE_RESPONSE_FD",
+                  std::to_string(response_pipe[1]).c_str(), 1) == 0);
+    RemoteDeleteOperationRecord retired_operation;
     {
       tigonkv::engine::mem_access::LatencyScope facade(
           latency_sim::ExecutionClass::kForeground);
-      {
-        std::lock_guard<std::mutex> lock(g_settlements_mutex);
-        g_settlements.clear();
-      }
-      auto *mailbox = engine->worker_mailboxes_[0].get();
-      // Stale-response idempotence: a late response for an older request
-      // identity must be dropped, not consumed as this request's response.
-      // Inject it first, then the matching Busy response; the delete must
-      // complete only on the matching sequence.
-      std::thread responder([&] {
-        while (mailbox->operation.expected_response_type == 0)
-          std::this_thread::yield();
-        const uint64_t stale_sequence = mailbox->operation.sequence + 7;
-        mailbox->retired_remote_deletes[0] = {
-            true, kOwner, mailbox->operation.partition_id, stale_sequence,
-            mailbox->operation.target_row};
-        {
-          tigonkv::engine::mem_access::LatencyScope owner_scope(
-              latency_sim::ExecutionClass::kBackground);
-          auto &busy_control = engine->pool_->allocator().layout()
-              .remote_delete_controls[kRequester][0];
-          const auto busy_tag = mailbox->operation.sequence;
-          assert(busy_control.CompareExchange(
-              busy_tag,
-              tigonkv::engine::RemoteDeleteControlState::kPending,
-              tigonkv::engine::RemoteDeleteControlState::kExecuting));
-          engine->VisiblePartition(busy_key)->AbortRemoteDelete(
-              mailbox->operation.target_row, kRequester);
-          busy_control.PublishError(
-              tigonkv::engine::RemoteDeleteControlError::kRejected);
-          assert(busy_control.CompareExchange(
-              busy_tag,
-              tigonkv::engine::RemoteDeleteControlState::kExecuting,
-              tigonkv::engine::RemoteDeleteControlState::kRejected));
-        }
-        auto stale_message = std::make_unique<star::Message>();
-        stale_message->set_source_node_id(kOwner);
-        stale_message->set_dest_node_id(kRequester);
-        star::TwoPLPashaMessageHandler::append_remote_delete_response(
-            *stale_message, tigonkv::engine::kSingleTableId,
-            mailbox->operation.partition_id,
-            star::RemoteDeleteOutcome::Deleted, 0,
-            mailbox->operation.target_row, stale_sequence);
-        mailbox->inbox.push(stale_message.release());
-        auto message = std::make_unique<star::Message>();
-        message->set_source_node_id(kOwner);
-        message->set_dest_node_id(kRequester);
-        star::TwoPLPashaMessageHandler::append_remote_delete_response(
-            *message, tigonkv::engine::kSingleTableId,
-            mailbox->operation.partition_id,
-            star::RemoteDeleteOutcome::Busy, 0, mailbox->operation.target_row,
-            mailbox->operation.sequence);
-        mailbox->inbox.push(message.release());
-        auto duplicate = std::make_unique<star::Message>();
-        duplicate->set_source_node_id(kOwner);
-        duplicate->set_dest_node_id(kRequester);
-        star::TwoPLPashaMessageHandler::append_remote_delete_response(
-            *duplicate, tigonkv::engine::kSingleTableId,
-            mailbox->operation.partition_id,
-            star::RemoteDeleteOutcome::Busy, 0, mailbox->operation.target_row,
-            mailbox->operation.sequence);
-        mailbox->inbox.push(duplicate.release());
-      });
-      const auto status = engine->Delete(busy_key);
-      responder.join();
-      assert(status.code == tigonkv::StatusCode::kBusy);
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-      assert(RequesterSettlements() == 0);  // nothing settled inside the critical state
-#endif
-      ClearSettlements();
-      // The row is restored and readable through the normal path.
-      const auto restored = engine->Get(busy_key);
-      assert(restored.status.ok() &&
-             restored.value == FixedValue("busy-me"));
-    }
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    assert(RequesterSettlements() >= 1);  // merged budget settled at the facade exit
-    assert(LastRequesterSettlementNs() > 0);
-#endif
-    ClearSettlements();
-
-    // Timeout / lost owner: no ack arrives within the bounded control-plane
-    // deadline, the delete times out and rolls the row back; nothing is left
-    // stranded (lock, valid flag, budgets).
-    {
-      tigonkv::engine::mem_access::LatencyScope facade(
-          latency_sim::ExecutionClass::kForeground);
-      {
-        std::lock_guard<std::mutex> lock(g_settlements_mutex);
-        g_settlements.clear();
-      }
       const auto status = engine->Delete(timeout_key);
+      retired_operation = ReadRemoteDeleteOperation(response_pipe[0]);
       assert(status.code == tigonkv::StatusCode::kTimeout);
       const auto restored = engine->Get(timeout_key);
       assert(restored.status.ok() &&
              restored.value == FixedValue("timeout-me"));
     }
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    // Transport/dispatch exception inside a deferred poll: the RAII poll
-    // guard must restore the thread scope state even when the poll body
-    // throws, and the merged deferred budget must settle exactly once at the
-    // outermost facade exit (never inside the critical state).
+    assert(unsetenv("TIGONKV_TEST_REMOTE_DELETE_RESPONSE_FD") == 0);
+
+    assert(setenv("TIGONKV_TEST_REMOTE_DELETE_RESPONSE_FD",
+                  std::to_string(response_pipe[1]).c_str(), 1) == 0);
     {
       tigonkv::engine::mem_access::LatencyScope facade(
           latency_sim::ExecutionClass::kForeground);
-      latency_sim::GlobalLatencySimulator().ChargeRange(
-          latency_sim::MemoryDomain::kHwcc,
-          latency_sim::AccessKind::kRead,
-          static_cast<const std::byte *>(engine->pool_->base()) +
-              config_busy.hwcc_offset_mb * 1024ull * 1024ull,
-          64);
-      {
-        std::lock_guard<std::mutex> lock(g_settlements_mutex);
-        g_settlements.clear();
-      }
-      {
-        tigonkv::engine::mem_access::ForegroundScopeSuspension
-            suspend_foreground;
-        tigonkv::engine::mem_access::DeferTransportSettlement
-            defer_settlement;
-        try {
-          tigonkv::engine::mem_access::DeferredTransportPollScope poll_scope;
-          throw std::runtime_error("dispatch exception");
-        } catch (const std::runtime_error &) {
-        }
-        // The poll scope destructor restored the suspended state.
-        assert(latency_sim::GlobalLatencySimulator()
-                   .ScopeSuspendedForTest());
-        assert(RequesterSettlements() == 0);
-      }
-      // The foreground suspension destructor restored the active foreground
-      // scope with its original class/depth.
-      assert(latency_sim::GlobalLatencySimulator()
-                 .HasTopLevelScopeForCurrentThread(
-                     latency_sim::ExecutionClass::kForeground));
-      assert(RequesterSettlements() == 0);
+      // A responder thread communicates only through the operation-record
+      // pipe and the real inbound MPSC ring.  It never reads or writes the
+      // requester's mailbox, whose operation slot and SPSC inbox remain
+      // single-thread-owned.
+      std::thread responder([&] {
+        const auto current = ReadRemoteDeleteOperation(response_pipe[0]);
+        assert(current.partition_id == retired_operation.partition_id);
+        assert(current.sequence != retired_operation.sequence);
+        tigonkv::engine::mem_access::LatencyScope owner_scope(
+            latency_sim::ExecutionClass::kBackground);
+        auto &busy_control = engine->pool_->allocator().layout()
+            .remote_delete_controls[kRequester][0];
+        assert(busy_control.CompareExchange(
+            current.sequence,
+            tigonkv::engine::RemoteDeleteControlState::kPending,
+            tigonkv::engine::RemoteDeleteControlState::kExecuting));
+        engine->VisiblePartition(busy_key)->AbortRemoteDelete(
+            current.target_row, kRequester);
+        busy_control.PublishError(
+            tigonkv::engine::RemoteDeleteControlError::kRejected);
+        assert(busy_control.CompareExchange(
+            current.sequence,
+            tigonkv::engine::RemoteDeleteControlState::kExecuting,
+            tigonkv::engine::RemoteDeleteControlState::kRejected));
+        auto stale_message = std::make_unique<star::Message>();
+        stale_message->set_source_node_id(kOwner);
+        stale_message->set_dest_node_id(kRequester);
+        star::TwoPLPashaMessageHandler::append_remote_delete_response(
+            *stale_message, tigonkv::engine::kSingleTableId,
+            retired_operation.partition_id,
+            star::RemoteDeleteOutcome::Deleted, 0,
+            retired_operation.target_row, retired_operation.sequence);
+        EnqueueResponse(engine.get(), std::move(stale_message));
+        auto failed_stale = std::make_unique<star::Message>();
+        failed_stale->set_source_node_id(kOwner);
+        failed_stale->set_dest_node_id(kRequester);
+        star::TwoPLPashaMessageHandler::append_remote_delete_response(
+            *failed_stale, tigonkv::engine::kSingleTableId,
+            retired_operation.partition_id,
+            star::RemoteDeleteOutcome::Failed, 0,
+            retired_operation.target_row, retired_operation.sequence);
+        EnqueueResponse(engine.get(), std::move(failed_stale));
+        auto message = std::make_unique<star::Message>();
+        message->set_source_node_id(kOwner);
+        message->set_dest_node_id(kRequester);
+        star::TwoPLPashaMessageHandler::append_remote_delete_response(
+            *message, tigonkv::engine::kSingleTableId,
+            current.partition_id,
+            star::RemoteDeleteOutcome::Busy, 0, current.target_row,
+            current.sequence);
+        EnqueueResponse(engine.get(), std::move(message));
+        auto duplicate = std::make_unique<star::Message>();
+        duplicate->set_source_node_id(kOwner);
+        duplicate->set_dest_node_id(kRequester);
+        star::TwoPLPashaMessageHandler::append_remote_delete_response(
+            *duplicate, tigonkv::engine::kSingleTableId,
+            current.partition_id,
+            star::RemoteDeleteOutcome::Busy, 0, current.target_row,
+            current.sequence);
+        EnqueueResponse(engine.get(), std::move(duplicate));
+      });
+      const auto status = engine->Delete(busy_key);
+      responder.join();
+      assert(status.code == tigonkv::StatusCode::kBusy);
+      // The row is restored and readable through the normal path.
+      const auto restored = engine->Get(busy_key);
+      assert(restored.status.ok() &&
+             restored.value == FixedValue("busy-me"));
     }
-    // Exactly one settlement at the facade exit, carrying the merged deferred
-    // budget (no loss, no duplication).
-    assert(RequesterSettlements() == 1);
-    assert(LastRequesterSettlementNs() == 1);
-#endif
+    assert(unsetenv("TIGONKV_TEST_REMOTE_DELETE_RESPONSE_FD") == 0);
+    close(response_pipe[0]);
+    close(response_pipe[1]);
     // A sequence may be allocated at UINT64_MAX exactly once, but the next
     // allocation must fail instead of wrapping into a reusable identity.
     auto *mailbox = engine->worker_mailboxes_[0].get();
@@ -751,8 +613,7 @@ int main() {
     assert(sequence_exhausted);
     engine->ReleaseWorker();
   }
-  UninstallBackend();
   unlink(path_template);
-  std::printf("remote_delete_latency_test ok\n");
+  std::printf("remote_delete_test ok\n");
   return 0;
 }

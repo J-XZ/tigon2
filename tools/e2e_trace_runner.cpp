@@ -1,6 +1,5 @@
 #include "kv/kv_store.h"
 #include "tools/e2e_trace_format.h"
-#include "tools/tigonkv_build_identity_query.h"
 
 #include <algorithm>
 #include <atomic>
@@ -467,7 +466,6 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (tigonkv::PrintBuildIdentityJsonIfRequested(argc, argv)) return 0;
   std::unique_ptr<KVStore> store;
   std::string trace;
   std::string phase;

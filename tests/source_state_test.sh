@@ -2,7 +2,7 @@
 set -euo pipefail
 # Automated test for tigonkv_source_state: any unstaged, staged or untracked
 # change in the parent repo or in a relevant submodule must change the state
-# hash (and thereby refuse a stale binary reuse); build artifacts covered by
+# hash (and thereby refuse a stale binary reuse); ignored build products
 # ignore rules must NOT change it.
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/tigonkv_build_helpers.sh
@@ -87,7 +87,7 @@ git -C "$parent/thirdparty_libs/latency_sim" reset --quiet AGENTS.md.tmp_probe
 rm -f "$parent/thirdparty_libs/latency_sim/AGENTS.md.tmp_probe"
 
 # 7. Ignored build products (build dirs, ccache, temp logs) must not change
-#    the state: they are reproducible artifacts, not source.
+#    the state: they are reproducible build products, not source.
 mkdir -p "$parent/build-relwithdebinfo-ninja-clang18-co_off"
 touch "$parent/build-relwithdebinfo-ninja-clang18-co_off/probe.o"
 mkdir -p "$parent/exp_data"
@@ -95,7 +95,7 @@ echo "log" > "$parent/exp_data/probe.log"
 echo "ccache" > "$parent/tmp_probe_ccache"
 ignored=$(tigonkv_source_state "$parent")
 [[ "$ignored" == "$base" ]] || {
-  echo "FAIL: ignored build artifacts changed source state" >&2
+  echo "FAIL: ignored build products changed source state" >&2
   exit 1
 }
 

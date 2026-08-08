@@ -11,6 +11,14 @@ function(tigonkv_set_default_build_type)
   if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
   endif()
+  # Remove CMake's implicit optimization/debug additions.  The target policy
+  # below is the single source of the requested flags for every configuration.
+  set(CMAKE_C_FLAGS_DEBUG "" CACHE STRING "" FORCE)
+  set(CMAKE_CXX_FLAGS_DEBUG "" CACHE STRING "" FORCE)
+  set(CMAKE_C_FLAGS_RELWITHDEBINFO "-DNDEBUG" CACHE STRING "" FORCE)
+  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-DNDEBUG" CACHE STRING "" FORCE)
+  set(CMAKE_C_FLAGS_RELEASE "-DNDEBUG" CACHE STRING "" FORCE)
+  set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG" CACHE STRING "" FORCE)
 endfunction()
 
 # Select the default toolchain.  MUST run before project(): callers that
@@ -102,18 +110,18 @@ function(tigonkv_check_lto_support)
   endif()
 endfunction()
 
-# Apply the CXLKV-aligned optimization/debug policy to one project-owned
-# target.  CMake's built-in per-config flags (-O2 -g -DNDEBUG for
-# RelWithDebInfo, -O3 -DNDEBUG for Release) may appear earlier on the command
-# line; these target options always follow them, so the final effective values
-# are the ones defined here.
+# Apply the optimization/debug and compile-off policy to one project-owned
+# target.  The cache flags above remove CMake's implicit optimization choices;
+# these target options are the exact project policy.
 #
 #   Debug:         -O0 -g3, no -march=native, no LTO
-#   RelWithDebInfo:-O3 -g3 -march=native, -flto=full (GCC: -flto),
-#                  built-in -DNDEBUG preserved
+#   RelWithDebInfo:-O3 -g3 -march=native, -flto=full (GCC: -flto), -DNDEBUG
 #   Release:       -O3 -march=native, -flto=full (GCC: -flto),
-#                  built-in -DNDEBUG preserved
+#                  -DNDEBUG
 function(tigonkv_apply_target_build_policy target_name)
+  if(LATENCY_SIM_COMPILE_OFF STREQUAL "ON")
+    target_compile_definitions(${target_name} PRIVATE LATENCY_SIM_COMPILE_OFF)
+  endif()
   target_compile_options(${target_name} PRIVATE
     $<$<CONFIG:Debug>:-O0>
     $<$<CONFIG:Debug>:-g3>

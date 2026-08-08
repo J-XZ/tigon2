@@ -90,9 +90,7 @@ void WaitForBarrierFile(const std::string &path) {
 }
 #endif
 
-void FlushForRemoteVisibility(const void *address, size_t bytes,
-                              bool charge_swcc_flush = true) {
-  if (charge_swcc_flush) mem_access::SwccInvalidate(address, bytes);
+void FlushForRemoteVisibility(const void *address, size_t bytes) {
 #if defined(__x86_64__) || defined(__i386__)
   const auto begin = reinterpret_cast<uintptr_t>(address) & ~(RegionAllocator::kAlignment - 1);
   const auto end = reinterpret_cast<uintptr_t>(address) + bytes;
@@ -156,7 +154,7 @@ RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
     entry.end = payload_begin + (payload * (shard + 1)) / shard_count;
     entry.bump = entry.begin;
   }
-  FlushForRemoteVisibility(header, MetadataBytes(), !control_is_hwcc);
+  FlushForRemoteVisibility(header, MetadataBytes());
   return RegionAllocator(region, region_bytes, header, control_is_hwcc, block_is_hwcc,
                          block_is_shared_payload);
 }
@@ -313,7 +311,7 @@ void RegionAllocator::AccountFree(uint64_t bytes, DomainCounter *counter) {
 }
 
 void RegionAllocator::FlushAllocatedRanges() const {
-  FlushForRemoteVisibility(header_, MetadataBytes(), !control_is_hwcc_);
+  FlushForRemoteVisibility(header_, MetadataBytes());
   RecordMetadataRead(&header_->shard_count, sizeof(header_->shard_count));
   for (uint32_t shard = 0; shard < header_->shard_count; ++shard) {
     const auto &entry = header_->shards[shard];
@@ -322,8 +320,7 @@ void RegionAllocator::FlushAllocatedRanges() const {
                            sizeof(entry.bump));
     const uint64_t bump = entry.bump;
     if (bump > entry.begin)
-      FlushForRemoteVisibility(base_ + entry.begin, bump - entry.begin,
-                               !control_is_hwcc_);
+      FlushForRemoteVisibility(base_ + entry.begin, bump - entry.begin);
   }
 }
 
@@ -332,16 +329,13 @@ void RegionAllocator::FlushOwnedRange(uint32_t owner_shard) const {
   if (owner_shard >= header_->shard_count)
     throw std::invalid_argument("flush owner shard outside allocator");
   const auto &entry = header_->shards[owner_shard];
-  FlushForRemoteVisibility(&entry, sizeof(entry), !control_is_hwcc_);
-  // The source loads bump/begin after invalidating the allocator shard. Keep
-  // the simulated cache order identical so these reads cannot inherit a
-  // pre-invalidation hit.
+  FlushForRemoteVisibility(&entry, sizeof(entry));
+  // The source loads bump/begin after flushing the allocator shard.
   RecordMetadataRead(&entry.begin,
                      sizeof(entry.begin) + sizeof(entry.end) +
                          sizeof(entry.bump));
   if (entry.bump > entry.begin)
-    FlushForRemoteVisibility(base_ + entry.begin, entry.bump - entry.begin,
-                             !control_is_hwcc_);
+    FlushForRemoteVisibility(base_ + entry.begin, entry.bump - entry.begin);
 }
 
 void *RegionAllocator::AllocateFromShard(uint64_t bytes, uint32_t size_class,
@@ -596,7 +590,7 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
                    swcc_metadata_bytes);
   // Remain unpublished until transport, EBR, dynamic descriptors and the
   // immutable static bounds have all been written by KVEngine.
-  FlushForRemoteVisibility(header, sizeof(*header), false);
+  FlushForRemoteVisibility(header, sizeof(*header));
   return DualRegionAllocator(base, config, header, hwcc);
 }
 
@@ -752,7 +746,7 @@ void DualRegionAllocator::FinalizeStaticHwccLayout() {
       throw std::runtime_error("dynamic owner arena has zero capacity");
   }
   FlushForRemoteVisibility(header_->layout.owner_dynamic_arenas.data(),
-                           sizeof(header_->layout.owner_dynamic_arenas), false);
+                           sizeof(header_->layout.owner_dynamic_arenas));
   static_hwcc_finalized_ = true;
 }
 
@@ -788,7 +782,7 @@ void DualRegionAllocator::PublishStaticHwccLayout() {
   // the release-store of magic.
   mem_access::HwccAtomicStore(header_->layout.magic, kSharedLayoutMagic,
                               std::memory_order_release);
-  FlushForRemoteVisibility(&header_->layout, sizeof(header_->layout), false);
+  FlushForRemoteVisibility(&header_->layout, sizeof(header_->layout));
 }
 
 DualRegionAllocator DualRegionAllocator::Attach(void *pool,
@@ -882,7 +876,7 @@ void DualRegionAllocator::PublishOwnerInitialized(uint32_t node_id) {
   if ((previous & bit) != 0)
     throw std::logic_error("owner initialization published more than once");
   FlushForRemoteVisibility(&header_->layout.owner_init_ready_bitmap,
-                           sizeof(header_->layout.owner_init_ready_bitmap), false);
+                           sizeof(header_->layout.owner_init_ready_bitmap));
 }
 
 void DualRegionAllocator::WaitForOwnersAndPublishReady() {
@@ -929,8 +923,7 @@ void DualRegionAllocator::PublishReady() {
   mem_access::HwccAtomicStore(
       header_->layout.state, static_cast<uint32_t>(LayoutState::kReady),
       std::memory_order_release);
-  FlushForRemoteVisibility(&header_->layout.state, sizeof(header_->layout.state),
-                           false);
+  FlushForRemoteVisibility(&header_->layout.state, sizeof(header_->layout.state));
 }
 
 void *DualRegionAllocator::Allocate(uint64_t bytes, AllocationDomain domain,

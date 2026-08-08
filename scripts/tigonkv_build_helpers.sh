@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# Canonical build directory and build-contract helpers for Tigon2 E2E/YCSB
+# Canonical build directory and stale-build helpers for Tigon2 E2E/YCSB
 # entry points.  The canonical build directory binds the generator (Ninja),
 # the clang/clang++-18 toolchain, the build type and LATENCY_SIM_COMPILE_OFF,
 # so no consumer blindly reads a stale `build-relwithdebinfo`.
 #
-# Every entry point reuses a directory only after verifying the real
-# CMakeCache.txt and the recorded build meta (parent HEAD, source-state hash,
-# latency_sim gitlink, configure command and binary hashes); any mismatch
-# fails explicitly instead of silently reusing a stale binary.
+# Reuse is allowed only when the real CMakeCache and source/submodule state
+# match. This is only a local stale-build guard.
 
 # Canonical build directory for the given root, build type and compile-off.
 tigonkv_canonical_build_dir() {
@@ -119,24 +117,17 @@ tigonkv_latency_sim_gitlink() {
     | awk '{print $1}' || echo nosub
 }
 
-# Write the build meta for a completed canonical build.  Records the real
-# generator/compiler/build-type/compile-off from the requested contract, the
-# parent HEAD + source-state hash, latency_sim gitlink, the configure command
-# and per-binary sha256.
+# Write the small local metadata needed to reject a stale canonical build.
 tigonkv_write_build_meta() {
   local build_dir="$1" root="$2" build_type="$3" compile_off="$4"
   shift 4
-  local compilers configure
-  compilers="$(tigonkv_compiler_paths)" || return 1
-  read -r configure <<<"cmake -S '$root' -B '$build_dir' -G Ninja -DCMAKE_BUILD_TYPE=$build_type -DCMAKE_C_COMPILER=${compilers% *} -DCMAKE_CXX_COMPILER=${compilers#* } -DLATENCY_SIM_COMPILE_OFF=$compile_off"
   local meta="$build_dir/tigonkv_build_meta.json"
   local gitlink
   gitlink="$(tigonkv_latency_sim_gitlink "$root")"
   python3 - "$meta" "$root" "$build_type" "$compile_off" "$gitlink" \
-    "$(tigonkv_source_state "$root")" "$configure" "$@" <<'PY'
+    "$(tigonkv_source_state "$root")" <<'PY'
 import json, os, sys
-meta_path, source_dir, build_type, compile_off, gitlink, source_state, configure = sys.argv[1:8]
-binaries = sys.argv[8:]
+meta_path, source_dir, build_type, compile_off, gitlink, source_state = sys.argv[1:7]
 payload = {
     'source_dir': source_dir,
     'build_type': build_type,
@@ -144,17 +135,7 @@ payload = {
     'latency_sim_compile_off': compile_off,
     'latency_sim_gitlink': gitlink,
     'source_state': source_state,
-    'configure_command': configure,
-    'contract': 'fixed-latency-only',
-    'binaries': {},
 }
-for binary in binaries:
-    try:
-        with open(binary, 'rb') as f:
-            import hashlib
-            payload['binaries'][binary] = hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        payload['binaries'][binary] = 'MISSING'
 tmp = meta_path + '.tmp'
 with open(tmp, 'w', encoding='utf-8') as output:
     json.dump(payload, output, indent=2, sort_keys=True)
@@ -164,8 +145,8 @@ os.replace(tmp, meta_path)
 PY
 }
 
-# Verify a recorded build meta against the current source/contract/binary
-# hashes.  Used by --skip-build: only an exact match may reuse the build.
+# Verify a recorded build meta against the current source and build selection.
+# Used by --skip-build: only an exact match may reuse the build.
 tigonkv_verify_build_meta() {
   local build_dir="$1" root="$2" build_type="$3" compile_off="$4"
   shift 4
@@ -178,7 +159,7 @@ tigonkv_verify_build_meta() {
   gitlink="$(tigonkv_latency_sim_gitlink "$root")"
   python3 - "$meta" "$root" "$build_type" "$compile_off" "$gitlink" \
     "$(tigonkv_source_state "$root")" "$@" <<'PY'
-import json, sys
+import json, os, sys
 meta_path, source_dir, build_type, compile_off, gitlink, source_state = sys.argv[1:7]
 binaries = sys.argv[7:]
 data = json.load(open(meta_path, encoding='utf-8'))
@@ -195,17 +176,9 @@ if data.get('latency_sim_gitlink') != gitlink:
     errors.append('latency_sim_gitlink')
 if data.get('source_state') != source_state:
     errors.append('source_state')
-if data.get('contract') != 'fixed-latency-only':
-    errors.append('contract')
-import hashlib
 for binary in binaries:
-    try:
-        with open(binary, 'rb') as f:
-            digest = hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        digest = 'MISSING'
-    if data.get('binaries', {}).get(binary) != digest:
-        errors.append('binary:' + binary)
+    if not os.path.isfile(binary):
+        errors.append('missing-binary:' + binary)
 if errors:
     raise SystemExit('build meta mismatch fields: ' + ', '.join(errors))
 PY

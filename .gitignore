@@ -7,7 +7,7 @@ core.*
 
 build
 build-*/
-# Experiment outputs / historical run artifacts (never commit)
+# Experiment outputs (never commit)
 exp_data/
 results/
 emulation/ivshmem/ivshmem-user/data/

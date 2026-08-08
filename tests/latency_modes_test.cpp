@@ -165,8 +165,8 @@ int main() {
   assert(!simulator.HasActiveScopeForCurrentThread());
   assert(simulator.PendingDelayNsForTest() == 0);
 
-  // Atomic wrappers preserve result/expected semantics and charge the actual
-  // atomic operation exactly once, regardless of CAS success.
+  // Atomic wrappers preserve result/expected semantics. Every RMW is charged
+  // as one read plus one write, regardless of CAS success.
   ReopenWith(&buffers, Fixed(3, 11));
   auto *value = new (buffers.hwcc) std::atomic<uint64_t>{7};
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
@@ -195,7 +195,7 @@ int main() {
       *value, expected, uint64_t{20}, std::memory_order_acq_rel,
       std::memory_order_acquire, latency_sim::MemoryDomain::kHwcc));
   assert(value->load(std::memory_order_relaxed) == 20);
-  assert(simulator.PendingDelayNsForTest() == 77);  // seven HWCC operations
+  assert(simulator.PendingDelayNsForTest() == 132);
   simulator.EndScopeAndDelay();
 
   // A background worker gets its own scope and pending delay; it cannot leak
@@ -251,19 +251,6 @@ int main() {
                         latency_sim::AccessKind::kRead, buffers.swcc, 64 * 4);
   assert(simulator.PendingDelayPsForTest() == 5000);
   assert(simulator.PendingDelayNsForTest() == 5);
-  simulator.EndScopeAndDelay();
-
-  // Flush/invalidate labels are audit-only and never add a second delay.
-  ReopenWith(&buffers, Fixed(7, 13));
-  simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
-                        latency_sim::AccessKind::kRead, buffers.swcc, 64);
-  assert(simulator.PendingDelayNsForTest() == 7);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
-                        latency_sim::AccessKind::kFlush, buffers.swcc, 64);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
-                        latency_sim::AccessKind::kInvalidate, buffers.swcc, 64);
-  assert(simulator.PendingDelayNsForTest() == 7);
   simulator.EndScopeAndDelay();
 
   // Maximum legal value accumulates without overflow; multiplication and

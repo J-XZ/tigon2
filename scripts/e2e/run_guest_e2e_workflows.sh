@@ -244,9 +244,7 @@ for suite in $suites; do
     *) echo "unsupported suite: $suite" >&2; exit 2 ;;
   esac
   [[ -x "$binary_dir/e2e_${suite}" ]] || { echo "missing $binary_dir/e2e_${suite}" >&2; exit 2; }
-  if [[ "${TIGONKV_V8_SKIP_SYNC:-0}" != 1 ]]; then
-    sync_guest_binary "$suite"
-  fi
+  sync_guest_binary "$suite"
   for ((round = 1; round <= rounds; round++)); do
     reset_pool
     run_init "$suite" "$round"

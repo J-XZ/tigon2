@@ -40,8 +40,6 @@ class SCCManager {
 
         inline void clflush(const void *addr, uint64_t len)
         {
-            tigonkv::engine::mem_access::SwccInvalidate(addr, len);
-
                 /*
                  * Loop through cache-line-size (typically 64B) aligned chunks
                  * covering the given range.
@@ -56,8 +54,6 @@ class SCCManager {
 
         inline void clwb(const void *addr, uint64_t len)
         {
-                tigonkv::engine::mem_access::SwccWriteback(addr, len);
-
                 /*
                  * Loop through cache-line-size (typically 64B) aligned chunks
                  * covering the given range.

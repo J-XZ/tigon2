@@ -31,10 +31,10 @@ flush/invalidate/writeback 和业务 runtime/memory accounting 仍保留，因�
 
 compile-on（默认）下模拟器被编译进去，配置完成后始终参与；`LATENCY_SIM_COMPILE_OFF=ON`
 是唯一无模拟代码方式——wrapper 编译为原始操作、scope 为 no-op、消费者不解析配置/
-不注册 pool/不校准 TSC/不初始化清理 simulator，compile-off ELF 不含
-simulator/TLS/TSC/parser 符号。固定延迟公共实现来自固定 Git 子模块
-`thirdparty_libs/latency_sim`（gitlink `3ed024f79f0f51f8180b887c8324024cc6536406`，
-`my-work` 分支）；项目工作位于 `my-work` 分支 `62f6554` 之后。
+不注册 pool/不校准 TSC/不初始化清理 simulator。固定延迟公共实现来自固定 Git 子模块
+`thirdparty_libs/latency_sim`（最终 gitlink
+`29df0f0a4b59e96c28e84755b4159e6a4e6feaf4`，`my-work` 分支）；Tigon 的改动只在
+`my-work` 分支本地提交，不 push。
 详细规则见 [硬件模拟当前实现.md](硬件模拟当前实现.md)。
 
 ## 内存与 VM
@@ -56,8 +56,8 @@ NUMA1。
 ```
 
 实际测试前必须确认其它项目的 QEMU、ivshmem 服务和 PID 文件已停止，并使用当前
-`image/root.img`、当前二进制和新建 backing。不要复用其它项目的镜像、trace、运行目录
-或测试结果。
+`image/root.img`、当前二进制和新建 backing。不要复用其它项目的镜像、backing、trace、
+运行副本或测试结果。
 
 ## 构建和测试
 
@@ -102,7 +102,8 @@ cmake -S . -B build-relwithdebinfo-ninja-clang18-co_on -G Ninja \
 cmake --build build-relwithdebinfo-ninja-clang18-co_on -j2
 ```
 
-固定延迟定向测试是 `latency_modes_test`；热路径开销对照是
+固定延迟定向测试是 `latency_modes_test`；Remote Delete 协议测试是
+`remote_delete_test`；热路径开销对照是
 `hardware_sim_disabled_benchmark`，以两个独立二进制对比 compile-on+0ns 与 compile-off
 上的真实 adapter 路径（typed/atomic、B+Tree domain/atomic、真实 RegionAllocator、
 transport ring、shared-payload bulk）。正式 fixed-latency 运行使用

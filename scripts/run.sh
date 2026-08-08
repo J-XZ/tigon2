@@ -849,15 +849,6 @@ source "$SCRIPT_DIR/../scripts/tigonkv_build_helpers.sh"
 typeset TIGONKV_BUILD_DIR
 TIGONKV_BUILD_DIR=$(tigonkv_canonical_build_dir "$SCRIPT_DIR/.." RelWithDebInfo "$LATENCY_SIM_COMPILE_OFF_VALUE")
 
-function write_latency_sim_build_contract_stamp {
-        tigonkv_write_build_meta "$TIGONKV_BUILD_DIR" "$SCRIPT_DIR/.." RelWithDebInfo \
-                "$LATENCY_SIM_COMPILE_OFF_VALUE"
-        if [ $? -ne 0 ]; then
-                echo "failed to write latency_sim build contract stamp" >&2
-                exit 2
-        fi
-}
-
 # global configurations
 typeset PASHA_CXL_TRANS_ENTRY_STRUCT_SIZE=2048
 typeset PASHA_CXL_TRANS_ENTRY_NUM=8192
@@ -1121,7 +1112,6 @@ elif [ $RUN_TYPE = "COMPILE" ]; then
                 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
                 -DLATENCY_SIM_COMPILE_OFF="$LATENCY_SIM_COMPILE_OFF_VALUE"
         cmake --build "$TIGONKV_BUILD_DIR" -j2
-        write_latency_sim_build_contract_stamp
 
         exit 0
 elif [ $RUN_TYPE = "COMPILE_SYNC" ]; then
@@ -1137,7 +1127,6 @@ elif [ $RUN_TYPE = "COMPILE_SYNC" ]; then
                 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
                 -DLATENCY_SIM_COMPILE_OFF="$LATENCY_SIM_COMPILE_OFF_VALUE"
         cmake --build "$TIGONKV_BUILD_DIR" -j2
-        write_latency_sim_build_contract_stamp
 
         # sync
         sync_binaries $HOST_NUM

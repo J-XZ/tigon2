@@ -1,5 +1,4 @@
 #include "tools/e2e_trace_format.h"
-#include "tools/tigonkv_build_identity_query.h"
 
 #include <algorithm>
 #include <array>
@@ -107,7 +106,6 @@ void ReplacePartitioning(const std::string &config_path,
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (tigonkv::PrintBuildIdentityJsonIfRequested(argc, argv)) return 0;
   try {
     if ((argc != 9 && argc != 11) || std::string_view(argv[1]) != "--trace-dir" ||
         std::string_view(argv[3]) != "--config" ||

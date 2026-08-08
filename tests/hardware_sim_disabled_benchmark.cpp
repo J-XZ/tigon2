@@ -22,7 +22,6 @@
 #include "common/btree_olc_cxl/BTreeOLC_CXL.h"
 #include "protocol/TwoPLPasha/TwoPLPashaHelper.h"
 #include "tests/latency_test_support.h"
-#include "tools/tigonkv_build_identity_query.h"
 
 // The benchmark needs the engine's mapped pool base to re-register its ranges
 // while the KV cases run (the component cases register the benchmark pool's
@@ -531,7 +530,6 @@ void Report(std::string_view name, Runner runner, bool has_raw,
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (tigonkv::PrintBuildIdentityJsonIfRequested(argc, argv)) return 0;
   const int cpu = argc > 1 ? std::atoi(argv[1]) : -1;
   if (cpu >= 0) {
     cpu_set_t set;

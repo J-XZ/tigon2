@@ -46,16 +46,17 @@ hard-fail。特别是 `hwcc_access_count`、`atomic_count`、`remote_cache_inval
 
 compile-on（默认）构建下，配置完成后模拟始终参与计费。只有真实 HWCC/SWCC
 load/store/原子操作/批量 copy 覆盖的 cache line 数按线程本地 line counter 累加到
-当前线程 scope 的 pending delay；flush/invalidate 标签本身不产生第二份固定延迟，但
-真实 `clflush`/`clwb`/invalidate/writeback/fence 及其顺序必须原样保留：
+当前线程 scope 的 pending delay；真实 `clflush`/`clwb`/invalidate/writeback/fence
+及其顺序必须原样保留，但不额外构造模拟访问：
 
 ```text
 pending_delay_ns += touched_swcc_lines * swcc_fixed_ns_per_line
 pending_delay_ns += touched_hwcc_lines * hwcc_fixed_ns_per_line
 ```
 
-同一行的两次真实访问分别收费；执行型 atomic wrapper 只能执行真实操作、保留返回值、
-CAS expected 和 memory order，并收费一次，不能累计访问/原子数。不得保存访问历史、
+同一行的两次真实访问分别收费；每个 RMW 按一次读加一次写收费两次。执行型 atomic
+wrapper 只能执行真实操作、保留返回值、CAS expected 和 memory order，不能累计访问/原子数。
+不得保存访问历史、
 cache 状态、remote event、全局 sequence、共享日志或模拟统计 schema。
 
 延迟只在最外层 scope 安全出口用校准成功的 x86 TSC 与 `_mm_pause` busy-wait 结算
@@ -81,11 +82,10 @@ unconfigured 态且两个 range 均已注册）；shutdown 在静默边界清空
 
 `LATENCY_SIM_COMPILE_OFF=ON` 是唯一无模拟代码方式：wrapper 编译为原始操作、scope 为
 no-op、消费者不解析 fixed-latency 配置（也不要求配置中存在该外层对象）/不注册
-pool/不校准 TSC/不初始化与清理 simulator，compile-off ELF 不含 simulator/TLS/TSC/
-parser 符号；OFF（默认）则模拟器被
+pool/不校准 TSC/不初始化与清理 simulator；OFF（默认）则模拟器被
 编译进去，配置完成后始终参与。私有 `TIGONKV_DISABLE_HARDWARE_SIMULATION` 已删除。
 固定延迟公共实现来自固定子模块 `thirdparty_libs/latency_sim`
-（V7 final gitlink `8e0a1d07d08a158fe52a6b03544c5d54a86d74f6`，与 cxlkv/sidle 完全一致），
+（最终 gitlink `29df0f0a4b59e96c28e84755b4159e6a4e6feaf4`），
 本仓只保留 `mem_access.h` 薄适配、生命周期与 scope 分类。
 
 ## 修改和验证
@@ -107,11 +107,6 @@ parser 符号；OFF（默认）则模拟器被
 - 临时命令输出可以放入 `/tmp`，但交接结论和复查所需信息必须写入仓库当前状态文档
   或 `/root/code` 下的持久任务目录；仓库内文档保持短且描述
   当前实现，不追加无限增长日志。
-
-V7 completion evidence is under `/root/code/latency_sim_v7_artifacts/tigon2/`. The
-parent final SHA is recorded in `final.sha`; the public dependency SHA must equal both
-that file and the committed submodule gitlink. Historical V5/V6 artifact directories
-are not current evidence.
 
 ## Git 与数据
 

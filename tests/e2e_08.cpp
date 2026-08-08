@@ -16,7 +16,6 @@
 #include <string>
 
 #include "e2e_vm_workflow.h"
-#include "tools/tigonkv_build_identity_query.h"
 #include <unistd.h>
 #include <sys/wait.h>
 #include <vector>
@@ -66,7 +65,6 @@ std::string Key8(uint32_t i) {
 }
 
 int main(int argc, char **argv) {
-  if (tigonkv::PrintBuildIdentityJsonIfRequested(argc, argv)) return 0;
   if (std::getenv("TIGONKV_E2E_MULTI_VM") != nullptr)
     return tigonkv::e2e_vm_workflow::RunE2E08MultiVm();
   if (std::getenv("TIGONKV_E2E_LOCAL_FORK") == nullptr) {

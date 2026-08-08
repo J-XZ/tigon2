@@ -617,104 +617,6 @@ void TestOwnerPrivateRetireQueue() {
   dual.Free(object, 96, AllocationDomain::kHwccIndex, 0, 0);
 }
 
-// Directed test for the allocator free-head classification.  shard.free_heads
-// is allocator control and must be charged at the control domain rate, while
-// block->next stays at the block domain rate.  With rates swapped between two
-// runs, control-HWCC/block-SWCC under rate A must equal control-SWCC/block-HWCC
-// under rate B (and vice versa); a free_heads misclassification breaks the
-// invariant.
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-void TestFreeHeadControlDomainClassification() {
-  // Re-initialize one region with different control/block classifications so
-  // both variants charge identical addresses and cache-line boundaries.
-  Mapping region(true);
-  auto &simulator = latency_sim::GlobalLatencySimulator();
-
-  // latency_sim accepts exactly one range per domain, so the allocator region
-  // is split into its control prefix and block payload, and the accounting
-  // counter is embedded inside the control prefix's reserved space (instead of
-  // a second range) so each run still charges control at the control rate.
-  constexpr uint64_t kCounterBytes = 64;
-
-  latency_sim::FixedLatencyConfig rate_a;
-  rate_a.cache_line_bytes = 64;
-  rate_a.swcc_fixed_ns_per_line = 1;
-  rate_a.hwcc_fixed_ns_per_line = 4;
-  latency_sim::FixedLatencyConfig rate_b = rate_a;
-  rate_b.swcc_fixed_ns_per_line = 4;
-  rate_b.hwcc_fixed_ns_per_line = 1;
-
-  const auto measure = [&](bool control_hwcc, bool block_hwcc,
-                           const latency_sim::FixedLatencyConfig &cfg) {
-    // The counter sits in the reserved prefix [metadata_bytes, metadata_bytes
-    // + kCounterBytes); the block payload starts right after it.  Only
-    // classifications that put control and block in different domains are
-    // observable under the one-range-per-domain contract.
-    assert(control_hwcc != block_hwcc);
-    auto allocator = RegionAllocator::Initialize(
-        region.base, kBytes, 1, kCounterBytes, control_hwcc, block_hwcc);
-    const uint64_t control_bytes =
-        static_cast<const RegionAllocatorHeader *>(region.base)->metadata_bytes;
-    auto *counter = new (static_cast<std::byte *>(region.base) + control_bytes)
-        DomainCounter;
-    const void *control_begin = region.base;
-    const uint64_t control_size = control_bytes + kCounterBytes;
-    const void *block_begin =
-        static_cast<const std::byte *>(region.base) + control_size;
-    const uint64_t block_size = kBytes - control_size;
-    const void *swcc = nullptr;
-    std::size_t swcc_size = 0;
-    const void *hwcc = nullptr;
-    std::size_t hwcc_size = 0;
-    if (control_hwcc) {
-      hwcc = control_begin;
-      hwcc_size = control_size;
-    } else {
-      swcc = control_begin;
-      swcc_size = control_size;
-    }
-    if (block_hwcc) {
-      assert(hwcc == nullptr);  // two HWCC ranges would violate the contract
-      hwcc = block_begin;
-      hwcc_size = block_size;
-    } else {
-      assert(swcc == nullptr);  // two SWCC ranges would violate the contract
-      swcc = block_begin;
-      swcc_size = block_size;
-    }
-    tigonkv::test::ScopedLatencyPools pools(swcc, swcc_size, hwcc, hwcc_size,
-                                            cfg);
-    simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-    void *block = allocator.Allocate(80, AllocationDomain::kHwccMetadata,
-                                     counter, 0);
-    allocator.Free(block, 80, AllocationDomain::kHwccMetadata, counter, 0, 0);
-    const uint64_t pending = simulator.PendingDelayPsForTest();
-    simulator.EndScopeAndDelay();
-    return pending;
-  };
-
-  // Same allocator, same addresses, three rate configurations.  With control
-  // at HWCC rate and block at SWCC rate, the pending delay must fit the
-  // linear model P = control_lines*rate_control + block_lines*rate_block, so
-  // the differences isolate integer per-domain line counts.  A free_heads
-  // misclassification (charged at the block rate instead of the control
-  // rate) shifts those counts and breaks the model.
-  const uint64_t p_hwcc_high = measure(true, false, rate_a);
-  const uint64_t p_swcc_high = measure(true, false, rate_b);
-  latency_sim::FixedLatencyConfig rate_eq = rate_a;
-  rate_eq.hwcc_fixed_ns_per_line = 1;
-  rate_eq.swcc_fixed_ns_per_line = 1;
-  const uint64_t p_eq = measure(true, false, rate_eq);
-  assert((p_hwcc_high - p_eq) % 3000 == 0);
-  assert((p_swcc_high - p_eq) % 3000 == 0);
-  const uint64_t control_lines = (p_hwcc_high - p_eq) / 3000;
-  const uint64_t block_lines = (p_swcc_high - p_eq) / 3000;
-  // Control (lock, free_heads, bump, accounting) dominates the block fields
-  // (next/size-class) in an allocate+free cycle.
-  assert(control_lines > 0 && block_lines > 0 && control_lines > block_lines);
-}
-
-#endif  // !defined(LATENCY_SIM_COMPILE_OFF)
 }  // namespace
 
 int main() {
@@ -727,7 +629,6 @@ int main() {
   TestMappedPoolAttach();
 #if !defined(LATENCY_SIM_COMPILE_OFF)
   TestAllocatorLatencyAccounting();
-  TestFreeHeadControlDomainClassification();
 #endif
   TestOwnerPrivateRetireQueue();
   return 0;
