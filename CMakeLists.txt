@@ -105,7 +105,7 @@ target_compile_options(hardware_sim_disabled_benchmark PRIVATE
                        -mclflushopt -mclwb)
 
 # Every project-owned C/C++ target receives the mode-consistent optimization
-# and LTO policy (audit list: nothing below may bypass the policy).
+# and LTO policy (nothing below may bypass the policy).
 set(TIGONKV_PROJECT_TARGETS
   tigonkv
   unit_tests

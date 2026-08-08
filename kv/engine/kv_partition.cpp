@@ -253,7 +253,7 @@ void KVPartition::ReleaseOwnerNextRowWriteLock(
     // remote_write_lock_abort settles an active latency scope before taking
     // smeta.  Its shared write bit still prevents move-out, so drop the
     // owner-private locator lock first rather than settling delay while a row
-    // lock is held (§ latency audit safety point).
+    // lock is held (§ settlement safety point).
     UnlockRow(metadata);
     star::TwoPLPashaHelper::remote_write_lock_abort(smeta);
     return;
