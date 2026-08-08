@@ -6,7 +6,13 @@ config=${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}
 source "$root/scripts/tigonkv_vm_common.sh"
 source "$root/scripts/tigonkv_build_helpers.sh"
 tigonkv_load_vm_config "$config"
-build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${TIGONKV_E2E_COMPILE_OFF:-OFF}")
+checker="${TIGONKV_E2E_LATENCYCHECK:-OFF}"
+case "$checker" in
+  ON) build_type=Debug ;;
+  OFF) build_type=RelWithDebInfo ;;
+  *) echo "TIGONKV_E2E_LATENCYCHECK must be ON or OFF" >&2; exit 2 ;;
+esac
+build=$(tigonkv_canonical_build_dir "$root" "$build_type" "${TIGONKV_E2E_COMPILE_OFF:-OFF}" "$checker")
 binary_dir=${TIGONKV_E2E_BINARY_DIR:-$build}
 log_root=${1:?usage: $0 LOG_ROOT [ROUNDS] [SUITES]}
 rounds=${2:-${TIGONKV_E2E_ROUNDS:-10}}
@@ -22,6 +28,8 @@ pool_init=${TIGONKV_POOL_INITER:-$build/cxl_pool_initer}
 shared_size_mb=${TIGONKV_SHARED_SIZE_MB:-$TIGONKV_SHARED_MB}
 shared_numa=${TIGONKV_SHARED_NUMA_NODE:-${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV_SHARED_NUMA%%,*}}}
 timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-1800}}
+local_tool_install="$root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"
+remote_tool_install="$remote_root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"
 
 [[ "$vm_count" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_VM_COUNT must be positive" >&2; exit 2; }
 [[ "$threads" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_E2E_THREADS must be positive" >&2; exit 2; }
@@ -45,12 +53,38 @@ remote() {
 kill_guest_suite() {
   local suite=$1 vm=$2 quoted_root
   printf -v quoted_root '%q' "$remote_root"
-  # Match /proc/exe rather than COMM and clean all three exact runner paths.
-  remote "$vm" "for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); case \"\$exe\" in \"\$runner\"|\"\$runner (deleted)\") kill -9 \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; for proc in /proc/[0-9]*; do exe=\$(readlink \"\$proc/exe\" 2>/dev/null || true); case \"\$exe\" in \"\$runner\"|\"\$runner (deleted)\") echo \"failed to stop stale guest runner pid=\${proc##*/} exe=\$exe\" >&2; exit 1 ;; esac; done; done"
+  # Under Valgrind /proc/<pid>/exe is valgrind, so identify only the exact
+  # project runner in the command line and never use a broad pkill.
+  remote "$vm" "for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do cmd=\$(tr '\0' ' ' <\"\$proc/cmdline\" 2>/dev/null || true); case \"\$cmd\" in *\"\$runner\"*) kill -TERM \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; done; sleep 0.1; for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do cmd=\$(tr '\0' ' ' <\"\$proc/cmdline\" 2>/dev/null || true); case \"\$cmd\" in *\"\$runner\"*) kill -KILL \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; done"
+}
+
+sync_latencycheck_prefix() {
+  [[ "$checker" == ON ]] || return 0
+  [[ -x "$local_tool_install/bin/valgrind" ]] || {
+    echo "missing Tigon2-local latencycheck prefix: $local_tool_install" >&2
+    exit 2
+  }
+  local vm
+  for ((vm = 0; vm < vm_count; vm++)); do
+    remote "$vm" "rm -rf '$remote_tool_install.new' '$remote_tool_install'"
+    remote "$vm" "mkdir -p '$(dirname "$remote_tool_install")'"
+    scp "${ssh_opts[@]}" -P "$((base_port + vm))" -r \
+      "$local_tool_install" "root@127.0.0.1:$remote_tool_install.new" >/dev/null
+    remote "$vm" "mv '$remote_tool_install.new' '$remote_tool_install'; test -x '$remote_tool_install/bin/valgrind'"
+    remote "$vm" "'$remote_tool_install/bin/valgrind' --version" >/dev/null
+  done
 }
 
 sync_guest_binary() {
   local suite=$1 vm
+  local expected_value
+  expected_value=$(sed -n -E \
+    's/^[[:space:]]*"fixed_value_size"[[:space:]]*:[[:space:]]*([0-9]+),?[[:space:]]*$/\1/p' \
+    "$config" | head -1)
+  [[ "$expected_value" =~ ^[0-9]+$ ]] || {
+    echo "local config has no numeric fixed_value_size: $config" >&2
+    exit 2
+  }
   for ((vm = 0; vm < vm_count; vm++)); do
     kill_guest_suite "$suite" "$vm"
     remote "$vm" "rm -f '$remote_root/build/e2e_${suite}'"
@@ -63,11 +97,16 @@ sync_guest_binary() {
     # Confirm sync landed (YCSB may previously leave 32/32 on the guest).
     local remote_value
     remote_value=$(remote "$vm" "grep -E '\"fixed_value_size\"[[:space:]]*:' '$remote_config' | head -1") || true
-    if ! grep -Eq '1000' <<<"$remote_value"; then
-      echo "guest config fixed_value_size not 1000 after sync: vm=$vm line='$remote_value' config=$config" >&2
+    local guest_value
+    guest_value=$(sed -n -E \
+      's/.*"fixed_value_size"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' \
+      <<<"$remote_value")
+    if [[ "$guest_value" != "$expected_value" ]]; then
+      echo "guest config fixed_value_size differs after sync: vm=$vm guest='$guest_value' expected='$expected_value' line='$remote_value' config=$config" >&2
       exit 2
     fi
   done
+  sync_latencycheck_prefix
 }
 
 reset_pool() {
@@ -90,7 +129,13 @@ run_remote() {
   if [[ "$phase" == init ]]; then
     extra="$extra TIGONKV_E2E_MULTI_VM_INIT_ONLY=1"
   fi
-  local command="env TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra '$remote_root/build/e2e_${suite}'"
+  local remote_binary="$remote_root/build/e2e_${suite}"
+  local command
+  if [[ "$checker" == ON ]]; then
+    command="env TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck '$remote_binary'"
+  else
+    command="env TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra '$remote_binary'"
+  fi
   timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" root@127.0.0.1 "$command" >"$log" 2>&1
 }
 
@@ -196,7 +241,7 @@ run_phase() {
 run_init() {
   local suite=$1 round=$2
   local init_dir="$log_root/round${round}/e2e_${suite}/init"
-  local vm pid
+  local vm pid remaining failed_vm=-1 status=0
   local -a pids=()
   mkdir -p "$init_dir"
   for ((vm = 0; vm < vm_count; vm++)); do
@@ -205,16 +250,43 @@ run_init() {
     run_remote "$suite" init "$vm" "$reset" "$init_dir/vm${vm}.log" &
     pids+=("$!")
   done
+  local -a finished=()
+  for ((vm = 0; vm < vm_count; vm++)); do finished[$vm]=0; done
+  remaining=$vm_count
   local failed=0
-  for pid in "${pids[@]}"; do
-    wait "$pid" || failed=1
+  while (( remaining > 0 )); do
+    for ((vm = 0; vm < vm_count; vm++)); do
+      (( finished[$vm] == 0 )) || continue
+      if kill -0 "${pids[$vm]}" 2>/dev/null; then continue; fi
+      if wait "${pids[$vm]}"; then
+        status=0
+      else
+        status=$?
+      fi
+      finished[$vm]=1
+      remaining=$((remaining - 1))
+      if (( status != 0 )); then
+        failed=1
+        failed_vm=$vm
+        break
+      fi
+    done
+    (( failed == 0 )) || break
+    (( remaining == 0 )) || sleep 0.05
   done
+  if (( failed )); then
+    for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  fi
   if (( failed )); then
     echo "init command failed: suite=$suite round=$round" >&2
     for ((vm = 0; vm < vm_count; vm++)); do
       echo "--- vm${vm} ---" >&2
       tail -n 80 "$init_dir/vm${vm}.log" >&2 || true
     done
+    if [[ "$checker" == ON ]] && rg -q 'LATENCYCHECK_FIRST_MISMATCH' "$init_dir"/*.log; then
+      echo "TIGONKV_LATENCYCHECK CHECKER_WORKING_MISMATCH_FOUND first_vm=$failed_vm" >&2
+    fi
     return 1
   fi
   for ((vm = 0; vm < vm_count; vm++)); do

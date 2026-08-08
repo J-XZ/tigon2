@@ -10,10 +10,14 @@ tigonkv_e2e_multivm_root() {
 source "$(tigonkv_e2e_multivm_root)/scripts/tigonkv_build_helpers.sh"
 
 tigonkv_e2e_multivm_preflight() {
-  local root build compile_off
+  local root build compile_off checker build_type
   root=$(tigonkv_e2e_multivm_root)
   compile_off="${TIGONKV_E2E_COMPILE_OFF:-OFF}"
-  if ! build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "$compile_off"); then
+  checker="${TIGONKV_E2E_LATENCYCHECK:-OFF}"
+  case "$checker" in ON) build_type=Debug;; OFF) build_type=RelWithDebInfo;; *)
+    echo "TIGONKV_E2E_LATENCYCHECK must be ON or OFF" >&2; exit 2;;
+  esac
+  if ! build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker"); then
     exit 2
   fi
   if [[ -n "${TIGONKV_E2E_BINARY_DIR:-}" ]]; then
@@ -22,13 +26,14 @@ tigonkv_e2e_multivm_preflight() {
     # A prebuilt canonical directory must match the requested contract; a
     # stale `build-relwithdebinfo` from an older scheme is never reused.
     if [[ -d "$build/CMakeFiles" ]] && \
-        ! tigonkv_verify_cmake_cache "$build" RelWithDebInfo "$compile_off"; then
+        ! tigonkv_verify_cmake_cache "$build" "$build_type" "$compile_off" "$checker"; then
       echo "tigonkv_e2e_multivm: $build does not match the canonical contract" >&2
       exit 2
     fi
   fi
   export TIGONKV_E2E_BINARY_DIR="$build"
   export TIGONKV_E2E_COMPILE_OFF="$compile_off"
+  export TIGONKV_E2E_LATENCYCHECK="$checker"
   export TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$build/cxl_pool_initer}"
   export TIGONKV_E2E_TRACE_RUNNER="${TIGONKV_E2E_TRACE_RUNNER:-$build/e2e_trace_runner}"
   # Multi-VM e2e_08/09 require fixed_value_size=1000. Default to the e2e overlay

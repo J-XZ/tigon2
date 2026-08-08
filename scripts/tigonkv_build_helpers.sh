@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Canonical build directory and stale-build helpers for Tigon2 E2E/YCSB
 # entry points.  The canonical build directory binds the generator (Ninja),
-# the clang/clang++-18 toolchain, the build type and LATENCY_SIM_COMPILE_OFF,
+# the clang/clang++-18 toolchain, the build type, compile-off and checker bits,
 # so no consumer blindly reads a stale `build-relwithdebinfo`.
 #
 # Reuse is allowed only when the real CMakeCache and source/submodule state
@@ -9,7 +9,7 @@
 
 # Canonical build directory for the given root, build type and compile-off.
 tigonkv_canonical_build_dir() {
-  local root="$1" build_type="${2:-RelWithDebInfo}" compile_off="${3:-OFF}"
+  local root="$1" build_type="${2:-RelWithDebInfo}" compile_off="${3:-OFF}" checker="${4:-OFF}"
   case "$compile_off" in
     ON|OFF) ;;
     *)
@@ -17,10 +17,23 @@ tigonkv_canonical_build_dir() {
       return 2
       ;;
   esac
+  case "$checker" in
+    ON|OFF) ;;
+    *)
+      echo "tigonkv_build_helpers: LATENCY_SIM_VALGRIND_CHECK must be ON or OFF, got: $checker" >&2
+      return 2
+      ;;
+  esac
+  if [[ "$checker" == ON && "$build_type" != Debug ]]; then
+    echo "tigonkv_build_helpers: latencycheck requires Debug + O0" >&2
+    return 2
+  fi
   local co
   co="$(printf '%s' "$compile_off" | tr '[:upper:]' '[:lower:]')"
-  printf '%s/build-%s-ninja-clang18-co_%s' \
-    "$root" "$(printf '%s' "$build_type" | tr '[:upper:]' '[:lower:]')" "$co"
+  local check
+  check="$(printf '%s' "$checker" | tr '[:upper:]' '[:lower:]')"
+  printf '%s/build-%s-ninja-clang18-co_%s-check_%s' \
+    "$root" "$(printf '%s' "$build_type" | tr '[:upper:]' '[:lower:]')" "$co" "$check"
 }
 
 # Resolve the canonical clang-18 compiler absolute paths.
@@ -39,7 +52,7 @@ tigonkv_compiler_paths() {
 # Verify an existing build directory's real CMakeCache against the requested
 # generator / compiler / build type / compile-off.  Returns 0 only on a match.
 tigonkv_verify_cmake_cache() {
-  local build_dir="$1" build_type="$2" compile_off="$3"
+  local build_dir="$1" build_type="$2" compile_off="$3" checker="${4:-OFF}"
   [[ -f "$build_dir/CMakeCache.txt" ]] || {
     echo "tigonkv_build_helpers: missing CMakeCache.txt: $build_dir" >&2
     return 1
@@ -56,6 +69,10 @@ tigonkv_verify_cmake_cache() {
   }
   grep -Eq "^LATENCY_SIM_COMPILE_OFF:(BOOL|STRING)=$compile_off$" <<<"$cache" || {
     echo "tigonkv_build_helpers: $build_dir LATENCY_SIM_COMPILE_OFF != $compile_off" >&2
+    return 1
+  }
+  grep -Eq "^LATENCY_SIM_VALGRIND_CHECK:(BOOL|STRING)=$checker$" <<<"$cache" || {
+    echo "tigonkv_build_helpers: $build_dir LATENCY_SIM_VALGRIND_CHECK != $checker" >&2
     return 1
   }
   local compilers
@@ -119,20 +136,21 @@ tigonkv_latency_sim_gitlink() {
 
 # Write the small local metadata needed to reject a stale canonical build.
 tigonkv_write_build_meta() {
-  local build_dir="$1" root="$2" build_type="$3" compile_off="$4"
+  local build_dir="$1" root="$2" build_type="$3" compile_off="$4" checker="${5:-OFF}"
   shift 4
   local meta="$build_dir/tigonkv_build_meta.json"
   local gitlink
   gitlink="$(tigonkv_latency_sim_gitlink "$root")"
-  python3 - "$meta" "$root" "$build_type" "$compile_off" "$gitlink" \
+  python3 - "$meta" "$root" "$build_type" "$compile_off" "$checker" "$gitlink" \
     "$(tigonkv_source_state "$root")" <<'PY'
 import json, os, sys
-meta_path, source_dir, build_type, compile_off, gitlink, source_state = sys.argv[1:7]
+meta_path, source_dir, build_type, compile_off, checker, gitlink, source_state = sys.argv[1:8]
 payload = {
     'source_dir': source_dir,
     'build_type': build_type,
     'generator': 'Ninja',
     'latency_sim_compile_off': compile_off,
+    'latency_sim_valgrind_check': checker,
     'latency_sim_gitlink': gitlink,
     'source_state': source_state,
 }
@@ -148,7 +166,7 @@ PY
 # Verify a recorded build meta against the current source and build selection.
 # Used by --skip-build: only an exact match may reuse the build.
 tigonkv_verify_build_meta() {
-  local build_dir="$1" root="$2" build_type="$3" compile_off="$4"
+  local build_dir="$1" root="$2" build_type="$3" compile_off="$4" checker="${5:-OFF}"
   shift 4
   local meta="$build_dir/tigonkv_build_meta.json"
   [[ -f "$meta" ]] || {
@@ -157,11 +175,11 @@ tigonkv_verify_build_meta() {
   }
   local gitlink
   gitlink="$(tigonkv_latency_sim_gitlink "$root")"
-  python3 - "$meta" "$root" "$build_type" "$compile_off" "$gitlink" \
+  python3 - "$meta" "$root" "$build_type" "$compile_off" "$checker" "$gitlink" \
     "$(tigonkv_source_state "$root")" "$@" <<'PY'
 import json, os, sys
-meta_path, source_dir, build_type, compile_off, gitlink, source_state = sys.argv[1:7]
-binaries = sys.argv[7:]
+meta_path, source_dir, build_type, compile_off, checker, gitlink, source_state = sys.argv[1:8]
+binaries = sys.argv[8:]
 data = json.load(open(meta_path, encoding='utf-8'))
 errors = []
 if data.get('source_dir') != source_dir:
@@ -172,6 +190,8 @@ if data.get('generator') != 'Ninja':
     errors.append('generator')
 if data.get('latency_sim_compile_off') != compile_off:
     errors.append('latency_sim_compile_off')
+if data.get('latency_sim_valgrind_check') != checker:
+    errors.append('latency_sim_valgrind_check')
 if data.get('latency_sim_gitlink') != gitlink:
     errors.append('latency_sim_gitlink')
 if data.get('source_state') != source_state:

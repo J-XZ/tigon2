@@ -11,10 +11,9 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 # A disposable worktree clone: the parent must be a git repo for the source
-# state to be meaningful, and the gitlink submodule must be present.  The
-# recorded gitlink may not be reachable from the declared remote (the V4
-# commit is local), so point the disposable clone's submodule at the local
-# checkout before initializing it.
+# state to be meaningful, and the gitlink submodule must be present.  Point
+# the disposable clone's submodule at the local checkout so this unit test is
+# independent of network availability and remote branch movement.
 parent="$tmp/worktree"
 git clone --quiet --shared "$root" "$parent" 2>/dev/null || {
   # --shared is optional; fall back to a plain local clone.

@@ -28,6 +28,19 @@ if(NOT LATENCY_SIM_COMPILE_OFF STREQUAL "ON"
   message(FATAL_ERROR
     "LATENCY_SIM_COMPILE_OFF must be ON or OFF; got '${LATENCY_SIM_COMPILE_OFF}'")
 endif()
+set(LATENCY_SIM_VALGRIND_CHECK "OFF" CACHE BOOL
+  "Build the Debug/O0 latencycheck consumer variant")
+set_property(CACHE LATENCY_SIM_VALGRIND_CHECK PROPERTY STRINGS ON OFF)
+if(LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON"
+   AND LATENCY_SIM_COMPILE_OFF STREQUAL "ON")
+  message(FATAL_ERROR
+    "LATENCY_SIM_VALGRIND_CHECK=ON is incompatible with LATENCY_SIM_COMPILE_OFF=ON")
+endif()
+if(LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON"
+   AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  message(FATAL_ERROR
+    "LATENCY_SIM_VALGRIND_CHECK=ON is restricted to the Debug build type with -O0")
+endif()
 tigonkv_enable_latency_sim()
 
 # Keep the single-config default identical to the documented production

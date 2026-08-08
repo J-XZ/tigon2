@@ -131,6 +131,14 @@ function(tigonkv_apply_target_build_policy target_name)
     $<$<CONFIG:Release>:-O3>
     $<$<CONFIG:Release>:-march=native>
   )
+  if(LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON")
+    # Valgrind cover is never valid against an optimized consumer.  Keep the
+    # flags target-local so a checker build cannot alter another CMake target.
+    # Valgrind 3.18.1 cannot read the newer DWARF forms emitted by clang-18;
+    # DWARF-4 keeps the Debug+O0 checker artifact readable without changing
+    # the production build policy.
+    target_compile_options(${target_name} PRIVATE -O0 -g3 -gdwarf-4)
+  endif()
   if(TIGONKV_ENABLE_FRAME_POINTERS)
     target_compile_options(${target_name} PRIVATE -fno-omit-frame-pointer)
   endif()
@@ -139,10 +147,12 @@ function(tigonkv_apply_target_build_policy target_name)
   else()
     set(_tigonkv_lto_flag "-flto=full")
   endif()
-  target_compile_options(${target_name} PRIVATE
-    $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:${_tigonkv_lto_flag}>
-  )
-  target_link_options(${target_name} PRIVATE
-    $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:${_tigonkv_lto_flag}>
-  )
+  if(NOT LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON")
+    target_compile_options(${target_name} PRIVATE
+      $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:${_tigonkv_lto_flag}>
+    )
+    target_link_options(${target_name} PRIVATE
+      $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:${_tigonkv_lto_flag}>
+    )
+  endif()
 endfunction()

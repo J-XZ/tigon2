@@ -6,7 +6,7 @@ tigonkv_load_vm_config() {
   local config=$1
   [[ -r "$config" ]] || { echo "configuration not readable: $config" >&2; return 2; }
   eval "$(python3 - "$config" <<'PY'
-import json, shlex, sys
+import json, os, shlex, sys
 path = sys.argv[1]
 text = open(path, encoding='utf-8').read()
 out=[]; quoted=False; escaped=False; i=0
@@ -48,6 +48,9 @@ def require(name, value):
         raise SystemExit(f'missing required config field: {name}')
     return value
 
+def override(name, value):
+    return os.environ.get(name, value)
+
 ssh_port = get('vm', 'ssh_base_port')
 if ssh_port is None:
     ssh_port = get('network', 'base_ssh_port')
@@ -65,11 +68,11 @@ values={
  'TIGONKV_VM_COUNT': require('vm.count', get('vm','count')),
  'TIGONKV_VM_CORES_PER_VM': require('vm.core_count_per_vm', get('vm','core_count_per_vm')),
  'TIGONKV_VM_MEM_MB': require('vm.mem_size_mb_per_vm', get('vm','mem_size_mb_per_vm')),
- 'TIGONKV_VM_STORAGE': require('vm.storage_path', get('vm','storage_path')),
+ 'TIGONKV_VM_STORAGE': require('vm.storage_path', override('TIGONKV_CONFIG_VM_STORAGE', get('vm','storage_path'))),
  'TIGONKV_VM_NUMA': ','.join(map(str, vm_numa)),
  'TIGONKV_VM_NUMA_PRIMARY': str(vm_numa[0]),
- 'TIGONKV_SSH_BASE_PORT': ssh_port,
- 'TIGONKV_SHARED_PATH': require('shared_memory.path', get('shared_memory','path')),
+ 'TIGONKV_SSH_BASE_PORT': override('TIGONKV_CONFIG_SSH_BASE_PORT', ssh_port),
+ 'TIGONKV_SHARED_PATH': require('shared_memory.path', override('TIGONKV_CONFIG_SHARED_PATH', get('shared_memory','path'))),
  'TIGONKV_SHARED_MB': require('shared_memory.size_mb', get('shared_memory','size_mb')),
  'TIGONKV_SHARED_NUMA': ','.join(map(str, shared_numa)),
  'TIGONKV_SHARED_NUMA_PRIMARY': str(shared_numa[0]),

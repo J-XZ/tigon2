@@ -3,7 +3,7 @@
 - HWCC/SWCC 是配置指定的两个不重叠物理区域；layout metadata 的计算只使用真实业务
   header、directory、tree、smeta、EBR 和 transport 对象。
 - HWCC 不再保留访问统计、事件日志、sequencer 或第二设备的隐藏 reserve；删除这些
-  模块后释放的空间回到业务 allocator。layout version 为 28，旧 backing 必须拒绝。
+  模块后释放的空间回到业务 allocator。layout version 为 30，旧 backing 必须拒绝。
 - owner-private arena、Clock tracker 和 EBR retire record 通过 RegionOffset 保存在
   owner-private SWCC；shared payload 通过 SCC 位于 shared SWCC；shared tree/root/smeta/
   epoch/transport 位于 HWCC。

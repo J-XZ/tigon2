@@ -19,6 +19,7 @@ include_guard(GLOBAL)
 #     target-local.
 #  6. LATENCY_SIM_COMPILE_OFF is the only compile-off gate; it must be
 #     ON or OFF and is validated here and in the build scripts.
+#  7. LATENCY_SIM_VALGRIND_CHECK is a separate compile-on Debug/O0 variant.
 # ---------------------------------------------------------------------------
 
 if(NOT DEFINED LATENCY_SIM_COMPILE_OFF)
@@ -28,6 +29,26 @@ if(NOT LATENCY_SIM_COMPILE_OFF STREQUAL "ON"
    AND NOT LATENCY_SIM_COMPILE_OFF STREQUAL "OFF")
   message(FATAL_ERROR
     "LATENCY_SIM_COMPILE_OFF must be ON or OFF; got '${LATENCY_SIM_COMPILE_OFF}'")
+endif()
+
+if(NOT DEFINED LATENCY_SIM_VALGRIND_CHECK)
+  set(LATENCY_SIM_VALGRIND_CHECK OFF CACHE BOOL
+      "Build the Debug/O0 latencycheck consumer variant")
+endif()
+if(NOT LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON"
+   AND NOT LATENCY_SIM_VALGRIND_CHECK STREQUAL "OFF")
+  message(FATAL_ERROR
+    "LATENCY_SIM_VALGRIND_CHECK must be ON or OFF; got '${LATENCY_SIM_VALGRIND_CHECK}'")
+endif()
+if(LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON"
+   AND LATENCY_SIM_COMPILE_OFF STREQUAL "ON")
+  message(FATAL_ERROR
+    "LATENCY_SIM_VALGRIND_CHECK=ON is incompatible with LATENCY_SIM_COMPILE_OFF=ON")
+endif()
+if(LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON"
+   AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  message(FATAL_ERROR
+    "LATENCY_SIM_VALGRIND_CHECK=ON is restricted to the Debug build type with -O0")
 endif()
 
 set(TIGONKV_LATENCY_SIM_SOURCE_DIR
@@ -55,4 +76,9 @@ function(tigonkv_enable_latency_sim)
   add_subdirectory("${TIGONKV_LATENCY_SIM_SOURCE_DIR}"
                    "${CMAKE_CURRENT_BINARY_DIR}/latency_sim_build"
                    EXCLUDE_FROM_ALL)
+  if(LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON")
+    # The submodule is built in this consumer's Debug checker variant too;
+    # keep its target-local debug info readable by the pinned Valgrind 3.18.1.
+    target_compile_options(latency_sim PRIVATE -gdwarf-4)
+  endif()
 endfunction()

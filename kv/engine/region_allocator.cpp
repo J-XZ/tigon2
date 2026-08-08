@@ -2,6 +2,7 @@
 #include "kv/engine/mem_access.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -102,6 +103,43 @@ void FlushForRemoteVisibility(const void *address, size_t bytes) {
   (void)bytes;
   std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
+}
+
+void ClearDualRegionPool(void *base, const DualRegionConfig &config) {
+  struct Region {
+    uint64_t offset;
+    uint64_t bytes;
+    latency_sim::MemoryDomain domain;
+  };
+  std::array<Region, 2> regions{{
+      {config.hwcc_offset_bytes, config.hwcc_size_bytes,
+       latency_sim::MemoryDomain::kHwcc},
+      {config.swcc_offset_bytes, config.swcc_size_bytes,
+       latency_sim::MemoryDomain::kSwcc},
+  }};
+  std::sort(regions.begin(), regions.end(),
+            [](const Region &left, const Region &right) {
+              return left.offset < right.offset;
+            });
+
+  auto *pool = static_cast<std::byte *>(base);
+  uint64_t cursor = 0;
+  for (const Region &region : regions) {
+    if (region.offset > config.total_pool_bytes ||
+        region.bytes > config.total_pool_bytes - region.offset ||
+        region.offset < cursor) {
+      throw std::invalid_argument("invalid dual-region clear geometry");
+    }
+    if (cursor < region.offset) {
+      std::memset(pool + cursor, 0, region.offset - cursor);
+    }
+    latency_sim::FixedLatencyMemsetShared(
+        region.domain, pool + region.offset, 0, region.bytes);
+    cursor = region.offset + region.bytes;
+  }
+  if (cursor < config.total_pool_bytes) {
+    std::memset(pool + cursor, 0, config.total_pool_bytes - cursor);
+  }
 }
 
 }  // namespace
@@ -1539,7 +1577,7 @@ DualRegionMappedPool DualRegionMappedPool::Open(const std::string &path,
         if (prezeroed == nullptr) prezeroed = std::getenv("CXLKV_DEVICE_BACKING_ZEROED");
         const bool skip_memset =
             prezeroed != nullptr && prezeroed[0] == '1' && prezeroed[1] == '\0';
-        if (!skip_memset) std::memset(base, 0, config.total_pool_bytes);
+        if (!skip_memset) ClearDualRegionPool(base, config);
         allocator = std::make_unique<DualRegionAllocator>(
             DualRegionAllocator::Initialize(base, config));
       } else {

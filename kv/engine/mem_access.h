@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstddef>
 #include <optional>
+#include <utility>
 
 namespace tigonkv::engine::mem_access {
 
@@ -28,13 +29,23 @@ inline thread_local int TlsDeferTransportSettlementDepth = 0;
 // tigonkv::LatencyScope to latency_sim::ScopeGuard.
 class LatencyScope {
  public:
-  explicit LatencyScope(latency_sim::ExecutionClass scope) : guard_(scope) {}
+  explicit LatencyScope(latency_sim::ExecutionClass scope)
+      : previous_scope_(current_scope_), guard_(scope) {
+    current_scope_ = this;
+  }
+  ~LatencyScope() { current_scope_ = previous_scope_; }
   LatencyScope(const LatencyScope&) = delete;
   LatencyScope& operator=(const LatencyScope&) = delete;
 
   latency_sim::ScopeGuard& Inner() { return guard_; }
+  latency_sim::ScopeSuspension SuspendWithoutWaiting() {
+    return guard_.SuspendWithoutWaiting();
+  }
+  static LatencyScope* Current() { return current_scope_; }
 
  private:
+  inline static thread_local LatencyScope* current_scope_ = nullptr;
+  LatencyScope* previous_scope_ = nullptr;
   latency_sim::ScopeGuard guard_;
 };
 
@@ -48,32 +59,21 @@ class LatencyScope {
 class ForegroundScopeSuspension {
  public:
   ForegroundScopeSuspension() {
-    // No runtime gate: in a compile-on build the simulator is always active;
-    // in a compile-off build the simulator does not exist and this is inert.
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    if (latency_sim::GlobalLatencySimulator()
-            .HasTopLevelScopeForCurrentThread(
-                latency_sim::ExecutionClass::kForeground)) {
-      generation_ = latency_sim::GlobalLatencySimulator()
-                        .SuspendScopeAndDelayLater();
+    // The project never inspects simulator TLS.  The current LatencyScope
+    // delegates suspension to the public move-only RAII token; a nested scope
+    // returns an empty token and is left untouched.
+    if (auto* scope = LatencyScope::Current()) {
+      auto token = scope->SuspendWithoutWaiting();
+      if (token) suspension_.emplace(std::move(token));
     }
-#endif
   }
-  ~ForegroundScopeSuspension() {
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    if (generation_ != 0)
-      latency_sim::GlobalLatencySimulator().ResumeScope(
-          latency_sim::ExecutionClass::kForeground, generation_);
-#endif
-  }
+  ~ForegroundScopeSuspension() = default;
   ForegroundScopeSuspension(const ForegroundScopeSuspension&) = delete;
   ForegroundScopeSuspension& operator=(const ForegroundScopeSuspension&) =
       delete;
 
  private:
-  // Lifecycle generation captured at suspension; the resume must present the
-  // same generation so a token can never cross a lifecycle reopen.
-  std::uint64_t generation_ = 0;
+  std::optional<latency_sim::ScopeSuspension> suspension_;
 };
 
 // RAII for the remote-delete critical state (deferred transport settlement
@@ -104,63 +104,14 @@ class DeferTransportSettlement {
 // so TLS depth/class/generation and the pending budget are never stranded.
 class DeferredTransportPollScope {
  public:
-  DeferredTransportPollScope() {
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    if (TlsDeferTransportSettlementDepth <= 0) return;
-    auto &simulator = latency_sim::GlobalLatencySimulator();
-    auto &state = latency_sim::detail::g_thread_state;
-    if (state.scope_suspended) {
-      // The enclosing scope is already suspended (cooperative foreground
-      // wait): resume it with its original class so the V6 resume contract
-      // (resume class must match the suspended scope class) holds; the poll
-      // still charges into the deferred segment, and on exit suspend it
-      // again.
-      was_suspended_ = true;
-      generation_ = state.generation;
-      simulator.ResumeScope(state.suspended_scope_class, generation_);
-      return;
-    }
-    if (state.scope_depth != 0) {
-      // An active top-level scope of any class: suspend it, run the poll as a
-      // background scope, then suspend again and restore the original class.
-      outer_class_ = state.scope_class;
-      generation_ = simulator.SuspendScopeAndDelayLater();
-      if (generation_ != 0) {
-        simulator.ResumeScope(latency_sim::ExecutionClass::kBackground,
-                              generation_);
-        return;
-      }
-    }
-    // No suspendable enclosing scope: the poll runs in a plain nested
-    // background scope (not reachable on the delete path, which always has an
-    // enclosing scope).
-    fallback_scope_.emplace(latency_sim::ExecutionClass::kBackground);
-#endif
-  }
-  ~DeferredTransportPollScope() {
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    if (fallback_scope_.has_value()) return;
-    if (generation_ == 0) return;
-    auto &simulator = latency_sim::GlobalLatencySimulator();
-    if (simulator.SuspendScopeAndDelayLater() == 0) {
-      // The resumed background scope must always be suspendable.
-      latency_sim::HardFail("deferred transport poll lost its resume scope");
-    }
-    if (!was_suspended_) {
-      simulator.ResumeScope(outer_class_, generation_);
-    }
-#endif
-  }
+  // The outer ForegroundScopeSuspension owns the deferred segment.  The poll
+  // itself is opened by KVEngine as a temporary public background ScopeGuard;
+  // no project code reaches into simulator TLS or maintains a second ledger.
+  DeferredTransportPollScope() = default;
+  ~DeferredTransportPollScope() = default;
   DeferredTransportPollScope(const DeferredTransportPollScope&) = delete;
   DeferredTransportPollScope& operator=(const DeferredTransportPollScope&) =
       delete;
-
- private:
-  bool was_suspended_ = false;
-  std::uint64_t generation_ = 0;
-  latency_sim::ExecutionClass outer_class_ =
-      latency_sim::ExecutionClass::kBackground;
-  std::optional<latency_sim::ScopeGuard> fallback_scope_;
 };
 
 inline void Record(latency_sim::MemoryDomain pool, latency_sim::AccessKind kind,
