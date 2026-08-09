@@ -85,7 +85,7 @@ no-op、消费者不解析 fixed-latency 配置（也不要求配置中存在该
 pool/不校准 TSC/不初始化与清理 simulator；OFF（默认）则模拟器被
 编译进去，配置完成后始终参与。私有 `TIGONKV_DISABLE_HARDWARE_SIMULATION` 已删除。
 固定延迟公共实现来自固定子模块 `thirdparty_libs/latency_sim`
-（最终 gitlink `81feee8e4a8887c39d9f86a84c06530ad9314b06`），
+（最终 gitlink `502d8543d4834e9eaecb2db86c3f7a354332b2d8`），
 本仓只保留 `mem_access.h` 薄适配、生命周期与 scope 分类。
 
 ## 修改和验证

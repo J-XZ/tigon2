@@ -37,6 +37,9 @@ def main() -> int:
     parser.add_argument("log_root", type=Path)
     parser.add_argument("--vm-count", type=int, required=True)
     parser.add_argument("--workflow-status", type=int, default=0)
+    parser.add_argument("--failed-stage", default="")
+    parser.add_argument("--first-vm", type=int, default=-1)
+    parser.add_argument("--cleanup-status", type=int, default=-1)
     args = parser.parse_args()
 
     if args.vm_count <= 0:
@@ -47,18 +50,21 @@ def main() -> int:
     logs = sorted(suite_root.glob("*/vm*.log"))
     summaries = {path: read_last_summary(path) for path in logs}
     mismatch_paths = []
-    for path, line in summaries.items():
+    failed_root = suite_root / args.failed_stage
+    candidate_paths: list[Path] = []
+    if args.failed_stage in phases and 0 <= args.first_vm < args.vm_count:
+        first_log = failed_root / f"vm{args.first_vm}.log"
+        if first_log.exists():
+            candidate_paths = [first_log]
+    for path in candidate_paths:
+        line = summaries.get(path)
         text = path.read_text(errors="replace")
         if ("LATENCYCHECK_FIRST_MISMATCH" in text and
                 "LATENCYCHECK_CHECKPOINT_FAIL" in text and
                 valid_nonzero_summary(line, sticky=True)):
             mismatch_paths.append(path)
 
-    workflow_text = ""
-    workflow_log = args.log_root / "workflow.log"
-    if workflow_log.exists():
-        workflow_text = workflow_log.read_text(errors="replace")
-    cleanup_ok = bool(re.search(r"TIGONKV_FAIL_FAST .*cleanup_status=0", workflow_text))
+    cleanup_ok = args.cleanup_status == 0
 
     clean = args.workflow_status == 0 and len(logs) == args.vm_count * len(phases)
     if clean:
@@ -93,11 +99,13 @@ def main() -> int:
         f"logs={len(logs)}",
         f"summaries={sum(line is not None for line in summaries.values())}",
         f"workflow_exit={args.workflow_status}",
+        f"failed_stage={args.failed_stage or 'none'}",
+        f"first_vm={args.first_vm}",
         f"mismatch_logs={len(mismatch_paths)}",
         f"cleanup_ok={str(cleanup_ok).lower()}",
     ]
     print("TIGONKV_LATENCYCHECK " + " ".join(result))
-    if mismatch_paths:
+    if status == "CHECKER_WORKING_MISMATCH_FOUND":
         first = mismatch_paths[0]
         text = first.read_text(errors="replace")
         first_line = next(

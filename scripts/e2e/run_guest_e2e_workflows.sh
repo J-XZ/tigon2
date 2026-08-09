@@ -202,15 +202,29 @@ run_phase() {
       fi
     done
     if (( dead_vm >= 0 )); then
+      local dead_status=0 cleanup_status=0
+      if wait "${pids[$dead_vm]}"; then
+        dead_status=0
+      else
+        dead_status=$?
+      fi
       echo "phase command exited before replay completion: suite=$suite round=$round phase=$phase vm=$dead_vm" >&2
       TIGONKV_PHASE_SUITE="$suite"
-      stop_phase_guests || true
+      if ! stop_phase_guests; then
+        cleanup_status=1
+      fi
       for pid in "${pids[@]}"; do
         kill "$pid" 2>/dev/null || true
       done
-      for pid in "${pids[@]}"; do
-        wait "$pid" 2>/dev/null || true
+      for ((vm = 0; vm < vm_count; vm++)); do
+        ((vm == dead_vm)) && continue
+        wait "${pids[$vm]}" 2>/dev/null || true
       done
+      TIGONKV_WORKFLOW_FAILED_STAGE="$phase"
+      TIGONKV_WORKFLOW_FIRST_VM=$dead_vm
+      TIGONKV_WORKFLOW_FIRST_EXIT=$dead_status
+      TIGONKV_WORKFLOW_CLEANUP_STATUS=$cleanup_status
+      echo "TIGONKV_FAIL_FAST suite=$suite round=$round phase=$phase first_vm=$dead_vm first_exit=$dead_status kind=pre_release_process cleanup_status=$cleanup_status" >&2
       for ((vm = 0; vm < vm_count; vm++)); do
         echo "--- vm${vm} ---" >&2
         tail -n 60 "$phase_dir/vm${vm}.log" >&2 || true
@@ -218,11 +232,19 @@ run_phase() {
       return 1
     fi
     if (( SECONDS >= deadline )); then
+      local cleanup_status=0
       echo "timeout waiting for replay completion: suite=$suite round=$round phase=$phase" >&2
       TIGONKV_PHASE_SUITE="$suite"
-      stop_phase_guests || true
+      if ! stop_phase_guests; then
+        cleanup_status=1
+      fi
       for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
       for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+      TIGONKV_WORKFLOW_FAILED_STAGE="$phase"
+      TIGONKV_WORKFLOW_FIRST_VM=-1
+      TIGONKV_WORKFLOW_FIRST_EXIT=124
+      TIGONKV_WORKFLOW_CLEANUP_STATUS=$cleanup_status
+      echo "TIGONKV_FAIL_FAST suite=$suite round=$round phase=$phase first_vm=-1 first_exit=124 kind=pre_release_timeout cleanup_status=$cleanup_status" >&2
       return 1
     fi
     sleep 0.05
@@ -238,6 +260,10 @@ run_phase() {
     printf '%s\n' "${TIGONKV_PHASE_EXIT_STATUS[$vm]}" >"$phase_dir/vm${vm}.exit"
   done
   if (( phase_status != 0 )); then
+    TIGONKV_WORKFLOW_FAILED_STAGE="$phase"
+    TIGONKV_WORKFLOW_FIRST_VM=$TIGONKV_PHASE_FIRST_VM
+    TIGONKV_WORKFLOW_FIRST_EXIT=$TIGONKV_PHASE_FIRST_EXIT
+    TIGONKV_WORKFLOW_CLEANUP_STATUS=$TIGONKV_PHASE_CLEANUP_STATUS
     echo "TIGONKV_FAIL_FAST suite=$suite round=$round phase=$phase first_vm=$TIGONKV_PHASE_FIRST_VM first_exit=$TIGONKV_PHASE_FIRST_EXIT kind=$TIGONKV_PHASE_FAILURE_KIND cleanup_status=$TIGONKV_PHASE_CLEANUP_STATUS" >&2
     echo "phase command failed: suite=$suite round=$round phase=$phase" >&2
     for ((vm = 0; vm < vm_count; vm++)); do
@@ -314,6 +340,10 @@ run_init() {
     for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
   fi
   if (( failed )); then
+    TIGONKV_WORKFLOW_FAILED_STAGE=init
+    TIGONKV_WORKFLOW_FIRST_VM=$failed_vm
+    TIGONKV_WORKFLOW_FIRST_EXIT=$status
+    TIGONKV_WORKFLOW_CLEANUP_STATUS=$cleanup_status
     echo "init command failed: suite=$suite round=$round" >&2
     for ((vm = 0; vm < vm_count; vm++)); do
       echo "--- vm${vm} ---" >&2
@@ -337,6 +367,10 @@ run_init() {
 }
 
 workflow_status=0
+TIGONKV_WORKFLOW_FAILED_STAGE=""
+TIGONKV_WORKFLOW_FIRST_VM=-1
+TIGONKV_WORKFLOW_FIRST_EXIT=0
+TIGONKV_WORKFLOW_CLEANUP_STATUS=-1
 for suite in $suites; do
   case "$suite" in
     08) phases=(fill read) ;;
@@ -379,7 +413,10 @@ done
 if [[ "$checker" == ON && "$suites" == 08 && "$rounds" == 1 ]]; then
   summary_status=0
   if python3 "$root/scripts/e2e/summarize_latencycheck_e2e08.py" \
-      "$log_root" --vm-count "$vm_count" --workflow-status "$workflow_status"; then
+      "$log_root" --vm-count "$vm_count" --workflow-status "$workflow_status" \
+      --failed-stage "$TIGONKV_WORKFLOW_FAILED_STAGE" \
+      --first-vm "$TIGONKV_WORKFLOW_FIRST_VM" \
+      --cleanup-status "$TIGONKV_WORKFLOW_CLEANUP_STATUS"; then
     summary_status=0
   else
     summary_status=$?

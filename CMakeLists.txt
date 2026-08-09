@@ -180,6 +180,9 @@ add_test(NAME ycsb_partition_splits_test
 add_test(NAME e2e_08_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_08_test.sh)
 add_test(NAME e2e_09_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_09_test.sh)
 add_test(NAME e2e_ycsb_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/e2e_ycsb_test.sh)
+add_test(NAME phase_fail_fast_shell_test
+         COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/e2e/run_phase_fail_fast_test.sh)
+set_tests_properties(phase_fail_fast_shell_test PROPERTIES TIMEOUT 10)
 # Every guest/QEMU-backed e2e owns shared backing, ports and guest runners.
 # RUN_SERIAL is deliberately applied to the whole e2e group so CTest never
 # overlaps an e2e with unit tests or another e2e.
