@@ -11,14 +11,6 @@ function(tigonkv_set_default_build_type)
   if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
   endif()
-  # Remove CMake's implicit optimization/debug additions.  The target policy
-  # below is the single source of the requested flags for every configuration.
-  set(CMAKE_C_FLAGS_DEBUG "" CACHE STRING "" FORCE)
-  set(CMAKE_CXX_FLAGS_DEBUG "" CACHE STRING "" FORCE)
-  set(CMAKE_C_FLAGS_RELWITHDEBINFO "-DNDEBUG" CACHE STRING "" FORCE)
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-DNDEBUG" CACHE STRING "" FORCE)
-  set(CMAKE_C_FLAGS_RELEASE "-DNDEBUG" CACHE STRING "" FORCE)
-  set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG" CACHE STRING "" FORCE)
 endfunction()
 
 # Select the default toolchain.  MUST run before project(): callers that
@@ -50,11 +42,18 @@ function(tigonkv_select_default_toolchain)
     endif()
   endif()
 
-  find_program(_tigonkv_ccache ccache)
-  if(_tigonkv_ccache)
-    set(CMAKE_C_COMPILER_LAUNCHER "${_tigonkv_ccache}" PARENT_SCOPE)
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${_tigonkv_ccache}" PARENT_SCOPE)
-  endif()
+  find_program(_tigonkv_ccache ccache REQUIRED)
+  foreach(_tigonkv_launcher CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER)
+    if(DEFINED ${_tigonkv_launcher}
+       AND NOT "${${_tigonkv_launcher}}" STREQUAL ""
+       AND NOT "${${_tigonkv_launcher}}" MATCHES "(^|/)ccache$")
+      message(FATAL_ERROR
+        "${_tigonkv_launcher} must use ccache; got '${${_tigonkv_launcher}}'")
+    endif()
+    set(${_tigonkv_launcher} "${_tigonkv_ccache}" CACHE STRING
+      "Required compiler launcher" FORCE)
+    set(${_tigonkv_launcher} "${_tigonkv_ccache}" PARENT_SCOPE)
+  endforeach()
 
   set(_tigonkv_clang_selected "")
   if(DEFINED CMAKE_C_COMPILER)
@@ -118,7 +117,8 @@ endfunction()
 #   RelWithDebInfo:-O3 -g3 -march=native, -flto=full (GCC: -flto), -DNDEBUG
 #   Release:       -O3 -march=native, -flto=full (GCC: -flto),
 #                  -DNDEBUG
-#   Checker Debug: -O0 -g3, compile-on, checker-on, NDEBUG
+#   Checker Debug: -O0 -g3, compile-on, checker-on.  NDEBUG is selected only
+#                  by tigonkv_apply_e2e_participant_policy().
 function(tigonkv_apply_target_build_policy target_name)
   if(LATENCY_SIM_COMPILE_OFF STREQUAL "ON")
     target_compile_definitions(${target_name} PRIVATE LATENCY_SIM_COMPILE_OFF)
@@ -126,6 +126,7 @@ function(tigonkv_apply_target_build_policy target_name)
   target_compile_options(${target_name} PRIVATE
     $<$<CONFIG:Debug>:-O0>
     $<$<CONFIG:Debug>:-g3>
+    $<$<CONFIG:Debug>:-gdwarf-4>
     $<$<CONFIG:RelWithDebInfo>:-O3>
     $<$<CONFIG:RelWithDebInfo>:-g3>
     $<$<CONFIG:RelWithDebInfo>:-march=native>
@@ -139,9 +140,6 @@ function(tigonkv_apply_target_build_policy target_name)
     # DWARF-4 keeps the Debug+O0 checker artifact readable without changing
     # the production build policy.
     target_compile_options(${target_name} PRIVATE -O0 -g3 -gdwarf-4)
-    # Checker E2E must use the Debug/O0 code shape without Debug-only
-    # assertions or validation statements in its access stream.
-    target_compile_definitions(${target_name} PRIVATE NDEBUG)
   endif()
   if(TIGONKV_ENABLE_FRAME_POINTERS)
     target_compile_options(${target_name} PRIVATE -fno-omit-frame-pointer)
@@ -159,4 +157,16 @@ function(tigonkv_apply_target_build_policy target_name)
       $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:${_tigonkv_lto_flag}>
     )
   endif()
+endfunction()
+
+# Thin project wrapper around the generic policy shipped by latency_sim.
+function(tigonkv_apply_e2e_participant_policy target_name)
+  if(NOT LATENCY_SIM_E2E_NDEBUG STREQUAL "ON")
+    return()
+  endif()
+  if(NOT COMMAND latency_sim_apply_e2e_participant_policy)
+    message(FATAL_ERROR
+      "latency_sim participant policy is unavailable; enable the submodule first")
+  endif()
+  latency_sim_apply_e2e_participant_policy(${target_name})
 endfunction()

@@ -10,14 +10,19 @@ tigonkv_e2e_multivm_root() {
 source "$(tigonkv_e2e_multivm_root)/scripts/tigonkv_build_helpers.sh"
 
 tigonkv_e2e_multivm_preflight() {
-  local root build compile_off checker build_type
+  local root build pool_build compile_off checker e2e_ndebug build_type
   root=$(tigonkv_e2e_multivm_root)
-  compile_off="${TIGONKV_E2E_COMPILE_OFF:-OFF}"
-  checker="${TIGONKV_E2E_LATENCYCHECK:-OFF}"
+  compile_off="${LATENCY_SIM_COMPILE_OFF:-OFF}"
+  checker="${LATENCY_SIM_VALGRIND_CHECK:-OFF}"
+  e2e_ndebug="${LATENCY_SIM_E2E_NDEBUG:-OFF}"
   case "$checker" in ON) build_type=Debug;; OFF) build_type=RelWithDebInfo;; *)
-    echo "TIGONKV_E2E_LATENCYCHECK must be ON or OFF" >&2; exit 2;;
+    echo "LATENCY_SIM_VALGRIND_CHECK must be ON or OFF" >&2; exit 2;;
   esac
-  if ! build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker"); then
+  case "$e2e_ndebug" in ON|OFF) ;; *) echo "LATENCY_SIM_E2E_NDEBUG must be ON or OFF" >&2; exit 2;; esac
+  if [[ "$checker" == ON && "$e2e_ndebug" != ON ]]; then
+    echo "checker E2E requires LATENCY_SIM_E2E_NDEBUG=ON" >&2; exit 2
+  fi
+  if ! build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker" "$e2e_ndebug"); then
     exit 2
   fi
   if [[ -n "${TIGONKV_E2E_BINARY_DIR:-}" ]]; then
@@ -26,16 +31,20 @@ tigonkv_e2e_multivm_preflight() {
     # A prebuilt canonical directory must match the requested contract; a
     # stale `build-relwithdebinfo` from an older scheme is never reused.
     if [[ -d "$build/CMakeFiles" ]] && \
-        ! tigonkv_verify_cmake_cache "$build" "$build_type" "$compile_off" "$checker"; then
+        ! tigonkv_verify_cmake_cache "$build" "$build_type" "$compile_off" "$checker" "$e2e_ndebug"; then
       echo "tigonkv_e2e_multivm: $build does not match the canonical contract" >&2
       exit 2
     fi
   fi
   export TIGONKV_E2E_BINARY_DIR="$build"
-  export TIGONKV_E2E_COMPILE_OFF="$compile_off"
-  export TIGONKV_E2E_LATENCYCHECK="$checker"
+  export LATENCY_SIM_COMPILE_OFF="$compile_off"
+  export LATENCY_SIM_VALGRIND_CHECK="$checker"
+  export LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug"
   if [[ "$checker" == ON ]]; then
-    tigonkv_verify_checker_compile_contract "$build"
+    tigonkv_verify_e2e_compile_contract "$build" ON ON e2e_08 e2e_trace_runner
+    pool_build=$(tigonkv_canonical_build_dir "$root" Debug OFF OFF ON)
+    tigonkv_verify_e2e_compile_contract "$pool_build" OFF ON cxl_pool_initer
+    export TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$pool_build/cxl_pool_initer}"
   fi
   export TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$build/cxl_pool_initer}"
   export TIGONKV_E2E_TRACE_RUNNER="${TIGONKV_E2E_TRACE_RUNNER:-$build/e2e_trace_runner}"

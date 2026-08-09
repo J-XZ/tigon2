@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/tigonkv_build_helpers.sh
 source "$root/scripts/tigonkv_build_helpers.sh"
-build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${TIGONKV_E2E_COMPILE_OFF:-OFF}")
+build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${LATENCY_SIM_COMPILE_OFF:-OFF}")
 traces="$root/results/e2e_ycsb_traces"
 config="$root/experiment_config.jsonc"
 logs="$root/results/e2e_ycsb_logs"

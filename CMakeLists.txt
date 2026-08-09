@@ -31,6 +31,22 @@ endif()
 set(LATENCY_SIM_VALGRIND_CHECK "OFF" CACHE BOOL
   "Build the Debug/O0 latencycheck consumer variant")
 set_property(CACHE LATENCY_SIM_VALGRIND_CHECK PROPERTY STRINGS ON OFF)
+if(NOT LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON"
+   AND NOT LATENCY_SIM_VALGRIND_CHECK STREQUAL "OFF")
+  message(FATAL_ERROR
+    "LATENCY_SIM_VALGRIND_CHECK must be ON or OFF; got '${LATENCY_SIM_VALGRIND_CHECK}'")
+endif()
+set(LATENCY_SIM_E2E_NDEBUG "OFF" CACHE BOOL
+  "Compile explicitly selected E2E participant targets with NDEBUG")
+set_property(CACHE LATENCY_SIM_E2E_NDEBUG PROPERTY STRINGS ON OFF)
+if(LATENCY_SIM_E2E_NDEBUG STREQUAL "ON"
+   OR LATENCY_SIM_E2E_NDEBUG STREQUAL "OFF")
+  # strict ON/OFF validation is intentionally explicit; no checker bit
+  # implicitly changes this independent production-shape option.
+else()
+  message(FATAL_ERROR
+    "LATENCY_SIM_E2E_NDEBUG must be ON or OFF; got '${LATENCY_SIM_E2E_NDEBUG}'")
+endif()
 if(LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON"
    AND LATENCY_SIM_COMPILE_OFF STREQUAL "ON")
   message(FATAL_ERROR
@@ -56,7 +72,12 @@ tigonkv_check_lto_support()
 # tigonkv_apply_target_build_policy() at the end of this file.
 add_compile_options(-Wall -Wextra -Wpedantic
   -Wno-unused-variable -Wno-unused-but-set-variable -Wno-variadic-macros
-  -Wno-deprecated-declarations)
+  -Wno-deprecated-declarations -Wno-unused-parameter
+  -Wno-c99-extensions -Wno-zero-length-array -Wno-deprecated-copy
+  -Wno-unused-function -Wno-sign-compare -Wno-switch
+  -Wno-return-type -Wno-delete-abstract-non-virtual-dtor
+  -Wno-delete-non-abstract-non-virtual-dtor -Wno-reorder-ctor
+  -Wno-c++20-extensions)
 
 include_directories(${CMAKE_SOURCE_DIR})
 
@@ -144,6 +165,19 @@ set(TIGONKV_PROJECT_TARGETS
 )
 foreach(TIGONKV_TARGET IN LISTS TIGONKV_PROJECT_TARGETS)
   tigonkv_apply_target_build_policy(${TIGONKV_TARGET})
+endforeach()
+
+# Only these targets participate in an E2E guest or its native pool setup.
+# Host/unit-test targets remain assertion-enabled in their ordinary Debug
+# build; NDEBUG is never inferred from LATENCY_SIM_VALGRIND_CHECK.
+set(TIGONKV_E2E_PARTICIPANT_TARGETS
+  tigonkv
+  e2e_08
+  e2e_09
+  e2e_trace_runner
+  cxl_pool_initer)
+foreach(TIGONKV_E2E_PARTICIPANT IN LISTS TIGONKV_E2E_PARTICIPANT_TARGETS)
+  tigonkv_apply_e2e_participant_policy(${TIGONKV_E2E_PARTICIPANT})
 endforeach()
 
 # Functionally required ISA features for the targets that compile sources

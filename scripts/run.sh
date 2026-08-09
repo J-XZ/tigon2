@@ -847,7 +847,7 @@ typeset RUN_TYPE=$1
 # shellcheck source=scripts/tigonkv_build_helpers.sh
 source "$SCRIPT_DIR/../scripts/tigonkv_build_helpers.sh"
 typeset TIGONKV_BUILD_DIR
-TIGONKV_BUILD_DIR=$(tigonkv_canonical_build_dir "$SCRIPT_DIR/.." RelWithDebInfo "$LATENCY_SIM_COMPILE_OFF_VALUE")
+TIGONKV_BUILD_DIR=$(tigonkv_canonical_build_dir "$SCRIPT_DIR/.." RelWithDebInfo "$LATENCY_SIM_COMPILE_OFF_VALUE" OFF OFF)
 
 # global configurations
 typeset PASHA_CXL_TRANS_ENTRY_STRUCT_SIZE=2048
@@ -1111,7 +1111,7 @@ elif [ $RUN_TYPE = "COMPILE" ]; then
         cmake -S "$SCRIPT_DIR/../" -B "$TIGONKV_BUILD_DIR" -G Ninja \
                 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
                 -DLATENCY_SIM_COMPILE_OFF="$LATENCY_SIM_COMPILE_OFF_VALUE"
-        cmake --build "$TIGONKV_BUILD_DIR" -j2
+        cmake --build "$TIGONKV_BUILD_DIR" --parallel
 
         exit 0
 elif [ $RUN_TYPE = "COMPILE_SYNC" ]; then
@@ -1126,7 +1126,7 @@ elif [ $RUN_TYPE = "COMPILE_SYNC" ]; then
         cmake -S "$SCRIPT_DIR/../" -B "$TIGONKV_BUILD_DIR" -G Ninja \
                 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
                 -DLATENCY_SIM_COMPILE_OFF="$LATENCY_SIM_COMPILE_OFF_VALUE"
-        cmake --build "$TIGONKV_BUILD_DIR" -j2
+        cmake --build "$TIGONKV_BUILD_DIR" --parallel
 
         # sync
         sync_binaries $HOST_NUM

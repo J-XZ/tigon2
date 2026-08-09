@@ -3,7 +3,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 rounds=1; records=100000; operations=100000; threads=4; workloads='a,b,c,d,e'; timeout=7200
 base_config="$root/experiment_config.jsonc"; out_dir=""; shared_size=32768; shared_numa=""
-latency_sim_compile_off=OFF
+latency_sim_compile_off="${LATENCY_SIM_COMPILE_OFF:-OFF}"
 latency_sim_compile_off_seen=false
 skip_build=false; skip_vm_init=false; skip_trace_gen=false; prepare_only=false
 sample_stride=64
@@ -55,34 +55,48 @@ for n in "$rounds" "$records" "$operations" "$threads" "$timeout" "$shared_size"
 }
 # shellcheck source=scripts/tigonkv_build_helpers.sh
 source "$root/scripts/tigonkv_build_helpers.sh"
+tigonkv_prepare_build_environment "$root" RelWithDebInfo "$latency_sim_compile_off" OFF OFF >/dev/null
 
 # Canonical build directory binds generator, clang-18, build type and
 # compile-off; every entry point derives it from the same helper.
-if ! build_dir=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "$latency_sim_compile_off"); then
+if ! build_dir=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "$latency_sim_compile_off" OFF OFF); then
   exit 2
 fi
 build_stamp="$build_dir/tigonkv_latency_sim_build_contract.json"
 
 ensure_build_configured() {
+  local configure_start_ms configure_end_ms
+  configure_start_ms=$(date +%s%3N)
   if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
     cmake -S "$root" -B "$build_dir" -G Ninja \
-      -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF="$latency_sim_compile_off"
-  elif ! tigonkv_verify_cmake_cache "$build_dir" RelWithDebInfo "$latency_sim_compile_off"; then
-    echo "tigonkv_ycsb: $build_dir does not match the requested canonical contract; reconfiguring" >&2
-    rm -rf "$build_dir"
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DLATENCY_SIM_COMPILE_OFF="$latency_sim_compile_off" \
+      -DLATENCY_SIM_VALGRIND_CHECK=OFF -DLATENCY_SIM_E2E_NDEBUG=OFF \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+  elif ! tigonkv_verify_cmake_cache "$build_dir" RelWithDebInfo "$latency_sim_compile_off" OFF OFF; then
+    echo "tigonkv_ycsb: $build_dir does not match the requested canonical contract; reconfiguring in place" >&2
     cmake -S "$root" -B "$build_dir" -G Ninja \
-      -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLATENCY_SIM_COMPILE_OFF="$latency_sim_compile_off"
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DLATENCY_SIM_COMPILE_OFF="$latency_sim_compile_off" \
+      -DLATENCY_SIM_VALGRIND_CHECK=OFF -DLATENCY_SIM_E2E_NDEBUG=OFF \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   fi
+  configure_end_ms=$(date +%s%3N)
+  TIGONKV_LAST_CONFIGURE_MS=$((configure_end_ms - configure_start_ms))
 }
 
 write_build_contract_stamp() {
   tigonkv_write_build_meta "$build_dir" "$root" RelWithDebInfo \
-    "$latency_sim_compile_off" "$build_dir/ycsb_partition_splits" "$build_dir/e2e_trace_runner"
+    "$latency_sim_compile_off" OFF "$build_dir/ycsb_partition_splits" "$build_dir/e2e_trace_runner"
 }
 
 verify_build_contract_stamp() {
   tigonkv_verify_build_meta "$build_dir" "$root" RelWithDebInfo \
-    "$latency_sim_compile_off" "$build_dir/ycsb_partition_splits" "$build_dir/e2e_trace_runner"
+    "$latency_sim_compile_off" OFF "$build_dir/ycsb_partition_splits" "$build_dir/e2e_trace_runner"
 }
 
 # shellcheck source=scripts/tigonkv_ycsb_cpp_pin.sh
@@ -215,7 +229,10 @@ if [[ "$skip_trace_gen" != true ]]; then
     }
   else
     ensure_build_configured
-    cmake --build "$build_dir" --target ycsb_partition_splits -j2
+    compile_start_ms=$(date +%s%3N)
+    cmake --build "$build_dir" --target ycsb_partition_splits --parallel
+    compile_end_ms=$(date +%s%3N)
+    tigonkv_emit_build_timing "$root" "${TIGONKV_LAST_CONFIGURE_MS:-0}" "$((compile_end_ms - compile_start_ms))" 0
     write_build_contract_stamp
   fi
   "$build_dir/ycsb_partition_splits" \
@@ -314,7 +331,10 @@ if [[ "$skip_build" == true ]]; then
   }
 else
   ensure_build_configured
-  cmake --build "$build_dir" --target e2e_trace_runner -j2
+  compile_start_ms=$(date +%s%3N)
+  cmake --build "$build_dir" --target e2e_trace_runner --parallel
+  compile_end_ms=$(date +%s%3N)
+  tigonkv_emit_build_timing "$root" "${TIGONKV_LAST_CONFIGURE_MS:-0}" "$((compile_end_ms - compile_start_ms))" 0
   write_build_contract_stamp
 fi
 [[ "$skip_vm_init" == true ]] || "$root/tigonkv_check_vms.sh" --config "$generated_config"

@@ -6,22 +6,58 @@ config=${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}
 source "$root/scripts/tigonkv_vm_common.sh"
 source "$root/scripts/tigonkv_build_helpers.sh"
 source "$root/scripts/e2e/phase_fail_fast.sh"
+checker="${LATENCY_SIM_VALGRIND_CHECK:-OFF}"
+compile_off="${LATENCY_SIM_COMPILE_OFF:-OFF}"
+e2e_ndebug="${LATENCY_SIM_E2E_NDEBUG:-OFF}"
+log_root=""
+rounds="${TIGONKV_E2E_ROUNDS:-10}"
+suites="${TIGONKV_E2E_SUITES:-08 09}"
+records_override=""
+checker_arg=0
+compile_off_arg=0
+e2e_ndebug_arg=0
+config_arg=0
+usage() {
+  echo "usage: $0 --out-dir DIR --rounds N --suite LIST --config PATH --records N [shared latency flags]" >&2
+}
+while (($#)); do
+  case "$1" in
+    --out-dir) (($# >= 2)) || { usage; exit 2; }; log_root=$2; shift 2 ;;
+    --rounds) (($# >= 2)) || { usage; exit 2; }; rounds=$2; shift 2 ;;
+    --suite|--suites) (($# >= 2)) || { usage; exit 2; }; suites=$2; shift 2 ;;
+    --records) (($# >= 2)) || { usage; exit 2; }; records_override=$2; shift 2 ;;
+    --config) (($# >= 2)) || { usage; exit 2; }; config=$2; config_arg=1; shift 2 ;;
+    --latency-sim-compile-off=*) compile_off="${1#*=}"; compile_off_arg=1; shift ;;
+    --latency-sim-valgrind-check=*) checker="${1#*=}"; checker_arg=1; shift ;;
+    --latency-sim-e2e-ndebug=*) e2e_ndebug="${1#*=}"; e2e_ndebug_arg=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *)
+      if [[ -z "$log_root" ]]; then log_root=$1
+      elif [[ "$rounds" == "${TIGONKV_E2E_ROUNDS:-10}" ]]; then rounds=$1
+      elif [[ "$suites" == "${TIGONKV_E2E_SUITES:-08 09}" ]]; then suites=$1
+      else usage; exit 2; fi
+      shift ;;
+  esac
+done
+[[ -n "$log_root" ]] || { usage; exit 2; }
 tigonkv_load_vm_config "$config"
-checker="${TIGONKV_E2E_LATENCYCHECK:-OFF}"
-compile_off="${TIGONKV_E2E_COMPILE_OFF:-OFF}"
 case "$checker" in
   ON) build_type=Debug ;;
   OFF) build_type=RelWithDebInfo ;;
-  *) echo "TIGONKV_E2E_LATENCYCHECK must be ON or OFF" >&2; exit 2 ;;
+  *) echo "LATENCY_SIM_VALGRIND_CHECK must be ON or OFF" >&2; exit 2 ;;
 esac
-build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker")
+case "$compile_off" in ON|OFF) ;; *) echo "LATENCY_SIM_COMPILE_OFF must be ON or OFF" >&2; exit 2;; esac
+case "$e2e_ndebug" in ON|OFF) ;; *) echo "LATENCY_SIM_E2E_NDEBUG must be ON or OFF" >&2; exit 2;; esac
+if [[ "$checker" == ON && "$e2e_ndebug" != ON ]]; then
+  echo "latencycheck E2E requires LATENCY_SIM_E2E_NDEBUG=ON" >&2
+  exit 2
+fi
+tigonkv_prepare_build_environment "$root" "$build_type" "$compile_off" "$checker" "$e2e_ndebug" >/dev/null
+build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker" "$e2e_ndebug")
 binary_dir=${TIGONKV_E2E_BINARY_DIR:-$build}
 if [[ "$checker" == ON ]]; then
-  tigonkv_verify_checker_compile_contract "$build"
+  tigonkv_verify_e2e_compile_contract "$build" ON ON e2e_08 e2e_trace_runner
 fi
-log_root=${1:?usage: $0 LOG_ROOT [ROUNDS] [SUITES]}
-rounds=${2:-${TIGONKV_E2E_ROUNDS:-10}}
-suites=${3:-${TIGONKV_E2E_SUITES:-"08 09"}}
 vm_count=${TIGONKV_VM_COUNT}
 threads=${TIGONKV_E2E_THREADS:-${TIGONKV_E2E_WORKERS:-4}}
 base_port=${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}
@@ -29,7 +65,16 @@ ssh_key=${TIGONKV_VM_SSH_KEY:-/root/.ssh/id_rsa}
 remote_root=${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}
 remote_config=${TIGONKV_VM_REMOTE_CONFIG:-$remote_root/experiment_config.jsonc}
 backing=${TIGONKV_SHARED_MEMORY_PATH:-$TIGONKV_SHARED_BACKING}
-pool_init=${TIGONKV_POOL_INITER:-$build/cxl_pool_initer}
+pool_build="$build"
+if [[ "$checker" == ON ]]; then
+  pool_build=$(tigonkv_canonical_build_dir "$root" Debug OFF OFF ON)
+fi
+if [[ -n "$records_override" ]]; then
+  [[ "$records_override" =~ ^[1-9][0-9]*$ ]] || { echo "--records must be a positive integer" >&2; exit 2; }
+  export TIGONKV_E2E08_TOTAL_KEYS="$records_override"
+  export TIGONKV_E2E09_TOTAL_KEYS="$records_override"
+fi
+pool_init=${TIGONKV_POOL_INITER:-$pool_build/cxl_pool_initer}
 shared_size_mb=${TIGONKV_SHARED_SIZE_MB:-$TIGONKV_SHARED_MB}
 shared_numa=${TIGONKV_SHARED_NUMA_NODE:-${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV_SHARED_NUMA%%,*}}}
 timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-1800}}
@@ -46,6 +91,9 @@ fi
 if [[ "$checker" == ON && "$compile_off" != OFF ]]; then
   echo "latencycheck E2E requires LATENCY_SIM_COMPILE_OFF=OFF" >&2
   exit 2
+fi
+if [[ "$checker" == ON ]]; then
+  tigonkv_verify_e2e_compile_contract "$pool_build" OFF ON cxl_pool_initer
 fi
 if [[ "$checker" == ON && "$suites" != 08 ]]; then
   echo "latencycheck E2E requires suite 08 only" >&2

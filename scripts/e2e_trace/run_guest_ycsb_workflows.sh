@@ -6,7 +6,7 @@ config=${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}
 source "$root/scripts/tigonkv_vm_common.sh"
 source "$root/scripts/tigonkv_build_helpers.sh"
 tigonkv_load_vm_config "$config"
-build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${TIGONKV_E2E_COMPILE_OFF:-OFF}")
+build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${LATENCY_SIM_COMPILE_OFF:-OFF}")
 trace_root=${1:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 log_root=${2:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 rounds=${3:-${TIGONKV_E2E_ROUNDS:-10}}

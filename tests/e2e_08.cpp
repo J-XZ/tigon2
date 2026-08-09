@@ -1,9 +1,6 @@
 #include "kv/kv_store.h"
 #include "kv/engine/kv_engine.h"
 
-#ifdef NDEBUG
-#undef NDEBUG
-#endif
 #include <cassert>
 #include <algorithm>
 #include <chrono>
