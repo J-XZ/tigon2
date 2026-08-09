@@ -5,14 +5,16 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 config=${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}
 source "$root/scripts/tigonkv_vm_common.sh"
 source "$root/scripts/tigonkv_build_helpers.sh"
+source "$root/scripts/e2e/phase_fail_fast.sh"
 tigonkv_load_vm_config "$config"
 checker="${TIGONKV_E2E_LATENCYCHECK:-OFF}"
+compile_off="${TIGONKV_E2E_COMPILE_OFF:-OFF}"
 case "$checker" in
   ON) build_type=Debug ;;
   OFF) build_type=RelWithDebInfo ;;
   *) echo "TIGONKV_E2E_LATENCYCHECK must be ON or OFF" >&2; exit 2 ;;
 esac
-build=$(tigonkv_canonical_build_dir "$root" "$build_type" "${TIGONKV_E2E_COMPILE_OFF:-OFF}" "$checker")
+build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker")
 binary_dir=${TIGONKV_E2E_BINARY_DIR:-$build}
 log_root=${1:?usage: $0 LOG_ROOT [ROUNDS] [SUITES]}
 rounds=${2:-${TIGONKV_E2E_ROUNDS:-10}}
@@ -36,6 +38,14 @@ remote_tool_install="$remote_root/thirdparty_libs/latency_sim/.latency_sim/laten
 [[ "$rounds" =~ ^[1-9][0-9]*$ ]] || { echo "rounds must be positive" >&2; exit 2; }
 if [[ "$checker" == ON && "$rounds" != 1 ]]; then
   echo "latencycheck E2E requires exactly one round" >&2
+  exit 2
+fi
+if [[ "$checker" == ON && "$compile_off" != OFF ]]; then
+  echo "latencycheck E2E requires LATENCY_SIM_COMPILE_OFF=OFF" >&2
+  exit 2
+fi
+if [[ "$checker" == ON && "$suites" != 08 ]]; then
+  echo "latencycheck E2E requires suite 08 only" >&2
   exit 2
 fi
 [[ "$vm_count" == 4 && "$threads" == 4 ]] || {
@@ -62,6 +72,16 @@ kill_guest_suite() {
   remote "$vm" "for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do cmd=\$(tr '\0' ' ' <\"\$proc/cmdline\" 2>/dev/null || true); case \"\$cmd\" in *\"\$runner\"*) kill -TERM \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; done; sleep 0.1; for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do cmd=\$(tr '\0' ' ' <\"\$proc/cmdline\" 2>/dev/null || true); case \"\$cmd\" in *\"\$runner\"*) kill -KILL \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; done"
 }
 
+stop_phase_guests() {
+  local cleanup_status=0 vm
+  for ((vm = 0; vm < vm_count; vm++)); do
+    if ! kill_guest_suite "$TIGONKV_PHASE_SUITE" "$vm"; then
+      cleanup_status=1
+    fi
+  done
+  return "$cleanup_status"
+}
+
 sync_latencycheck_prefix() {
   [[ "$checker" == ON ]] || return 0
   [[ -x "$local_tool_install/bin/valgrind" ]] || {
@@ -75,7 +95,7 @@ sync_latencycheck_prefix() {
     scp "${ssh_opts[@]}" -P "$((base_port + vm))" -r \
       "$local_tool_install" "root@127.0.0.1:$remote_tool_install.new" >/dev/null
     remote "$vm" "mv '$remote_tool_install.new' '$remote_tool_install'; test -x '$remote_tool_install/bin/valgrind'"
-    remote "$vm" "'$remote_tool_install/bin/valgrind' --version" >/dev/null
+    remote "$vm" "VALGRIND_LIB='$remote_tool_install/libexec/valgrind' '$remote_tool_install/bin/valgrind' --tool=latencycheck --version" >/dev/null
   done
 }
 
@@ -136,7 +156,7 @@ run_remote() {
   local remote_binary="$remote_root/build/e2e_${suite}"
   local command
   if [[ "$checker" == ON ]]; then
-    command="env TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck '$remote_binary'"
+    command="env VALGRIND_LIB='$remote_tool_install/libexec/valgrind' TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck '$remote_binary'"
   else
     command="env TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra '$remote_binary'"
   fi
@@ -183,6 +203,8 @@ run_phase() {
     done
     if (( dead_vm >= 0 )); then
       echo "phase command exited before replay completion: suite=$suite round=$round phase=$phase vm=$dead_vm" >&2
+      TIGONKV_PHASE_SUITE="$suite"
+      stop_phase_guests || true
       for pid in "${pids[@]}"; do
         kill "$pid" 2>/dev/null || true
       done
@@ -197,24 +219,26 @@ run_phase() {
     fi
     if (( SECONDS >= deadline )); then
       echo "timeout waiting for replay completion: suite=$suite round=$round phase=$phase" >&2
+      TIGONKV_PHASE_SUITE="$suite"
+      stop_phase_guests || true
       for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
       for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
       return 1
     fi
     sleep 0.05
   done
-  local failed=0
+  TIGONKV_PHASE_SUITE="$suite"
+  local phase_status=0
+  if tigonkv_poll_phase_pids "$deadline" stop_phase_guests "${pids[@]}"; then
+    phase_status=0
+  else
+    phase_status=$?
+  fi
   for ((vm = 0; vm < vm_count; vm++)); do
-    local node_status=0
-    if wait "${pids[$vm]}"; then
-      :
-    else
-      node_status=$?
-      failed=1
-    fi
-    printf '%s\n' "$node_status" >"$phase_dir/vm${vm}.exit"
+    printf '%s\n' "${TIGONKV_PHASE_EXIT_STATUS[$vm]}" >"$phase_dir/vm${vm}.exit"
   done
-  if (( failed )); then
+  if (( phase_status != 0 )); then
+    echo "TIGONKV_FAIL_FAST suite=$suite round=$round phase=$phase first_vm=$TIGONKV_PHASE_FIRST_VM first_exit=$TIGONKV_PHASE_FIRST_EXIT kind=$TIGONKV_PHASE_FAILURE_KIND cleanup_status=$TIGONKV_PHASE_CLEANUP_STATUS" >&2
     echo "phase command failed: suite=$suite round=$round phase=$phase" >&2
     for ((vm = 0; vm < vm_count; vm++)); do
       echo "--- vm${vm} ---" >&2
@@ -279,6 +303,13 @@ run_init() {
     (( remaining == 0 )) || sleep 0.05
   done
   if (( failed )); then
+    TIGONKV_PHASE_SUITE="$suite"
+    local cleanup_status=0
+    if stop_phase_guests; then
+      cleanup_status=0
+    else
+      cleanup_status=1
+    fi
     for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
     for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
   fi
@@ -288,6 +319,7 @@ run_init() {
       echo "--- vm${vm} ---" >&2
       tail -n 80 "$init_dir/vm${vm}.log" >&2 || true
     done
+    echo "TIGONKV_FAIL_FAST suite=$suite round=$round phase=init first_vm=$failed_vm first_exit=$status kind=process cleanup_status=$cleanup_status" >&2
     if [[ "$checker" == ON ]] && rg -q 'LATENCYCHECK_FIRST_MISMATCH' "$init_dir"/*.log; then
       echo "TIGONKV_LATENCYCHECK CHECKER_WORKING_MISMATCH_FOUND first_vm=$failed_vm" >&2
     fi
@@ -304,6 +336,7 @@ run_init() {
   echo "TIGONKV_MULTI_VM_E2E suite=$suite round=$round phase=init pass"
 }
 
+workflow_status=0
 for suite in $suites; do
   case "$suite" in
     08) phases=(fill read) ;;
@@ -323,10 +356,38 @@ for suite in $suites; do
   sync_guest_binary "$suite"
   for ((round = 1; round <= rounds; round++)); do
     reset_pool
-    run_init "$suite" "$round"
+    if run_init "$suite" "$round"; then
+      :
+    else
+      workflow_status=$?
+      break
+    fi
     for phase in "${phases[@]}"; do
-      run_phase "$suite" "$phase" "$round"
+      if run_phase "$suite" "$phase" "$round"; then
+        :
+      else
+        workflow_status=$?
+        break
+      fi
     done
+    (( workflow_status == 0 )) || break
     echo "TIGONKV_MULTI_VM_E2E suite=$suite round=$round pass"
   done
+  (( workflow_status == 0 )) || break
 done
+
+if [[ "$checker" == ON && "$suites" == 08 && "$rounds" == 1 ]]; then
+  summary_status=0
+  if python3 "$root/scripts/e2e/summarize_latencycheck_e2e08.py" \
+      "$log_root" --vm-count "$vm_count" --workflow-status "$workflow_status"; then
+    summary_status=0
+  else
+    summary_status=$?
+  fi
+  if (( summary_status == 1 )); then
+    workflow_status=1
+  elif (( summary_status >= 2 )); then
+    workflow_status=2
+  fi
+fi
+exit "$workflow_status"

@@ -1,6 +1,7 @@
 #include "common/btree_olc_cxl/BTreeOLC_CXL.h"
 #include "kv/engine/kv_types_layout.h"
 #include "kv/engine/region_allocator.h"
+#include <latency_sim/testing.h>
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -265,11 +266,11 @@ int main() {
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
   regions.BindOwnerPrivateAllocators(0);
   assert(private_tree->lookup(Key(250), value) && value == 250);
-  assert(simulator.PendingDelayNsForTest() > 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
   assert(shared_tree->lookup(Key(250), value) && value == 1250);
-  assert(simulator.PendingDelayNsForTest() > 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() > 0);
   simulator.EndScopeAndDelay();
 #endif
 

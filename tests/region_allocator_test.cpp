@@ -5,6 +5,7 @@
 #include <latency_sim/domain.h>
 #include <latency_sim/scope.h>
 #include <latency_sim/simulator.h>
+#include <latency_sim/testing.h>
 #include "tests/latency_test_support.h"
 
 #include <array>
@@ -398,7 +399,7 @@ void TestDualPhysicalRegions() {
   checkpoint_simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
   dual->FlushOwnedRanges(0);
   attached->FlushOwnedRanges(1);
-  assert(checkpoint_simulator.PendingDelayNsForTest() > 0);
+  assert(latency_sim::testing::Accessor(checkpoint_simulator).PendingDelayNsForTest() > 0);
   checkpoint_simulator.EndScopeAndDelay();
 #endif
   assert(dual->layout().state.load(std::memory_order_acquire) ==
@@ -533,7 +534,7 @@ void TestAllocatorLatencyAccounting() {
                                          hwcc_counter, 0);
     hwcc_allocator.Free(hwcc, 80, AllocationDomain::kHwccMetadata, hwcc_counter,
                         0, 0);
-    assert(simulator.PendingDelayNsForTest() > 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() > 0);
     simulator.EndScopeAndDelay();
   }
 
@@ -548,7 +549,7 @@ void TestAllocatorLatencyAccounting() {
         80, AllocationDomain::kSharedPayloadSwcc, swcc_counter, 0);
     swcc_allocator.Free(swcc, 80, AllocationDomain::kSharedPayloadSwcc,
                         swcc_counter, 0, 0);
-    assert(simulator.PendingDelayNsForTest() > 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() > 0);
     simulator.EndScopeAndDelay();
   }
 
@@ -567,7 +568,7 @@ void TestAllocatorLatencyAccounting() {
     void *owner = dual->AllocateOwnerPrivate(80, 0, 0);
     dual->FreeOwnerPrivate(owner, 80, 0, 0);
     assert(dual->SharedPayloadCapacityBytes(0) > 0);
-    assert(simulator.PendingDelayNsForTest() > 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() > 0);
     simulator.EndScopeAndDelay();
   }
 
@@ -582,7 +583,7 @@ void TestAllocatorLatencyAccounting() {
     simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
     void *dynamic = dual->Allocate(80, AllocationDomain::kHwccIndex, 0);
     dual->Free(dynamic, 80, AllocationDomain::kHwccIndex, 0, 0);
-    assert(simulator.PendingDelayNsForTest() > 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() > 0);
     simulator.EndScopeAndDelay();
   }
 }

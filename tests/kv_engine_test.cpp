@@ -11,6 +11,7 @@
 #include <latency_sim/domain.h>
 #include <latency_sim/scope.h>
 #include <latency_sim/simulator.h>
+#include <latency_sim/testing.h>
 #include "protocol/TwoPLPasha/TwoPLPashaMessage.h"
 
 #ifdef NDEBUG
@@ -273,7 +274,9 @@ void RunFocusedG() {
   // Shutdown clears the pool registrations at the quiescent boundary; the
   // simulator is left unconfigured with no active scope and zero pending.
   assert(!latency_sim::GlobalLatencySimulator().HasActiveScopeForCurrentThread());
-  assert(latency_sim::GlobalLatencySimulator().PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(
+             latency_sim::GlobalLatencySimulator())
+             .PendingDelayNsForTest() == 0);
 #endif
   assert(!star::CXLMemory::dual_region_allocator_bound());
   assert(star::CXL_EBR::bound_regions() == nullptr);

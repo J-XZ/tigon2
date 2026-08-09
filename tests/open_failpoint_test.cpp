@@ -9,6 +9,7 @@
 #include "kv/engine/kv_engine.h"
 
 #include <latency_sim/simulator.h>
+#include <latency_sim/testing.h>
 
 #include <cassert>
 #include <cstdint>
@@ -79,9 +80,9 @@ int main() {
 #if !defined(LATENCY_SIM_COMPILE_OFF)
     auto &simulator = latency_sim::GlobalLatencySimulator();
     assert(!simulator.HasActiveScopeForCurrentThread());
-    assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
     simulator.ClearPoolRegistrations();
-    assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
 #endif
 
     // Reopen against a different mapping succeeds and stays usable.  Engine

@@ -124,46 +124,46 @@ int main() {
   // scope is required and bookkeeping still runs; the pending delay is zero.
   // (ScopedLatencyPools already applied the 0/0 model above.)
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 256);
-  assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
   assert(simulator.HasActiveScopeForCurrentThread());
   simulator.EndScopeAndDelay();
   assert(!simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
 
   // Real range coverage: zero bytes are free, unaligned and repeated accesses
   // are charged by covered line on every call.
   ReopenWith(&buffers, Fixed(7, 13));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 0);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 1, 1);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 63, 2);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 1, 1);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kWrite,
                         static_cast<std::byte *>(buffers.hwcc) + 127, 2);
-  assert(simulator.PendingDelayNsForTest() == 54);  // 4*7 + 2*13
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 54);  // 4*7 + 2*13
 
   // Nested scopes share one worker-local pending delay and settle only at the
   // outer safe point.
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 1);
-  assert(simulator.PendingDelayNsForTest() == 67);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 67);
   simulator.EndScopeAndDelay();
   assert(simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 67);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 67);
   simulator.EndScopeAndDelay();
   assert(!simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
 
   // Atomic wrappers preserve result/expected semantics. Every RMW is charged
   // as one read plus one write, regardless of CAS success.
@@ -195,24 +195,24 @@ int main() {
       *value, expected, uint64_t{20}, std::memory_order_acq_rel,
       std::memory_order_acquire, latency_sim::MemoryDomain::kHwcc));
   assert(value->load(std::memory_order_relaxed) == 20);
-  assert(simulator.PendingDelayNsForTest() == 132);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 132);
   simulator.EndScopeAndDelay();
 
   // A background worker gets its own scope and pending delay; it cannot leak
   // into the foreground thread.
   ReopenWith(&buffers, Fixed(17, 19));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 64);
   std::thread worker([&] {
     simulator.BeginScope(latency_sim::ExecutionClass::kBackground);
-    simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+    latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                           latency_sim::AccessKind::kRead, buffers.swcc, 64);
-    assert(simulator.PendingDelayNsForTest() == 17);
+    assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 17);
     simulator.EndScopeAndDelay();
   });
   worker.join();
-  assert(simulator.PendingDelayNsForTest() == 19);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 19);
   simulator.EndScopeAndDelay();
 
   // RAII settles pending delay on an exception and leaves no active scope.
@@ -222,35 +222,35 @@ int main() {
   } catch (const std::runtime_error &) {
   }
   assert(!simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
 
   // Fractional per-line delays accumulate exactly in fixed point and round
   // once at scope exit: 0.4ns x 5 lines = 2ns, 1.25ns x 4 lines = 5ns, and
   // 0.4 + 0.4 + 0.2 = 1ns while each access alone would round to 0ns.
   ReopenWith(&buffers, Fixed(0.4, 0.2));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64 * 5);
-  assert(simulator.PendingDelayPsForTest() == 2000);
-  assert(simulator.PendingDelayNsForTest() == 2);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayPsForTest() == 2000);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 2);
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 64, 64);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 64);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 128, 64);
-  assert(simulator.PendingDelayPsForTest() == 3000);
-  assert(simulator.PendingDelayNsForTest() == 3);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayPsForTest() == 3000);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 3);
   simulator.EndScopeAndDelay();
 
   ReopenWith(&buffers, Fixed(1.25, 0.0));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64 * 4);
-  assert(simulator.PendingDelayPsForTest() == 5000);
-  assert(simulator.PendingDelayNsForTest() == 5);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayPsForTest() == 5000);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 5);
   simulator.EndScopeAndDelay();
 
   // Maximum legal value accumulates without overflow; multiplication and
@@ -260,11 +260,11 @@ int main() {
   latency_sim::detail::SetDelaySpinBackendForTest(&NoOpDelaySpin);
   ReopenWith(&buffers, Fixed(1.0e16, 0.0));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64);
-  assert(simulator.PendingDelayPsForTest() == 10000000000000000000ull);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayPsForTest() == 10000000000000000000ull);
   simulator.EndScopeAndDelay();
-  assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
 
   // Two lines in one access overflow the fixed-point multiply at the scope
   // exit settlement, not at the charge site.
@@ -272,7 +272,7 @@ int main() {
   if (fork() == 0) {
     {
       latency_sim::ScopeGuard scope(latency_sim::ExecutionClass::kForeground);
-      simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                             latency_sim::AccessKind::kRead, buffers.swcc, 128);
     }  // scope exit settles: 2 x 1e19 ps overflows -> abort before _exit
     _exit(0);
@@ -287,9 +287,9 @@ int main() {
   if (fork() == 0) {
     {
       latency_sim::ScopeGuard scope(latency_sim::ExecutionClass::kForeground);
-      simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                             latency_sim::AccessKind::kRead, buffers.swcc, 64);
-      simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                             latency_sim::AccessKind::kRead, buffers.hwcc, 64);
     }  // scope exit settles: 1e19 + 1e19 ps overflows -> abort before _exit
     _exit(0);
@@ -301,7 +301,7 @@ int main() {
   // Always-active access outside an explicit scope hard fails.
   ReopenWith(&buffers, Fixed(3, 11));
   if (fork() == 0) {
-    simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+    latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                           latency_sim::AccessKind::kRead, buffers.hwcc, 64);
     _exit(0);
   }
@@ -313,14 +313,14 @@ int main() {
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
   if (debug_range_checks) {
     if (fork() == 0) {
-      simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                             latency_sim::AccessKind::kRead, buffers.hwcc, 64);
       _exit(0);
     }
     assert(waitpid(-1, &status, 0) > 0);
     assert(WIFSIGNALED(status));
     if (fork() == 0) {
-      simulator.ChargeRange(
+      latency_sim::FixedLatencyChargeRange(
           latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
           static_cast<std::byte *>(buffers.hwcc) + kPage - 1, 2);
       _exit(0);
@@ -338,31 +338,31 @@ int main() {
   // still-alive guard) and no deferred segment is lost or duplicated.
   ReopenWith(&buffers, Fixed(9, 9));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 64);
-  assert(simulator.PendingDelayNsForTest() == 9);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 9);
   const std::uint64_t foreground_generation =
       simulator.SuspendScopeAndDelayLater();
   assert(foreground_generation != 0);
   assert(!simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
   simulator.BeginScope(latency_sim::ExecutionClass::kBackground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64);
-  assert(simulator.PendingDelayNsForTest() == 9);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 9);
   // V6 contract: a second suspension while already suspended is a lifecycle
   // violation and hard fails before moving any budget; the temporary scope
   // settles its own budget at its own exit instead.
   assert(simulator.HasActiveScopeForCurrentThread());
   simulator.EndScopeAndDelay();  // temporary scope settles its own 9 (swcc)
   assert(!simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
   simulator.ResumeScope(latency_sim::ExecutionClass::kForeground,
                         foreground_generation);
   assert(simulator.HasActiveScopeForCurrentThread());
   simulator.EndScopeAndDelay();  // settles the deferred 9 (hwcc) exactly once
   assert(!simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
 
   // A ForegroundScopeSuspension inside an already nested scope must not eat a
   // nesting level (which would settle the outer budget while guards are still
@@ -370,21 +370,21 @@ int main() {
   ReopenWith(&buffers, Fixed(3, 3));
   simulator.BeginScope(latency_sim::ExecutionClass::kBackground);
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  simulator.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 64);
-  assert(simulator.PendingDelayNsForTest() == 3);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 3);
   {
     tigonkv::engine::mem_access::ForegroundScopeSuspension suspend;
     assert(simulator.HasActiveScopeForCurrentThread());
   }
   assert(simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 3);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 3);
   simulator.EndScopeAndDelay();  // nested exit: depth stays 1, no settlement
   assert(simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 3);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 3);
   simulator.EndScopeAndDelay();  // outermost exit settles exactly once
   assert(!simulator.HasActiveScopeForCurrentThread());
-  assert(simulator.PendingDelayNsForTest() == 0);
+  assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
 
   // Sequential open/close of two different mappings in one process.  The
   // reopen boundary (KVEngine::Open) clears stale registrations before
@@ -405,9 +405,9 @@ int main() {
   global.RegisterPool(latency_sim::MemoryDomain::kHwcc, gen1, kPage);
   global.Configure(Fixed(1, 1));
   global.BeginScope(latency_sim::ExecutionClass::kForeground);
-  global.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                      latency_sim::AccessKind::kRead, gen1, 64);
-  assert(global.PendingDelayNsForTest() == 1);
+  assert(latency_sim::testing::Accessor(global).PendingDelayNsForTest() == 1);
   global.EndScopeAndDelay();
 
   global.ClearPoolRegistrations();
@@ -418,16 +418,16 @@ int main() {
   global.BeginScope(latency_sim::ExecutionClass::kForeground);
   if (debug_range_checks) {
     if (fork() == 0) {
-      global.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                          latency_sim::AccessKind::kRead, gen1, 64);
       _exit(0);
     }
     assert(waitpid(-1, &status, 0) > 0);
     assert(WIFSIGNALED(status));
   }
-  global.ChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
                      latency_sim::AccessKind::kRead, gen2, 64);
-  assert(global.PendingDelayNsForTest() == 1);
+  assert(latency_sim::testing::Accessor(global).PendingDelayNsForTest() == 1);
   global.EndScopeAndDelay();
   global.ClearPoolRegistrations();
   munmap(gen1, kPage);

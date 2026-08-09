@@ -33,7 +33,7 @@ compile-on（默认）下模拟器被编译进去，配置完成后始终参与�
 是唯一无模拟代码方式——wrapper 编译为原始操作、scope 为 no-op、消费者不解析配置/
 不注册 pool/不校准 TSC/不初始化清理 simulator。固定延迟公共实现来自固定 Git 子模块
 `thirdparty_libs/latency_sim`（最终 gitlink
-`a15cc4ee4d6d79057dc8f44f2f3467a3158de637`，`my-work` 分支）；Tigon 的改动只在
+`81feee8e4a8887c39d9f86a84c06530ad9314b06`，`my-work` 分支）；Tigon 的改动只在
 `my-work` 分支本地提交，不 push。
 详细规则见 [硬件模拟当前实现.md](硬件模拟当前实现.md)。
 
@@ -119,6 +119,9 @@ transport ring、shared-payload bulk）。正式 fixed-latency 运行使用
 
 本轮四仓库任务对消费者只执行一轮 E2E08 和最小必要定向测试；checker 首次发现
 mismatch 时立即终止同轮 guest，不为追求 `CHECK_CLEAN` 追加多轮修复业务插桩缺口。
+Tigon2 V11 的专属 VM 结果为 `CHECKER_WORKING_MISMATCH_FOUND`：VM0 在 init 的
+checkpoint=1 首错，`target_accesses=2279282`、`expectations=6`、`checkpoints=1`，
+并以 `cleanup_status=0` 终止 VM1–3；完整摘要见 [验证证据.md](验证证据.md)。
 
 4VM trace 入口和 YCSB 约定见 [YCSB指南.md](YCSB指南.md)。正式报告应披露
 `foreground=4 + demuxer=1`、NUMA/容量、固定延迟参数、trace、计时窗口以及本地
