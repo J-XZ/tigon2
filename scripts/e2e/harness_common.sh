@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# Small run-scoped helpers used by the canonical Tigon2 VM entry points.
+set -euo pipefail
+
+harness_require_positive() {
+  [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "$1 must be a positive integer" >&2; return 2; }
+}
+harness_resolve_cli_path() {
+  local root=$1 value=$2
+  if [[ "$value" = /* ]]; then realpath -m -- "$value"; else realpath -m -- "$root/$value"; fi
+}
+harness_hash_file() { sha256sum -- "$1" | awk '{print $1}'; }
+harness_manifest() {
+  local output=$1 input path
+  shift
+  : >"$output"
+  for input in "$@"; do
+    [[ -e "$input" && ! -L "$input" ]] || { echo "manifest input is missing or a symlink: $input" >&2; return 2; }
+    if [[ -f "$input" ]]; then
+      printf '%s  %s\n' "$(harness_hash_file "$input")" "$(realpath "$input")" >>"$output"
+    elif [[ -d "$input" ]]; then
+      while IFS= read -r -d '' path; do
+        printf '%s  %s\n' "$(harness_hash_file "$path")" "$(realpath "$path")"
+      done < <(find -P "$input" -type f -print0 | sort -z) >>"$output"
+    else
+      echo "manifest input is not a regular file or directory: $input" >&2
+      return 2
+    fi
+  done
+  sort -u -o "$output" "$output"
+}
+harness_manifest_sha() { harness_hash_file "$1"; }
+harness_closure_manifest() {
+  local runtime=$1 variant=$2 output=$3
+  shift 3
+  local cache_dir="$runtime/e2e/closure-cache"
+  mkdir -p "$cache_dir"
+  local key_input="$variant"$'\n'"runtime=$(realpath -m "$runtime")"$'\n'"$(sha256sum "$BASH_SOURCE" | awk '{print $1}')"
+  key_input+=$'\n'"ldd=$(ldd --version 2>&1 | head -n 1)"
+  key_input+=$'\n'"LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}"
+  key_input+=$'\n'"PATH=${PATH-}"
+  if [[ -n "${HARNESS_CLOSURE_STAMPS:-}" ]]; then
+    local stamp
+    for stamp in $HARNESS_CLOSURE_STAMPS; do
+      if [[ -f "$stamp" ]]; then
+        key_input+=$'\n'"stamp=$(realpath "$stamp")"$'\n'"$(harness_hash_file "$stamp")"
+      else
+        key_input+=$'\n'"stamp=$(realpath -m "$stamp")=missing"
+      fi
+    done
+  fi
+  local elf
+  for elf in "$@"; do
+    [[ -x "$elf" ]] || { echo "participant is not executable: $elf" >&2; return 2; }
+    key_input+=$'\n'$(harness_hash_file "$elf")$'\n'$(realpath "$elf")
+    key_input+=$'\n'"$(readelf -l -d "$elf" 2>/dev/null | sed -n '/INTERP\|RPATH\|RUNPATH/p')"
+  done
+  local key cache valid=0
+  key=$(printf '%s' "$key_input" | sha256sum | awk '{print $1}')
+  cache="$cache_dir/$key.manifest"
+  if [[ -s "$cache" ]]; then
+    valid=1
+    while read -r expected path; do
+      if [[ -z "$path" || ! -f "$path" || "$expected" != "$(harness_hash_file "$path")" ]]; then valid=0; break; fi
+    done <"$cache"
+  fi
+  if ((valid)); then cp -- "$cache" "$output"; echo "CLOSURE_CACHE_HIT key=$key"; return 0; fi
+  local tmp="$cache.tmp.$$"
+  : >"$tmp"
+  local -a queue=("$@")
+  local queue_index=0
+  declare -A seen=()
+  while ((queue_index < ${#queue[@]})); do
+    elf=${queue[$queue_index]}
+    queue_index=$((queue_index + 1))
+    [[ -n "$elf" ]] || continue
+    local current
+    current=$(realpath -e -- "$elf" 2>/dev/null || true)
+    [[ -n "$current" && -f "$current" ]] || continue
+    if [[ -n "${seen[$current]:-}" ]]; then continue; fi
+    seen[$current]=1
+    printf '%s  %s\n' "$(harness_hash_file "$current")" "$current" >>"$tmp"
+    local dep
+    while IFS= read -r dep; do
+      if [[ -n "$dep" && -f "$dep" ]]; then
+        dep=$(realpath -e -- "$dep" 2>/dev/null || true)
+        if [[ -n "$dep" ]]; then queue+=("$dep"); fi
+      fi
+    done < <({ ldd "$current" 2>/dev/null || true; readelf -l "$current" 2>/dev/null || true; } |
+      awk '/=> \// {print $3} /^[[:space:]]*\// {print $1}' | sed 's/[][]//g' | sort -u)
+  done
+  sort -u -o "$tmp" "$tmp"
+  mv -f -- "$tmp" "$cache"
+  cp -- "$cache" "$output"
+  echo "CLOSURE_CACHE_MISS key=$key"
+}
+harness_state_matches() {
+  local state=$1
+  shift
+  [[ -s "$state" ]] || return 1
+  python3 - "$state" "$@" <<'PY'
+import json, sys
+from pathlib import Path
+data=json.loads(Path(sys.argv[1]).read_text())
+if str(data.get('schema_version', '')) != '1': raise SystemExit(1)
+for item in sys.argv[2:]:
+    key, expected=item.split('=', 1)
+    if str(data.get(key, '')) != expected: raise SystemExit(1)
+PY
+}
+harness_write_state() {
+  local state=$1
+  shift
+  python3 - "$state" "$@" <<'PY'
+import json, os, sys
+from pathlib import Path
+target=Path(sys.argv[1]); payload={}
+for item in sys.argv[2:]:
+    key, value=item.split('=', 1); payload[key]=value
+payload['schema_version']='1'
+target.parent.mkdir(parents=True, exist_ok=True)
+tmp=target.with_name(target.name + f'.new.{os.getpid()}')
+tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
+os.replace(tmp, target)
+PY
+}
+harness_prepare_output() {
+  local root=$1 requested=$2 project=$3 suite=$4 records=$5
+  local experiment_root="$root/exp_data"
+  mkdir -p "$experiment_root"
+  if [[ -n "$requested" ]]; then
+    HARNESS_OUT_DIR=$(harness_resolve_cli_path "$root" "$requested")
+    [[ ! -e "$HARNESS_OUT_DIR" ]] || { echo "refusing to reuse existing output directory: $HARNESS_OUT_DIR" >&2; return 2; }
+    mkdir -p "$HARNESS_OUT_DIR"
+  else
+    HARNESS_OUT_DIR=$(mktemp -d "$experiment_root/$project""_suite""$suite""_""$records""_XXXXXX")
+  fi
+  HARNESS_RUN_ID=$(basename "$HARNESS_OUT_DIR")
+  local runtime_root="$root/.tigon2"
+  if [[ -n "${HARNESS_PROJECT_RUNTIME-}" ]]; then runtime_root=$HARNESS_PROJECT_RUNTIME; fi
+  HARNESS_RUNTIME_RUN_DIR="$runtime_root/e2e/$HARNESS_RUN_ID"
+  mkdir -p "$HARNESS_RUNTIME_RUN_DIR"/{logs,round_logs,ssh}
+}
+harness_acquire_lock() {
+  local config=$1 vm_count=$2 base_port=$3 runtime=$4 config_sha
+  config_sha=$(harness_hash_file "$config")
+  mkdir -p "$runtime/e2e/locks"
+  local lock="$runtime/e2e/locks/$config_sha""_""$vm_count""_""$base_port.lock"
+  exec {HARNESS_LOCK_FD}>"$lock"
+  flock -n "$HARNESS_LOCK_FD" || { echo "HARNESS_INVALID reason=existing_project_invocation lock=$lock" >&2; return 125; }
+  HARNESS_LOCK_PATH=$lock
+}
+harness_write_common_meta() {
+  local path=$1 project=$2 suite=$3 profile=$4 records=$5 config=$6 source=$7 latency_sha=$8 prepared=$9
+  local remote_root=; if (( $# >= 10 )); then remote_root=$10; fi
+  python3 - "$path" "$project" "$suite" "$profile" "$records" "$config" "$source" "$latency_sha" "$prepared" "$remote_root" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+path, project, suite, profile, records, config, source, latency_sha, prepared, remote_root=sys.argv[1:]
+path=Path(path); cfg=Path(config)
+payload={'project':project,'suite':suite,'profile':profile,'record_count':int(records),'operation_count':None,
+ 'logical_operation_count':int(records),'physical_operation_count':int(records),'vm_count':None,
+ 'workers_per_vm':None,'source_fingerprint':source,'latency_sim_sha':latency_sha,
+ 'config_sha256':hashlib.sha256(cfg.read_bytes()).hexdigest(),'prepared_state':prepared,
+ 'failed_stage':'','first_node':None,'cleanup_status':'pending','first_mismatch':None,
+ 'run_id':path.parent.name,'remote_root':remote_root}
+payload['config']=str(cfg.resolve())
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
+PY
+}
+harness_emit_result() {
+  local out=$1 status=$2 failed_stage=$3 first_node=$4 cleanup=$5
+  python3 - "$out/run_result.json" "$status" "$failed_stage" "$first_node" "$cleanup" <<'PY'
+import json, re, sys
+from pathlib import Path
+result_path=Path(sys.argv[1])
+if result_path.exists(): data=json.loads(result_path.read_text())
+else: data=json.loads((result_path.parent/'run_meta.json').read_text())
+status, failed_stage, first_node, cleanup=sys.argv[2:]
+data.update({'status':status,'failed_stage':failed_stage,
+             'first_node':None if first_node in ('','-1') else int(first_node),
+             'cleanup_status':cleanup})
+def first_mismatch(root):
+    for path in sorted(root.rglob('*')):
+        if not path.is_file() or path.name in {'run_result.json','run_meta.json'}:
+            continue
+        try:
+            lines=path.read_text(errors='replace').splitlines()
+        except OSError:
+            continue
+        for index,line in enumerate(lines):
+            if 'LATENCYCHECK_FIRST_MISMATCH' not in line:
+                continue
+            window_lines=lines[index:index+32]
+            if 'LATENCYCHECK_CHECKPOINT_FAIL' not in '\n'.join(window_lines):
+                continue
+            summaries=[item for item in lines[index:] if 'LATENCYCHECK_SUMMARY' in item]
+            if not any(
+                'sticky_error=true' in item
+                and all(re.search(rf'\b{key}=(\d+)', item) and int(re.search(rf'\b{key}=(\d+)', item).group(1)) > 0
+                        for key in ('target_accesses','expectations','checkpoints'))
+                for item in summaries
+            ):
+                continue
+            item={'raw':line.strip(),'source_log':str(path.relative_to(root))}
+            for name in ('pid','tid','checkpoint','class','generation','status','domain','logical','actual','addr','bytes','actual_ip','actual_guest_pc','actual_module','actual_source'):
+                match=re.search(rf'\b{name}=([^ ]*)',line)
+                if match: item[name]=match.group(1)
+            for name in ('function','location','source'):
+                match=re.search(rf'\b{name}=(.*?)(?=\s+(?:location|source|function|$))',line)
+                if match: item[name]=match.group(1).strip()
+            for context in window_lines:
+                if 'LATENCYCHECK_FIRST_MISMATCH_CONTEXT' not in context or 'side=actual' not in context:
+                    continue
+                for source_name,target_name in (('actual','actual'),('actual_ip','actual_ip'),('context_function','actual_function'),('context_source','actual_source')):
+                    match=re.search(rf'\b{source_name}=([^ ]*)',context)
+                    if match and item.get(target_name,'') in {'','invalid','unknown'}: item[target_name]=match.group(1)
+                break
+            node=re.search(r'(?:^|/)(?:vm|node)([0-9]+)(?:\.log|/)',str(path))
+            if node: item['node']=int(node.group(1))
+            return item
+    return None
+data['first_mismatch']=first_mismatch(result_path.parent) if status == 'CHECK_MISMATCH' else None
+if data['first_mismatch'] is not None and data.get('first_node') is None:
+    data['first_node']=data['first_mismatch'].get('node')
+result_path.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
+(result_path.parent/'run_complete.meta').write_text(f"status={status} run_id={data['run_id']} failed_stage={failed_stage}\n")
+print(f"{status} out_dir={result_path.parent}")
+PY
+}
+harness_plan_line() {
+  printf 'HARNESS_PLAN project=%s suite=%s profile=%s records=%s execute=%s out_dir=%s\n' "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+harness_valid_business_mismatch() {
+  python3 - "$1" <<'PY'
+import re, sys
+from pathlib import Path
+root=Path(sys.argv[1])
+for path in sorted(root.rglob('*')):
+    if not path.is_file():
+        continue
+    try: lines=path.read_text(errors='replace').splitlines()
+    except OSError: continue
+    for index,line in enumerate(lines):
+        if 'LATENCYCHECK_FIRST_MISMATCH' not in line:
+            continue
+        if 'LATENCYCHECK_CHECKPOINT_FAIL' not in '\n'.join(lines[index:index+32]):
+            continue
+        if not any(re.search(r'FAIL_FAST|fail-fast|checker round failed', item, re.IGNORECASE) for item in lines):
+            continue
+        summaries=[item for item in lines if 'LATENCYCHECK_SUMMARY' in item]
+        if not summaries:
+            continue
+        summary=summaries[-1]
+        values={key:int(value) for key,value in re.findall(r'\b(target_accesses|expectations|checkpoints)=(\d+)',summary)}
+        if all(values.get(key,0)>0 for key in ('target_accesses','expectations','checkpoints')) and 'sticky_error=true' in summary:
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+harness_checker_summaries_clean() {
+  python3 - "$1" <<'PY'
+import re, sys
+import json
+from pathlib import Path
+root=Path(sys.argv[1])
+try: expected_nodes=int(json.loads((root/'run_meta.json').read_text()).get('vm_count') or 0)
+except (OSError,TypeError,ValueError,json.JSONDecodeError): expected_nodes=0
+if expected_nodes <= 0: raise SystemExit(1)
+summaries=[]
+for path in sorted(root.rglob('*')):
+    if path.is_file():
+        try: summaries.extend(line for line in path.read_text(errors='replace').splitlines() if 'LATENCYCHECK_SUMMARY' in line)
+        except OSError: pass
+if len(summaries) < expected_nodes:
+    raise SystemExit(1)
+for line in summaries:
+    values={key:int(value) for key,value in re.findall(r'\b(target_accesses|expectations|checkpoints)=(\d+)',line)}
+    if any(values.get(key,0)<=0 for key in ('target_accesses','expectations','checkpoints')) or 'sticky_error=false' not in line:
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+harness_classify_status() {
+  local out=$1 runner_status=$2 checker=$3
+  if [[ "$checker" != ON ]]; then
+    if ((runner_status == 0)); then printf 'CHECK_CLEAN\n'; else printf 'HARNESS_INVALID\n'; fi
+    return 0
+  fi
+  if ((runner_status != 0)) && harness_valid_business_mismatch "$out"; then
+    printf 'CHECK_MISMATCH\n'
+  elif ((runner_status == 0)) && harness_checker_summaries_clean "$out"; then
+    printf 'CHECK_CLEAN\n'
+  else
+    printf 'HARNESS_INVALID\n'
+  fi
+}
+
+harness_probe_guest() {
+  local vm_count=$1 base_port=$2 control_path=$3 output=$4 command_template=$5
+  local control_dir
+  control_dir=$(dirname "$control_path")
+  mkdir -p "$control_dir"
+  : >"$output"
+  local -a pids=()
+  local node
+  for ((node=0; node<vm_count; ++node)); do
+    local port=$((base_port + node)) command
+    command=${command_template//\{node\}/$node}
+    ssh -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+      -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+      -o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$control_path" \
+      -p "$port" root@127.0.0.1 "$command" >"$output.node$node" 2>&1 &
+    pids+=($!)
+  done
+  local status=0 pid
+  for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+  if ((status != 0)); then rm -f -- "$output.node"*; return 1; fi
+  for ((node=0; node<vm_count; ++node)); do cat "$output.node$node" >>"$output"; done
+  rm -f -- "$output.node"*
+  harness_hash_file "$output"
+}
+
+harness_probe_matches() {
+  local output=$1 expected_nodes=$2 expected_participants=$3 expected_config=$4 expected_tool=$5
+  python3 - "$output" "$expected_nodes" "$expected_participants" "$expected_config" "$expected_tool" <<'PY'
+import re, sys
+from pathlib import Path
+path, expected_nodes, participant_csv, expected_config, expected_tool = sys.argv[1:]
+lines = [line.strip() for line in Path(path).read_text(errors="replace").splitlines() if line.strip()]
+expected_node_ids = set(range(int(expected_nodes)))
+if len(lines) != int(expected_nodes): raise SystemExit(1)
+participant_values = participant_csv.split(",")
+if len(participant_values) not in (1, int(expected_nodes)):
+    raise SystemExit(1)
+seen_nodes = set()
+for line in lines:
+    node_match = re.search(r"\bnode=(\d+)\b", line)
+    if not node_match or not re.search(r"\bboot_id=[0-9a-f-]+\b", line): raise SystemExit(1)
+    node = int(node_match.group(1))
+    if node not in expected_node_ids or node in seen_nodes: raise SystemExit(1)
+    seen_nodes.add(node)
+    participant = re.search(r"\bparticipant=([0-9a-f]{64})\b", line); config = re.search(r"\bconfig=([0-9a-f]{64})\b", line); tool = re.search(r"\btool=([^ ]+)\b", line)
+    expected_participant = participant_values[node] if len(participant_values) == int(expected_nodes) else participant_values[0]
+    if not participant or participant.group(1) != expected_participant or not config or config.group(1) != expected_config or not tool or tool.group(1) != expected_tool: raise SystemExit(1)
+if seen_nodes != expected_node_ids: raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+harness_probe_boot_ids() {
+  python3 - "$1" <<'PY'
+import re, sys
+from pathlib import Path
+rows = []
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    node = re.search(r"\bnode=(\d+)\b", line)
+    boot = re.search(r"\bboot_id=([0-9a-f-]+)\b", line)
+    if not node or not boot:
+        raise SystemExit(1)
+    rows.append((int(node.group(1)), boot.group(1)))
+if not rows or len({node for node, _ in rows}) != len(rows):
+    raise SystemExit(1)
+print(",".join(f"node{node}:{boot}" for node, boot in sorted(rows)))
+PY
+}
+
+harness_close_ssh_masters() {
+  local vm_count=$1 base_port=$2 control_path=$3
+  local control_dir
+  control_dir=$(dirname "$control_path")
+  local node
+  for ((node = 0; node < vm_count; ++node)); do
+    ssh -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+      -o ControlMaster=auto -o "ControlPath=$control_path" -O exit \
+      -p "$((base_port + node))" root@127.0.0.1 >/dev/null 2>&1 || true
+  done
+  find -P "$control_dir" -maxdepth 1 -type s -delete 2>/dev/null || true
+}

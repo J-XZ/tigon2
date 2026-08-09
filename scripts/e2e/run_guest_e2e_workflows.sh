@@ -107,7 +107,22 @@ fi
 [[ -f "$ssh_key" ]] || { echo "missing SSH key: $ssh_key" >&2; exit 2; }
 
 mkdir -p "$log_root"
-ssh_opts=(-i "$ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+run_id="${TIGONKV_E2E_RUN_ID:-manual-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+runtime_run_dir="${TIGONKV_E2E_RUNTIME_DIR:-$root/.tigon2/e2e/$run_id}"
+control_dir="$runtime_run_dir/ssh"
+mkdir -p "$control_dir"
+control_path="${TIGONKV_E2E_SSH_CONTROL_PATH:-$control_dir/%C}"
+ssh_opts=(-i "$ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$control_path")
+
+close_ssh_controlmasters() {
+  local vm
+  for ((vm = 0; vm < vm_count; vm++)); do
+    ssh "${ssh_opts[@]}" -O exit -p "$((base_port + vm))" root@127.0.0.1 >/dev/null 2>&1 || true
+  done
+  find -P "$control_dir" -maxdepth 1 -type s -delete 2>/dev/null || true
+}
+trap close_ssh_controlmasters EXIT
 
 remote() {
   local vm=$1
@@ -139,15 +154,41 @@ sync_latencycheck_prefix() {
     echo "missing Tigon2-local latencycheck prefix: $local_tool_install" >&2
     exit 2
   }
-  local vm
-  for ((vm = 0; vm < vm_count; vm++)); do
-    remote "$vm" "rm -rf '$remote_tool_install.new' '$remote_tool_install'"
-    remote "$vm" "mkdir -p '$(dirname "$remote_tool_install")'"
-    scp "${ssh_opts[@]}" -P "$((base_port + vm))" -r \
-      "$local_tool_install" "root@127.0.0.1:$remote_tool_install.new" >/dev/null
-    remote "$vm" "mv '$remote_tool_install.new' '$remote_tool_install'; test -x '$remote_tool_install/bin/valgrind'"
+  local local_manifest="$runtime_run_dir/latencycheck.deploy.manifest"
+  if [[ ! -f "$local_manifest" ]]; then
+    (cd "$local_tool_install" && find -P . -type f -print0 | sort -z | xargs -0 sha256sum) >"$local_manifest"
+  fi
+  sync_latencycheck_vm() {
+    local vm=$1 port=$((base_port + vm))
+    local remote_manifest="$remote_tool_install.manifest"
+    local staging="$remote_tool_install.new.$run_id"
+    local old="$remote_tool_install.old.$run_id"
+    local rsync_ssh port_arg
+    printf -v rsync_ssh 'ssh %q ' "${ssh_opts[@]}"
+    printf -v port_arg '%q' "$port"
+    rsync_ssh+="-p $port_arg"
+    scp "${ssh_opts[@]}" -P "$port" "$local_manifest" \
+      "root@127.0.0.1:$remote_manifest.new.$run_id" >/dev/null
+    if remote "$vm" "test -d '$remote_tool_install' && test -f '$remote_manifest' && cmp -s '$remote_manifest' '$remote_manifest.new.$run_id'"; then
+      remote "$vm" "rm -f '$remote_manifest.new.$run_id'"
+    else
+      remote "$vm" "mkdir -p '$(dirname "$remote_tool_install")' '$staging'"
+      rsync -a --delete -e "$rsync_ssh" "$local_tool_install/" \
+        "root@127.0.0.1:$staging/" >/dev/null
+      remote "$vm" "cd '$staging' && sha256sum --status -c '$remote_manifest.new.$run_id'" || {
+        remote "$vm" "rm -rf '$staging' '$remote_manifest.new.$run_id'"
+        return 1
+      }
+      remote "$vm" "rm -rf '$old'; if [ -d '$remote_tool_install' ]; then mv '$remote_tool_install' '$old'; fi; if mv '$staging' '$remote_tool_install'; then mv '$remote_manifest.new.$run_id' '$remote_manifest'; rm -rf '$old'; else rm -rf '$staging'; if [ -d '$old' ]; then mv '$old' '$remote_tool_install'; fi; rm -f '$remote_manifest.new.$run_id'; exit 1; fi"
+    fi
+    remote "$vm" "test -x '$remote_tool_install/bin/valgrind'"
     remote "$vm" "VALGRIND_LIB='$remote_tool_install/libexec/valgrind' '$remote_tool_install/bin/valgrind' --tool=latencycheck --version" >/dev/null
-  done
+  }
+  local -a pids=()
+  local vm status=0
+  for ((vm = 0; vm < vm_count; vm++)); do sync_latencycheck_vm "$vm" & pids+=("$!"); done
+  for vm in "${!pids[@]}"; do wait "${pids[$vm]}" || status=1; done
+  return "$status"
 }
 
 sync_guest_binary() {
@@ -160,15 +201,27 @@ sync_guest_binary() {
     echo "local config has no numeric fixed_value_size: $config" >&2
     exit 2
   }
-  for ((vm = 0; vm < vm_count; vm++)); do
+  sync_guest_binary_vm() {
+    local vm=$1 port=$((base_port + vm))
     kill_guest_suite "$suite" "$vm"
-    remote "$vm" "rm -f '$remote_root/build/e2e_${suite}'"
     remote "$vm" "mkdir -p '$remote_root/build'"
-    scp "${ssh_opts[@]}" -P "$((base_port + vm))" \
-      "$binary_dir/e2e_${suite}" "root@127.0.0.1:$remote_root/build/e2e_${suite}.new" >/dev/null
-    remote "$vm" "mv -f '$remote_root/build/e2e_${suite}.new' '$remote_root/build/e2e_${suite}'"
-    scp "${ssh_opts[@]}" -P "$((base_port + vm))" \
-      "$config" "root@127.0.0.1:$remote_config" >/dev/null
+    local remote_binary="$remote_root/build/e2e_${suite}"
+    local local_binary_sha remote_binary_sha
+    local_binary_sha=$(sha256sum "$binary_dir/e2e_${suite}" | awk '{print $1}')
+    remote_binary_sha=$(remote "$vm" "sha256sum '$remote_binary' 2>/dev/null | awk '{print \$1}'" || true)
+    if [[ "$local_binary_sha" != "$remote_binary_sha" ]]; then
+      scp "${ssh_opts[@]}" -P "$port" \
+        "$binary_dir/e2e_${suite}" "root@127.0.0.1:$remote_binary.new.$run_id" >/dev/null
+      remote "$vm" "test \"\$(sha256sum '$remote_binary.new.$run_id' | awk '{print \$1}')\" = '$local_binary_sha'; mv -f '$remote_binary.new.$run_id' '$remote_binary'"
+    fi
+    local config_sha remote_config_sha
+    config_sha=$(sha256sum "$config" | awk '{print $1}')
+    remote_config_sha=$(remote "$vm" "sha256sum '$remote_config' 2>/dev/null | awk '{print \$1}'" || true)
+    if [[ "$config_sha" != "$remote_config_sha" ]]; then
+      scp "${ssh_opts[@]}" -P "$port" \
+        "$config" "root@127.0.0.1:$remote_config.new.$run_id" >/dev/null
+      remote "$vm" "test \"\$(sha256sum '$remote_config.new.$run_id' | awk '{print \$1}')\" = '$config_sha'; mv -f '$remote_config.new.$run_id' '$remote_config'"
+    fi
     # Confirm sync landed (YCSB may previously leave 32/32 on the guest).
     local remote_value
     remote_value=$(remote "$vm" "grep -E '\"fixed_value_size\"[[:space:]]*:' '$remote_config' | head -1") || true
@@ -180,7 +233,12 @@ sync_guest_binary() {
       echo "guest config fixed_value_size differs after sync: vm=$vm guest='$guest_value' expected='$expected_value' line='$remote_value' config=$config" >&2
       exit 2
     fi
-  done
+  }
+  local -a pids=()
+  local vm status=0
+  for ((vm = 0; vm < vm_count; vm++)); do sync_guest_binary_vm "$vm" & pids+=("$!"); done
+  for vm in "${!pids[@]}"; do wait "${pids[$vm]}" || status=1; done
+  ((status == 0)) || return "$status"
   sync_latencycheck_prefix
 }
 

@@ -24,8 +24,18 @@ pool_init=${TIGONKV_POOL_INITER:-$build/cxl_pool_initer}
 shared_size_mb=${TIGONKV_SHARED_SIZE_MB:-$TIGONKV_SHARED_MB}
 shared_numa=${TIGONKV_SHARED_NUMA_NODE:-${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV_SHARED_NUMA%%,*}}}
 timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-600}}
+checker=${LATENCY_SIM_VALGRIND_CHECK:-OFF}
+load_policy=${TIGONKV_E2E_LOAD_POLICY:-per-round}
+run_id="${TIGONKV_E2E_RUN_ID:-manual-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+runtime_run_dir="${TIGONKV_E2E_RUNTIME_DIR:-$root/.tigon2/e2e/$run_id}"
+control_dir="$runtime_run_dir/ssh"
+mkdir -p "$control_dir"
+control_path="${TIGONKV_E2E_SSH_CONTROL_PATH:-$control_dir/%C}"
+local_tool_install="${TIGONKV_E2E_TRACE_TOOL_INSTALL:-$root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install}"
+remote_tool_install="$remote_root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"
 
 [[ -d "$trace_root" ]] || { echo "missing trace root: $trace_root" >&2; exit 2; }
+case "$load_policy" in per-workload|per-round|once) ;; *) echo "TIGONKV_E2E_LOAD_POLICY must be per-workload, per-round, or once" >&2; exit 2 ;; esac
 [[ -x "$runner" ]] || { echo "missing trace runner: $runner" >&2; exit 2; }
 [[ -x "$pool_init" ]] || { echo "build cxl_pool_initer first: $pool_init" >&2; exit 2; }
 [[ -f "$ssh_key" ]] || { echo "missing SSH key: $ssh_key" >&2; exit 2; }
@@ -37,7 +47,16 @@ timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-600}}
 }
 
 mkdir -p "$log_root"
-ssh_opts=(-i "$ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+ssh_opts=(-i "$ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$control_path")
+close_ssh_controlmasters() {
+  local vm
+  for ((vm = 0; vm < vm_count; vm++)); do
+    ssh "${ssh_opts[@]}" -O exit -p "$((base_port + vm))" root@127.0.0.1 >/dev/null 2>&1 || true
+  done
+  find -P "$control_dir" -maxdepth 1 -type s -delete 2>/dev/null || true
+}
+trap close_ssh_controlmasters EXIT
 remote() {
   local vm=$1
   shift
@@ -68,16 +87,59 @@ done"
 }
 
 sync_guest_runtime() {
-  local vm
-  for ((vm = 0; vm < vm_count; vm++)); do
+  sync_guest_runtime_vm() {
+    local vm=$1 port=$((base_port + vm))
     # Never attach a new runner while a previous livelocked process still owns
     # the shared MPSC rings.
     kill_guest_runners "$vm"
     remote "$vm" "mkdir -p '$remote_root/build'"
-    scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$runner" "root@127.0.0.1:$remote_runner.next" >/dev/null
-    remote "$vm" "mv -f '$remote_runner.next' '$remote_runner'"
-    scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$config" "root@127.0.0.1:$remote_config" >/dev/null
-  done
+    local runner_sha config_sha guest_sha
+    runner_sha=$(sha256sum "$runner" | awk '{print $1}')
+    guest_sha=$(remote "$vm" "sha256sum '$remote_runner' 2>/dev/null | awk '{print \$1}'" || true)
+    if [[ "$runner_sha" != "$guest_sha" ]]; then
+      scp "${ssh_opts[@]}" -P "$port" "$runner" "root@127.0.0.1:$remote_runner.new.$run_id" >/dev/null
+      remote "$vm" "test \"\$(sha256sum '$remote_runner.new.$run_id' | awk '{print \$1}')\" = '$runner_sha'; mv -f '$remote_runner.new.$run_id' '$remote_runner'"
+    fi
+    config_sha=$(sha256sum "$config" | awk '{print $1}')
+    guest_sha=$(remote "$vm" "sha256sum '$remote_config' 2>/dev/null | awk '{print \$1}'" || true)
+    if [[ "$config_sha" != "$guest_sha" ]]; then
+      scp "${ssh_opts[@]}" -P "$port" "$config" "root@127.0.0.1:$remote_config.new.$run_id" >/dev/null
+      remote "$vm" "test \"\$(sha256sum '$remote_config.new.$run_id' | awk '{print \$1}')\" = '$config_sha'; mv -f '$remote_config.new.$run_id' '$remote_config'"
+    fi
+  }
+  local -a pids=()
+  local vm status=0
+  for ((vm = 0; vm < vm_count; vm++)); do sync_guest_runtime_vm "$vm" & pids+=("$!"); done
+  for vm in "${!pids[@]}"; do wait "${pids[$vm]}" || status=1; done
+  ((status == 0)) || return "$status"
+  if [[ "$checker" == ON ]]; then
+    [[ -x "$local_tool_install/bin/valgrind" ]] || { echo "missing latencycheck prefix: $local_tool_install" >&2; return 1; }
+    sync_guest_tool_vm() {
+      local vm=$1 port=$((base_port + vm))
+      local staging="$remote_tool_install.new.$run_id" old="$remote_tool_install.old.$run_id"
+      local manifest="$runtime_run_dir/latencycheck.deploy.manifest"
+      if [[ ! -f "$manifest" ]]; then
+        manifest="$runtime_run_dir/latencycheck.manifest"
+        (cd "$local_tool_install" && find -P . -type f -print0 | sort -z | xargs -0 sha256sum) >"$manifest"
+      fi
+      scp "${ssh_opts[@]}" -P "$port" "$manifest" "root@127.0.0.1:$remote_tool_install.manifest.new.$run_id" >/dev/null
+      if remote "$vm" "test -d '$remote_tool_install' && test -f '$remote_tool_install.manifest' && cmp -s '$remote_tool_install.manifest' '$remote_tool_install.manifest.new.$run_id'"; then
+        remote "$vm" "rm -f '$remote_tool_install.manifest.new.$run_id'"
+      else
+        local rsync_ssh port_arg
+        printf -v rsync_ssh 'ssh %q ' "${ssh_opts[@]}"; printf -v port_arg '%q' "$port"; rsync_ssh+="-p $port_arg"
+        remote "$vm" "mkdir -p '$staging'"
+        rsync -a --delete -e "$rsync_ssh" "$local_tool_install/" "root@127.0.0.1:$staging/" >/dev/null
+        remote "$vm" "cd '$staging' && sha256sum --status -c '$remote_tool_install.manifest.new.$run_id'" || { remote "$vm" "rm -rf '$staging' '$remote_tool_install.manifest.new.$run_id'"; return 1; }
+        remote "$vm" "rm -rf '$old'; if [ -d '$remote_tool_install' ]; then mv '$remote_tool_install' '$old'; fi; if mv '$staging' '$remote_tool_install'; then mv '$remote_tool_install.manifest.new.$run_id' '$remote_tool_install.manifest'; rm -rf '$old'; else rm -rf '$staging'; if [ -d '$old' ]; then mv '$old' '$remote_tool_install'; fi; rm -f '$remote_tool_install.manifest.new.$run_id'; exit 1; fi"
+      fi
+      remote "$vm" "VALGRIND_LIB='$remote_tool_install/libexec/valgrind' '$remote_tool_install/bin/valgrind' --tool=latencycheck --version" >/dev/null
+    }
+    pids=(); status=0
+    for ((vm = 0; vm < vm_count; vm++)); do sync_guest_tool_vm "$vm" & pids+=("$!"); done
+    for vm in "${!pids[@]}"; do wait "${pids[$vm]}" || status=1; done
+    ((status == 0)) || return "$status"
+  fi
 }
 
 tigonkv_assert_host_test_isolated
@@ -87,9 +149,13 @@ sync_guest_runtime
 sync_traces() {
   local round=$1 workload=$2 phase=$3 vm worker trace remote_dir wl
   wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
-  for ((vm = 0; vm < vm_count; vm++)); do
-    remote_dir="$remote_root/ycsb-guest-traces/round$round/workload$wl/$phase"
-    remote "$vm" "mkdir -p '$remote_dir'"
+  sync_trace_vm() {
+    local vm=$1 port=$((base_port + vm))
+    local target="$remote_root/ycsb-guest-traces/round$round/workload$wl/$phase"
+    local stage="$target.new.$run_id" old="$target.old.$run_id"
+    local rsync_ssh port_arg
+    printf -v rsync_ssh 'ssh %q ' "${ssh_opts[@]}"; printf -v port_arg '%q' "$port"; rsync_ssh+="-p $port_arg"
+    remote "$vm" "mkdir -p '$stage'"
     for ((worker = 0; worker < threads_per_vm; worker++)); do
       if [[ "$phase" == load ]]; then
         trace="$trace_root/load/worker$((vm * threads_per_vm + worker)).txt"
@@ -97,9 +163,15 @@ sync_traces() {
         trace="$trace_root/workload${wl}/worker$((vm * threads_per_vm + worker)).txt"
       fi
       [[ -f "$trace" ]] || { echo "missing trace: $trace" >&2; exit 2; }
-      scp "${ssh_opts[@]}" -P "$((base_port + vm))" "$trace" "root@127.0.0.1:$remote_dir/worker$worker.txt" >/dev/null
+      rsync -a -e "$rsync_ssh" "$trace" "root@127.0.0.1:$stage/worker$worker.txt" >/dev/null
     done
-  done
+    remote "$vm" "rm -rf '$old'; if [ -d '$target' ]; then mv '$target' '$old'; fi; if mv '$stage' '$target'; then rm -rf '$old'; else rm -rf '$stage'; if [ -d '$old' ]; then mv '$old' '$target'; fi; exit 1; fi"
+  }
+  local -a pids=()
+  local vm status=0
+  for ((vm = 0; vm < vm_count; vm++)); do sync_trace_vm "$vm" & pids+=("$!"); done
+  for vm in "${!pids[@]}"; do wait "${pids[$vm]}" || status=1; done
+  ((status == 0)) || return "$status"
 }
 
 pool_reset() {
@@ -132,7 +204,12 @@ run_fixed() {
   [[ -n "$scan_max_key" ]] && scan_env="$scan_env TIGONKV_E2E_SCAN_MAX_KEY='$scan_max_key'"
   [[ -n "$test_value_hex" ]] && scan_env="$scan_env TIGONKV_E2E_TEST_VALUE_HEX='$test_value_hex'"
   scan_env="$scan_env TIGONKV_E2E_REQUIRE_GET_FOUND=$require_get_found"
-  local command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed '$remote_runner'"
+  local command
+  if [[ "$checker" == ON ]]; then
+    command="env VALGRIND_LIB='$remote_tool_install/libexec/valgrind' TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck '$remote_runner'"
+  else
+    command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed '$remote_runner'"
+  fi
   # Pre-create the log so the host wait loop never races rg against ENOENT.
   : >"$log"
   timeout "$timeout_sec" ssh "${ssh_opts[@]}" -p "$((base_port + vm))" "root@127.0.0.1" "$command" >>"$log" 2>&1
@@ -278,14 +355,28 @@ for ((round = 1; round <= rounds; round++)); do
     echo "at least one YCSB workload is required" >&2
     exit 2
   }
-  # Load once per round, then run every selected workload against the same
-  # populated dataset. Selecting A and E must not silently perform a second
-  # load/reset between them.
-  first_workload=$(printf '%s' "${selected_workloads[0]}" | tr '[:upper:]' '[:lower:]')
-  pool_reset
-  run_ycsb_phase "$round" "$first_workload" load
-  for workload in "${selected_workloads[@]}"; do
-    wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
-    run_ycsb_phase "$round" "$wl" run
-  done
+  if [[ "$load_policy" == once && "$round" -gt 1 ]]; then
+    for workload in "${selected_workloads[@]}"; do
+      wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
+      run_ycsb_phase "$round" "$wl" run
+    done
+  elif [[ "$load_policy" == per-workload ]]; then
+    for workload in "${selected_workloads[@]}"; do
+      wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
+      pool_reset
+      run_ycsb_phase "$round" "$wl" load
+      run_ycsb_phase "$round" "$wl" run
+    done
+  else
+    # Existing trace workflow semantics: one reset/load per round, then all
+    # selected workloads consume that dataset. `once` keeps the first round's
+    # dataset for subsequent rounds.
+    first_workload=$(printf '%s' "${selected_workloads[0]}" | tr '[:upper:]' '[:lower:]')
+    if [[ "$load_policy" != once || "$round" == 1 ]]; then pool_reset; fi
+    run_ycsb_phase "$round" "$first_workload" load
+    for workload in "${selected_workloads[@]}"; do
+      wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
+      run_ycsb_phase "$round" "$wl" run
+    done
+  fi
 done
