@@ -1,5 +1,18 @@
 # TigonKV trace runner
 
+用户从 `scripts/e2e/run_vm_trace.sh` 进入 trace/YCSB；本文件描述被 canonical 入口调用的
+内部 runner。统一 CLI 使用 `--config` 表示实验拓扑、`--trace-config` 表示 trace 配置，
+`--record-count` 是集群 load record 总数，`--operation-count` 是 UPDATE 展开前逻辑请求数。
+准备阶段示例：
+
+```bash
+bash scripts/e2e/run_vm_trace.sh --execute --prepare-only --profile native \
+  --config experiment_config.jsonc --trace-config tests/fixtures/multivm_trace_config.jsonc \
+  --record-count 4096 --operation-count 4096 --trace-workers-per-vm 4 \
+  --workloads workloada --load-policy per-round --rounds 1 \
+  --out-dir exp_data/trace_runs/<new-run>
+```
+
 Trace files use the cxlkv-compatible records `OP KEY_LEN LEN KEY`, where `KEY` is
 parsed by byte length. `PUT` uses `LEN` as value length; `GET` and `DELETE` require
 zero; `SCAN` uses `LEN` as its limit. `e2e_trace_runner` reads one file per worker
@@ -21,7 +34,8 @@ barrier directory must be fresh for each run. Finished foreground workers contin
 serve their own inbox until that barrier, so an unbound control thread never polls a
 worker-local queue.
 
-`run_guest_ycsb_workflows.sh` is the formal four-VM workflow. It assumes the cxlkv-style
+`run_guest_ycsb_workflows.sh` is an internal four-VM workflow called by
+`scripts/e2e/run_vm_trace.sh`. It assumes the cxlkv-style
 ivshmem server is already running, with `/dev/ivpci0` present in every guest, and uses
 SSH forwarding on ports 10022--10025. It initializes the host backing on shared NUMA
 node 1 before each workload, runs VM0's load with reset, attaches the other VMs in
@@ -44,7 +58,7 @@ hardware. The script's pass markers cover replay only; initialization and SSH/fi
 synchronization are outside workload timing.
 
 For cxlkv-style multi-VM e2e08/e2e09, use
-`scripts/e2e/run_guest_e2e_workflows.sh`. It launches one independent process per VM
+`scripts/e2e/run_vm_e2e.sh`. It launches one independent process per VM
 and four worker threads per process by default, with e2e08 phases
 `fill/read` and e2e09 phases `fill/update/read`. The default binary
 directory is `build-relwithdebinfo-ninja-clang18-co_off` (CTest / guest scripts), and each round starts with a
@@ -57,8 +71,7 @@ cmake --build build-relwithdebinfo-ninja-clang18-co_off -j"$(nproc)"
 Legacy alias `build-rel` is not the formal path.
 
 ```sh
-TIGONKV_VM_COUNT=4 TIGONKV_E2E_THREADS=4 \
-  scripts/e2e/run_guest_e2e_workflows.sh \
-  /mnt/xz_vm_storage/tigon2-formal-20260718/multivm-e2e-rel-5rounds \
-  5 '08 09'
+bash scripts/e2e/run_vm_e2e.sh --execute --profile native --suite 08 \
+  --config experiment_config.jsonc --rounds 1 --record-count 4096 \
+  --out-dir exp_data/e2e08_runs/<new-run>
 ```

@@ -61,6 +61,28 @@ NUMA1。
 
 ## 构建和测试
 
+### 统一 VM/trace 入口
+
+公开入口只有 `scripts/e2e/run_vm_e2e.sh` 和 `scripts/e2e/run_vm_trace.sh`。两者从脚本
+位置解析仓库根；不传 `--execute` 时只打印 plan。checker 入口自动选择本项目 build、pool
+tool、latencycheck prefix 和 `VALGRIND_LIB`，固定 Debug/O0、compile-on、checker ON、
+`LATENCY_SIM_E2E_NDEBUG=ON`、`extra_check=false`、suite 08、单轮：
+
+```bash
+bash scripts/e2e/run_vm_e2e.sh --execute --profile latencycheck --suite 08 \
+  --config experiment_config.jsonc --rounds 1 --record-count 4096 \
+  --out-dir exp_data/e2e08_runs/<new-run>
+bash scripts/e2e/run_vm_trace.sh --execute --prepare-only --profile native \
+  --config experiment_config.jsonc --trace-config tests/fixtures/multivm_trace_config.jsonc \
+  --record-count 4096 --operation-count 4096 --trace-workers-per-vm 4 \
+  --workloads workloada --load-policy per-round --rounds 1 \
+  --out-dir exp_data/trace_runs/<new-run>
+```
+
+`--record-count` 和 `--operation-count` 都是集群总量；后者是 UPDATE 展开前逻辑请求数。
+配置中的 `shared_memory.backing_path` 是宿主机精确 backing 文件，
+`shared_memory.device_path` 是 guest 字符设备；不得再用一个 path 字段表达两者。
+
 标准工具链入口：`clang-18`/`clang++-18`（调用者显式指定其它编译器时保留其选择，
 GCC 仍可用，此时 LTO 使用 `-flto`），Ninja 生成器（命令中显式 `-G Ninja`），
 检测到 `ccache` 时自动作为 compiler launcher。单配置构建未指定

@@ -16,7 +16,7 @@ usage() {
 Usage: run_e2e_ycsb_rounds.sh [options]
 
 Run the only §6.3.1 e2e_ycsb entry: 100k load + 100k workload A traces.
-  --traces DIR      Output of prepare_e2e_ycsb_traces.sh.
+  --traces DIR      Prepared load/workload trace directory.
   --config FILE     TigonKV experiment config.
   --logs DIR        Per-round runner logs.
   --rounds N        Consecutive rounds (default: 10).
@@ -42,7 +42,7 @@ for value in "$rounds" "$vms"; do
 done
 [[ -f $config ]] || { echo "missing config: $config" >&2; exit 2; }
 [[ -d $traces/load && -d $traces/workloada ]] || {
-  echo "missing load/workloada traces; run prepare_e2e_ycsb_traces.sh first" >&2; exit 2;
+  echo "missing load/workloada traces; prepare them through scripts/e2e/run_vm_trace.sh first" >&2; exit 2;
 }
 mkdir -p "$logs"
 for ((round = 1; round <= rounds; ++round)); do

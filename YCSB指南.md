@@ -1,7 +1,9 @@
 # TigonKV YCSB / trace 指南
 
-本指南只覆盖当前 TigonKV fixed-latency-only 路径。YCSB trace、镜像、backing、日志和
-结果必须由本仓库独立生成；不得读取其它项目的构建目录或实验产物。
+本指南只覆盖当前 TigonKV fixed-latency-only 路径。公开 YCSB/trace 入口是
+`scripts/e2e/run_vm_trace.sh`；YCSB trace、镜像、backing、日志和
+结果必须由本仓库独立生成；不得读取其它项目的构建目录或实验产物。项目内部的
+trace generator/workflow 只由 canonical 入口调用。
 
 默认设备是 CloudLab R6525 2-NUMA，根 `experiment_config.jsonc` 已按 VM NUMA0、共享
 内存 NUMA1 配置。其它拓扑必须通过本仓独立配置显式选择。
@@ -66,12 +68,12 @@ shared backing，才允许进入其它项目。
 
 1. `unit_tests --config-only`、`latency_modes_test`、`hardware_sim_disabled_benchmark`
    和非 VM CTest 全通过。
-2. 运行一轮无延迟代表性 trace，验证 load/run/pass marker、操作数和业务结果。
+2. 通过 `scripts/e2e/run_vm_trace.sh` 运行一轮无延迟代表性 trace，验证 load/run/pass marker、操作数和业务结果。
 3. 用临时非零 fixed-latency 配置跑小型 canary，覆盖前台操作、CXL receive/RPC
    background scope，确认无卡死、无共享统计输出和 clean shutdown。
-4. 需要 YCSB 工作负载时使用仓库现有 `prepare_e2e_ycsb_traces.sh`、
-   `run_e2e_ycsb_rounds.sh` 或 `scripts/e2e_trace/*` 入口，并保留本轮生成的简短
-   machine-readable 摘要；不要默认跑无关的 10 轮性能矩阵。
+4. 需要 YCSB 工作负载时只从 `scripts/e2e/run_vm_trace.sh` 进入；内部 trace generator、
+   VM workflow 和 summarizer 由该入口调用。保留本轮生成的简短 machine-readable 摘要；
+   不要默认跑无关的 10 轮性能矩阵。
 
 正式报告必须写明：构建类型、4VM/每 VM worker 数、demuxer 数、NUMA/容量、固定延迟
 参数、trace 来源、warmup/计时窗口、无延迟和 canary 的 wall time，以及 VM 是否由
