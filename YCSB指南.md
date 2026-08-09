@@ -31,9 +31,9 @@ cmake --build build-relwithdebinfo-ninja-clang18-co_on -j2
 ```
 
 compile-off 构建下 wrapper 编译为原始操作、scope 为 no-op、消费者不解析配置/不注册
-pool/不校准 TSC/不初始化清理 simulator。实验封装 `tigonkv_run_ycsb_experiment.sh`
-只接受精确的 `--latency-sim-compile-off=ON|OFF`，并分别使用上述两个构建目录；脚本会
-在构建目录写入 fixed-latency-only 契约 stamp，`--skip-build` 会校验该 stamp。
+ pool/不校准 TSC/不初始化清理 simulator。实验准备和执行统一由
+`scripts/e2e/run_vm_trace.sh` 完成；该入口从 profile 推导构建和工具路径，并校验
+fixed-latency-only 契约与 prepared state。
 `fixed_latency_nonzero` 元数据按生成配置的
 `swcc_fixed_ns_per_line`/`hwcc_fixed_ns_per_line` 是否非零判定。
 
