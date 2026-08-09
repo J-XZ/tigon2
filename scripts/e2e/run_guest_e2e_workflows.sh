@@ -34,6 +34,10 @@ remote_tool_install="$remote_root/thirdparty_libs/latency_sim/.latency_sim/laten
 [[ "$vm_count" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_VM_COUNT must be positive" >&2; exit 2; }
 [[ "$threads" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_E2E_THREADS must be positive" >&2; exit 2; }
 [[ "$rounds" =~ ^[1-9][0-9]*$ ]] || { echo "rounds must be positive" >&2; exit 2; }
+if [[ "$checker" == ON && "$rounds" != 1 ]]; then
+  echo "latencycheck E2E requires exactly one round" >&2
+  exit 2
+fi
 [[ "$vm_count" == 4 && "$threads" == 4 ]] || {
   echo "cxlkv-aligned guest e2e requires 4 VMs × 4 threads (got ${vm_count}×${threads})" >&2
   exit 2
