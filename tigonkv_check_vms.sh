@@ -8,9 +8,9 @@ tigonkv_assert_host_test_isolated
 tigonkv_assert_qemu_group expected
 
 [[ -e "$TIGONKV_SHARED_BACKING" ]] || { echo "shared backing missing: $TIGONKV_SHARED_BACKING" >&2; exit 2; }
-mountpoint -q -- "$TIGONKV_SHARED_PATH" || { echo "shared_memory.path is not a mountpoint: $TIGONKV_SHARED_PATH" >&2; exit 2; }
+mountpoint -q -- "$TIGONKV_SHARED_PATH" || { echo "shared_memory.backing_path parent is not a mountpoint: $TIGONKV_SHARED_PATH" >&2; exit 2; }
 fstype=$(findmnt -n -T "$TIGONKV_SHARED_PATH" -o FSTYPE 2>/dev/null || true)
-[[ "$fstype" == "tmpfs" ]] || { echo "shared_memory.path fstype=$fstype (expected tmpfs)" >&2; exit 2; }
+[[ "$fstype" == "tmpfs" ]] || { echo "shared_memory.backing_path parent fstype=$fstype (expected tmpfs)" >&2; exit 2; }
 opts=$(findmnt -n -T "$TIGONKV_SHARED_PATH" -o OPTIONS 2>/dev/null || true)
 # tmpfs mpol may appear as mpol=bind:1 or mpol=bind:0,1
 echo "$opts" | grep -q "mpol=bind:" || { echo "shared tmpfs missing mpol=bind (opts=$opts)" >&2; exit 2; }

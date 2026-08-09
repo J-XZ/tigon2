@@ -72,7 +72,7 @@ values={
  'TIGONKV_VM_NUMA': ','.join(map(str, vm_numa)),
  'TIGONKV_VM_NUMA_PRIMARY': str(vm_numa[0]),
  'TIGONKV_SSH_BASE_PORT': override('TIGONKV_CONFIG_SSH_BASE_PORT', ssh_port),
- 'TIGONKV_SHARED_PATH': require('shared_memory.path', override('TIGONKV_CONFIG_SHARED_PATH', get('shared_memory','path'))),
+ 'TIGONKV_SHARED_BACKING': require('shared_memory.backing_path', get('shared_memory','backing_path')),
  'TIGONKV_SHARED_MB': require('shared_memory.size_mb', get('shared_memory','size_mb')),
  'TIGONKV_SHARED_NUMA': ','.join(map(str, shared_numa)),
  'TIGONKV_SHARED_NUMA_PRIMARY': str(shared_numa[0]),
@@ -85,13 +85,14 @@ values={
  'TIGONKV_LOCAL_SSH_PUB_KEY': get('vm', 'local_ssh_pub_key', default=''),
  'TIGONKV_COPY_ROOT_IMG': '1' if get('vm', 'copy_root_img', default=False) else '0',
 }
+values['TIGONKV_SHARED_PATH'] = os.path.dirname(values['TIGONKV_SHARED_BACKING'])
 for key, value in values.items():
     print(f'{key}={shlex.quote(str(value))}')
 PY
 )"
   # Compatibility alias used by some guest/orchestration scripts.
   TIGONKV_VM_SSH_BASE_PORT=${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}
-  TIGONKV_SHARED_BACKING="${TIGONKV_SHARED_PATH%/}/ivshmem_shared_mem"
+  : "TIGONKV_SHARED_BACKING is the exact configured backing file"
 }
 
 tigonkv_validate_vm_config() {

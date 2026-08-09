@@ -146,7 +146,7 @@ tigonkv_setup_shared_memory() {
   local mount_size_mb=$((size_mb + 100))
   local backing=$TIGONKV_SHARED_BACKING
 
-  [[ -f "$path" ]] && { echo "shared_memory.path is a file, expected directory: $path" >&2; return 2; }
+  [[ -f "$path" ]] && { echo "shared_memory.backing_path parent is a file: $path" >&2; return 2; }
   mkdir -p "$path"
 
   if mountpoint -q -- "$path"; then

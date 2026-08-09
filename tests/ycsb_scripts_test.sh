@@ -12,7 +12,7 @@ python3 - "$tmp/out/configs/experiment_config_ycsb_4vm.jsonc" "$tmp/out/run_meta
 import json, sys
 d=json.load(open(sys.argv[1]))
 root=sys.argv[3]
-assert d['shared_memory']['path'] == '/mnt/xz_shared_mem'
+assert d['shared_memory']['backing_path'] == '/mnt/xz_shared_mem/ivshmem_shared_mem'
 assert d['shared_memory']['numa_node'] == [1]
 assert d['vm']['numa_node'] == [0]
 assert d['vm']['ssh_base_port'] == 10022
@@ -38,11 +38,11 @@ expected_fl = {
 }
 assert meta['fixed_latency'] == expected_fl
 assert meta['latency_sim_compile_off'] == 'OFF'
-assert meta['build_dir'].endswith('/build-relwithdebinfo-ninja-clang18-co_off')
+assert meta['build_dir'].endswith('/build-relwithdebinfo-ninja-clang18-co_off-check_off-ndebug_off')
 import re
 assert re.fullmatch(r'[0-9a-f]{40}', meta['parent_sha']), meta['parent_sha']
 assert re.fullmatch(r'[0-9a-f]{40}', meta['latency_sim_gitlink']), meta['latency_sim_gitlink']
-assert len(meta['source_state'].split(':')) == 5, meta['source_state']
+assert len(meta['source_state']) == 64 and all(c in '0123456789abcdef' for c in meta['source_state']), meta['source_state']
 assert 'generated_config_sha256' in meta and len(meta['generated_config_sha256']) == 64
 reproduce = meta['reproduce_command']
 assert reproduce.startswith('bash ' + repr(root) +
@@ -89,7 +89,7 @@ e2e_workflow="$root/scripts/e2e/run_guest_e2e_workflows.sh"
 ! rg -q 'killall .*e2e_' "$e2e_workflow"
 rg -q 'kill_guest_suite' "$e2e_workflow"
 rg -Fq 'for proc in /proc/[0-9]*' "$e2e_workflow"
-rg -Fq 'readlink \"\$proc/exe\"' "$e2e_workflow"
+rg -q 'cmd=.*proc/cmdline' "$e2e_workflow"
 # A guest that finishes replay first must keep servicing peer transport until
 # every VM reaches replay_done.
 rg -q 'TIGONKV_E2E_RELEASE_FILE=' "$guest_workflow"

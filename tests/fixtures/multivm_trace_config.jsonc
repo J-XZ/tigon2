@@ -1,7 +1,7 @@
 {
   "shared_memory": {
     "size_mb": 64,
-    "path": "/tmp/tigonkv-multivm-trace-backing",
+    "backing_path": "/tmp/tigonkv-multivm-trace-backing",
     "device_path": "/dev/ivpci0",
     "hwcc": { "offset_mb": 0, "size_mb": 32 },
     "swcc": { "offset_mb": 32, "size_mb": 32 }

@@ -580,7 +580,7 @@ void ParseStrictLatencyConfig(std::string_view text, std::string_view raw_text,
     }
   };
   reject_child_members("shared_memory",
-                       {"size_mb", "path", "device_path", "numa_node",
+                       {"size_mb", "backing_path", "device_path", "numa_node",
                         "hwcc", "swcc"});
   for (const auto &root_member : root) {
     if (root_member.key != "shared_memory" ||
@@ -755,7 +755,7 @@ Config Config::FromJsonc(const std::string &path) {
                          std::istreambuf_iterator<char>());
     const std::string text = StripJsonComments(raw_text);
     Config c;
-    JsonString(text, "path", &c.shared_memory_path);
+    JsonString(text, "backing_path", &c.shared_memory_path);
     JsonString(text, "device_path", &c.device_path);
     JsonNumber(text, "size_mb", &c.size_mb);
     JsonNumberOrFirstArrayInObject(text, "shared_memory", "numa_node", &c.shared_memory_numa_node);
@@ -788,8 +788,6 @@ Config Config::FromJsonc(const std::string &path) {
     JsonNumberInObject(text, "swcc", "size_mb", &c.swcc_size_mb);
     ParseStrictLatencyConfig(text, raw_text, &c);
     ParsePartitioningConfig(text, &c);
-    if (c.shared_memory_path == "/mnt/xz_shared_mem" || c.shared_memory_path == "/mnt/xz_shared_mem/")
-      c.shared_memory_path = "/mnt/xz_shared_mem/ivshmem_shared_mem";
     struct stat device_stat {};
     if (!c.device_path.empty() && ::stat(c.device_path.c_str(), &device_stat) == 0 &&
         S_ISCHR(device_stat.st_mode)) {

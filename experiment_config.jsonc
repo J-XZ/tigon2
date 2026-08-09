@@ -19,7 +19,7 @@
       "offset_mb": 1024,
       "size_mb": 31744
     },
-    "path": "/mnt/xz_shared_mem",
+    "backing_path": "/mnt/xz_shared_mem/ivshmem_shared_mem",
     "device_path": "/dev/ivpci0",
     "numa_node": [
       1
