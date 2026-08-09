@@ -32,8 +32,8 @@ flush/invalidate/writeback 和业务 runtime/memory accounting 仍保留，因�
 compile-on（默认）下模拟器被编译进去，配置完成后始终参与；`LATENCY_SIM_COMPILE_OFF=ON`
 是唯一无模拟代码方式——wrapper 编译为原始操作、scope 为 no-op、消费者不解析配置/
 不注册 pool/不校准 TSC/不初始化清理 simulator。固定延迟公共实现来自固定 Git 子模块
-`thirdparty_libs/latency_sim`（最终 gitlink
-`502d8543d4834e9eaecb2db86c3f7a354332b2d8`，`my-work` 分支）；Tigon 的改动只在
+`thirdparty_libs/latency_sim`（三个消费者同步使用同一个最终 gitlink，`my-work`
+分支）；Tigon 的改动只在
 `my-work` 分支本地提交，不 push。
 详细规则见 [硬件模拟当前实现.md](硬件模拟当前实现.md)。
 
@@ -72,6 +72,8 @@ GCC 仍可用，此时 LTO 使用 `-flto`），Ninja 生成器（命令中显式
 Debug:          -O0 -g3，无 -march=native，无 LTO
 RelWithDebInfo: -O3 -g3 -march=native，编译和最终链接均 -flto=full，保留 -DNDEBUG
 Release:        -O3 -march=native，编译和最终链接均 -flto=full，保留 -DNDEBUG
+Checker E2E:    Debug/O0/compile-on/checker-on，额外定义 -DNDEBUG；runtime 使用
+                verbose=false、extra_check=false。
 ```
 
 配置阶段执行 full-LTO 能力检查，工具链不支持时明确失败而不是静默降级。默认不强制
@@ -101,12 +103,13 @@ cmake -S . -B build-relwithdebinfo-ninja-clang18-co_on -G Ninja \
   -DLATENCY_SIM_COMPILE_OFF=ON
 cmake --build build-relwithdebinfo-ninja-clang18-co_on -j2
 
-# latencycheck 只允许独立的 Debug+O0 consumer；不得用 RelWithDebInfo/Release。
+# latencycheck 只允许独立的 Debug+O0/NDEBUG consumer；不得用 RelWithDebInfo/Release。
 # clang-18 checker 额外使用 DWARF-4 以兼容 Valgrind 3.18.1。
 cmake -S . -B build-debug-ninja-clang18-co_off-check_on -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
   -DLATENCY_SIM_COMPILE_OFF=OFF \
-  -DLATENCY_SIM_VALGRIND_CHECK=ON
+  -DLATENCY_SIM_VALGRIND_CHECK=ON \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 cmake --build build-debug-ninja-clang18-co_off-check_on --target e2e_08 cxl_pool_initer -j2
 ```
 
@@ -117,11 +120,9 @@ cmake --build build-debug-ninja-clang18-co_off-check_on --target e2e_08 cxl_pool
 transport ring、shared-payload bulk）。正式 fixed-latency 运行使用
 `RelWithDebInfo`、`verbose=false`、`extra_check=false` 和成功 TSC 校准。
 
-本轮四仓库任务对消费者只执行一轮 E2E08 和最小必要定向测试；checker 首次发现
-mismatch 时立即终止同轮 guest，不为追求 `CHECK_CLEAN` 追加多轮修复业务插桩缺口。
-Tigon2 V11 的专属 VM 结果为 `CHECKER_WORKING_MISMATCH_FOUND`：VM0 在 init 的
-checkpoint=1 首错，`target_accesses=2279282`、`expectations=6`、`checkpoints=1`，
-并以 `cleanup_status=0` 终止 VM1–3；完整摘要见 [验证证据.md](验证证据.md)。
+每次 checker invocation 只执行一轮 E2E08；checker 首次发现 mismatch 时立即终止
+同轮 guest。完整验收使用多个独立新输出目录累计 clean，并另行完成较大规模复核；历史
+V11 目录仅作为诊断参考，不构成当前 `CHECK_CLEAN` 证据，摘要见 [验证证据.md](验证证据.md)。
 
 4VM trace 入口和 YCSB 约定见 [YCSB指南.md](YCSB指南.md)。正式报告应披露
 `foreground=4 + demuxer=1`、NUMA/容量、固定延迟参数、trace、计时窗口以及本地

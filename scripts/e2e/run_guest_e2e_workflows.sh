@@ -16,6 +16,9 @@ case "$checker" in
 esac
 build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker")
 binary_dir=${TIGONKV_E2E_BINARY_DIR:-$build}
+if [[ "$checker" == ON ]]; then
+  tigonkv_verify_checker_compile_contract "$build"
+fi
 log_root=${1:?usage: $0 LOG_ROOT [ROUNDS] [SUITES]}
 rounds=${2:-${TIGONKV_E2E_ROUNDS:-10}}
 suites=${3:-${TIGONKV_E2E_SUITES:-"08 09"}}

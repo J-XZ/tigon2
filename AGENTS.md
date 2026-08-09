@@ -84,8 +84,8 @@ unconfigured 态且两个 range 均已注册）；shutdown 在静默边界清空
 no-op、消费者不解析 fixed-latency 配置（也不要求配置中存在该外层对象）/不注册
 pool/不校准 TSC/不初始化与清理 simulator；OFF（默认）则模拟器被
 编译进去，配置完成后始终参与。私有 `TIGONKV_DISABLE_HARDWARE_SIMULATION` 已删除。
-固定延迟公共实现来自固定子模块 `thirdparty_libs/latency_sim`
-（最终 gitlink `502d8543d4834e9eaecb2db86c3f7a354332b2d8`），
+固定延迟公共实现来自固定子模块 `thirdparty_libs/latency_sim`；三个消费者最终
+同步到同一个 gitlink，
 本仓只保留 `mem_access.h` 薄适配、生命周期与 scope 分类。
 
 ## 修改和验证
@@ -99,10 +99,10 @@ pool/不校准 TSC/不初始化与清理 simulator；OFF（默认）则模拟器
 - VM 测试只能使用本仓库的 `tigonkv_kill_vms.sh`、`tigonkv_init_vms.sh`、镜像、配置、
   二进制和 trace。测试前停止并核对所有项目的 QEMU/ivshmem/PID，再用本项目专属的
   storage、shared backing、端口和运行目录创建干净 4VM，不清理或复用其它项目资源。
-- 本轮消费者验收只跑一轮 E2E08 checker 和最小必要定向测试；首次 mismatch 立即中止，
-  不追加多轮运行修复业务插桩缺口。固定 canary 不导出
+- 每次 E2E08 checker invocation 只跑一轮；首次 mismatch 立即中止，修复后以新的独立
+  invocation 继续验收并累计 clean。固定 canary 不导出
   访问计数，不输出模拟统计。
-- E2E08 checker 只接受 `compile-on + Debug + O0 + rounds=1 + suite=08`；runner 对
+- E2E08 checker 只接受 `compile-on + Debug + O0 + NDEBUG + rounds=1 + suite=08`；runner 对
   `CHECK_CLEAN`、`CHECKER_WORKING_MISMATCH_FOUND` 和 `HARNESS_INVALID` 三态严格分流。
   首个 guest 进程非零退出后，只调用本项目的精确 runner cleanup，停止其它本轮 VM，保留
   首错日志，不把业务缺口伪装成 harness 修复。

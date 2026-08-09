@@ -1,7 +1,7 @@
 # Third-party notices
 
-固定延迟实现来自固定 Git 子模块 `thirdparty_libs/latency_sim`（gitlink
-`502d8543d4834e9eaecb2db86c3f7a354332b2d8`，`my-work` 分支），Apache-2.0 与
+固定延迟实现来自固定 Git 子模块 `thirdparty_libs/latency_sim`（三个消费者最终
+同步使用同一个 gitlink，`my-work` 分支），Apache-2.0 与
 NOTICE 随子模块分发（`thirdparty_libs/latency_sim/LICENSE`、
 `thirdparty_libs/latency_sim/NOTICE`）。本仓只保留项目薄适配（mem_access.h、
 KVEngine 生命周期与 scope 分类），运行时不依赖其它兄弟仓库。

@@ -34,6 +34,9 @@ tigonkv_e2e_multivm_preflight() {
   export TIGONKV_E2E_BINARY_DIR="$build"
   export TIGONKV_E2E_COMPILE_OFF="$compile_off"
   export TIGONKV_E2E_LATENCYCHECK="$checker"
+  if [[ "$checker" == ON ]]; then
+    tigonkv_verify_checker_compile_contract "$build"
+  fi
   export TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$build/cxl_pool_initer}"
   export TIGONKV_E2E_TRACE_RUNNER="${TIGONKV_E2E_TRACE_RUNNER:-$build/e2e_trace_runner}"
   # Multi-VM e2e_08/09 require fixed_value_size=1000. Default to the e2e overlay

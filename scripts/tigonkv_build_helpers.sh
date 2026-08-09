@@ -90,6 +90,69 @@ tigonkv_verify_cmake_cache() {
   return 0
 }
 
+# Verify the actual Debug/O0/NDEBUG checker participant commands.  The cache
+# contract alone cannot prove that a target-local option reached the command
+# line, so inspect compile_commands.json for the project, pool initializer and
+# public latency_sim sources that enter the guest artifacts.
+tigonkv_verify_checker_compile_contract() {
+  local build_dir="$1"
+  [[ -f "$build_dir/CMakeCache.txt" ]] || {
+    echo "tigonkv_build_helpers: missing checker CMakeCache.txt: $build_dir" >&2
+    return 1
+  }
+  grep -q '^CMAKE_BUILD_TYPE:STRING=Debug$' "$build_dir/CMakeCache.txt" || {
+    echo "tigonkv_build_helpers: checker build is not Debug: $build_dir" >&2
+    return 1
+  }
+  grep -q '^LATENCY_SIM_COMPILE_OFF:BOOL=OFF$' "$build_dir/CMakeCache.txt" || {
+    echo "tigonkv_build_helpers: checker build is not compile-on: $build_dir" >&2
+    return 1
+  }
+  grep -q '^LATENCY_SIM_VALGRIND_CHECK:BOOL=ON$' "$build_dir/CMakeCache.txt" || {
+    echo "tigonkv_build_helpers: checker build is not latencycheck-enabled: $build_dir" >&2
+    return 1
+  }
+  [[ -f "$build_dir/compile_commands.json" ]] || {
+    echo "tigonkv_build_helpers: checker build has no compile_commands.json: $build_dir" >&2
+    return 1
+  }
+  python3 - "$build_dir/compile_commands.json" <<'PY'
+import json
+import pathlib
+import shlex
+import sys
+
+rows = json.load(open(sys.argv[1], encoding="utf-8"))
+selected = []
+for row in rows:
+    path = pathlib.PurePosixPath(row["file"].replace("\\", "/"))
+    text = str(path)
+    if ("/kv/" in text or "/core/" in text or "/common/" in text or
+            "/protocol/" in text or text.endswith("/tests/e2e_08.cpp") or
+            text.endswith("/tools/cxl_pool_initer.cpp") or
+            "/thirdparty_libs/latency_sim/src/" in text):
+        selected.append((text, shlex.split(row["command"])))
+
+if not selected:
+    raise SystemExit("checker compile contract selected no participant commands")
+errors = []
+for path, argv in selected:
+    flags = set(argv)
+    if "-O0" not in flags:
+        errors.append(f"{path}: missing -O0")
+    if "-DNDEBUG" not in flags:
+        errors.append(f"{path}: missing -DNDEBUG")
+    forbidden = sorted(flag for flag in flags if (
+        flag in {"-O1", "-O2", "-O3", "-UNDEBUG", "-DTBB_USE_DEBUG"} or
+        flag.startswith("-flto")))
+    if forbidden:
+        errors.append(f"{path}: forbidden {' '.join(forbidden)}")
+if errors:
+    raise SystemExit("checker compile contract failed:\n" + "\n".join(errors))
+print(f"checker compile contract OK participant_commands={len(selected)}")
+PY
+}
+
 # Stable hash of the parent repo HEAD, tracked/untracked working-tree content
 # and submodule state, so a dirty or stale source tree can never be reused.
 tigonkv_source_state() {

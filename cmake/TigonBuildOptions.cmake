@@ -118,6 +118,7 @@ endfunction()
 #   RelWithDebInfo:-O3 -g3 -march=native, -flto=full (GCC: -flto), -DNDEBUG
 #   Release:       -O3 -march=native, -flto=full (GCC: -flto),
 #                  -DNDEBUG
+#   Checker Debug: -O0 -g3, compile-on, checker-on, NDEBUG
 function(tigonkv_apply_target_build_policy target_name)
   if(LATENCY_SIM_COMPILE_OFF STREQUAL "ON")
     target_compile_definitions(${target_name} PRIVATE LATENCY_SIM_COMPILE_OFF)
@@ -138,6 +139,9 @@ function(tigonkv_apply_target_build_policy target_name)
     # DWARF-4 keeps the Debug+O0 checker artifact readable without changing
     # the production build policy.
     target_compile_options(${target_name} PRIVATE -O0 -g3 -gdwarf-4)
+    # Checker E2E must use the Debug/O0 code shape without Debug-only
+    # assertions or validation statements in its access stream.
+    target_compile_definitions(${target_name} PRIVATE NDEBUG)
   endif()
   if(TIGONKV_ENABLE_FRAME_POINTERS)
     target_compile_options(${target_name} PRIVATE -fno-omit-frame-pointer)
