@@ -44,3 +44,4 @@ pid
 
 # VM runtime directory (OVMF copies, per-VM state); aligns with cxlkv
 emulation/vms/
+.tigon2/
