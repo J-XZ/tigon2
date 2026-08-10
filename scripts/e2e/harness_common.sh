@@ -526,6 +526,67 @@ harness_classify_status() {
   fi
 }
 
+# The workflow runner is a child process, so its shell failure variables are
+# not visible to the canonical entry point.  Consume its machine-readable
+# fail-fast record instead of guessing from the lexical order of node logs.
+harness_runner_failure_fields() {
+  local out=$1
+  python3 - "$out" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+paths = []
+for preferred in (root / "logs" / "runner.log", root / "runner.log"):
+    if preferred.is_file():
+        paths.append(preferred)
+paths.extend(path for path in sorted(root.rglob("*"))
+             if path.is_file() and path not in paths)
+
+fail_fast = re.compile(
+    r"\b(?:TIGONKV|DSIDLE)_FAIL_FAST\b.*?"
+    r"\bphase=(?P<stage>[^ ]+)\b.*?"
+    r"\bfirst_(?:vm|node)=(?P<node>-?\d+)\b.*?"
+    r"\bfirst_exit=(?P<exit>-?\d+)\b.*?"
+    r"\bcleanup_status=(?P<cleanup>\d+)\b",
+    re.IGNORECASE,
+)
+status_line = re.compile(
+    r"\b(?:TIGONKV|DSIDLE)_LATENCYCHECK\b.*?"
+    r"\bfailed_stage=(?P<stage>[^ ]+)\b.*?"
+    r"\bfirst_(?:vm|node)=(?P<node>-?\d+)\b.*?"
+    r"\bcleanup_ok=(?P<cleanup>true|false)\b",
+    re.IGNORECASE,
+)
+
+for path in paths:
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        continue
+    for line in lines:
+        match = fail_fast.search(line)
+        if match:
+            node = match.group("node")
+            cleanup = "verified" if match.group("cleanup") == "0" else "failed"
+            print("\t".join((match.group("stage"),
+                              "" if node == "-1" else node,
+                              cleanup, "runner")))
+            raise SystemExit(0)
+        match = status_line.search(line)
+        if match:
+            node = match.group("node")
+            cleanup = "verified" if match.group("cleanup").lower() == "true" else "failed"
+            print("\t".join((match.group("stage"),
+                              "" if node == "-1" else node,
+                              cleanup, "runner")))
+            raise SystemExit(0)
+
+print("runner\t\tfailed\trunner")
+PY
+}
+
 harness_probe_guest() {
   local vm_count=$1 base_port=$2 control_path=$3 output=$4 command_template=$5
   local control_dir

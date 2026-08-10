@@ -245,11 +245,25 @@ harness_write_state "$state" "${state_common[@]}" "guest_artifact_manifest_sha25
 [[ "$prepared_state" == hit ]] || echo "PREPARED_STATE_REFRESHED"
 status="$(harness_classify_status "$out_dir" "$runner_status" "$checker")"
 failed_stage=
-[[ "$status" == CHECK_MISMATCH ]] && failed_stage=checker
+first_node=
+cleanup_status=verified
+result_reason=
+if [[ "$status" == CHECK_MISMATCH ]]; then
+  failed_stage=checker
+  result_reason=checker
+elif [[ "$status" == HARNESS_INVALID ]]; then
+  if ((runner_status != 0)); then
+    IFS=$'\t' read -r failed_stage first_node cleanup_status result_reason \
+      <<<"$(harness_runner_failure_fields "$out_dir")"
+  else
+    failed_stage=summary
+    result_reason=summary
+  fi
+fi
 cleanup_start_ms=$(harness_now_ms)
 trap - EXIT
 harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"
 harness_mark_timing "$out_dir/run_meta.json" cleanup_ms "$cleanup_start_ms"
 harness_mark_timing "$out_dir/run_meta.json" total_prepare_ms "$total_start_ms"
-harness_emit_result "$out_dir" "$status" "$failed_stage" "" verified
+harness_emit_result "$out_dir" "$status" "$failed_stage" "$first_node" "$cleanup_status" "$result_reason"
 case "$status" in CHECK_CLEAN) exit 0;; CHECK_MISMATCH) exit 1;; *) exit 125;; esac

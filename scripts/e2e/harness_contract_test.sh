@@ -141,6 +141,29 @@ assert data['first_node'] == 2
 assert data['first_mismatch']['node'] == 2
 PY
 
+# Runner-owned fail-fast metadata must survive the child-process boundary.
+# This is an invalid workflow result, not a checker mismatch, and the
+# canonical result must retain the phase, node, exit and cleanup fields.
+runner_invalid="$tmp/runner-invalid"; mkdir -p "$runner_invalid/logs"
+harness_write_common_meta "$runner_invalid/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
+harness_record_runner_exit "$runner_invalid/run_meta.json" 124
+printf 'TIGONKV_FAIL_FAST suite=08 round=1 phase=init first_vm=2 first_exit=124 kind=process cleanup_status=0\n' >"$runner_invalid/logs/runner.log"
+printf '%s\n' '{"kind":"pool_reset","owner":"round-runner","count":1,"elapsed_ms":11,"status":"success"}' >"$runner_invalid/actual_events.jsonl"
+harness_record_pool_reset_meta "$runner_invalid/run_meta.json" "$runner_invalid/actual_events.jsonl"
+[[ "$(harness_runner_failure_fields "$runner_invalid")" == $'init\t2\tverified\trunner' ]]
+harness_emit_result "$runner_invalid" HARNESS_INVALID init 2 verified runner >/dev/null
+python3 - "$runner_invalid/run_result.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data['status'] == 'HARNESS_INVALID'
+assert data['failed_stage'] == 'init'
+assert data['reason'] == 'runner'
+assert data['runner_exit_code'] == 124
+assert data['first_node'] == 2
+assert data['pool_reset_count'] == 1 and data['pool_reset_ms'] == 11
+assert data['first_mismatch'] is None
+PY
+
 clean="$tmp/clean"; mkdir -p "$clean"
 harness_write_common_meta "$clean/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
 harness_update_meta "$clean/run_meta.json" "vm_count=1"
