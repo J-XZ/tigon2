@@ -61,5 +61,21 @@ if [[ "$allow" == true ]]; then
     echo "shared tmpfs remains mounted after teardown: $TIGONKV_SHARED_PATH" >&2
     exit 2
   fi
+  storage_real=$(realpath -- "$TIGONKV_VM_STORAGE")
+  for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
+    vm_dir="$storage_real/vm_$i"
+    [[ -e "$vm_dir" || -L "$vm_dir" ]] || continue
+    [[ ! -L "$vm_dir" && -d "$vm_dir" ]] || {
+      echo "refusing to clear non-directory VM path: $vm_dir" >&2
+      exit 2
+    }
+    vm_dir_real=$(realpath -- "$vm_dir")
+    [[ "$vm_dir_real" == "$storage_real/vm_$i" ]] || {
+      echo "refusing to clear VM path outside exact storage root: $vm_dir" >&2
+      exit 2
+    }
+    echo "TIGONKV_VM_KILL clearing writable VM state $vm_dir_real"
+    find -P "$vm_dir_real" -depth -delete
+  done
   echo "TIGONKV_VM_KILL verified_no_qemu_and_unmounted"
 fi
