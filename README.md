@@ -55,9 +55,11 @@ NUMA1。
 ./tigonkv_check_vms.sh --config ./experiment_config.jsonc
 ```
 
-实际测试前必须确认其它项目的 QEMU、ivshmem 服务和 PID 文件已停止，并使用当前
-`image/root.img`、当前二进制和新建 backing。不要复用其它项目的镜像、backing、trace、
-运行副本或测试结果。
+实际测试前必须确认其它项目的 QEMU、ivshmem 服务和 PID 文件已停止。三个项目有意共享
+`/mnt/xz_vm_storage`、`/mnt/xz_shared_mem/ivshmem_shared_mem` 和 SSH 端口
+`10022..10025`；权威互斥锁是 `/run/lock/shared-vm-e2e-resources.lock`，因此任何时刻只允许运行
+一个项目。切换时仍必须使用当前 `image/root.img`、当前二进制和当前项目初始化脚本重建
+共享位置；不得复用其它项目的 guest 内容、prepared state、pool、trace、运行副本或测试结果。
 
 ## 构建和测试
 

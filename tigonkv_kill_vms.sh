@@ -3,7 +3,15 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 config="${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}"; allow=false
 while (($#)); do case "$1" in --config) config=$2; shift;; --allow-state-change) allow=true;; --dry-run) allow=false;; -h|--help) echo "usage: $0 [--config PATH] --allow-state-change"; exit 0;; *) echo "unknown option: $1" >&2; exit 2;; esac; shift; done
-source "$root/scripts/tigonkv_vm_common.sh"; tigonkv_load_vm_config "$config"
+source "$root/scripts/tigonkv_vm_common.sh"
+source "$root/scripts/e2e/shared_vm_lock.sh"
+tigonkv_load_vm_config "$config"
+tigonkv_validate_vm_config false
+shared_vm_resources_validate "$TIGONKV_VM_STORAGE" "$TIGONKV_SHARED_BACKING" "$TIGONKV_SSH_BASE_PORT" "$TIGONKV_VM_COUNT" 0
+if [[ "${SHARED_VM_LOCK_HELD:-0}" != 1 ]]; then
+  shared_vm_lock_acquire tigon2 vm-cleanup "$config" "$TIGONKV_VM_STORAGE" "$TIGONKV_SHARED_BACKING" "$TIGONKV_SSH_BASE_PORT" "$TIGONKV_VM_COUNT"
+  trap 'shared_vm_lock_release' EXIT
+fi
 for ((i=0;i<TIGONKV_VM_COUNT;i++)); do
   pidfile="$TIGONKV_VM_STORAGE/vm_${i}/qemu.pid"
   [[ -r "$pidfile" ]] || continue

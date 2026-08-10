@@ -53,19 +53,46 @@ mkdir -p "$tmp/project/exp_data/existing"
 if harness_prepare_output "$tmp/project" "$tmp/project/exp_data/existing" tigon2 08 4096; then exit 1; fi
 
 config="$tmp/config.jsonc"; printf '{}\n' >"$config"
+export SHARED_VM_E2E_LOCK_PATH="$tmp/shared-vm.lock"
 control_path="$(harness_ssh_control_path "$tmp/runtime/e2e/run-id" tigon2 "$(harness_hash_file "$config")")"
 control_worst=${control_path//%p/99999}
 [[ "$control_path" =~ /run-id/s/[0-9a-f]{2}-%p$ && ${#control_worst} -lt 91 ]]
 (
   source "$script_dir/harness_common.sh"
-  harness_acquire_lock "$config" 4 10022 "$tmp/runtime"
+  harness_acquire_lock tigon2 "$config" 4 10022 "$tmp/runtime" holder /mnt/xz_vm_storage /mnt/xz_shared_mem/ivshmem_shared_mem
   sleep 2
 ) & holder=$!
-for _ in {1..20}; do [[ -e "$tmp/runtime/e2e/locks"/* ]] && break; sleep 0.05; done
-if (source "$script_dir/harness_common.sh"; harness_acquire_lock "$config" 4 10022 "$tmp/runtime"); then
+for _ in {1..20}; do grep -q '^run_id=holder$' "$SHARED_VM_E2E_LOCK_PATH" 2>/dev/null && break; sleep 0.05; done
+if (source "$script_dir/harness_common.sh"; harness_acquire_lock tigon2 "$config" 4 10022 "$tmp/runtime" duplicate /mnt/xz_vm_storage /mnt/xz_shared_mem/ivshmem_shared_mem); then
   kill "$holder" 2>/dev/null || true; wait "$holder" || true; exit 1
 fi
 wait "$holder"
+
+# The three projects intentionally contend on the same host lock.  Verify the
+# canonical name and that releasing one project permits the next project.
+[[ "$(SHARED_VM_E2E_LOCK_PATH= shared_vm_lock_path)" == /run/lock/shared-vm-e2e-resources.lock ]]
+(
+  source "$script_dir/harness_common.sh"
+  harness_acquire_lock cxlkv "$config" 4 10022 "$tmp/runtime" cross-holder /mnt/xz_vm_storage /mnt/xz_shared_mem/ivshmem_shared_mem
+  sleep 1
+) &
+cross_holder=$!
+for _ in {1..20}; do grep -q '^run_id=cross-holder$' "$SHARED_VM_E2E_LOCK_PATH" 2>/dev/null && break; sleep 0.05; done
+if (
+  source "$script_dir/harness_common.sh"
+  harness_acquire_lock sidle "$config" 4 10022 "$tmp/runtime" cross-contender /mnt/xz_vm_storage /mnt/xz_shared_mem/ivshmem_shared_mem
+); then
+  echo "TIGON2: cross-project lock unexpectedly succeeded" >&2
+  kill "$cross_holder" 2>/dev/null || true
+  wait "$cross_holder" || true
+  exit 1
+fi
+wait "$cross_holder"
+(
+  source "$script_dir/harness_common.sh"
+  harness_acquire_lock tigon2 "$config" 4 10022 "$tmp/runtime" after-release /mnt/xz_vm_storage /mnt/xz_shared_mem/ivshmem_shared_mem
+  shared_vm_lock_release
+)
 
 run="$tmp/run"; mkdir -p "$run"
 python3 - "$run/run_meta.json" <<'PY'

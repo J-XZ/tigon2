@@ -48,9 +48,6 @@ def require(name, value):
         raise SystemExit(f'missing required config field: {name}')
     return value
 
-def override(name, value):
-    return os.environ.get(name, value)
-
 ssh_port = get('vm', 'ssh_base_port')
 if ssh_port is None:
     ssh_port = get('network', 'base_ssh_port')
@@ -68,10 +65,10 @@ values={
  'TIGONKV_VM_COUNT': require('vm.count', get('vm','count')),
  'TIGONKV_VM_CORES_PER_VM': require('vm.core_count_per_vm', get('vm','core_count_per_vm')),
  'TIGONKV_VM_MEM_MB': require('vm.mem_size_mb_per_vm', get('vm','mem_size_mb_per_vm')),
- 'TIGONKV_VM_STORAGE': require('vm.storage_path', override('TIGONKV_CONFIG_VM_STORAGE', get('vm','storage_path'))),
+ 'TIGONKV_VM_STORAGE': require('vm.storage_path', get('vm','storage_path')),
  'TIGONKV_VM_NUMA': ','.join(map(str, vm_numa)),
  'TIGONKV_VM_NUMA_PRIMARY': str(vm_numa[0]),
- 'TIGONKV_SSH_BASE_PORT': override('TIGONKV_CONFIG_SSH_BASE_PORT', ssh_port),
+ 'TIGONKV_SSH_BASE_PORT': ssh_port,
  'TIGONKV_SHARED_BACKING': require('shared_memory.backing_path', get('shared_memory','backing_path')),
  'TIGONKV_SHARED_MB': require('shared_memory.size_mb', get('shared_memory','size_mb')),
  'TIGONKV_SHARED_NUMA': ','.join(map(str, shared_numa)),
@@ -90,8 +87,6 @@ for key, value in values.items():
     print(f'{key}={shlex.quote(str(value))}')
 PY
 )"
-  # Compatibility alias used by some guest/orchestration scripts.
-  TIGONKV_VM_SSH_BASE_PORT=${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}
   : "TIGONKV_SHARED_BACKING is the exact configured backing file"
 }
 

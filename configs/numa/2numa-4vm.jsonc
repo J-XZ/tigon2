@@ -5,7 +5,7 @@
     "size_mb": 32768,
     "hwcc": { "offset_mb": 0, "size_mb": 1024 },
     "swcc": { "offset_mb": 1024, "size_mb": 31744 },
-    "backing_path": "/mnt/xz_shared_mem/tigon2/ivshmem_shared_mem",
+    "backing_path": "/mnt/xz_shared_mem/ivshmem_shared_mem",
     "device_path": "/dev/ivpci0",
     "numa_node": [1]
   },
@@ -19,11 +19,11 @@
     "count": 4,
     "core_count_per_vm": 8,
     "mem_size_mb_per_vm": 2048,
-    "storage_path": "/mnt/xz_vm_storage/tigon2_vm_storage",
+    "storage_path": "/mnt/xz_vm_storage",
     "first_ip": "192.168.100.2",
     "bridge_tap_ip": "192.168.100.1",
     "numa_node": [0],
-    "ssh_base_port": 11022,
+    "ssh_base_port": 10022,
     "copy_root_img": true,
     "use_ivshmem_doorbell": false
   },

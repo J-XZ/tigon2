@@ -62,11 +62,11 @@ if [[ "$checker" == ON ]]; then
 fi
 vm_count=${TIGONKV_VM_COUNT}
 threads=${TIGONKV_E2E_THREADS:-${TIGONKV_E2E_WORKERS:-4}}
-base_port=${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}
+base_port=$TIGONKV_SSH_BASE_PORT
 ssh_key=${TIGONKV_VM_SSH_KEY:-/root/.ssh/id_rsa}
 remote_root=${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}
 remote_config=${TIGONKV_VM_REMOTE_CONFIG:-$remote_root/experiment_config.jsonc}
-backing=${TIGONKV_SHARED_MEMORY_PATH:-$TIGONKV_SHARED_BACKING}
+backing=$TIGONKV_SHARED_BACKING
 pool_build="$build"
 if [[ "$checker" == ON ]]; then
   pool_build=$(tigonkv_canonical_build_dir "$root" Debug OFF OFF ON)

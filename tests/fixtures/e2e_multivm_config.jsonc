@@ -13,7 +13,7 @@
       "offset_mb": 1024,
       "size_mb": 31744
     },
-    "backing_path": "/mnt/xz_shared_mem/tigon2/ivshmem_shared_mem",
+    "backing_path": "/mnt/xz_shared_mem/ivshmem_shared_mem",
     "device_path": "/dev/ivpci0",
     "numa_node": [
       1
@@ -66,13 +66,13 @@
     "count": 4,
     "core_count_per_vm": 8,
     "mem_size_mb_per_vm": 2048,
-    "storage_path": "/mnt/xz_vm_storage/tigon2_vm_storage",
+    "storage_path": "/mnt/xz_vm_storage",
     "first_ip": "192.168.100.2",
     "bridge_tap_ip": "192.168.100.1",
     "numa_node": [
       0
     ],
-    "ssh_base_port": 11022,
+    "ssh_base_port": 10022,
     "copy_root_img": true,
     "use_ivshmem_doorbell": false,
     "local_ssh_pub_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDJRRfQun/GuTm3/achpoel3HeV+lMqQ43H/XE1gxJJGFJK/htv4q6wBvo7O8iNQWXJs7aJ+VhEnmC+ehu3C958RfNBYUdWTkiVvM7b9PEGwSR/ZKtH+fauMiYaV4lcmpV25rJCzOx8V0Mpqro16yh0wcyrpaWoKI9yZIURkuPvziPnofx+L/ADJjAOOxFaW8hoW4hvASTUt0Zuu4ghXN5WTiQzJXm2h49uQeJNTKC2ZwsSoa4fHdVK7EcOhEJ6VS/+tpgdcYC0aIvYr6Lahs2SWBNZ20nw7PfPIZFc1eO+SSt2Kaf3+wWaLnqB30BiPxZLUHad0j4KB5gBWsNeXK2x5ZW9CYbecakgCnrxnAcviDg5EcrTkoespGjuteHJHjqiw1cmav6yDVTq/NaY+KNhwpjIPIaBWp5byXsdRfwbVFlTNc07PUuAi3kczMtFQukJODz4K9G/vOELk+Uua+pGsdgfYHi/KQrqyzroKEU3b1F2I0+fKIviBRJGfyG5SnE= root@node1.cxl2.dpmfs-pg0.clemson.cloudlab.us"

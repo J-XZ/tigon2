@@ -7,7 +7,7 @@ set -uo pipefail
 function ssh_command {
         typeset command=$1
         typeset vm_id=$2
-        typeset base_port=${TIGONKV_VM_SSH_BASE_PORT:-${TIGONKV_SSH_BASE_PORT:-10022}}
+        typeset base_port=${TIGONKV_SSH_BASE_PORT:?TIGONKV_SSH_BASE_PORT must be loaded from experiment_config.jsonc}
 
         typeset port=$(expr $base_port + $vm_id)
         ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $port root@127.0.0.1 ""$command""
@@ -17,7 +17,7 @@ function sync_files {
         typeset src=$1
         typeset dst=$2
         typeset vm_num=$3
-        typeset base_port=${TIGONKV_VM_SSH_BASE_PORT:-${TIGONKV_SSH_BASE_PORT:-10022}}
+        typeset base_port=${TIGONKV_SSH_BASE_PORT:?TIGONKV_SSH_BASE_PORT must be loaded from experiment_config.jsonc}
         typeset i=0
 
         for (( i=0; i < $vm_num; ++i ))

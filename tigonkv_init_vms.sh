@@ -32,6 +32,7 @@ while (($#)); do
 done
 
 source "$root/scripts/tigonkv_vm_common.sh"
+source "$root/scripts/e2e/shared_vm_lock.sh"
 tigonkv_load_vm_config "$config"
 tigonkv_validate_vm_config "$overlap"
 
@@ -39,6 +40,17 @@ tigonkv_validate_vm_config "$overlap"
   echo "refusing to alter VM state; use --dry-run or --allow-state-change" >&2
   exit 2
 }
+shared_vm_resources_validate "$TIGONKV_VM_STORAGE" "$TIGONKV_SHARED_BACKING" \
+  "$TIGONKV_SSH_BASE_PORT" "$TIGONKV_VM_COUNT" "$([[ "$dry_run" == true ]] && echo 0 || echo 1)"
+if [[ "$dry_run" != true ]]; then
+  if [[ "${SHARED_VM_LOCK_HELD:-0}" != 1 ]]; then
+    shared_vm_lock_acquire tigon2 vm-init "$config" "$TIGONKV_VM_STORAGE" \
+      "$TIGONKV_SHARED_BACKING" "$TIGONKV_SSH_BASE_PORT" "$TIGONKV_VM_COUNT"
+    trap 'shared_vm_lock_release' EXIT
+  fi
+  shared_vm_resources_assert_idle "$TIGONKV_VM_STORAGE" "$TIGONKV_SHARED_BACKING" \
+    "$TIGONKV_SSH_BASE_PORT" "$TIGONKV_VM_COUNT"
+fi
 
 image="$root/image/root.img"
 ivshmem_kernel_src="$root/emulation/ivshmem/ivshmem-kernel"

@@ -4,9 +4,9 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 config=${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}
 source "$root/scripts/tigonkv_vm_common.sh"
 tigonkv_load_vm_config "$config"
-backing=${TIGONKV_SHARED_MEMORY_PATH:-$TIGONKV_SHARED_BACKING}
+backing=$TIGONKV_SHARED_BACKING
 vm_count=${TIGONKV_VM_COUNT}
-ssh_base_port=${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}
+ssh_base_port=$TIGONKV_SSH_BASE_PORT
 ssh_key=${TIGONKV_VM_SSH_KEY:-/root/.ssh/id_rsa}
 numa_node=${TIGONKV_SHARED_NUMA_NODE:-${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV_SHARED_NUMA%%,*}}}
 device_path=${TIGONKV_DEVICE_PATH}

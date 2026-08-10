@@ -37,19 +37,21 @@ worker-local queue.
 `run_guest_ycsb_workflows.sh` is an internal four-VM workflow called by
 `scripts/e2e/run_vm_trace.sh`. It assumes the cxlkv-style
 ivshmem server is already running, with `/dev/ivpci0` present in every guest, and uses
-SSH forwarding on ports 11022--11025. It initializes the host backing on shared NUMA
+SSH forwarding on ports 10022--10025. It initializes the host backing on shared NUMA
 node 1 before each workload, runs VM0's load with reset, attaches the other VMs in
 parallel, and then runs all VMs in parallel. The backing is
-`/mnt/xz_shared_mem/tigon2/ivshmem_shared_mem`; VM disks and logs belong below
-`/mnt/xz_vm_storage/tigon2_vm_storage`.
+`/mnt/xz_shared_mem/ivshmem_shared_mem`; VM disks belong below the shared
+`/mnt/xz_vm_storage` mount. CXLKV, Tigon2, and SIDLE intentionally share these physical
+resources and ports `10022--10025`, serialized by
+`/run/lock/shared-vm-e2e-resources.lock`; guest contents and prepared state remain project-specific.
 
 Example:
 
 ```sh
 TIGONKV_VM_COUNT=4 \
   scripts/e2e_trace/run_guest_ycsb_workflows.sh \
-  /mnt/xz_vm_storage/tigon2-formal-20260718/ycsb-traces-10k \
-  /mnt/xz_vm_storage/tigon2-formal-20260718/ycsb-10k-rounds5 \
+  /mnt/xz_vm_storage/ycsb-traces-10k \
+  /mnt/xz_vm_storage/ycsb-10k-rounds5 \
   5 'A B C D E'
 ```
 

@@ -57,7 +57,9 @@ pool_build="$(tigonkv_canonical_build_dir "$root" Debug OFF OFF "$e2e_ndebug")"
 participant="$build/e2e_$suite"; pool_tool="$pool_build/cxl_pool_initer"
 tool_prefix="$root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"; latency_sim="$root/thirdparty_libs/latency_sim"
 latency_sha="$(git -C "$latency_sim" rev-parse HEAD)"; config_sha="$(harness_hash_file "$config")"; source_fingerprint="$(tigonkv_source_state "$root")"; export HARNESS_CLOSURE_STAMPS="$build/tigonkv_latency_sim_build_contract.json"
-remote_root="${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}"; runtime="$root/.tigon2"; vm_count="$TIGONKV_VM_COUNT"; base_port="${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}"
+remote_root="${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}"; runtime="$root/.tigon2"; vm_count="$TIGONKV_VM_COUNT"; base_port="$TIGONKV_SSH_BASE_PORT"
+storage="$TIGONKV_VM_STORAGE"; backing="$TIGONKV_SHARED_BACKING"
+shared_vm_resources_validate "$storage" "$backing" "$base_port" "$vm_count" "$execute"
 deploy_timeout="${TIGONKV_E2E_DEPLOY_TIMEOUT_SEC:-300}"
 [[ "$deploy_timeout" =~ ^[1-9][0-9]*$ && "$deploy_timeout" -le 3600 ]] || {
   echo "TIGONKV_E2E_DEPLOY_TIMEOUT_SEC must be 1..3600 seconds" >&2
@@ -89,10 +91,16 @@ if ((execute == 0)); then
     "$([[ "$checker" == ON ]] && printf '%s' "$tool_prefix/libexec/valgrind" || printf '%s' none)"
   exit 0
 fi
-export HARNESS_PROJECT_RUNTIME="$runtime"; total_start_ms=$(harness_now_ms); harness_acquire_lock "$config" "$vm_count" "$base_port" "$runtime"
+export HARNESS_PROJECT_RUNTIME="$runtime"; total_start_ms=$(harness_now_ms)
 harness_prepare_output "$root" "$requested_out" tigon2 "$suite" "$record_count"
 out_dir="$HARNESS_OUT_DIR"; run_id="$HARNESS_RUN_ID"; run_runtime="$HARNESS_RUNTIME_RUN_DIR"
 mkdir -p "$out_dir/logs" "$out_dir/round_logs"
+if ! harness_acquire_lock tigon2 "$config" "$vm_count" "$base_port" "$runtime" "$run_id" "$storage" "$backing"; then
+  harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$config" unknown "$latency_sha" miss "$remote_root"
+  harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=4" "failed_stage=resolve" "reason=shared-vm-resources-busy"
+  harness_emit_result "$out_dir" HARNESS_INVALID resolve "" failed shared-vm-resources-busy
+  exit 125
+fi
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$config" unknown "$latency_sha" refreshed "$remote_root"
 harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=4" "failed_stage=resolve" "reason=resolved"
 harness_mark_timing "$out_dir/run_meta.json" resolve_ms "$total_start_ms"
@@ -159,10 +167,12 @@ else : >"$tool_manifest"; tool_sha=none; tool_binary_sha=none; fi
 harness_mark_timing "$out_dir/run_meta.json" freeze_ms "$freeze_start_ms"
 backing_real="$(realpath -m "$TIGONKV_SHARED_BACKING")"; backing_inode=missing; backing_size=missing
 if [[ -e "$backing_real" && ! -L "$backing_real" ]]; then backing_inode="$(stat -c '%i' "$backing_real")"; backing_size="$(stat -c '%s' "$backing_real")"; fi
+storage_real="$(realpath -m "$storage")"; storage_source="$(findmnt -n -T "$storage_real" -o SOURCE 2>/dev/null || true)"; storage_fstype="$(findmnt -n -T "$storage_real" -o FSTYPE 2>/dev/null || true)"; storage_source=${storage_source:-missing}; storage_fstype=${storage_fstype:-missing}
 state="$runtime/e2e/prepared_state.json"; state_common=(
   "project_id=tigon2" "repo_root=$root" "latency_sim_fingerprint=$latency_sha" "participant_targets=e2e_$suite,cxl_pool_initer"
   "build_fingerprint=$source_fingerprint" "compile_contract=Debug/O0/compile-on/checker-$checker/ndebug-$e2e_ndebug"
   "vm_count=$vm_count" "ssh_base_port=$base_port"
+  "storage_path=$storage_real" "storage_source=$storage_source" "storage_fstype=$storage_fstype"
   "participant_elf_sha256=$participant_sha" "runtime_closure_manifest_sha=$closure_sha" "experiment_config_sha256=$config_sha"
   "latencycheck_prefix_manifest_sha=$tool_sha" "guest_participant_sha256=$(harness_hash_file "$participant")" "guest_config_sha256=$config_sha" "guest_tool_sha256=$tool_binary_sha" "remote_root=$remote_root" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size")
 printf -v q_remote_root '%q' "$remote_root"

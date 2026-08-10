@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Small run-scoped helpers used by the canonical Tigon2 VM entry points.
 set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/shared_vm_lock.sh"
 
 harness_require_positive() {
   [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "$1 must be a positive integer" >&2; return 2; }
@@ -159,13 +160,10 @@ harness_prepare_output() {
   mkdir -p "$HARNESS_RUNTIME_RUN_DIR"/{logs,round_logs,ssh}
 }
 harness_acquire_lock() {
-  local config=$1 vm_count=$2 base_port=$3 runtime=$4 config_sha
-  config_sha=$(harness_hash_file "$config")
-  mkdir -p "$runtime/e2e/locks"
-  local lock="$runtime/e2e/locks/$config_sha""_""$vm_count""_""$base_port.lock"
-  exec {HARNESS_LOCK_FD}>"$lock"
-  flock -n "$HARNESS_LOCK_FD" || { echo "HARNESS_INVALID reason=existing_project_invocation lock=$lock" >&2; return 125; }
-  HARNESS_LOCK_PATH=$lock
+  local project=$1 config=$2 vm_count=$3 base_port=$4 runtime=$5 run_id=$6 storage=$7 backing=$8
+  shared_vm_lock_acquire "$project" "$run_id" "$config" "$storage" "$backing" "$base_port" "$vm_count" || return $?
+  HARNESS_LOCK_FD=$SHARED_VM_LOCK_FD
+  HARNESS_LOCK_PATH=$SHARED_VM_LOCK_PATH
 }
 harness_write_common_meta() {
   local path=$1 project=$2 suite=$3 profile=$4 records=$5 config=$6 source=$7 latency_sha=$8 prepared=$9

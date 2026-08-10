@@ -12,10 +12,10 @@ python3 - "$tmp/out/configs/experiment_config_ycsb_4vm.jsonc" "$tmp/out/run_meta
 import json, sys
 d=json.load(open(sys.argv[1]))
 root=sys.argv[3]
-assert d['shared_memory']['backing_path'] == '/mnt/xz_shared_mem/tigon2/ivshmem_shared_mem'
+assert d['shared_memory']['backing_path'] == '/mnt/xz_shared_mem/ivshmem_shared_mem'
 assert d['shared_memory']['numa_node'] == [1]
 assert d['vm']['numa_node'] == [0]
-assert d['vm']['ssh_base_port'] == 11022
+assert d['vm']['ssh_base_port'] == 10022
 assert d['e2e']['foreground_worker_count_per_vm'] == 4
 assert 'tigon_kv' in d and d['tigon_kv']['partition_count'] == 4
 assert d['tigon_kv']['fixed_key_size'] == 32
@@ -57,8 +57,8 @@ PY
 # Ensure VM scripts still derive ports/backing from the generated config.
 source "$root/scripts/tigonkv_vm_common.sh"
 tigonkv_load_vm_config "$tmp/out/configs/experiment_config_ycsb_4vm.jsonc"
-[[ "$TIGONKV_SSH_BASE_PORT" == 11022 ]]
-[[ "$TIGONKV_SHARED_BACKING" == /mnt/xz_shared_mem/tigon2/ivshmem_shared_mem ]]
+[[ "$TIGONKV_SSH_BASE_PORT" == 10022 ]]
+[[ "$TIGONKV_SHARED_BACKING" == /mnt/xz_shared_mem/ivshmem_shared_mem ]]
 [[ "$TIGONKV_E2E_WORKERS" == 4 ]]
 [[ "$TIGONKV_VM_NUMA_PRIMARY" == 0 ]]
 [[ "$TIGONKV_SHARED_NUMA_PRIMARY" == 1 ]]
