@@ -12,10 +12,10 @@
     "partitioning": {
       "strategy": "range",
       "ranges": [
-        {"lower_key": "", "upper_key": "d"}, {"lower_key": "d", "upper_key": "h"},
-        {"lower_key": "h", "upper_key": "l"}, {"lower_key": "l", "upper_key": "p"},
-        {"lower_key": "p", "upper_key": "t"}, {"lower_key": "t", "upper_key": "x"},
-        {"lower_key": "x", "upper_key": "z"}, {"lower_key": "z", "upper_key": ""}
+        {"lower_key": "", "upper_key": "a"}, {"lower_key": "a", "upper_key": "d"},
+        {"lower_key": "d", "upper_key": "h"}, {"lower_key": "h", "upper_key": "l"},
+        {"lower_key": "l", "upper_key": "m"}, {"lower_key": "m", "upper_key": "n"},
+        {"lower_key": "n", "upper_key": "z"}, {"lower_key": "z", "upper_key": ""}
       ]
     },
     "fixed_key_size": 32,

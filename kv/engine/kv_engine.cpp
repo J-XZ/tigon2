@@ -1775,11 +1775,10 @@ Status KVEngine::Forward(star::TwoPLPashaMessage type, std::string_view key,
   // The request phase ends immediately after the transport publication.  The
   // cooperative wait deliberately has no active latency scope: any peer
   // request it services is charged as that peer's independent request, and
-  // the response starts a fresh local continuation below.
-  // The suspension only deactivates the scope; its pending delay is settled at
-  // the outermost scope exit after the caller's EBR and other guards are gone.
-  // RAII restores the foreground scope on every return path.
-  mem_access::ForegroundScopeSuspension suspend_foreground;
+  // the response resumes the local continuation below.  Each PollTransport()
+  // call owns the suspension boundary for this wait, so AwaitResponse must
+  // not suspend the same foreground scope a second time.  Its wait itself
+  // performs no shared-memory access and therefore receives no expectation.
   const Status result = AwaitResponse(mailbox);
   return result;
 }

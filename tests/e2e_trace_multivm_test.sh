@@ -43,14 +43,19 @@ run_worker() {
   TIGONKV_E2E_WORKER_ID="$node" TIGONKV_E2E_TRACE_PHASE=multivm \
   TIGONKV_E2E_RELEASE_FILE="$barrier/release.$node" \
   TIGONKV_NODE_ID="$node" TIGONKV_E2E_TRACE_FILE="$trace" \
-  TIGONKV_E2E_RESET="$reset" "$runner" >"$log" 2>&1
+  TIGONKV_E2E_RESET="$reset" exec "$runner" >"$log" 2>&1
 }
 
 run_worker 0 "$root/tests/fixtures/multivm_trace_node0.txt" 1 "$barrier/node0.log" &
 first=$!
 deadline=$((SECONDS + 120))
-while [[ ! -e "$barrier/multivm.ready.0" ]]; do
+expected_backing_bytes=$((64 * 1024 * 1024))
+while :; do
   kill -0 "$first" 2>/dev/null || { wait "$first" || true; exit 1; }
+  if [[ -f "$backing" ]] &&
+     [[ "$(stat -c '%s' "$backing" 2>/dev/null || echo 0)" == "$expected_backing_bytes" ]]; then
+    break
+  fi
   (( SECONDS < deadline )) || exit 1
   sleep 0.05
 done
