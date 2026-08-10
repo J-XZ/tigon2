@@ -182,12 +182,13 @@ payload.update({'project':project,'suite':suite,'profile':profile,'record_count'
  'config_sha256':hashlib.sha256(cfg.read_bytes()).hexdigest(),'prepared_state':prepared,
  'remote_root':remote_root})
 defaults={'reason':'','failed_stage':'','first_node':None,'cleanup_status':'pending',
- 'runner_exit_code':None,'pool_reset_count':0,'participant_manifest_sha256':None,
+ 'runner_exit_code':None,'pool_reset_count':0,'pool_reset_ms':0,'pool_reset_owner':None,
+ 'pool_reset_event_count':0,'pool_reset_status':'missing','participant_manifest_sha256':None,
  'runtime_closure_manifest_sha256':None,'latencycheck_prefix_manifest_sha256':None,
  'participant_expected_sha256':None,'participant_observed_sha256':None,
  'per_node_expected':None,'per_node_observed':None,'first_mismatch':None,
  'resolve_ms':0,'build_ms':0,'freeze_ms':0,'closure_ms':0,'prepare_ms':0,'deploy_ms':0,
- 'probe_ms':0,'pool_reset_ms':0,'cleanup_ms':0,'total_prepare_ms':0,
+ 'probe_ms':0,'cleanup_ms':0,
  'run_id':path.parent.name}
 for key,value in defaults.items(): payload.setdefault(key,value)
 payload['config']=str(cfg.resolve())
@@ -223,6 +224,73 @@ for item in sys.argv[2:]:
 path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PY
 }
+
+harness_record_runner_exit() {
+  local meta=$1 status=$2
+  harness_update_meta "$meta" "runner_exit_code=$status"
+  local result="${meta%/run_meta.json}/run_result.json"
+  if [[ -f "$result" ]]; then
+    python3 - "$result" "$status" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+data["runner_exit_code"] = int(sys.argv[2])
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PY
+  fi
+}
+
+harness_record_pool_reset_meta() {
+  local meta=$1 events=$2
+  python3 - "$meta" "$events" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+meta_path, events_path = map(Path, sys.argv[1:])
+data = json.loads(meta_path.read_text())
+rows = []
+if events_path.is_file():
+    for line in events_path.read_text(errors="replace").splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if item.get("kind") == "pool_reset":
+            rows.append(item)
+
+if len(rows) == 1:
+    row = rows[0]
+    try:
+        elapsed = int(row.get("elapsed_ms", 0))
+        count = int(row.get("count", 0))
+    except (TypeError, ValueError):
+        elapsed, count = 0, 0
+    success = row.get("status") == "success" and count == 1 and elapsed > 0
+    data.update({
+        "pool_reset_count": 1 if success else 0,
+        "pool_reset_ms": elapsed if elapsed >= 0 else 0,
+        "pool_reset_owner": row.get("owner"),
+        "pool_reset_event_count": 1,
+        "pool_reset_status": "success" if success else "failed",
+    })
+    meta_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    raise SystemExit(0 if success else 1)
+
+data.update({
+    "pool_reset_count": 0,
+    "pool_reset_ms": 0,
+    "pool_reset_owner": None,
+    "pool_reset_event_count": len(rows),
+    "pool_reset_status": "missing" if not rows else "ambiguous",
+})
+meta_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+raise SystemExit(2)
+PY
+}
+
 harness_record_probe_meta() {
   local meta=$1 output=$2 expected_nodes=$3 expected_participants=$4 expected_config=$5 expected_tool=$6
   python3 - "$meta" "$output" "$expected_nodes" "$expected_participants" "$expected_config" "$expected_tool" <<'PY'
@@ -280,10 +348,40 @@ if result_path.exists(): data=json.loads(result_path.read_text())
 else: data=json.loads((result_path.parent/'run_meta.json').read_text())
 status, failed_stage, first_node, cleanup, reason=sys.argv[2:]
 data.update({'status':status,'failed_stage':failed_stage,
-             'first_node':None if first_node in ('','-1') else int(first_node),
              'cleanup_status':cleanup})
 data['reason']=reason
+
+def authoritative_first_node(root):
+    events = root / 'actual_events.jsonl'
+    if events.is_file():
+        for raw in events.read_text(errors='replace').splitlines():
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if item.get('kind') == 'fail_fast' and isinstance(item.get('node'), int):
+                return item['node']
+    paths=[]
+    for path in root.rglob('*'):
+        if not path.is_file() or path.name in {'run_result.json','run_meta.json'}:
+            continue
+        priority=0 if path.name in {'runner.log','e2e_v100_round_launcher.log'} else 1
+        paths.append((priority,str(path),path))
+    patterns=(
+        re.compile(r'first checker failure\s+node\s*([0-9]+)',re.IGNORECASE),
+        re.compile(r'\bFAIL_FAST\b.*?\bfirst_node=([0-9]+)',re.IGNORECASE),
+        re.compile(r'\b(?:TIGONKV_FAIL_FAST|DSIDLE_FAIL_FAST)\b.*?\bfirst_vm=([0-9]+)',re.IGNORECASE),
+    )
+    for _,_,path in sorted(paths):
+        for line in path.read_text(errors='replace').splitlines():
+            for pattern in patterns:
+                match=pattern.search(line)
+                if match:
+                    return int(match.group(1))
+    return None
+
 def first_mismatch(root):
+    candidates=[]
     for path in sorted(root.rglob('*')):
         if not path.is_file() or path.name in {'run_result.json','run_meta.json'}:
             continue
@@ -319,13 +417,23 @@ def first_mismatch(root):
                     match=re.search(rf'\b{source_name}=([^ ]*)',context)
                     if match and item.get(target_name,'') in {'','invalid','unknown'}: item[target_name]=match.group(1)
                 break
-            node=re.search(r'(?:^|/)(?:vm|node)([0-9]+)(?:\.log|/)',str(path))
+            node=re.search(r'(?:^|[/_.-])(?:vm|node)([0-9]+)(?:\.log|/|$)',str(path))
             if node: item['node']=int(node.group(1))
-            return item
-    return None
+            candidates.append(item)
+    preferred=authoritative_first_node(root)
+    if preferred is not None:
+        for candidate in candidates:
+            if candidate.get('node') == preferred:
+                return candidate
+    return candidates[0] if candidates else None
 data['first_mismatch']=first_mismatch(result_path.parent) if status == 'CHECK_MISMATCH' else None
+provided_node=None if first_node in ('','-1') else int(first_node)
+authoritative_node=authoritative_first_node(result_path.parent)
+data['first_node']=authoritative_node if authoritative_node is not None else provided_node
 if data['first_mismatch'] is not None and data.get('first_node') is None:
     data['first_node']=data['first_mismatch'].get('node')
+if data['first_mismatch'] is not None and data.get('first_node') is not None:
+    data['first_mismatch']['node']=data['first_node']
 result_path.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
 meta_path = result_path.parent/'run_meta.json'
 if meta_path.exists():
@@ -348,6 +456,17 @@ harness_valid_business_mismatch() {
 import re, sys
 from pathlib import Path
 root=Path(sys.argv[1])
+has_fail_fast = False
+for candidate in root.rglob('*'):
+    if not candidate.is_file():
+        continue
+    try: candidate_lines = candidate.read_text(errors='replace').splitlines()
+    except OSError: continue
+    if any(re.search(r'FAIL_FAST|fail-fast|checker round failed', item, re.IGNORECASE) for item in candidate_lines):
+        has_fail_fast = True
+        break
+if not has_fail_fast:
+    raise SystemExit(1)
 for path in sorted(root.rglob('*')):
     if not path.is_file():
         continue
@@ -357,8 +476,6 @@ for path in sorted(root.rglob('*')):
         if 'LATENCYCHECK_FIRST_MISMATCH' not in line:
             continue
         if 'LATENCYCHECK_CHECKPOINT_FAIL' not in '\n'.join(lines[index:index+32]):
-            continue
-        if not any(re.search(r'FAIL_FAST|fail-fast|checker round failed', item, re.IGNORECASE) for item in lines):
             continue
         summaries=[item for item in lines if 'LATENCYCHECK_SUMMARY' in item]
         if not summaries:

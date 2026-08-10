@@ -217,6 +217,7 @@ set +e
 deploy_start_ms=$(harness_now_ms)
 timeout "$total_timeout" env TIGONKV_E2E_TRACE_RUNNER="$runner" TIGONKV_POOL_INITER="$pool_tool" TIGONKV_E2E_TRACE_TOOL_INSTALL="$tool_prefix" TIGONKV_E2E_TRACE_TOOL_MANIFEST="${TIGONKV_E2E_TOOL_MANIFEST:-}" TIGONKV_YCSB_THREADS_PER_VM="$trace_workers" TIGONKV_YCSB_WORKLOADS="$workloads" TIGONKV_E2E_LOAD_POLICY="$load_policy" TIGONKV_E2E_TRACE_PREPARE_ONLY="$prepare_only" LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" bash "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$trace_dir" "$out_dir" "$rounds" "$workloads" >"$out_dir/logs/runner.log" 2>&1
 runner_status=$?; set -e
+harness_record_runner_exit "$out_dir/run_meta.json" "$runner_status"
 harness_mark_timing "$out_dir/run_meta.json" deploy_ms "$deploy_start_ms"
 probe_start_ms=$(harness_now_ms)
 if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" || \

@@ -249,8 +249,17 @@ sync_guest_binary() {
 }
 
 reset_pool() {
+  local start_ms status=0 elapsed_ms events
+  start_ms=$(date +%s%3N)
   numactl --cpunodebind="$shared_numa" --membind="$shared_numa" \
-    "$pool_init" "$backing" "$shared_size_mb" >/dev/null
+    "$pool_init" "$backing" "$shared_size_mb" >/dev/null || status=$?
+  elapsed_ms=$(( $(date +%s%3N) - start_ms ))
+  events="${TIGONKV_E2E_ACTUAL_EVENTS:-$log_root/actual_events.jsonl}"
+  mkdir -p "$(dirname "$events")"
+  printf '{"kind":"pool_reset","owner":"round-runner","round":%d,"count":%d,"elapsed_ms":%d,"status":"%s"}\n' \
+    "$round" "$([[ "$status" == 0 ]] && echo 1 || echo 0)" "$elapsed_ms" \
+    "$([[ "$status" == 0 ]] && echo success || echo failed)" >>"$events"
+  return "$status"
 }
 
 run_remote() {

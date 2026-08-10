@@ -95,7 +95,12 @@ import json, sys
 from pathlib import Path
 Path(sys.argv[1]).write_text(json.dumps({'vm_count': 4, 'run_id': 'mismatch'}) + '\n')
 PY
-printf 'TIGONKV_FAIL_FAST first_vm=0\nLATENCYCHECK_FIRST_MISMATCH checkpoint=2 class=background status=MISSING domain=HWCC logical=PLAIN_WRITE actual=invalid addr=0x10 bytes=8\nLATENCYCHECK_CHECKPOINT_FAIL ordinal=2\nLATENCYCHECK_SUMMARY target_accesses=2 expectations=2 checkpoints=1 sticky_error=true\n' >"$mismatch/node0.log"
+printf '{"kind":"pool_reset","owner":"round-runner","count":1,"elapsed_ms":17,"status":"success"}\n{"kind":"fail_fast","owner":"round-runner","node":2,"exit_code":1}\n' >"$mismatch/actual_events.jsonl"
+harness_record_pool_reset_meta "$mismatch/run_meta.json" "$mismatch/actual_events.jsonl"
+harness_record_runner_exit "$mismatch/run_meta.json" 1
+printf 'TIGONKV_FAIL_FAST suite=08 first_vm=2 first_exit=1\n' >"$mismatch/runner.log"
+printf 'LATENCYCHECK_FIRST_MISMATCH checkpoint=1 class=background status=MISSING domain=HWCC logical=PLAIN_WRITE actual=invalid addr=0x11 bytes=8\nLATENCYCHECK_CHECKPOINT_FAIL ordinal=1\nLATENCYCHECK_SUMMARY target_accesses=2 expectations=2 checkpoints=1 sticky_error=true\n' >"$mismatch/run_a_node1.log"
+printf 'LATENCYCHECK_FIRST_MISMATCH checkpoint=2 class=background status=MISSING domain=HWCC logical=PLAIN_WRITE actual=invalid addr=0x10 bytes=8\nLATENCYCHECK_CHECKPOINT_FAIL ordinal=2\nLATENCYCHECK_SUMMARY target_accesses=2 expectations=2 checkpoints=1 sticky_error=true\n' >"$mismatch/run_z_node2.log"
 [[ "$(harness_classify_status "$mismatch" 1 ON)" == CHECK_MISMATCH ]]
 harness_emit_result "$mismatch" CHECK_MISMATCH checker '' verified >/dev/null
 python3 - "$mismatch/run_result.json" <<'PY'
@@ -103,6 +108,44 @@ import json, sys
 data=json.load(open(sys.argv[1]))
 assert data['status'] == 'CHECK_MISMATCH'
 assert data['first_mismatch']['domain'] == 'HWCC'
+assert data['runner_exit_code'] == 1
+assert data['pool_reset_count'] == 1 and data['pool_reset_ms'] == 17
+assert data['first_node'] == 2
+assert data['first_mismatch']['node'] == 2
+PY
+
+clean="$tmp/clean"; mkdir -p "$clean"
+harness_write_common_meta "$clean/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
+harness_update_meta "$clean/run_meta.json" "vm_count=1"
+printf '{"kind":"pool_reset","owner":"round-runner","count":1,"elapsed_ms":9,"status":"success"}\n' >"$clean/actual_events.jsonl"
+harness_record_pool_reset_meta "$clean/run_meta.json" "$clean/actual_events.jsonl"
+harness_record_runner_exit "$clean/run_meta.json" 0
+printf 'LATENCYCHECK_SUMMARY target_accesses=2 expectations=2 checkpoints=1 sticky_error=false\n' >"$clean/node0.log"
+harness_emit_result "$clean" CHECK_CLEAN '' '' verified >/dev/null
+python3 - "$clean/run_result.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data['status'] == 'CHECK_CLEAN'
+assert data['runner_exit_code'] == 0
+assert data['pool_reset_count'] == 1 and data['pool_reset_ms'] == 9
+assert data['first_mismatch'] is None
+PY
+
+reset_fail="$tmp/reset-fail"; mkdir -p "$reset_fail"
+harness_write_common_meta "$reset_fail/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
+printf '{"kind":"pool_reset","owner":"round-runner","count":0,"elapsed_ms":4,"status":"failed"}\n' >"$reset_fail/actual_events.jsonl"
+if harness_record_pool_reset_meta "$reset_fail/run_meta.json" "$reset_fail/actual_events.jsonl"; then
+  echo 'pool reset failure unexpectedly accepted' >&2
+  exit 1
+fi
+harness_emit_result "$reset_fail" HARNESS_INVALID pool-reset '' verified pool-reset >/dev/null
+python3 - "$reset_fail/run_result.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data['status'] == 'HARNESS_INVALID'
+assert data['reason'] == 'pool-reset'
+assert data['pool_reset_count'] == 0
+assert data['first_node'] is None
 PY
 
 "$script_dir/run_vm_e2e.sh" --help >/dev/null

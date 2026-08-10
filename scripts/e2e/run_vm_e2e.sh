@@ -207,12 +207,14 @@ d.update({"rounds": int(sys.argv[2]), "round_timeout_sec": int(sys.argv[3]),
 p.write_text(json.dumps(d, indent=2, sort_keys=True) + "\n")
 PY
 : >"$out_dir/actual_events.jsonl"
+export TIGONKV_E2E_ACTUAL_EVENTS="$out_dir/actual_events.jsonl"
 workflow_args=(--out-dir "$out_dir" --rounds "$rounds" --suite "$suite" --config "$config" --records "$record_count")
 if ((prepare_only)); then workflow_args+=(--prepare-only); fi
 set +e
 deploy_start_ms=$(harness_now_ms)
 timeout "$total_timeout" bash "$root/scripts/e2e/run_guest_e2e_workflows.sh" "${workflow_args[@]}" >"$out_dir/logs/runner.log" 2>&1
 runner_status=$?; set -e
+harness_record_runner_exit "$out_dir/run_meta.json" "$runner_status"
 harness_mark_timing "$out_dir/run_meta.json" deploy_ms "$deploy_start_ms"
 if ((prepare_only)); then
   probe_start_ms=$(harness_now_ms)
@@ -243,6 +245,15 @@ if ((prepare_only)); then
   harness_mark_timing "$out_dir/run_meta.json" total_prepare_ms "$total_start_ms"
   harness_emit_result "$out_dir" PREPARED prepare-only "" verified prepared
   exit 0
+fi
+set +e
+harness_record_pool_reset_meta "$out_dir/run_meta.json" "$out_dir/actual_events.jsonl"
+pool_reset_status=$?
+set -e
+if ((pool_reset_status != 0)); then
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=pool-reset" "reason=pool-reset"
+  harness_emit_result "$out_dir" HARNESS_INVALID pool-reset "" verified pool-reset
+  exit 125
 fi
 probe_start_ms=$(harness_now_ms)
 if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" || \
