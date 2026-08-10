@@ -92,6 +92,21 @@ shared_vm_lock_release() {
   fi
 }
 
+shared_vm_run_without_lock_fd() {
+  if [[ -z "${SHARED_VM_LOCK_FD:-}" ]]; then
+    "$@"
+    return $?
+  fi
+  [[ "$SHARED_VM_LOCK_FD" =~ ^[0-9]+$ ]] || {
+    echo "invalid shared VM lock descriptor" >&2
+    return 125
+  }
+  (
+    eval "exec ${SHARED_VM_LOCK_FD}>&-"
+    "$@"
+  )
+}
+
 if [[ "${1:-}" == --validate ]]; then
   (($# == 5 || $# == 6)) || { echo "usage: $0 --validate STORAGE BACKING BASE_PORT VM_COUNT [REQUIRE_MOUNT]" >&2; exit 2; }
   shared_vm_resources_validate "$2" "$3" "$4" "$5" "${6:-1}"
@@ -111,15 +126,8 @@ if [[ "${1:-}" == --exec ]]; then
   }
   shared_vm_lock_acquire "$2" "$3" "$4" "$5" "$6" "$7" "$8"
   shift 9
-  # Keep the lock in this supervisor while the command runs, but do not pass
-  # the descriptor to daemonized QEMU or other descendants.  A daemon that
-  # inherits the descriptor would keep the resource lock held after this
-  # invocation has finished and make the next canonical harness fail closed.
   set +e
-  (
-    eval "exec ${SHARED_VM_LOCK_FD}>&-"
-    "$@"
-  )
+  shared_vm_run_without_lock_fd "$@"
   command_status=$?
   shared_vm_lock_release
   exit "$command_status"

@@ -418,7 +418,7 @@ for ((i = 0; i < TIGONKV_VM_COUNT; i++)); do
   fi
   tigonkv_prepare_vm_disk "$i"
   tigonkv_prepare_qemu_cmd "$i"
-  "${TIGONKV_QEMU_CMD[@]}"
+  shared_vm_run_without_lock_fd "${TIGONKV_QEMU_CMD[@]}"
   pid=$(<"$vm_dir/qemu.pid")
   # Reconstruct the per-VM slice at the pin point.  Keep this independent of
   # the shell's IFS state: taskset requires one comma-separated CPU argument.
