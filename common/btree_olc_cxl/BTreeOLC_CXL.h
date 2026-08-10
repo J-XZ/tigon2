@@ -87,23 +87,35 @@ struct TreeNodeAllocation {
 inline thread_local bool TreeAccessIsHwcc = true;
 inline thread_local const TreeNodeAllocation *TreeAccessBinding = nullptr;
 
+inline bool IsTreeDataAddress(const void *address);
+inline latency_sim::MemoryDomain TreeDataDomain();
+
 template <typename T>
 class PersistentOffset {
  public:
-  PersistentOffset() = default;
-  PersistentOffset(std::nullptr_t) {}
+  PersistentOffset() { store_offset(tigonkv::engine::kNullOffset); }
+  PersistentOffset(std::nullptr_t) {
+    store_offset(tigonkv::engine::kNullOffset);
+  }
+  PersistentOffset(std::nullptr_t, latency_sim::MemoryDomain domain) {
+    latency_sim::FixedLatencyMemoryStore(
+        domain, &offset_, tigonkv::engine::kNullOffset);
+  }
   PersistentOffset(T *pointer) { assign(pointer); }
   T *get() const {
-    if (offset_ == tigonkv::engine::kNullOffset) return nullptr;
+    const auto offset = load_offset();
+    if (offset == tigonkv::engine::kNullOffset) return nullptr;
     if (TreeAccessBinding == nullptr)
       throw std::runtime_error("persistent tree offset resolved without binding");
-    return static_cast<T *>(TreeAccessBinding->FromOffset(offset_));
+    return static_cast<T *>(TreeAccessBinding->FromOffset(offset));
   }
   T *operator->() const { return get(); }
-  explicit operator bool() const { return offset_ != tigonkv::engine::kNullOffset; }
+  explicit operator bool() const {
+    return load_offset() != tigonkv::engine::kNullOffset;
+  }
   operator T *() const { return get(); }
   PersistentOffset &operator=(std::nullptr_t) {
-    offset_ = tigonkv::engine::kNullOffset;
+    store_offset(tigonkv::engine::kNullOffset);
     return *this;
   }
   PersistentOffset &operator=(T *pointer) {
@@ -113,23 +125,38 @@ class PersistentOffset {
   bool operator==(std::nullptr_t) const { return !static_cast<bool>(*this); }
   bool operator!=(std::nullptr_t) const { return static_cast<bool>(*this); }
   bool operator==(const PersistentOffset &other) const {
-    return offset_ == other.offset_;
+    return load_offset() == other.load_offset();
   }
   bool operator!=(const PersistentOffset &other) const {
-    return offset_ != other.offset_;
+    return load_offset() != other.load_offset();
   }
 
  private:
+  tigonkv::engine::RegionOffset load_offset() const {
+    return IsTreeDataAddress(&offset_)
+               ? latency_sim::FixedLatencyMemoryLoad(TreeDataDomain(),
+                                                     &offset_)
+               : offset_;
+  }
+
+  void store_offset(tigonkv::engine::RegionOffset offset) {
+    if (IsTreeDataAddress(&offset_)) {
+      latency_sim::FixedLatencyMemoryStore(TreeDataDomain(), &offset_, offset);
+    } else {
+      offset_ = offset;
+    }
+  }
+
   void assign(T *pointer) {
     if (pointer == nullptr) {
-      offset_ = tigonkv::engine::kNullOffset;
+      store_offset(tigonkv::engine::kNullOffset);
       return;
     }
     if (TreeAccessBinding == nullptr)
       throw std::runtime_error("persistent tree offset assigned without binding");
-    offset_ = TreeAccessBinding->ToOffset(pointer);
+    store_offset(TreeAccessBinding->ToOffset(pointer));
   }
-  tigonkv::engine::RegionOffset offset_{tigonkv::engine::kNullOffset};
+  tigonkv::engine::RegionOffset offset_;
 };
 
 static_assert(sizeof(PersistentOffset<void>) ==
@@ -157,23 +184,76 @@ class TreeAccessScope {
   const TreeNodeAllocation *previous_binding_;
 };
 
-inline void RecordTreeDataRead(const void *address, uint64_t bytes) {
-	if (TreeAccessIsHwcc)
-		tigonkv::engine::mem_access::HwccRead(address, bytes);
-	else
-		tigonkv::engine::mem_access::PrivateRead(address, bytes);
-}
-
-inline void RecordTreeDataWrite(const void *address, uint64_t bytes) {
-	if (TreeAccessIsHwcc)
-		tigonkv::engine::mem_access::HwccWrite(address, bytes);
-	else
-		tigonkv::engine::mem_access::PrivateWrite(address, bytes);
-}
-
 inline latency_sim::MemoryDomain TreeDataDomain() {
 	return TreeAccessIsHwcc ? latency_sim::MemoryDomain::kHwcc
 	                        : latency_sim::MemoryDomain::kOwnerPrivateSwcc;
+}
+
+// TableBTreeOLC also creates short-lived value objects on the host stack.
+// Only a value slot inside the currently bound tree mapping is shared data;
+// the storage policy uses this predicate to keep those local temporaries on
+// the original raw-assignment path.
+inline bool IsTreeDataAddress(const void *address) {
+        if (address == nullptr || TreeAccessBinding == nullptr ||
+            TreeAccessBinding->regions == nullptr) {
+                return false;
+        }
+        return TreeAccessBinding->domain ==
+                       tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc
+                   ? TreeAccessBinding->regions->IsSwccAddress(address)
+                   : TreeAccessBinding->regions->IsHwccAddress(address);
+}
+
+template <typename KeyType>
+struct SharedBytewiseComparator {
+        int operator()(const KeyType &left, const KeyType &right) const {
+                const bool left_shared = IsTreeDataAddress(&left);
+                const bool right_shared = IsTreeDataAddress(&right);
+                const auto domain = TreeDataDomain();
+                if (left_shared && right_shared) {
+                        return latency_sim::FixedLatencyMemcmpSharedToShared(
+                            domain, &left, domain, &right, sizeof(KeyType));
+                }
+                if (left_shared) {
+                        return latency_sim::FixedLatencyMemcmpSharedToLocal(
+                            domain, &left, &right, sizeof(KeyType));
+                }
+                if (right_shared) {
+                        return latency_sim::FixedLatencyMemcmpLocalToShared(
+                            domain, &left, &right, sizeof(KeyType));
+                }
+                return std::memcmp(&left, &right, sizeof(KeyType));
+        }
+};
+
+template <typename T>
+inline T TreeLoad(const T *address) {
+        return IsTreeDataAddress(address)
+                   ? latency_sim::FixedLatencyMemoryLoad(TreeDataDomain(),
+                                                         address)
+                   : *address;
+}
+
+template <typename T>
+inline void TreeStoreFrom(T *destination, const T *source) {
+        const T value = TreeLoad(source);
+        if (IsTreeDataAddress(destination)) {
+                latency_sim::FixedLatencyMemoryStore(
+                    TreeDataDomain(), destination, value);
+        } else {
+                *destination = value;
+        }
+}
+
+template <typename T>
+inline void TreeConstructFrom(T *destination, const T *source) {
+        const T value = TreeLoad(source);
+        if (IsTreeDataAddress(destination)) {
+                latency_sim::FixedLatencyConstructShared<T>(
+                    TreeDataDomain(), destination, value);
+        } else {
+                ::new (destination) T(value);
+        }
 }
 
 inline void* TreeMemmove(void* dst, const void* src, uint64_t bytes) {
@@ -250,24 +330,14 @@ inline T TreeAtomicFetchSub(std::atomic<T> &value, T operand,
                  latency_sim::MemoryDomain::kOwnerPrivateSwcc);
 }
 
-// Record the cache line containing the node latch and metadata at each node
-// actually visited.  Charging an entire 4 KiB page per operation both
-// over-counted untouched payload and missed non-root nodes.
-inline void RecordTreeAccess(const TreeNodeAllocation &allocation, const void *page,
-                             bool write) {
-	if (page == nullptr) return;
-	constexpr uint64_t kNodeMetadataBytes = 64;
-	if (allocation.domain == tigonkv::engine::AllocationDomain::kOwnerPrivateSwcc) {
-		if (write) tigonkv::engine::mem_access::PrivateWrite(page, kNodeMetadataBytes);
-		else tigonkv::engine::mem_access::PrivateRead(page, kNodeMetadataBytes);
-	} else {
-		if (write) tigonkv::engine::mem_access::HwccWrite(page, kNodeMetadataBytes);
-		else tigonkv::engine::mem_access::HwccRead(page, kNodeMetadataBytes);
-	}
-}
-
 struct LatchBase {
-	std::atomic<uint64_t> word{ 0 };
+	std::atomic<uint64_t> word;
+
+	LatchBase()
+	{
+		latency_sim::FixedLatencyConstructShared<std::atomic<uint64_t>>(
+		    TreeDataDomain(), &word, uint64_t{ 0 });
+	}
 
 	uint64_t load(std::memory_order order = std::memory_order_seq_cst) {
 		return TreeAtomicLoad(word, order);
@@ -530,7 +600,7 @@ class BPlusTree {
 			//     //OLTP_LOG_INFO(RWSpinLatchThreadId, " upgradeToWriteLockOrRestart on ", (uint64_t)this,  ", Readers:
 			//     ",getReaderCount(word.load()));
 			// } else {
-			if ((word & kReaderMask) != 0) {
+			if ((load() & kReaderMask) != 0) {
 				needRestart = true;
 				return;
 			}
@@ -743,9 +813,11 @@ class BPlusTree {
 		uint16_t count_;
 
 		NodeMetaData(NodeType nodeType)
-			: type_(nodeType)
-			, count_(0)
 		{
+			latency_sim::FixedLatencyMemoryStore(TreeDataDomain(), &type_,
+			                                    nodeType);
+			latency_sim::FixedLatencyMemoryStore(TreeDataDomain(), &count_,
+			                                    uint16_t{ 0 });
 		}
 	};
 
@@ -765,16 +837,18 @@ class BPlusTree {
 		}
 		NodeType getType() const
 		{
-			return meta_.type_;
+			return latency_sim::FixedLatencyMemoryLoad(TreeDataDomain(),
+			                                          &meta_.type_);
 		}
 		uint16_t getCount() const
 		{
-			return meta_.count_;
+			return latency_sim::FixedLatencyMemoryLoad(TreeDataDomain(),
+			                                          &meta_.count_);
 		}
 		void setCount(uint16_t count)
 		{
-			RecordTreeDataWrite(&meta_.count_, sizeof(meta_.count_));
-			meta_.count_ = count;
+			latency_sim::FixedLatencyMemoryStore(TreeDataDomain(), &meta_.count_,
+			                                    count);
 		}
 	};
 
@@ -805,23 +879,9 @@ class BPlusTree {
 
 		BTreeLeaf()
 			: NodeBase(NodeType::BTreeLeaf)
-			, pre_(nullptr)
-			, next_(nullptr)
+			, pre_(nullptr, TreeDataDomain())
+			, next_(nullptr, TreeDataDomain())
 		{
-		}
-
-		void recordEntriesRead(size_t begin, size_t count) const
-		{
-			if (count == 0) return;
-			RecordTreeDataRead(keys_ + begin, sizeof(KeyType) * count);
-			RecordTreeDataRead(values_ + begin, sizeof(ValueType) * count);
-		}
-
-		void recordEntriesWrite(size_t begin, size_t count)
-		{
-			if (count == 0) return;
-			RecordTreeDataWrite(keys_ + begin, sizeof(KeyType) * count);
-			RecordTreeDataWrite(values_ + begin, sizeof(ValueType) * count);
 		}
 
 		/**
@@ -844,13 +904,10 @@ class BPlusTree {
 		/**
 		 * @note Used when KeyType is trivial, e.g. `OLTPBtreeFixedLenKey`.
 		 */
-		template <typename T = KeyType> typename std::enable_if<std::is_trivial<T>::value == true, void>::type __adjust_elements_in_erase(int pos)
+			template <typename T = KeyType> typename std::enable_if<std::is_trivial<T>::value == true, void>::type __adjust_elements_in_erase(int pos)
 		{
 			const size_t moved = this->getCount() - pos - 1;
 			const size_t key_bytes = sizeof(KeyType) * moved;
-			const size_t value_bytes = sizeof(ValueType) * moved;
-			RecordTreeDataRead(values_ + pos + 1, value_bytes);
-			RecordTreeDataWrite(values_ + pos, value_bytes);
 			TreeMemmove(keys_ + pos, keys_ + pos + 1, key_bytes);
 			// memmove(values_ + pos, values_ + pos + 1, sizeof(ValueType) * (this->getCount() - pos - 1));
                         for (int i = 0; i < this->getCount() - pos - 1; i++) {
@@ -902,21 +959,16 @@ class BPlusTree {
 			assert(hasEnoughSpace(sibling->getCount()));
 			const uint16_t base = this->getCount();
 			const uint16_t incoming = sibling->getCount();
-			sibling->recordEntriesRead(0, incoming);
-			recordEntriesWrite(base, incoming);
 			for (uint16_t i = this->getCount(); i < sibling->getCount() + this->getCount(); i++) {
-				new (&keys_[i]) KeyType{ sibling->keys_[i - this->getCount()] }; // Placement new
+					TreeConstructFrom(&keys_[i],
+					                 &sibling->keys_[i - this->getCount()]);
 				new (&values_[i]) ValueType{ sibling->values_[i - this->getCount()] };
 				sibling->keys_[i - this->getCount()].~KeyType(); // call dtor manually
 				sibling->values_[i - this->getCount()].~ValueType();
 			}
 			this->setCount(this->getCount() + sibling->getCount());
-			RecordTreeDataRead(&sibling->next_, sizeof(sibling->next_));
-			RecordTreeDataWrite(&this->next_, sizeof(this->next_));
 			this->next_ = sibling->next_.get();
                         if (this->next_.get()) {
-				RecordTreeDataWrite(&sibling->next_->pre_,
-				                    sizeof(sibling->next_->pre_));
                                 sibling->next_->pre_ = this;
 			}
 			assert(((uint64_t)sibling) != 0xffffffffffffffffull);
@@ -947,30 +999,26 @@ class BPlusTree {
 			if (pos < this->getCount() && keyComp_(keys_[pos], k) == 0) {
 				// already exists
 				success = false;
-				RecordTreeDataRead(&values_[pos], sizeof(ValueType));
 				return values_[pos];
 			} else {
-				const uint16_t count = this->getCount();
-				recordEntriesRead(pos, count - pos);
-				recordEntriesWrite(pos, count - pos + 1);
 				if (pos == this->getCount()) {
 					// Placement new
-					new (&keys_[this->getCount()]) KeyType{ k };
+					TreeConstructFrom(&keys_[this->getCount()], &k);
 					new (&values_[this->getCount()]) ValueType{ createValue() };
 				} else {
 					// Placement new
-					new (&keys_[this->getCount()]) KeyType{ keys_[this->getCount() - 1] };
+						TreeConstructFrom(&keys_[this->getCount()],
+						                 &keys_[this->getCount() - 1]);
 					new (&values_[this->getCount()]) ValueType{ values_[this->getCount() - 1] };
 					for (uint16_t i = this->getCount() - 1; i > pos; i--) {
-						keys_[i] = keys_[i - 1];
+							TreeStoreFrom(&keys_[i], &keys_[i - 1]);
 						values_[i] = values_[i - 1];
 					}
-					keys_[pos] = k;
+						TreeStoreFrom(&keys_[pos], &k);
 					values_[pos] = createValue();
 				}
 				this->setCount(this->getCount() + 1);
 				success = true;
-				RecordTreeDataRead(&values_[pos], sizeof(ValueType));
 				return values_[pos];
 			}
 		}
@@ -979,9 +1027,8 @@ class BPlusTree {
 		{
 			if (this->getCount() < 128) {
 				int left = 0;
-				while (left < this->getCount()) {
-					RecordTreeDataRead(&this->keys_[left], sizeof(KeyType));
-					if (keyComp_(this->keys_[left], k) >= 0) break;
+			while (left < this->getCount()) {
+						if (keyComp_(this->keys_[left], k) >= 0) break;
 					++left;
 				}
 				return left;
@@ -989,8 +1036,7 @@ class BPlusTree {
 				int left = 0, right = this->getCount() - 1;
 				while (left <= right) {
 					int mid = left + (right - left) / 2;
-					RecordTreeDataRead(&keys_[mid], sizeof(KeyType));
-					int comp = keyComp_(keys_[mid], k);
+						int comp = keyComp_(keys_[mid], k);
 					if (comp == 0)
 						return mid;
 					else if (comp < 0)
@@ -1005,15 +1051,13 @@ class BPlusTree {
 		__attribute__((deprecated)) void update(const KeyType &k, ValueType p, unsigned pos)
 		{
 			assert(keyComp_(keys_[pos], k) == 0);
-			RecordTreeDataWrite(&values_[pos], sizeof(ValueType));
 			values_[pos] = p;
 		}
 
-		const KeyType &max_key()
+		KeyType max_key()
 		{
 			assert(this->getCount());
-			RecordTreeDataRead(&keys_[this->getCount() - 1], sizeof(KeyType));
-			return keys_[this->getCount() - 1];
+			return TreeLoad(&keys_[this->getCount() - 1]);
 		}
 
 		// void insert_at(KeyType k, ValueType p, unsigned pos) {
@@ -1044,25 +1088,22 @@ class BPlusTree {
 			if (pos < this->getCount() && keyComp_(keys_[pos], k) == 0) {
 				// already exists
 				success = false;
-				RecordTreeDataRead(&values_[pos], sizeof(ValueType));
 				return values_[pos];
 			} else {
-				const uint16_t count = this->getCount();
-				recordEntriesRead(pos, count - pos);
-				recordEntriesWrite(pos, count - pos + 1);
 				if (pos == this->getCount()) {
 					// Placement new
-					new (&keys_[this->getCount()]) KeyType{ k };
+						TreeConstructFrom(&keys_[this->getCount()], &k);
 					new (&values_[this->getCount()]) ValueType{ v };
 				} else {
 					// Placement new
-					new (&keys_[this->getCount()]) KeyType{ keys_[this->getCount() - 1] };
+						TreeConstructFrom(&keys_[this->getCount()],
+						                 &keys_[this->getCount() - 1]);
 					new (&values_[this->getCount()]) ValueType{ values_[this->getCount() - 1] };
 					for (uint16_t i = this->getCount() - 1; i > pos; i--) {
-						keys_[i] = keys_[i - 1];
+							TreeStoreFrom(&keys_[i], &keys_[i - 1]);
 						values_[i] = values_[i - 1];
 					}
-					keys_[pos] = k;
+						TreeStoreFrom(&keys_[pos], &k);
 					values_[pos] = v;
 				}
 				this->setCount(this->getCount() + 1);
@@ -1084,22 +1125,20 @@ class BPlusTree {
 				// already exists
 				return false;
 			} else {
-				const uint16_t count = this->getCount();
-				recordEntriesRead(pos, count - pos);
-				recordEntriesWrite(pos, count - pos + 1);
 				if (pos == this->getCount()) {
 					// Placement new
-					new (&keys_[this->getCount()]) KeyType{ k };
+					TreeConstructFrom(&keys_[this->getCount()], &k);
 					new (&values_[this->getCount()]) ValueType{ v };
 				} else {
 					// Placement new
-					new (&keys_[this->getCount()]) KeyType{ keys_[this->getCount() - 1] };
+					TreeConstructFrom(&keys_[this->getCount()],
+					                 &keys_[this->getCount() - 1]);
 					new (&values_[this->getCount()]) ValueType{ values_[this->getCount() - 1] };
 					for (uint16_t i = this->getCount() - 1; i > pos; i--) {
-						keys_[i] = keys_[i - 1];
+						TreeStoreFrom(&keys_[i], &keys_[i - 1]);
 						values_[i] = values_[i - 1];
 					}
-					keys_[pos] = k;
+					TreeStoreFrom(&keys_[pos], &k);
 					values_[pos] = v;
 				}
 				this->setCount(this->getCount() + 1);
@@ -1114,33 +1153,25 @@ class BPlusTree {
 		{
 			char *base = reinterpret_cast<char *>(allocation.Allocate(LeafPageSize));
 			BTreeLeaf *newLeaf = new (base) BTreeLeaf(); // Placement new
-			RecordTreeAccess(allocation, newLeaf, true);
 
 			newLeaf->setCount(this->getCount() - (this->getCount() / 2));
 			const uint16_t moved = newLeaf->getCount();
 			newLeaf->next_ = next_.get();
 			newLeaf->pre_ = this;
-			RecordTreeDataRead(&next_, sizeof(next_));
-			RecordTreeDataWrite(&newLeaf->next_, sizeof(newLeaf->next_));
-			RecordTreeDataWrite(&newLeaf->pre_, sizeof(newLeaf->pre_));
 
 			this->setCount(this->getCount() - newLeaf->getCount());
-			recordEntriesRead(this->getCount(), moved);
-			newLeaf->recordEntriesWrite(0, moved);
-			RecordTreeDataWrite(&next_, sizeof(next_));
 			next_ = newLeaf;
 			// Master's split forgot the backward link: the old right sibling
 			// still points at this leaf, so leaf-first-key callbacks observe a
 			// stale predecessor and the migrated prev/next bits stay wrong
 			// (YCSB-E scan probe livelock). Mirror the erase-merge back-link.
 			if (newLeaf->next_.get() != nullptr) {
-				RecordTreeDataWrite(&newLeaf->next_->pre_,
-				                    sizeof(newLeaf->next_->pre_));
 				newLeaf->next_->pre_ = newLeaf;
 			}
 
 			for (uint16_t i = 0; i < newLeaf->getCount(); i++) {
-				new (&newLeaf->keys_[i]) KeyType{ keys_[i + this->getCount()] }; // Placement new
+					TreeConstructFrom(&newLeaf->keys_[i],
+					                 &keys_[i + this->getCount()]);
 				new (&newLeaf->values_[i]) ValueType{ values_[i + this->getCount()] }; // Placement new
 				keys_[i + this->getCount()].~KeyType();
 				values_[i + this->getCount()].~ValueType(); // call dtor manually
@@ -1155,8 +1186,7 @@ class BPlusTree {
 		 */
 		template <typename T = KeyType> typename std::enable_if<std::is_trivial<T>::value == true, void>::type __get_separate_key_in_split(KeyType &sep)
 		{
-			RecordTreeDataRead(&keys_[this->getCount() - 1], sizeof(KeyType));
-			sep = keys_[this->getCount() - 1];
+			sep = TreeLoad(&keys_[this->getCount() - 1]);
 		}
 		/**
 		 * @note Used when KeyType is non-trivial, e.g. `OLTPBtreeVarlenKey`.
@@ -1202,46 +1232,45 @@ class BPlusTree {
 		{
 			auto *key = reinterpret_cast<KeyType *>(
 			    reinterpret_cast<intptr_t>(data_) + i * sizeof(KeyType));
-			RecordTreeDataRead(key, sizeof(KeyType));
 			return *key;
 		}
 
-		PersistentOffset<NodeBase> &childAt(size_t i)
+		const KeyType &keyForCompare(size_t i) const
 		{
-			auto *child =
-			    reinterpret_cast<PersistentOffset<NodeBase> *>(
-			        reinterpret_cast<intptr_t>(data_) + childOffset +
-			        i * sizeof(PersistentOffset<NodeBase>));
-			RecordTreeDataRead(
-			    child, sizeof(PersistentOffset<NodeBase>));
-			return *child;
+			return *reinterpret_cast<const KeyType *>(
+			    reinterpret_cast<intptr_t>(data_) + i * sizeof(KeyType));
 		}
 
+			PersistentOffset<NodeBase> &childAt(size_t i)
+			{
+				auto *child =
+				    reinterpret_cast<PersistentOffset<NodeBase> *>(
+				        reinterpret_cast<intptr_t>(data_) + childOffset +
+				        i * sizeof(PersistentOffset<NodeBase>));
+				return *child;
+			}
+
 		void setKeyAt(size_t i, const KeyType &key)
-		{
-			auto *slot = reinterpret_cast<KeyType *>(
-			    reinterpret_cast<intptr_t>(data_) + i * sizeof(KeyType));
-			RecordTreeDataWrite(slot, sizeof(KeyType));
-			*slot = key;
+			{
+				auto *slot = reinterpret_cast<KeyType *>(
+				    reinterpret_cast<intptr_t>(data_) + i * sizeof(KeyType));
+				TreeStoreFrom(slot, &key);
 		}
 
 		void setChildAt(size_t i, NodeBase *child)
 		{
-			auto *slot =
-			    reinterpret_cast<PersistentOffset<NodeBase> *>(
-			        reinterpret_cast<intptr_t>(data_) + childOffset +
-			        i * sizeof(PersistentOffset<NodeBase>));
-			RecordTreeDataWrite(
-			        slot, sizeof(PersistentOffset<NodeBase>));
-			*slot = child;
+				auto *slot =
+				    reinterpret_cast<PersistentOffset<NodeBase> *>(
+				        reinterpret_cast<intptr_t>(data_) + childOffset +
+				        i * sizeof(PersistentOffset<NodeBase>));
+				*slot = child;
 		}
 
 		void newKey(const size_t pos, const KeyType &key)
 		{
-			auto *slot = reinterpret_cast<KeyType *>(
-			    reinterpret_cast<intptr_t>(data_) + pos * sizeof(KeyType));
-			RecordTreeDataWrite(slot, sizeof(KeyType));
-			new (slot) KeyType{ key }; // Placement new
+				auto *slot = reinterpret_cast<KeyType *>(
+				    reinterpret_cast<intptr_t>(data_) + pos * sizeof(KeyType));
+				TreeConstructFrom(slot, &key);
 		}
 
 		bool isFull()
@@ -1375,14 +1404,15 @@ class BPlusTree {
 		{
 			if (this->getCount() < 128) {
 				int left = 0;
-				while (left < this->getCount() && keyComp_(keyAt(left), k) < 0)
+				while (left < this->getCount() &&
+				       keyComp_(keyForCompare(left), k) < 0)
 					++left;
 				return left;
 			} else {
 				int left = 0, right = this->getCount() - 1;
 				while (left <= right) {
 					int mid = left + (right - left) / 2;
-					int comp = keyComp_(keyAt(mid), k);
+				int comp = keyComp_(keyForCompare(mid), k);
 					if (comp == 0)
 						return mid;
 					else if (comp < 0)
@@ -1409,12 +1439,11 @@ class BPlusTree {
 		{
 			char *base = reinterpret_cast<char *>(allocation.Allocate(InnerPageSize));
 			BTreeInner *newInner = new (base) BTreeInner(); // Placement new
-			RecordTreeAccess(allocation, newInner, true);
 
 			newInner->setCount(this->getCount() - (this->getCount() / 2));
 			this->setCount(this->getCount() - newInner->getCount() - 1);
 
-			sep = keyAt(this->getCount());
+			sep = TreeLoad(&keyAt(this->getCount()));
 			/*
 			 * separate key will push up to the node's parent,
 			 * so need to destruct separate key here and NO need
@@ -1435,10 +1464,10 @@ class BPlusTree {
 			return newInner;
 		}
 
-		const KeyType &max_key()
+		KeyType max_key()
 		{
 			assert(this->getCount());
-			return keyAt(this->getCount() - 1);
+			return TreeLoad(&keyAt(this->getCount() - 1));
 		}
 
 		void insert(const KeyType &k, NodeBase *child, const KeyComparator &keyComp_)
@@ -1461,10 +1490,10 @@ class BPlusTree {
                         }
 			setChildAt(pos, child);
 
-			auto displaced = childAt(pos + 1);
-			auto inserted = childAt(pos);
-			setChildAt(pos, displaced.get());
-			setChildAt(pos + 1, inserted.get());
+			NodeBase *displaced = childAt(pos + 1).get();
+			NodeBase *inserted = childAt(pos).get();
+			setChildAt(pos, displaced);
+			setChildAt(pos + 1, inserted);
 			this->setCount(this->getCount() + 1);
 		}
 
@@ -1557,15 +1586,13 @@ class BPlusTree {
 			return !result;
 		}
 
-		const KeyType &key() const
+		KeyType key() const
 		{
-			RecordTreeDataRead(&curNode_->keys_[curPos_], sizeof(KeyType));
-			return curNode_->keys_[curPos_];
+			return TreeLoad(&curNode_->keys_[curPos_]);
 		}
 
-		const ValueType &value() const
+		ValueType value() const
 		{
-			RecordTreeDataRead(&curNode_->values_[curPos_], sizeof(ValueType));
 			return curNode_->values_[curPos_];
 		}
 
@@ -1630,15 +1657,12 @@ class BPlusTree {
 			curPos_++;
 			// move to next leafNode
 			if (curPos_ >= static_cast<int>(curNode_->getCount())) {
-				RecordTreeDataRead(&curNode_->next_, sizeof(curNode_->next_));
 				if (curNode_->next_.get() == nullptr) {
 					setEndIterator(true);
 					return;
 				}
 				auto preNode = curNode_.get();
 				curNode_ = curNode_->next_.get();
-				if (allocation_ != nullptr)
-					RecordTreeAccess(*allocation_, curNode_.get(), false);
 				curNode_->iteratorEnter(needRestart);
 				if (needRestart) {
 					preNode->iteratorLeave();
@@ -1660,15 +1684,12 @@ class BPlusTree {
 			curPos_--;
 			// move to previous leafNode
 			if (curPos_ < 0) {
-				RecordTreeDataRead(&curNode_->pre_, sizeof(curNode_->pre_));
 				if (curNode_->pre_.get() == nullptr) {
 					setEndIterator(true);
 					return;
 				}
 				auto preNode = curNode_.get();
 				curNode_ = curNode_->pre_.get();
-				if (allocation_ != nullptr)
-					RecordTreeAccess(*allocation_, curNode_.get(), false);
 				curNode_->iteratorEnter(needRestart);
 				if (needRestart) {
 					preNode->iteratorLeave();
@@ -1751,7 +1772,6 @@ class BPlusTree {
 		TreeAccessScope access_scope(allocation_);
 		char *base = reinterpret_cast<char *>(allocation_.Allocate(InnerPageSize));
 		auto inner = new (base) BTreeInner(); // Placement new
-		RecordTreeAccess(allocation_, inner, true);
 
 		inner->setCount(1);
 		inner->newKey(0, k);
@@ -1839,17 +1859,13 @@ class BPlusTree {
 				 *    b       c  d                  b  c      d
 				 */
 				// adjust left node
-				b->recordEntriesRead(0, 1);
-				a->recordEntriesWrite(a->getCount(), 1);
-				new (&a->keys_[a->getCount()]) KeyType{ b->keys_[0] }; // Placement new
+				TreeConstructFrom(&a->keys_[a->getCount()], &b->keys_[0]);
 				new (&a->values_[a->getCount()]) ValueType{ b->values_[0] }; // Placement new
 				a->setCount(a->getCount() + 1);
 
 				// adjust right node
-				b->recordEntriesRead(1, b->getCount() - 1);
-				b->recordEntriesWrite(0, b->getCount() - 1);
 				for (uint16_t i = 0; i < b->getCount() - 1; i++) {
-					b->keys_[i] = b->keys_[i + 1];
+					TreeStoreFrom(&b->keys_[i], &b->keys_[i + 1]);
 					b->values_[i] = b->values_[i + 1];
 				}
 				b->keys_[b->getCount() - 1].~KeyType(); // call dtor manually
@@ -1866,20 +1882,17 @@ class BPlusTree {
 				 *    b  c      d                  b       c  d
 				 */
 				// move right
-				b->recordEntriesRead(0, b->getCount());
-				b->recordEntriesWrite(1, b->getCount());
 				for (uint16_t i = b->getCount(); i > 0; i--) {
-					new (&b->keys_[i]) KeyType{ b->keys_[i - 1] };
+					TreeConstructFrom(&b->keys_[i], &b->keys_[i - 1]);
 					new (&b->values_[i]) ValueType{ b->values_[i - 1] };
 					b->keys_[i - 1].~KeyType();
 					b->values_[i - 1].~ValueType();
 				}
 				b->setCount(b->getCount() + 1);
 				a->setCount(a->getCount() - 1);
-				a->recordEntriesRead(a->getCount(), 1);
-				b->recordEntriesWrite(0, 1);
 				for (int i = 0; i < 1; i++) {
-					new (&b->keys_[i]) KeyType{ a->keys_[a->getCount() + i] };
+					TreeConstructFrom(&b->keys_[i],
+					                 &a->keys_[a->getCount() + i]);
 					new (&b->values_[i]) ValueType{ a->values_[a->getCount() + i] };
 					a->keys_[a->getCount() + i].~KeyType();
 					a->values_[a->getCount() + i].~ValueType();
@@ -1989,7 +2002,6 @@ restart:
 
 		// Current node
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2049,7 +2061,6 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 			// prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -2152,7 +2163,6 @@ restart:
 		if (restartCount++) yield(restartCount, true);
 		bool needRestart = false;
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2192,7 +2202,6 @@ restart:
 			parent = inner;
 			versionParent = versionNode;
 			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart) goto restart;
 			versionNode = node->readLockOrRestart(needRestart);
@@ -2247,7 +2256,6 @@ restart:
 			if (pos == leaf->getCount()) {
 				nextLeaf = leaf->next_.get();
 				CHECK(nextLeaf != nullptr);
-				RecordTreeAccess(allocation_, nextLeaf, true);
 				nextLeaf->writeLockOrRestart(needRestart);
 				if (needRestart) {
 					leaf->writeUnlock();
@@ -2288,7 +2296,6 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2330,7 +2337,6 @@ restart:
 			parent = inner;
 			versionParent = versionNode;
 			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart) goto restart;
 			versionNode = node->readLockOrRestart(needRestart);
@@ -2392,7 +2398,6 @@ restart:
 				prev_key = &leaf->keys_[pos - 1];
 				prev_value = &leaf->values_[pos - 1];
 			} else if ((prevLeaf = leaf->pre_.get()) != nullptr) {
-				RecordTreeAccess(allocation_, prevLeaf, true);
 				prevLeaf->writeLockOrRestart(needRestart);
 				if (needRestart) {
 					leaf->writeUnlock();
@@ -2406,7 +2411,6 @@ restart:
 			if (pos == leaf->getCount()) {
 				nextLeaf = leaf->next_.get();
 				CHECK(nextLeaf != nullptr);
-				RecordTreeAccess(allocation_, nextLeaf, true);
 				nextLeaf->writeLockOrRestart(needRestart);
 				if (needRestart) {
 					leaf->writeUnlock();
@@ -2447,7 +2451,6 @@ restart:
 
 		// Current node
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2514,7 +2517,6 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 			// prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -2618,7 +2620,6 @@ restart:
 
 		// Current node
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2685,7 +2686,6 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(k, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 			// prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -2840,7 +2840,6 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2864,7 +2863,6 @@ restart:
 			parent = inner;
 			versionParent = versionNode;
 			node = inner->childAt(inner->lowerBound(lowKey, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 
 			// prefetch((char *)node, kPageSize);
 			inner->checkOrRestart(versionNode, needRestart);
@@ -2891,7 +2889,6 @@ restart:
 				if (needRestart)
 					goto restart;
 				leaf = nextLeaf;
-				RecordTreeAccess(allocation_, leaf, false);
 				pos = 0;
 			} else {
 				pos++;
@@ -2935,7 +2932,6 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -2959,7 +2955,6 @@ restart:
 			parent = inner;
 			versionParent = versionNode;
 			node = inner->childAt(inner->lowerBound(lowKey, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 
 			// prefetch((char *)node, kPageSize);
 			inner->checkOrRestart(versionNode, needRestart);
@@ -2992,8 +2987,6 @@ restart:
 		BTreeLeaf *nextLeaf = leaf->next_.get();
 		for (unsigned p = pos; p < leaf->getCount(); ++p) {
 			bool lastItem = nextLeaf == nullptr && p + 1 == leaf->getCount();
-			RecordTreeDataRead(&leaf->keys_[p], sizeof(KeyType));
-			RecordTreeDataRead(&leaf->values_[p], sizeof(ValueType));
                         CHECK(keyComp_(leaf->keys_[p], lowKey) >= 0);
 			bool end = processor(leaf->keys_[p], leaf->values_[p], lastItem);
 			if (end) {
@@ -3230,7 +3223,8 @@ restart:
 			auto child = static_cast<BTreeInner *>(childNode);
 			auto sibling = static_cast<BTreeInner *>(siblingNode);
 			if (opt == MergeOperation::LeftToRight) {
-				const KeyType &subTreeMaxKey = _getSubTreeMaxKey(child->childAt(child->getCount()).get());
+				const KeyType subTreeMaxKey =
+				    _getSubTreeMaxKey(child->childAt(child->getCount()).get());
 				child->merge(sibling, subTreeMaxKey, allocation_);
 				stats_.inner_nodes--;
 				// KeyType siblingSubTreeMaxKey = _getSubTreeMaxKey(sibling);
@@ -3242,7 +3236,8 @@ restart:
 					store_root(child);
 				}
 			} else if (opt == MergeOperation::RightToLeft) {
-				const KeyType &subTreeMaxKey = _getSubTreeMaxKey(sibling->childAt(sibling->getCount()).get());
+				const KeyType subTreeMaxKey =
+				    _getSubTreeMaxKey(sibling->childAt(sibling->getCount()).get());
 				sibling->merge(child, subTreeMaxKey, allocation_);
 				stats_.inner_nodes--;
 				changeRoot = parentNode->erase(siblingPos, allocation_);
@@ -3421,7 +3416,7 @@ restart:
 	char pad_[64];
 	tree_stats stats_;
 
-	const KeyType &_getSubTreeMaxKey(NodeBase *node)
+	KeyType _getSubTreeMaxKey(NodeBase *node)
 	{
 		int restartCount = 0;
 restart:
@@ -3429,7 +3424,6 @@ restart:
 			yield(restartCount);
 
 		bool needRestart = false;
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t version = node->readLockOrRestart(needRestart);
 		if (needRestart)
 			goto restart;
@@ -3451,7 +3445,6 @@ restart:
 			// get the last child
 			auto pos = node->getCount();
 			node = inner->childAt(pos).get();
-			RecordTreeAccess(allocation_, node, false);
 
 			inner->checkOrRestart(version, needRestart);
 			if (needRestart)
@@ -3463,7 +3456,7 @@ restart:
 
 		auto leaf = static_cast<BTreeLeaf *>(node);
 		// int pos = leaf->getCount() ? leaf->getCount() - 1 : 0;
-		const KeyType &res = leaf->max_key();
+		KeyType res = leaf->max_key();
 		if (parent) {
 			parent->readUnlockOrRestart(parentVersion, needRestart);
 			if (needRestart) {
@@ -3493,7 +3486,6 @@ restart:
 		// from which the current node is derived.
 		std::vector<StackNodeElement> stack;
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -3520,7 +3512,6 @@ restart:
 
 			unsigned pos = inner->lowerBound(element.first, keyComp_);
 			node = inner->childAt(pos).get();
-			RecordTreeAccess(allocation_, node, false);
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart) {
 				goto restart;
@@ -3649,7 +3640,6 @@ restart:
 		// from which the current node is derived.
 		std::vector<StackNodeElement> stack;
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -3676,7 +3666,6 @@ restart:
 
 			unsigned pos = inner->lowerBound(deleteKey, keyComp_);
 			node = inner->childAt(pos).get();
-			RecordTreeAccess(allocation_, node, false);
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart) {
 				goto restart;
@@ -3793,7 +3782,6 @@ restart:
 		bool needRestart = false;
 		std::vector<StackNodeElement> stack;
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -3813,7 +3801,6 @@ restart:
 			versionParent = versionNode;
 			unsigned child_pos = inner->lowerBound(deleteKey, keyComp_);
 			node = inner->childAt(child_pos).get();
-			RecordTreeAccess(allocation_, node, false);
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
 				goto restart;
@@ -3852,7 +3839,6 @@ restart:
 				} else {
 					prevLeaf = leaf->pre_.get();
 					if (prevLeaf) {
-						RecordTreeAccess(allocation_, prevLeaf, true);
 						prevLeaf->writeLockOrRestart(needRestart);
 						if (needRestart) {
 							leaf->writeUnlock();
@@ -3870,7 +3856,6 @@ restart:
 				} else {
 					nextLeaf = leaf->next_.get();
 					if (nextLeaf) {
-						RecordTreeAccess(allocation_, nextLeaf, true);
 						nextLeaf->writeLockOrRestart(needRestart);
 						if (needRestart) {
 							leaf->writeUnlock();
@@ -3936,7 +3921,6 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -3960,7 +3944,6 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(key, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 			prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -3992,8 +3975,6 @@ restart:
 		bool success = false;
 		if ((pos < leaf->getCount()) && keyComp_(leaf->keys_[pos], key) == 0) {
 			success = true;
-			RecordTreeDataRead(&leaf->keys_[pos], sizeof(KeyType));
-			RecordTreeDataWrite(&leaf->values_[pos], sizeof(ValueType));
 			update_processor(leaf->keys_[pos], leaf->values_[pos]);
 		}
 
@@ -4011,7 +3992,6 @@ restart:
 		if (restartCount++) yield(restartCount);
 		bool needRestart = false;
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || node != load_root()) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -4028,7 +4008,6 @@ restart:
 			parent = inner;
 			versionParent = versionNode;
 			node = inner->childAt(inner->lowerBound(key, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 			prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart) goto restart;
@@ -4058,7 +4037,6 @@ restart:
 				prev_key = &leaf->keys_[pos - 1];
 				prev_value = &leaf->values_[pos - 1];
 			} else if ((prevLeaf = leaf->pre_.get()) != nullptr) {
-				RecordTreeAccess(allocation_, prevLeaf, true);
 				prevLeaf->writeLockOrRestart(needRestart);
 				if (needRestart) { leaf->writeUnlock(); goto restart; }
 				if (prevLeaf->getCount() > 0) {
@@ -4070,7 +4048,6 @@ restart:
 				next_key = &leaf->keys_[pos + 1];
 				next_value = &leaf->values_[pos + 1];
 			} else if ((nextLeaf = leaf->next_.get()) != nullptr) {
-				RecordTreeAccess(allocation_, nextLeaf, true);
 				nextLeaf->writeLockOrRestart(needRestart);
 				if (needRestart) {
 					leaf->writeUnlock();
@@ -4102,7 +4079,6 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -4126,7 +4102,6 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(element.first, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 			prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -4138,10 +4113,7 @@ restart:
 		auto leaf = static_cast<BTreeLeaf *>(node);
 		unsigned pos = leaf->lowerBound(element.first, keyComp_);
 		bool success = false;
-		if (pos < leaf->getCount())
-			RecordTreeDataRead(&leaf->keys_[pos], sizeof(KeyType));
 		if ((pos < leaf->getCount()) && keyComp_(leaf->keys_[pos], element.first) == 0) {
-			RecordTreeDataRead(&leaf->values_[pos], sizeof(ValueType));
 			if (flag) {
 				success = true;
 				result = leaf->values_[pos];
@@ -4177,7 +4149,6 @@ restart:
 		bool needRestart = false;
 
 		NodeBase *node = load_root();
-		RecordTreeAccess(allocation_, node, false);
 		uint64_t versionNode = node->readLockOrRestart(needRestart);
 		if (needRestart || (node != load_root())) {
 			node->readUnlockOrRestart(versionNode, needRestart);
@@ -4201,7 +4172,6 @@ restart:
 			versionParent = versionNode;
 
 			node = inner->childAt(inner->lowerBound(key, keyComp_)).get();
-			RecordTreeAccess(allocation_, node, false);
 			prefetch((char *)node, sizeof(NodeMetaData));
 			inner->checkOrRestart(versionNode, needRestart);
 			if (needRestart)
@@ -4217,8 +4187,6 @@ restart:
 		unsigned pos = leaf->lowerBound(key, keyComp_);
 		bool success = false;
 		if ((pos < leaf->getCount()) && keyComp_(leaf->keys_[pos], key) == 0) {
-			RecordTreeDataRead(&leaf->keys_[pos], sizeof(KeyType));
-			RecordTreeDataRead(&leaf->values_[pos], sizeof(ValueType));
 			success = true;
 			result = leaf->values_[pos];
 		}

@@ -15,14 +15,18 @@ class SCCNoOP : public SCCManager {
         void init_scc_metadata(void *scc_meta, std::size_t cur_host_id)
         {}
 
-        void do_read(void *scc_meta, std::size_t cur_host_id, void *dst, const void *src, uint64_t size)
+        void do_read(void *scc_meta, std::size_t cur_host_id, void *dst,
+                     const void *src, uint64_t size,
+                     ReadDestination destination = ReadDestination::kLocal)
         {
-                std::memcpy(dst, src, size);
+                copy_read(dst, src, size, destination);
         }
 
-        void do_write(void *scc_meta, std::size_t cur_host_id, void *dst, const void *src, uint64_t size)
+        void do_write(void *scc_meta, std::size_t cur_host_id, void *dst,
+                      const void *src, uint64_t size,
+                      WriteSource source = WriteSource::kLocal)
         {
-                std::memcpy(dst, src, size);
+                copy_write(dst, src, size, source);
         }
 };
 

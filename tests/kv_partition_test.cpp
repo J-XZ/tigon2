@@ -26,11 +26,11 @@ class PassthroughScc final : public star::SCCManager {
     smeta->set_scc_bit(host);
   }
   void do_read(void *, std::size_t, void *dst, const void *src,
-               uint64_t bytes) override {
+               uint64_t bytes, star::SCCManager::ReadDestination) override {
     std::memcpy(dst, src, bytes);
   }
   void do_write(void *, std::size_t, void *dst, const void *src,
-                uint64_t bytes) override {
+                uint64_t bytes, star::SCCManager::WriteSource) override {
     std::memcpy(dst, src, bytes);
   }
 };

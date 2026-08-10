@@ -25,7 +25,9 @@ class SCCWriteThrough : public SCCManager {
                 set_bit(*meta, cur_host_id);
         }
 
-        void do_read(void *scc_meta, std::size_t cur_host_id, void *dst, const void *src, uint64_t size)
+        void do_read(void *scc_meta, std::size_t cur_host_id, void *dst,
+                     const void *src, uint64_t size,
+                     ReadDestination destination = ReadDestination::kLocal)
         {
                 MetaType *meta = reinterpret_cast<MetaType *>(scc_meta);
 
@@ -35,10 +37,12 @@ class SCCWriteThrough : public SCCManager {
                 }
 
                 // do read
-                std::memcpy(dst, src, size);
+                copy_read(dst, src, size, destination);
         }
 
-        void do_write(void *scc_meta, std::size_t cur_host_id, void *dst, const void *src, uint64_t size)
+        void do_write(void *scc_meta, std::size_t cur_host_id, void *dst,
+                      const void *src, uint64_t size,
+                      WriteSource source = WriteSource::kLocal)
         {
                 MetaType *meta = reinterpret_cast<MetaType *>(scc_meta);
 
@@ -50,7 +54,7 @@ class SCCWriteThrough : public SCCManager {
                 set_bit(*meta, cur_host_id);
 
                 // do write
-                std::memcpy(dst, src, size);
+                copy_write(dst, src, size, source);
                 clwb(dst, size);
         }
 

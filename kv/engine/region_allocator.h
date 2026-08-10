@@ -86,7 +86,12 @@ class RegionAllocator {
   void *FromOffset(RegionOffset offset) const;
   bool Contains(const void *pointer) const;
   uint64_t capacity() const { return bytes_; }
-  uint64_t metadata_bytes() const { return header_->metadata_bytes; }
+  uint64_t metadata_bytes() const {
+    return latency_sim::FixedLatencyMemoryLoad(
+        control_is_hwcc_ ? latency_sim::MemoryDomain::kHwcc
+                         : latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+        &header_->metadata_bytes);
+  }
   uint64_t allocated() const {
     const auto domain = control_is_hwcc_
                             ? latency_sim::MemoryDomain::kHwcc
@@ -94,7 +99,12 @@ class RegionAllocator {
     return latency_sim::FixedLatencyAtomicLoad(header_->allocated_bytes,
                                           std::memory_order_acquire, domain);
   }
-  uint32_t shard_count() const { return header_->shard_count; }
+  uint32_t shard_count() const {
+    return latency_sim::FixedLatencyMemoryLoad(
+        control_is_hwcc_ ? latency_sim::MemoryDomain::kHwcc
+                         : latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+        &header_->shard_count);
+  }
   // Flush allocator metadata plus each shard's allocated high-water range.
   // This deliberately never sweeps an entire region.
   void FlushAllocatedRanges() const;
@@ -121,10 +131,6 @@ class RegionAllocator {
   void FreeLocal(RegionOffset offset, uint32_t size_class, uint32_t owner_shard);
   void AccountAllocate(uint64_t bytes, DomainCounter *counter);
   void AccountFree(uint64_t bytes, DomainCounter *counter);
-  void RecordMetadataRead(const void *address, uint64_t bytes) const;
-  void RecordMetadataWrite(const void *address, uint64_t bytes) const;
-  void RecordBlockMetadataRead(const void *address, uint64_t bytes) const;
-  void RecordBlockMetadataWrite(const void *address, uint64_t bytes) const;
 
   std::byte *base_;
   uint64_t bytes_;

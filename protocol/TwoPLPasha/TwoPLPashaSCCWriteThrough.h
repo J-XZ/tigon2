@@ -27,14 +27,18 @@ class TwoPLPashaSCCWriteThrough : public SCCManager {
                 smeta->set_scc_bit(cur_host_id);
         }
 
-        void do_read(void *scc_meta, std::size_t cur_host_id, void *dst, const void *src, uint64_t size) override
+        void do_read(void *scc_meta, std::size_t cur_host_id, void *dst,
+                     const void *src, uint64_t size,
+                     ReadDestination destination = ReadDestination::kLocal) override
         {
-                memcpy(dst, src, size);
+                copy_read(dst, src, size, destination);
         }
 
-        void do_write(void *scc_meta, std::size_t cur_host_id, void *dst, const void *src, uint64_t size) override
+        void do_write(void *scc_meta, std::size_t cur_host_id, void *dst,
+                      const void *src, uint64_t size,
+                      WriteSource source = WriteSource::kLocal) override
         {
-                memcpy(dst, src, size);
+                copy_write(dst, src, size, source);
         }
 
         void prepare_read(void *scc_meta, std::size_t cur_host_id, void *scc_data, uint64_t size) override

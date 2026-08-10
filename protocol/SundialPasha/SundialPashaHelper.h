@@ -465,7 +465,11 @@ out_lmeta_unlock:
                         smeta->owner = lmeta->owner;
 
                         // copy data
-                        scc_manager->do_write(&smeta->scc_meta, coordinator_id, migrated_row_value_ptr, local_data, table->value_size());
+                        scc_manager->do_write(
+                            &smeta->scc_meta, coordinator_id,
+                            migrated_row_value_ptr, local_data,
+                            table->value_size(),
+                            SCCManager::WriteSource::kOwnerPrivateSwcc);
 
                         // set the migrated row as valid
                         smeta->is_valid = true;
@@ -564,7 +568,11 @@ out_lmeta_unlock:
                                 smeta->owner = lmeta->owner;
 
                                 // copy data
-                                scc_manager->do_write(&smeta->scc_meta, coordinator_id, migrated_row_value_ptr, local_data, table->value_size());
+                                scc_manager->do_write(
+                                    &smeta->scc_meta, coordinator_id,
+                                    migrated_row_value_ptr, local_data,
+                                    table->value_size(),
+                                    SCCManager::WriteSource::kOwnerPrivateSwcc);
 
                                 // set the migrated row as valid
                                 smeta->is_valid = true;

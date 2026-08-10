@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <pthread.h>
 #include <stdexcept>
 #include <string_view>
@@ -62,11 +63,19 @@ constexpr uint32_t kMaxForegroundWorkers = 256;
 constexpr uint32_t kSingleTableId = 0;
 static_assert(kSingleTableId == 0, "TigonKV exposes exactly one logical table");
 
+// Owner-private metadata contains an opaque shared spinlock whose libc
+// initialization is its own semantic operation.  This tag selects the
+// offset-backed construction path without wrapping the whole object in a
+// second operation.
+struct OwnerPrivateSharedInitTag {};
+
 // The original TwoPLPasha local metadata is one storage body. Only the two
 // references vary between the legacy DRAM representation and the persistent
 // KV representation; all latch/state fields and their order stay identical.
 template <typename MigratedRowRef, typename SccDataRef>
 struct TwoPLPashaMetadataLocalStorage {
+  static constexpr bool kOffsetBacked = std::is_integral_v<MigratedRowRef>;
+
   TwoPLPashaMetadataLocalStorage()
       : tid(0),
         is_valid(false),
@@ -77,33 +86,55 @@ struct TwoPLPashaMetadataLocalStorage {
     pthread_spin_init(&latch, PTHREAD_PROCESS_PRIVATE);
   }
 
-  static constexpr bool kOffsetBacked = std::is_integral_v<MigratedRowRef>;
+  explicit TwoPLPashaMetadataLocalStorage(OwnerPrivateSharedInitTag) {
+    static_assert(kOffsetBacked,
+                  "owner-private shared initialization requires offsets");
+    // The union members are implicit-lifetime scalar types.  Start their
+    // lifetimes without writing them, then let the exact wrappers below own
+    // every initialized byte in the persistent object.
+    ::new (static_cast<void *>(&migrated_row)) MigratedRowRef;
+    ::new (static_cast<void *>(&scc_data)) SccDataRef;
+    latency_sim::FixedLatencyMemoryStore(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &tid, uint64_t{0});
+    latency_sim::FixedLatencyMemoryStore(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &is_valid, false);
+    latency_sim::FixedLatencyMemoryStore(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &is_migrated, false);
+    latency_sim::FixedLatencyMemoryStore(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+        &is_data_modified_since_moved_out, true);
+    latency_sim::FixedLatencyMemoryStore(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &migrated_row,
+        MigratedRowRef{});
+    latency_sim::FixedLatencyMemoryStore(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &scc_data, SccDataRef{});
+    (void)latency_sim::FixedLatencyPthreadSpinInitShared(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &latch,
+        PTHREAD_PROCESS_PRIVATE);
+  }
 
   void lock() {
-    // The offset-backed storage lives in owner-private SWCC; cover the real
-    // pthread spin-lock atomic accesses without changing the lock protocol.
-    // The legacy DRAM form is pure local memory and stays direct.
     if constexpr (kOffsetBacked) {
-      tigonkv::engine::mem_access::PrivateWrite(
-          reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(&latch)),
-          sizeof(latch));
+      (void)latency_sim::FixedLatencyPthreadSpinLockShared(
+          latency_sim::MemoryDomain::kOwnerPrivateSwcc, &latch);
+    } else {
+      pthread_spin_lock(&latch);
     }
-    pthread_spin_lock(&latch);
   }
   void unlock() {
     if constexpr (kOffsetBacked) {
-      tigonkv::engine::mem_access::PrivateWrite(
-          reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(&latch)),
-          sizeof(latch));
+      (void)latency_sim::FixedLatencyPthreadSpinUnlockShared(
+          latency_sim::MemoryDomain::kOwnerPrivateSwcc, &latch);
+    } else {
+      pthread_spin_unlock(&latch);
     }
-    pthread_spin_unlock(&latch);
   }
 
   pthread_spinlock_t latch;
-  uint64_t tid{0};
-  bool is_valid{false};
-  bool is_migrated{false};
-  bool is_data_modified_since_moved_out{true};
+  uint64_t tid;
+  bool is_valid;
+  bool is_migrated;
+  bool is_data_modified_since_moved_out;
   // The second spelling is retained as a source-level adapter for the
   // offset-backed KV call sites. Both names are the same one storage slot;
   // there is no second locator or state field.

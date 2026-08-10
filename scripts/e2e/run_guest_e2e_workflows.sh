@@ -242,7 +242,7 @@ sync_guest_binary() {
   sync_guest_binary_vm() {
     local vm=$1 port=$((base_port + vm))
     kill_guest_suite "$suite" "$vm"
-    deploy_remote "$vm" "mkdir -p '$remote_root/build'"
+    deploy_remote "$vm" "mkdir -p '$remote_root/build' '$(dirname "$remote_config")'"
     local remote_binary="$remote_root/build/e2e_${suite}"
     local local_binary_sha remote_binary_sha
     local_binary_sha=$(sha256sum "$binary_dir/e2e_${suite}" | awk '{print $1}')

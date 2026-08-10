@@ -36,26 +36,57 @@ namespace star
 // but carry no state.  Cross-node ref counting and Clock's second chance are
 // in HWCC smeta instead.
 struct TwoPLPashaSharedDataSCC {
-        TwoPLPashaSharedDataSCC() : tid(0), flags(0) {}
+        TwoPLPashaSharedDataSCC() {
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kSwcc, &tid, uint64_t{0});
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kSwcc, &flags, uint8_t{0});
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kSwcc,
+                    &legacy_ref_cnt_padding, uint8_t{0});
+                latency_sim::FixedLatencyMemsetShared(
+                    latency_sim::MemoryDomain::kSwcc, legacy_policy_padding, 0,
+                    sizeof(legacy_policy_padding));
+        }
 
         static constexpr int valid_flag_index = 0;
 
         bool get_flag(int flag_index) const {
-                return (flags & (1u << flag_index)) != 0;
+                const uint8_t observed = latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kSwcc, &flags);
+                return (observed & (1u << flag_index)) != 0;
         }
 
         void set_flag(int flag_index) {
-                flags = static_cast<uint8_t>(flags | (1u << flag_index));
+                const uint8_t observed = latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kSwcc, &flags);
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kSwcc, &flags,
+                    static_cast<uint8_t>(observed | (1u << flag_index)));
         }
 
         void clear_flag(int flag_index) {
-                flags = static_cast<uint8_t>(flags & ~(1u << flag_index));
+                const uint8_t observed = latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kSwcc, &flags);
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kSwcc, &flags,
+                    static_cast<uint8_t>(observed & ~(1u << flag_index)));
         }
 
-        uint64_t tid{0};
-        uint8_t flags{0};
-        uint8_t legacy_ref_cnt_padding{0};
-        char legacy_policy_padding[MigrationManager::migration_policy_meta_size]{};
+        uint64_t load_tid() const {
+                return latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kSwcc, &tid);
+        }
+
+        void store_tid(uint64_t value) {
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kSwcc, &tid, value);
+        }
+
+        uint64_t tid;
+        uint8_t flags;
+        uint8_t legacy_ref_cnt_padding;
+        char legacy_policy_padding[MigrationManager::migration_policy_meta_size];
         char data[];
 };
 
@@ -96,18 +127,64 @@ static_assert(sizeof(TwoPLPashaMetadataLocal) ==
 // Write → Unlock → pthread unlock.
 template <typename LocalMetadata>
 struct LocalMetadataAccess {
+        static void CopySharedToLocal(void *dest, const void *src,
+                                      std::size_t size) {
+                std::memcpy(dest, src, size);
+        }
         static void Lock(LocalMetadata &) {}
         static void Unlock(LocalMetadata &) {}
         static void Read(const LocalMetadata &) {}
         static void Write(LocalMetadata &) {}
+
+        static bool LoadValid(const LocalMetadata &lmeta) {
+                return lmeta.is_valid;
+        }
+        static void StoreValid(LocalMetadata &lmeta, bool value) {
+                lmeta.is_valid = value;
+        }
+        static bool LoadMigrated(const LocalMetadata &lmeta) {
+                return lmeta.is_migrated;
+        }
+        static void StoreMigrated(LocalMetadata &lmeta, bool value) {
+                lmeta.is_migrated = value;
+        }
+        static uint64_t LoadTid(const LocalMetadata &lmeta) {
+                return lmeta.tid;
+        }
+        static void StoreTid(LocalMetadata &lmeta, uint64_t value) {
+                lmeta.tid = value;
+        }
+        static bool LoadDataModified(const LocalMetadata &lmeta) {
+                return lmeta.is_data_modified_since_moved_out;
+        }
+        static void StoreDataModified(LocalMetadata &lmeta, bool value) {
+                lmeta.is_data_modified_since_moved_out = value;
+        }
+        static auto LoadMigratedRow(const LocalMetadata &lmeta)
+            -> decltype(lmeta.migrated_row) {
+                return lmeta.migrated_row;
+        }
+        template <typename Value>
+        static void StoreMigratedRow(LocalMetadata &lmeta, Value value) {
+                lmeta.migrated_row = value;
+        }
+        static auto LoadSccData(const LocalMetadata &lmeta)
+            -> decltype(lmeta.scc_data) {
+                return lmeta.scc_data;
+        }
+        template <typename Value>
+        static void StoreSccData(LocalMetadata &lmeta, Value value) {
+                lmeta.scc_data = value;
+        }
 };
 
 template <>
 struct LocalMetadataAccess<TwoPLPashaMetadataLocalOffset> {
-        static constexpr size_t kStateOffset =
-            offsetof(TwoPLPashaMetadataLocalOffset, tid);
-        static constexpr size_t kStateBytes =
-            sizeof(TwoPLPashaMetadataLocalOffset) - kStateOffset;
+        static void CopySharedToLocal(void *dest, const void *src,
+                                      std::size_t size) {
+                tigonkv::engine::mem_access::PrivateCopySharedToLocal(
+                    dest, src, size);
+        }
 
         static void Lock(TwoPLPashaMetadataLocalOffset &lmeta) {
                 // pthread_spinlock_t is an opaque lock object, not a
@@ -118,15 +195,81 @@ struct LocalMetadataAccess<TwoPLPashaMetadataLocalOffset> {
         static void Unlock(TwoPLPashaMetadataLocalOffset &lmeta) {
                 (void)lmeta;
         }
-        static void Read(const TwoPLPashaMetadataLocalOffset &lmeta) {
-                tigonkv::engine::mem_access::PrivateRead(
-                    reinterpret_cast<const char *>(&lmeta) + kStateOffset,
-                    kStateBytes);
+        static void Read(const TwoPLPashaMetadataLocalOffset &) {
         }
-        static void Write(TwoPLPashaMetadataLocalOffset &lmeta) {
-                tigonkv::engine::mem_access::PrivateWrite(
-                    reinterpret_cast<char *>(&lmeta) + kStateOffset,
-                    kStateBytes);
+        static void Write(TwoPLPashaMetadataLocalOffset &) {
+        }
+
+        static bool LoadValid(const TwoPLPashaMetadataLocalOffset &lmeta) {
+                return latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.is_valid);
+        }
+        static void StoreValid(TwoPLPashaMetadataLocalOffset &lmeta,
+                               bool value) {
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.is_valid, value);
+        }
+        static bool LoadMigrated(const TwoPLPashaMetadataLocalOffset &lmeta) {
+                return latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.is_migrated);
+        }
+        static void StoreMigrated(TwoPLPashaMetadataLocalOffset &lmeta,
+                                  bool value) {
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.is_migrated, value);
+        }
+        static uint64_t LoadTid(const TwoPLPashaMetadataLocalOffset &lmeta) {
+                return latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc, &lmeta.tid);
+        }
+        static void StoreTid(TwoPLPashaMetadataLocalOffset &lmeta,
+                             uint64_t value) {
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.tid, value);
+        }
+        static bool LoadDataModified(
+            const TwoPLPashaMetadataLocalOffset &lmeta) {
+                return latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.is_data_modified_since_moved_out);
+        }
+        static void StoreDataModified(
+            TwoPLPashaMetadataLocalOffset &lmeta, bool value) {
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.is_data_modified_since_moved_out, value);
+        }
+        static auto LoadMigratedRow(
+            const TwoPLPashaMetadataLocalOffset &lmeta)
+            -> decltype(lmeta.migrated_row) {
+                return latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.migrated_row);
+        }
+        template <typename Value>
+        static void StoreMigratedRow(TwoPLPashaMetadataLocalOffset &lmeta,
+                                     Value value) {
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.migrated_row, value);
+        }
+        static auto LoadSccData(const TwoPLPashaMetadataLocalOffset &lmeta)
+            -> decltype(lmeta.scc_data) {
+                return latency_sim::FixedLatencyMemoryLoad(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.scc_data);
+        }
+        template <typename Value>
+        static void StoreSccData(TwoPLPashaMetadataLocalOffset &lmeta,
+                                 Value value) {
+                latency_sim::FixedLatencyMemoryStore(
+                    latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+                    &lmeta.scc_data, value);
         }
 };
 
@@ -162,7 +305,7 @@ struct TwoPLPashaMetadataShared {
 
                 store_atomic_word(scc_data_cxl_offset << SCC_DATA_OFFSET,
                                   std::memory_order_release);
-                tigonkv::engine::mem_access::HwccWrite(&ref_cnt, sizeof(ref_cnt));
+                tigonkv::engine::mem_access::HwccStore(&ref_cnt, uint8_t{0});
         }
 
 	void lock()
@@ -398,28 +541,29 @@ retry:
         }
 
         uint8_t get_ref_cnt() const {
-                tigonkv::engine::mem_access::HwccRead(&ref_cnt, sizeof(ref_cnt));
-                return ref_cnt;
+                return tigonkv::engine::mem_access::HwccLoad(&ref_cnt);
         }
 
         void increment_ref_cnt() {
-                tigonkv::engine::mem_access::HwccRead(&ref_cnt, sizeof(ref_cnt));
-                if (ref_cnt == std::numeric_limits<uint8_t>::max()) {
+                const uint8_t observed =
+                    tigonkv::engine::mem_access::HwccLoad(&ref_cnt);
+                if (observed == std::numeric_limits<uint8_t>::max()) {
                         LOG(FATAL) << "TwoPLPasha shared ref count overflow smeta="
                                    << this;
                 }
-                tigonkv::engine::mem_access::HwccWrite(&ref_cnt, sizeof(ref_cnt));
-                ++ref_cnt;
+                tigonkv::engine::mem_access::HwccStore(
+                    &ref_cnt, static_cast<uint8_t>(observed + 1));
         }
 
         void decrement_ref_cnt() {
-                tigonkv::engine::mem_access::HwccRead(&ref_cnt, sizeof(ref_cnt));
-                if (ref_cnt == 0) {
+                const uint8_t observed =
+                    tigonkv::engine::mem_access::HwccLoad(&ref_cnt);
+                if (observed == 0) {
                         LOG(FATAL) << "TwoPLPasha shared ref count underflow smeta="
                                    << this;
                 }
-                tigonkv::engine::mem_access::HwccWrite(&ref_cnt, sizeof(ref_cnt));
-                --ref_cnt;
+                tigonkv::engine::mem_access::HwccStore(
+                    &ref_cnt, static_cast<uint8_t>(observed - 1));
         }
 
         // bit 63: latch bit
@@ -430,10 +574,10 @@ retry:
         // bit 39 - 38: is_next_key_real, is_prev_key_real
         // bit 37 - 37: Clock second chance
         // bit 36 - 0: scc_data - enough for referencing 128 GB shared CXL memory
-        std::atomic<uint64_t> atomic_word{ 0 };
+        std::atomic<uint64_t> atomic_word;
 
         // multi-host accessors pin this; move-out requires ref_cnt == 0
-        uint8_t ref_cnt{ 0 };
+        uint8_t ref_cnt;
 };
 static_assert(offsetof(TwoPLPashaMetadataShared, ref_cnt) == 8);
 static_assert(sizeof(TwoPLPashaMetadataShared) == 16);
@@ -485,7 +629,7 @@ class TwoPLPashaHelper {
                         if (result != nullptr) *result = RowOutcome::kMissing;
                         return 0;
                 }
-                const uint64_t tid = remove_lock_bit(scc_data->tid);
+                const uint64_t tid = remove_lock_bit(scc_data->load_tid());
                 const bool write_locked = smeta->is_write_locked();
                 const uint64_t reader_count = smeta->get_reader_count();
                 const uint8_t ref_count = smeta->get_ref_cnt();
@@ -499,8 +643,6 @@ class TwoPLPashaHelper {
                 smeta->increase_reader_count();
                 if (inc_ref_cnt) smeta->increment_ref_cnt();
                 if (dest != nullptr && size != 0) {
-                        tigonkv::engine::mem_access::SharedPayloadRead(
-                            scc_data->data, size);
                         scc_manager->do_read(nullptr, host_id, dest,
                                              scc_data->data, size);
                 }
@@ -528,7 +670,7 @@ class TwoPLPashaHelper {
                         if (result != nullptr) *result = RowOutcome::kMissing;
                         return 0;
                 }
-                const uint64_t tid = remove_lock_bit(scc_data->tid);
+                const uint64_t tid = remove_lock_bit(scc_data->load_tid());
                 if (smeta->is_write_locked() || smeta->get_reader_count() != 0 ||
                     (inc_ref_cnt && smeta->get_ref_cnt() ==
                         std::numeric_limits<uint8_t>::max())) {
@@ -538,8 +680,6 @@ class TwoPLPashaHelper {
                 smeta->set_write_locked();
                 if (inc_ref_cnt) smeta->increment_ref_cnt();
                 if (dest != nullptr && size != 0) {
-                        tigonkv::engine::mem_access::SharedPayloadRead(
-                            scc_data->data, size);
                         scc_manager->do_read(nullptr, host_id, dest,
                                              scc_data->data, size);
                 }
@@ -591,9 +731,7 @@ class TwoPLPashaHelper {
                         smeta->decrement_ref_cnt();
                 }
                 smeta->clear_write_locked();
-                tigonkv::engine::mem_access::SharedPayloadWrite(
-                    &scc_data->tid, sizeof(scc_data->tid));
-                scc_data->tid = new_tid;
+                scc_data->store_tid(new_tid);
                 scc_manager->finish_write(smeta, host_id, scc_data, scc_bytes);
                 smeta->unlock();
         }
@@ -618,8 +756,6 @@ class TwoPLPashaHelper {
                         smeta->unlock();
                         return false;
                 }
-                tigonkv::engine::mem_access::SharedPayloadWrite(scc_data->data,
-                                                                  size);
                 scc_manager->do_write(smeta, host_id, scc_data->data, src, size);
                 scc_data->set_flag(TwoPLPashaSharedDataSCC::valid_flag_index);
                 smeta->set_is_data_modified_since_moved_in();
@@ -627,9 +763,7 @@ class TwoPLPashaHelper {
                         smeta->decrement_ref_cnt();
                 }
                 smeta->clear_write_locked();
-                tigonkv::engine::mem_access::SharedPayloadWrite(
-                    &scc_data->tid, sizeof(scc_data->tid));
-                scc_data->tid = new_tid;
+                scc_data->store_tid(new_tid);
                 scc_manager->finish_write(smeta, host_id, scc_data,
                                           scc_data_bytes(size));
                 smeta->unlock();
@@ -651,17 +785,18 @@ class TwoPLPashaHelper {
                 Access::Lock(lmeta);
                 lmeta.lock();
                 Access::Read(lmeta);
-                if (migrated != nullptr) *migrated = lmeta.is_migrated;
-                if (!lmeta.is_valid || lmeta.is_migrated) {
+                if (migrated != nullptr) *migrated = Access::LoadMigrated(lmeta);
+                if (!Access::LoadValid(lmeta) || Access::LoadMigrated(lmeta)) {
                         success = false;
                 } else {
-                        old_value = lmeta.tid;
+                        old_value = Access::LoadTid(lmeta);
                         if (is_write_locked(old_value) ||
                             read_lock_num(old_value) == read_lock_max()) {
                                 success = false;
                         } else {
-                                lmeta.tid = old_value +
-                                    (uint64_t{1} << READ_LOCK_BIT_OFFSET);
+                                Access::StoreTid(
+                                    lmeta, old_value +
+                                        (uint64_t{1} << READ_LOCK_BIT_OFFSET));
                                 std::memcpy(dest, src, size);
                                 success = true;
                                 wrote = true;
@@ -691,24 +826,25 @@ class TwoPLPashaHelper {
                 Access::Lock(lmeta);
                 lmeta.lock();
                 Access::Read(lmeta);
-                const bool row_migrated = lmeta.is_migrated;
+                const bool row_migrated = Access::LoadMigrated(lmeta);
                 if (migrated != nullptr) *migrated = row_migrated;
                 if (!row_migrated) {
-                        if (!lmeta.is_valid) {
+                        if (!Access::LoadValid(lmeta)) {
                                 Access::Unlock(lmeta);
                                 lmeta.unlock();
                                 return 0;
                         }
-                        old_value = lmeta.tid;
+                        old_value = Access::LoadTid(lmeta);
                         if (is_write_locked(old_value) ||
                             read_lock_num(old_value) == read_lock_max()) {
                                 Access::Unlock(lmeta);
                                 lmeta.unlock();
                                 return remove_lock_bit(old_value);
                         }
-                        lmeta.tid = old_value +
-                            (uint64_t{1} << READ_LOCK_BIT_OFFSET);
-                        std::memcpy(dest, local_data, size);
+                        Access::StoreTid(
+                            lmeta, old_value +
+                                (uint64_t{1} << READ_LOCK_BIT_OFFSET));
+                                Access::CopySharedToLocal(dest, local_data, size);
                         success = true;
                         Access::Write(lmeta);
                         Access::Unlock(lmeta);
@@ -735,27 +871,24 @@ class TwoPLPashaHelper {
                                 lmeta.unlock();
                                 return 0;
                         }
-                        old_value = scc_data->tid;
-                        lmeta.is_valid = true;
-                        lmeta.tid = scc_data->tid;
-                        tigonkv::engine::mem_access::SharedPayloadRead(
-                            scc_data->data, size);
-                        tigonkv::engine::mem_access::PrivateWrite(local_data,
-                                                                    size);
+                        old_value = scc_data->load_tid();
+                        Access::StoreValid(lmeta, true);
+                        Access::StoreTid(lmeta, scc_data->load_tid());
                         scc_manager->do_read(nullptr, host_id, local_data,
-                                             scc_data->data, size);
+                                             scc_data->data, size,
+                                             SCCManager::ReadDestination::kOwnerPrivateSwcc);
                         smeta->clear_is_data_modified_since_moved_in();
                         wrote = true;
                         if (local_refreshed != nullptr)
                                 *local_refreshed = true;
                 } else {
-                        if (!lmeta.is_valid) {
+                        if (!Access::LoadValid(lmeta)) {
                                 smeta->unlock();
                                 Access::Unlock(lmeta);
                                 lmeta.unlock();
                                 return 0;
                         }
-                        old_value = lmeta.tid;
+                        old_value = Access::LoadTid(lmeta);
                 }
                 if (smeta->is_write_locked() ||
                     smeta->get_reader_count() ==
@@ -767,7 +900,7 @@ class TwoPLPashaHelper {
                         return remove_lock_bit(old_value);
                 }
                 smeta->increase_reader_count();
-                std::memcpy(dest, local_data, size);
+                        Access::CopySharedToLocal(dest, local_data, size);
                 success = true;
                 if (shared_locked != nullptr) *shared_locked = smeta;
                 smeta->unlock();
@@ -788,16 +921,17 @@ class TwoPLPashaHelper {
                 Access::Lock(lmeta);
                 lmeta.lock();
                 Access::Read(lmeta);
-                if (migrated != nullptr) *migrated = lmeta.is_migrated;
-                if (!lmeta.is_valid || lmeta.is_migrated) {
+                if (migrated != nullptr) *migrated = Access::LoadMigrated(lmeta);
+                if (!Access::LoadValid(lmeta) || Access::LoadMigrated(lmeta)) {
                         success = false;
                 } else {
-                        old_value = lmeta.tid;
+                        old_value = Access::LoadTid(lmeta);
                         if (is_read_locked(old_value) || is_write_locked(old_value)) {
                                 success = false;
                         } else {
-                                lmeta.tid = old_value |
-                                    (WRITE_LOCK_BIT_MASK << WRITE_LOCK_BIT_OFFSET);
+                                Access::StoreTid(
+                                    lmeta, old_value |
+                                        (WRITE_LOCK_BIT_MASK << WRITE_LOCK_BIT_OFFSET));
                                 success = true;
                                 wrote = true;
                         }
@@ -830,23 +964,24 @@ class TwoPLPashaHelper {
                 lmeta.lock();
                 Access::Read(lmeta);
                 try {
-                        const bool row_migrated = lmeta.is_migrated;
+                        const bool row_migrated = Access::LoadMigrated(lmeta);
                         if (migrated != nullptr) *migrated = row_migrated;
                         if (!row_migrated) {
-                                if (!lmeta.is_valid) {
+                                if (!Access::LoadValid(lmeta)) {
                                         Access::Unlock(lmeta);
                                         lmeta.unlock();
                                         return 0;
                                 }
-                                old_value = lmeta.tid;
+                                old_value = Access::LoadTid(lmeta);
                                 if (is_read_locked(old_value) ||
                                     is_write_locked(old_value)) {
                                         Access::Unlock(lmeta);
                                         lmeta.unlock();
                                         return remove_lock_bit(old_value);
                                 }
-                                lmeta.tid = old_value |
-                                    (WRITE_LOCK_BIT_MASK << WRITE_LOCK_BIT_OFFSET);
+                                Access::StoreTid(
+                                    lmeta, old_value |
+                                        (WRITE_LOCK_BIT_MASK << WRITE_LOCK_BIT_OFFSET));
                                 success = true;
                                 Access::Write(lmeta);
                                 Access::Unlock(lmeta);
@@ -875,19 +1010,16 @@ class TwoPLPashaHelper {
                                         lmeta.unlock();
                                         return 0;
                                 }
-                                lmeta.is_valid = true;
-                                lmeta.tid = scc_data->tid;
-                                tigonkv::engine::mem_access::SharedPayloadRead(
-                                    scc_data->data, size);
-                                tigonkv::engine::mem_access::PrivateWrite(local_data,
-                                                                            size);
+                                Access::StoreValid(lmeta, true);
+                                Access::StoreTid(lmeta, scc_data->load_tid());
                                 scc_manager->do_read(nullptr, host_id, local_data,
-                                                     scc_data->data, size);
+                                                     scc_data->data, size,
+                                                     SCCManager::ReadDestination::kOwnerPrivateSwcc);
                                 smeta->clear_is_data_modified_since_moved_in();
                                 wrote = true;
                                 if (local_refreshed != nullptr)
                                         *local_refreshed = true;
-                        } else if (!lmeta.is_valid) {
+                        } else if (!Access::LoadValid(lmeta)) {
                                 smeta->unlock();
                                 Access::Unlock(lmeta);
                                 lmeta.unlock();
@@ -897,7 +1029,8 @@ class TwoPLPashaHelper {
                         // dirty shared row refreshes the local TID.  Otherwise
                         // the local mirror remains the authority for this
                         // owner-side lock acquisition.
-                        old_value = shared_dirty ? scc_data->tid : lmeta.tid;
+                        old_value = shared_dirty ? scc_data->load_tid()
+                                                 : Access::LoadTid(lmeta);
                         if (smeta->get_reader_count() != 0 ||
                             smeta->is_write_locked()) {
                                 smeta->unlock();
@@ -943,12 +1076,13 @@ class TwoPLPashaHelper {
                 lmeta.lock();
                 Access::Read(lmeta);
                 bool wrote = false;
-                if (!lmeta.is_migrated) {
-                        const uint64_t old_value = lmeta.tid;
+                if (!Access::LoadMigrated(lmeta)) {
+                        const uint64_t old_value = Access::LoadTid(lmeta);
                         DCHECK(is_read_locked(old_value));
                         DCHECK(!is_write_locked(old_value));
-                        lmeta.tid = old_value -
-                            (uint64_t{1} << READ_LOCK_BIT_OFFSET);
+                        Access::StoreTid(
+                            lmeta, old_value -
+                                (uint64_t{1} << READ_LOCK_BIT_OFFSET));
                         wrote = true;
                 } else {
                         auto *smeta = resolve_shared(lmeta);
@@ -980,12 +1114,13 @@ class TwoPLPashaHelper {
                 lmeta.lock();
                 Access::Read(lmeta);
                 bool wrote = false;
-                if (!lmeta.is_migrated) {
-                        DCHECK(is_write_locked(lmeta.tid));
-                        DCHECK(!is_read_locked(lmeta.tid));
+                if (!Access::LoadMigrated(lmeta)) {
+                        const uint64_t old_value = Access::LoadTid(lmeta);
+                        DCHECK(is_write_locked(old_value));
+                        DCHECK(!is_read_locked(old_value));
                         DCHECK(!is_write_locked(new_tid));
                         DCHECK(!is_read_locked(new_tid));
-                        lmeta.tid = new_tid;
+                        Access::StoreTid(lmeta, new_tid);
                         wrote = true;
                 } else {
                         auto *smeta = resolve_shared(lmeta);
@@ -1002,9 +1137,7 @@ class TwoPLPashaHelper {
                         DCHECK(!is_write_locked(new_tid));
                         DCHECK(!is_read_locked(new_tid));
                         smeta->clear_write_locked();
-                        tigonkv::engine::mem_access::SharedPayloadWrite(
-                            &scc_data->tid, sizeof(scc_data->tid));
-                        scc_data->tid = new_tid;
+                        scc_data->store_tid(new_tid);
                         scc_manager->finish_write(smeta, host_id, scc_data,
                                                   scc_data_bytes(size));
                         smeta->unlock();
@@ -1187,7 +1320,7 @@ class TwoPLPashaHelper {
                         local->lock();
                         Access::Read(*local);
                         try {
-                                if (local->is_migrated) {
+                                if (Access::LoadMigrated(*local)) {
                                         auto *smeta = resolve_shared(*local);
                                         if (smeta == nullptr)
                                                 throw std::runtime_error(
@@ -1301,10 +1434,11 @@ class TwoPLPashaHelper {
             std::size_t value_bytes, RemoveShared &&remove_shared,
             RetireShared &&retire_shared)
         {
+                using Access = LocalMetadataAccess<LocalMetadata>;
                 if (smeta == nullptr || local_data == nullptr ||
                     scc_manager == nullptr)
                         throw std::invalid_argument("null move-out row");
-                DCHECK(local.is_valid == true);
+                DCHECK(Access::LoadValid(local) == true);
                 smeta->lock();
                 auto *payload = smeta->get_scc_data();
                 if (smeta->get_ref_cnt() != 0) {
@@ -1313,29 +1447,29 @@ class TwoPLPashaHelper {
                 }
                 scc_manager->prepare_read(smeta, host_id, payload,
                                           scc_data_bytes(value_bytes));
-                local.is_valid = payload->get_flag(
-                    TwoPLPashaSharedDataSCC::valid_flag_index);
-                local.tid = payload->tid;
-                set_read_lock_num(local.tid, smeta->get_reader_count());
+                Access::StoreValid(
+                    local, payload->get_flag(
+                              TwoPLPashaSharedDataSCC::valid_flag_index));
+                uint64_t local_tid = payload->load_tid();
+                set_read_lock_num(local_tid, smeta->get_reader_count());
                 if (smeta->is_write_locked())
-                        set_write_lock_bit(local.tid);
+                        set_write_lock_bit(local_tid);
                 else
-                        clear_write_lock_bit(local.tid);
-                DCHECK(read_lock_num(local.tid) == smeta->get_reader_count());
-                DCHECK(is_write_locked(local.tid) == smeta->is_write_locked());
+                        clear_write_lock_bit(local_tid);
+                Access::StoreTid(local, local_tid);
+                DCHECK(read_lock_num(local_tid) == smeta->get_reader_count());
+                DCHECK(is_write_locked(local_tid) == smeta->is_write_locked());
                 if (smeta->is_data_modified_since_moved_in()) {
-                        tigonkv::engine::mem_access::SharedPayloadRead(
-                            payload->data, value_bytes);
-                        tigonkv::engine::mem_access::PrivateWrite(local_data,
-                                                                   value_bytes);
                         scc_manager->do_read(smeta, host_id, local_data,
-                                             payload->data, value_bytes);
+                                             payload->data, value_bytes,
+                                             SCCManager::ReadDestination::kOwnerPrivateSwcc);
                         smeta->clear_is_data_modified_since_moved_in();
                 }
-                local.is_data_modified_since_moved_out = false;
+                Access::StoreDataModified(local, false);
                 payload->clear_flag(TwoPLPashaSharedDataSCC::valid_flag_index);
-                local.is_migrated = false;
-                local.migrated_row = decltype(local.migrated_row){};
+                Access::StoreMigrated(local, false);
+                Access::StoreMigratedRow(
+                    local, decltype(local.migrated_row){});
                 scc_manager->finish_write(smeta, host_id, payload,
                                           scc_data_bytes(value_bytes));
                 retire_shared(payload, smeta);
@@ -1364,6 +1498,7 @@ class TwoPLPashaHelper {
             bool prev_migrated, bool next_migrated,
             PublishLocal &&publish_local)
         {
+                using Access = LocalMetadataAccess<LocalMetadata>;
                 if (local_data == nullptr || smeta == nullptr || payload == nullptr ||
                     scc_manager == nullptr)
                         throw std::invalid_argument("null move-in row");
@@ -1374,7 +1509,7 @@ class TwoPLPashaHelper {
                         smeta->unlock();
                         throw std::runtime_error("shared row reference count overflow");
                 }
-                const uint64_t local_tid = local.tid;
+                const uint64_t local_tid = Access::LoadTid(local);
                 smeta->set_reader_count(read_lock_num(local_tid));
                 if (is_write_locked(local_tid))
                         smeta->set_write_locked();
@@ -1384,24 +1519,19 @@ class TwoPLPashaHelper {
                 DCHECK(is_write_locked(local_tid) == smeta->is_write_locked());
 
                 if (copy_payload) {
-                        tigonkv::engine::mem_access::PrivateRead(local_data,
-                                                                  value_bytes);
-                        tigonkv::engine::mem_access::SharedPayloadWrite(
-                            payload->data, value_bytes);
                         scc_manager->do_write(smeta, host_id, payload->data,
-                                              local_data, value_bytes);
+                                              local_data, value_bytes,
+                                              SCCManager::WriteSource::kOwnerPrivateSwcc);
                 }
-                local.is_data_modified_since_moved_out = false;
+                Access::StoreDataModified(local, false);
                 smeta->clear_is_data_modified_since_moved_in();
-                if (local.is_valid)
+                if (Access::LoadValid(local))
                         payload->set_flag(
                             TwoPLPashaSharedDataSCC::valid_flag_index);
                 else
                         payload->clear_flag(
                             TwoPLPashaSharedDataSCC::valid_flag_index);
-                tigonkv::engine::mem_access::SharedPayloadWrite(
-                    &payload->tid, sizeof(payload->tid));
-                payload->tid = local_tid;
+                payload->store_tid(local_tid);
 
                 if (inc_ref_cnt)
                         smeta->increment_ref_cnt();
@@ -1559,9 +1689,7 @@ class TwoPLPashaHelper {
                         scc_data->clear_flag(
                             TwoPLPashaSharedDataSCC::valid_flag_index);
                 if (update_tid) {
-                        tigonkv::engine::mem_access::SharedPayloadWrite(
-                            &scc_data->tid, sizeof(scc_data->tid));
-                        scc_data->tid = tid;
+                        scc_data->store_tid(tid);
                 }
                 scc_manager->finish_write(smeta, coordinator_id, scc_data,
                                           scc_bytes);
@@ -1633,7 +1761,7 @@ class TwoPLPashaHelper {
                                                   scc_data_bytes(size));
                         DCHECK(smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index) == true);
                         scc_manager->do_read(nullptr, coordinator_id, dest, src, size);
-                        tid_ = scc_data->tid;
+                        tid_ = scc_data->load_tid();
                         smeta->unlock();
                 }
                 lmeta->unlock();
@@ -1769,13 +1897,16 @@ class TwoPLPashaHelper {
                                         goto out_unlock_lmeta;
                                 }
 
-                                old_value = scc_data->tid;
+                                old_value = scc_data->load_tid();
                                 tid = remove_lock_bit(old_value);
 
                                 // we update our local cache
                                 lmeta->is_valid = smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                                lmeta->tid = scc_data->tid;
-                                scc_manager->do_read(nullptr, coordinator_id, data_ptr, scc_data->data, size);
+                                lmeta->tid = scc_data->load_tid();
+                                scc_manager->do_read(
+                                    nullptr, coordinator_id, data_ptr,
+                                    scc_data->data, size,
+                                    SCCManager::ReadDestination::kOwnerPrivateSwcc);
 
                                 // unset the flag
                                 smeta->clear_is_data_modified_since_moved_in();
@@ -2175,7 +2306,7 @@ out_unlock_lmeta:
                         } else {
                                 smeta->clear_flag(TwoPLPashaMetadataShared::valid_flag_index);
                         }
-                        scc_data->tid = lmeta->tid;
+                        scc_data->store_tid(lmeta->tid);
                         smeta->set_reader_count(read_lock_num(lmeta->tid));
                         if (is_write_locked(lmeta->tid) == true) {
                                 smeta->set_write_locked();
@@ -2187,7 +2318,10 @@ out_unlock_lmeta:
 
                         // copy data
                         if (lmeta->is_data_modified_since_moved_out == true || context.enable_migration_optimization == false) {
-                                scc_manager->do_write(nullptr, coordinator_id, scc_data->data, local_data, table->value_size());
+                                scc_manager->do_write(
+                                    nullptr, coordinator_id, scc_data->data,
+                                    local_data, table->value_size(),
+                                    SCCManager::WriteSource::kOwnerPrivateSwcc);
                         }
                         lmeta->is_data_modified_since_moved_out = false;    // optimization to reduce memcpy when moving data in
                         smeta->clear_is_data_modified_since_moved_in();   // optimization to reduce memcpy when moving data out
@@ -2455,7 +2589,7 @@ out_unlock_lmeta:
 
                         // copy metadata back
                         lmeta->is_valid = smeta->get_flag(TwoPLPashaMetadataShared::valid_flag_index);
-                        lmeta->tid = scc_data->tid;
+                        lmeta->tid = scc_data->load_tid();
                         set_read_lock_num(lmeta->tid, smeta->get_reader_count());
                         if (smeta->is_write_locked() == true) {
                                 set_write_lock_bit(lmeta->tid);
@@ -2467,7 +2601,10 @@ out_unlock_lmeta:
 
                         // copy data back
                         if (smeta->is_data_modified_since_moved_in() == true || context.enable_migration_optimization == false) {
-                                scc_manager->do_read(nullptr, coordinator_id, local_data, scc_data->data, table->value_size());
+                                scc_manager->do_read(
+                                    nullptr, coordinator_id, local_data,
+                                    scc_data->data, table->value_size(),
+                                    SCCManager::ReadDestination::kOwnerPrivateSwcc);
                         }
                         lmeta->is_data_modified_since_moved_out = false;
                         smeta->clear_is_data_modified_since_moved_in();

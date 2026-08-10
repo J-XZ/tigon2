@@ -101,33 +101,81 @@ class CXLTableBTreeOLC : public CXLTableBase {
         // std::atomic has implicitly deleted copy-constructor
         // so we need to define a ValueType that supports it
         struct BTreeOLCValue {
-                BTreeOLCValue() = default;
+                BTreeOLCValue()
+                {
+                        StoreRow(*this, StoredRow{});
+                        StoreValid(*this, false);
+                }
 
                 BTreeOLCValue(const BTreeOLCValue &value)
                 {
-                        this->row = value.row;
-                        const bool valid =
-                            value.is_valid.load(std::memory_order_relaxed);
-                        this->is_valid.store(valid, std::memory_order_relaxed);
+                        StoreRow(*this, LoadRow(value));
+                        StoreValid(*this, LoadValid(value));
                 }
 
                 BTreeOLCValue &operator=(const BTreeOLCValue &value)
                 {
-                        this->row = value.row;
-                        const bool valid =
-                            value.is_valid.load(std::memory_order_relaxed);
-                        this->is_valid.store(valid, std::memory_order_relaxed);
+                        StoreRow(*this, LoadRow(value));
+                        StoreValid(*this, LoadValid(value));
                         return *this;
                 }
 
-                typename SharedRowReferencePolicy::StoredRow row{};
-                std::atomic<bool> is_valid{ false };
+                using StoredRow = typename SharedRowReferencePolicy::StoredRow;
+
+                static StoredRow LoadRow(const BTreeOLCValue &value)
+                {
+                        return btreeolc_cxl::IsTreeDataAddress(&value.row)
+                                   ? latency_sim::FixedLatencyMemoryLoad(
+                                         btreeolc_cxl::TreeDataDomain(),
+                                         &value.row)
+                                   : value.row;
+                }
+
+                static void StoreRow(BTreeOLCValue &value, StoredRow row)
+                {
+                        if (btreeolc_cxl::IsTreeDataAddress(&value.row)) {
+                                latency_sim::FixedLatencyMemoryStore(
+                                    btreeolc_cxl::TreeDataDomain(),
+                                    &value.row, row);
+                        } else {
+                                value.row = row;
+                        }
+                }
+
+                static bool LoadValid(const BTreeOLCValue &value)
+                {
+                        return btreeolc_cxl::IsTreeDataAddress(
+                                   &value.is_valid)
+                                   ? latency_sim::FixedLatencyAtomicLoad(
+                                         value.is_valid,
+                                         std::memory_order_relaxed,
+                                         btreeolc_cxl::TreeDataDomain())
+                                   : value.is_valid.load(
+                                         std::memory_order_relaxed);
+                }
+
+                static void StoreValid(BTreeOLCValue &value, bool valid)
+                {
+                        if (btreeolc_cxl::IsTreeDataAddress(&value.is_valid)) {
+                                latency_sim::FixedLatencyAtomicStore(
+                                    value.is_valid, valid,
+                                    std::memory_order_relaxed,
+                                    btreeolc_cxl::TreeDataDomain());
+                        } else {
+                                value.is_valid.store(valid,
+                                                     std::memory_order_relaxed);
+                        }
+                }
+
+                StoredRow row;
+                std::atomic<bool> is_valid;
         };
 
         struct BTreeOLCValueComparator {
                 int operator()(const BTreeOLCValue &a, const BTreeOLCValue &b) const
                 {
-                        if (a.row == b.row)
+                        if (BTreeOLCValue::LoadRow(a) ==
+                            BTreeOLCValue::LoadRow(b))
                                 return 0;
                         else
                                 return 1;
@@ -161,8 +209,8 @@ class CXLTableBTreeOLC : public CXLTableBase {
                 const auto &k = *static_cast<const KeyType *>(key);
                 BTreeOLCValue value;
                 if (!cxl_btree_->lookup(k, value)) return false;
-                if (!value.is_valid.load(std::memory_order_relaxed)) return false;
-                *row = value.row;
+                if (!BTreeOLCValue::LoadValid(value)) return false;
+                *row = BTreeOLCValue::LoadRow(value);
                 return !row_policy_.IsNull(*row);
         }
 
@@ -171,7 +219,10 @@ class CXLTableBTreeOLC : public CXLTableBase {
                 const auto &min_k = *static_cast<const KeyType *>(min_key);
 
                 auto processor = [&](const KeyType &key, BTreeOLCValue &value, bool is_last_tuple) -> bool {
-                        bool should_end = scan_processor(&key, row_policy_.Resolve(value.row), is_last_tuple);
+                        bool should_end = scan_processor(
+                            &key,
+                            row_policy_.Resolve(BTreeOLCValue::LoadRow(value)),
+                            is_last_tuple);
 
                         if (should_end == false) {
                                 return false;
@@ -188,9 +239,8 @@ class CXLTableBTreeOLC : public CXLTableBase {
                 const auto &k = *static_cast<const KeyType *>(key);
 
                 BTreeOLCValue value;
-                value.row = row_policy_.Encode(row);
-                value.is_valid.store(is_placeholder == false,
-                                     std::memory_order_relaxed);
+                BTreeOLCValue::StoreRow(value, row_policy_.Encode(row));
+                BTreeOLCValue::StoreValid(value, is_placeholder == false);
 
 		bool success = cxl_btree_->insert(k, value);
 		return success;

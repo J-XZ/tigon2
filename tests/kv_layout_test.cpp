@@ -22,6 +22,17 @@ int main() {
   assert(alignof(PrivateMetadataLocal) == alignof(uint64_t));
   assert(sizeof(PrivateMetadataLocal) ==
          sizeof(star::TwoPLPashaMetadataLocal));
+  static_assert(std::is_constructible_v<PrivateMetadataLocal,
+                                        OwnerPrivateSharedInitTag>);
+  static_assert(!std::is_constructible_v<PrivateMetadataLocal, bool>);
+  static_assert(offsetof(PrivateMetadataLocal, latch) ==
+                offsetof(star::TwoPLPashaMetadataLocal, latch));
+  static_assert(offsetof(PrivateMetadataLocal, tid) ==
+                offsetof(star::TwoPLPashaMetadataLocal, tid));
+  static_assert(offsetof(PrivateMetadataLocal, migrated_row) ==
+                offsetof(star::TwoPLPashaMetadataLocal, migrated_row));
+  static_assert(offsetof(PrivateMetadataLocal, scc_data) ==
+                offsetof(star::TwoPLPashaMetadataLocal, scc_data));
   // Transport uses the original Message/MessagePiece framing. The largest KV
   // request is a 32B key + 1024B fixed value + original transaction/key slot.
   {

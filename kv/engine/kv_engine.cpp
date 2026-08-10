@@ -658,8 +658,9 @@ std::unique_ptr<KVEngine> KVEngine::Open(Config config, bool reset) {
     // publish via cxl_global_ebr_meta_root_index for peer attach.
     ebr = static_cast<star::CXL_EBR *>(star::cxl_memory.cxlalloc_malloc_wrapper(
         sizeof(star::CXL_EBR), star::CXLMemory::MISC_ALLOCATION));
-    new (ebr) star::CXL_EBR(config.vm_count,
-                            config.foreground_worker_count_per_vm);
+    ebr = latency_sim::FixedLatencyConstructShared<star::CXL_EBR>(
+        latency_sim::MemoryDomain::kHwcc, ebr, config.vm_count,
+        config.foreground_worker_count_per_vm);
     star::CXLMemory::commit_shared_data_initialization(
         star::CXLMemory::cxl_global_ebr_meta_root_index, ebr);
     pool->allocator().FinalizeStaticHwccLayout();

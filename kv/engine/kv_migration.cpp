@@ -21,15 +21,18 @@ RegionOffsetRowStorage::StoredRow RegionOffsetRowStorage::AllocateAndConstruct(
     const void *value, bool is_placeholder) const {
   if (partition == nullptr) throw std::runtime_error("null owner partition");
   const std::string_view fixed_value = TableValue(value, value_size);
-  auto *metadata = new (partition->regions_.AllocateOwnerPrivate(
+  void *metadata_storage = partition->regions_.AllocateOwnerPrivate(
       sizeof(PrivateMetadataLocal), partition->partition_id_,
-      partition->owner_shard_)) PrivateMetadataLocal;
+      partition->owner_shard_);
+  auto *metadata = ::new (metadata_storage)
+      PrivateMetadataLocal(OwnerPrivateSharedInitTag{});
   const uint64_t row_bytes = sizeof(PrivateValueStruct) + value_size;
   PrivateValueStruct *row = nullptr;
   try {
-    row = new (partition->regions_.AllocateOwnerPrivate(
-        row_bytes, partition->partition_id_, partition->owner_shard_))
-        PrivateValueStruct;
+    void *row_storage = partition->regions_.AllocateOwnerPrivate(
+        row_bytes, partition->partition_id_, partition->owner_shard_);
+    row = latency_sim::FixedLatencyConstructShared<PrivateValueStruct>(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, row_storage);
   } catch (const std::bad_alloc &) {
     partition->regions_.FreeOwnerPrivate(
         metadata, sizeof(PrivateMetadataLocal), partition->partition_id_,
@@ -42,11 +45,14 @@ RegionOffsetRowStorage::StoredRow RegionOffsetRowStorage::AllocateAndConstruct(
                                                partition->partition_id_),
       std::memory_order_release);
   mem_access::PrivateCopyLocalToShared(row->data, fixed_value.data(), value_size);
-  metadata->is_valid = !is_placeholder;
-  metadata->tid = partition->NextCommitTid(metadata->tid);
-  mem_access::PrivateWrite(
-      reinterpret_cast<char *>(metadata) + offsetof(PrivateMetadataLocal, is_valid),
-      sizeof(PrivateMetadataLocal) - offsetof(PrivateMetadataLocal, is_valid));
+  latency_sim::FixedLatencyMemoryStore(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, &metadata->is_valid,
+      !is_placeholder);
+  const uint64_t observed_tid = latency_sim::FixedLatencyMemoryLoad(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, &metadata->tid);
+  latency_sim::FixedLatencyMemoryStore(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, &metadata->tid,
+      partition->NextCommitTid(observed_tid));
   return partition->regions_.ToOwnerPrivateOffset(row, partition->partition_id_);
 }
 

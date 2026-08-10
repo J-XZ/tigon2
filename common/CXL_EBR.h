@@ -79,12 +79,14 @@ class CXL_EBR {
                                  uint64_t coordinator_id, uint64_t thread_id)
         {
 
-                tigonkv::engine::mem_access::HwccRead(
-                    &coordinator_num, sizeof(coordinator_num));
-                tigonkv::engine::mem_access::HwccRead(
-                    &thread_num, sizeof(thread_num));
-                local_ebr_meta.coordinator_count = coordinator_num;
-                local_ebr_meta.thread_count = thread_num;
+                const uint64_t coordinator_count =
+                    latency_sim::FixedLatencyMemoryLoad(
+                        latency_sim::MemoryDomain::kHwcc, &coordinator_num);
+                const uint64_t thread_count =
+                    latency_sim::FixedLatencyMemoryLoad(
+                        latency_sim::MemoryDomain::kHwcc, &thread_num);
+                local_ebr_meta.coordinator_count = coordinator_count;
+                local_ebr_meta.thread_count = thread_count;
                 CHECK(coordinator_id < local_ebr_meta.coordinator_count);
                 CHECK(thread_id < local_ebr_meta.thread_count);
                 local_ebr_meta.coordinator_id = coordinator_id;

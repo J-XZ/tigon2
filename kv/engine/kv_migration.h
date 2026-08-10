@@ -22,6 +22,35 @@ struct RegionOffsetRowStorage {
   using ValueStruct = PrivateValueStruct;
   using StoredRow = RegionOffset;
 
+  static void Store(StoredRow *destination, StoredRow value) {
+    if (btreeolc_cxl::IsTreeDataAddress(destination)) {
+      latency_sim::FixedLatencyMemoryStore(
+          btreeolc_cxl::TreeDataDomain(), destination, value);
+    } else {
+      *destination = value;
+    }
+  }
+
+  static StoredRow Load(const StoredRow *source) {
+    return btreeolc_cxl::IsTreeDataAddress(source)
+               ? latency_sim::FixedLatencyMemoryLoad(
+                     btreeolc_cxl::TreeDataDomain(), source)
+               : *source;
+  }
+
+  static void Copy(StoredRow *destination, const StoredRow *source) {
+    const auto domain = btreeolc_cxl::TreeDataDomain();
+    const StoredRow value = btreeolc_cxl::IsTreeDataAddress(source)
+                                ? latency_sim::FixedLatencyMemoryLoad(
+                                      domain, source)
+                                : *source;
+    if (btreeolc_cxl::IsTreeDataAddress(destination)) {
+      latency_sim::FixedLatencyMemoryStore(domain, destination, value);
+    } else {
+      *destination = value;
+    }
+  }
+
   KVPartition *partition = nullptr;
   uint32_t key_size = 0;
   uint32_t value_size = 0;
@@ -60,7 +89,8 @@ struct RegionOffsetRowStorage {
 };
 
 using KvTableBase = star::TableBTreeOLC<
-    FixedKey, FixedKey, FixedKeyComparator, FixedKeyComparator,
+    FixedKey, FixedKey, btreeolc_cxl::SharedBytewiseComparator<FixedKey>,
+    FixedKeyComparator,
     star::MetaInitFuncNothing, btreeolc_cxl::BPlusTree,
     RegionOffsetRowStorage>;
 

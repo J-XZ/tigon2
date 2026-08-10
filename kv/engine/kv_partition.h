@@ -64,7 +64,8 @@ class KVPartition {
   // persists a process VA.  The C++ table object below remains a non-owning
   // process-local handle.
   using SharedTable = star::CXLTableBTreeOLC<
-      FixedKey, FixedKeyComparator, RegionOffsetSharedRowReference>;
+      FixedKey, btreeolc_cxl::SharedBytewiseComparator<FixedKey>,
+      RegionOffsetSharedRowReference>;
   using SharedTreeValue = SharedTable::BTreeOLCValue;
   using SharedTree = SharedTable::CXLBTree;
 

@@ -23,8 +23,7 @@ namespace tigonkv::engine {
 namespace {
 
 uint32_t ReadHwccConfigField(const uint32_t *field) {
-  mem_access::HwccRead(field, sizeof(*field));
-  return *field;
+  return mem_access::HwccLoad(field);
 }
 
 bool IsInternalMaxSentinel(const FixedKey &key, uint32_t fixed_key_size) {
@@ -66,8 +65,6 @@ KVPartition::KVPartition(DualRegionAllocator &regions, star::CXL_EBR &ebr,
   if (attach) {
     RegionOffset private_root = kNullOffset;
     if (materialize_private) {
-      mem_access::PrivateRead(&private_arena_->private_root,
-                              sizeof(private_arena_->private_root));
       private_root = mem_access::PrivateAtomicLoad(
           private_arena_->private_root, std::memory_order_acquire);
     }
@@ -213,7 +210,9 @@ bool KVPartition::AcquireOwnerNextRowWriteLock(
   locked_row->observed_tid = star::TwoPLPashaHelper::take_write_lock(
       *metadata, value->data, fixed_value_size_, locked,
       [this](const PrivateMetadataLocal &local) {
-        return SharedMetadataFromOffset(local.migrated_smeta_off);
+        return SharedMetadataFromOffset(
+            star::LocalMetadataAccess<PrivateMetadataLocal>::LoadMigratedRow(
+                local));
       },
       owner_shard_, &shared_locked, nullptr, nullptr);
   if (!locked) return false;
@@ -225,18 +224,21 @@ void KVPartition::ReleaseOwnerNextRowWriteLock(
     const OwnerNextRowLock &locked_row, uint64_t new_tid, bool commit) {
   if (locked_row.metadata == nullptr) return;
   auto *metadata = locked_row.metadata;
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   if (!locked_row.shared) {
     star::TwoPLPashaHelper::write_lock_release(
         *metadata, commit ? new_tid : locked_row.observed_tid,
         fixed_value_size_, owner_shard_,
         [this](const PrivateMetadataLocal &local) {
-          return SharedMetadataFromOffset(local.migrated_smeta_off);
+          return SharedMetadataFromOffset(
+              star::LocalMetadataAccess<PrivateMetadataLocal>::LoadMigratedRow(
+                  local));
         });
     return;
   }
 
   LockRow(metadata);
-  const RegionOffset smeta_offset = metadata->migrated_smeta_off;
+  const RegionOffset smeta_offset = Access::LoadMigratedRow(*metadata);
   if (smeta_offset == kNullOffset) {
     UnlockRow(metadata);
     throw std::runtime_error("owner insert next-row shared locator vanished");
@@ -292,7 +294,9 @@ bool KVPartition::InsertOwnerPlaceholderWithNextLock(
           star::TwoPLPashaHelper::clear_adjacent_migrated_rows(
               prev, next,
               [this](const PrivateMetadataLocal &local) {
-                return SharedMetadataFromOffset(local.migrated_smeta_off);
+                return SharedMetadataFromOffset(
+                    star::LocalMetadataAccess<PrivateMetadataLocal>::
+                        LoadMigratedRow(local));
               });
         } catch (...) {
           ReleaseOwnerNextRowWriteLock(*locked_row, 0, false);
@@ -316,20 +320,23 @@ bool KVPartition::PublishOwnerPlaceholder(const FixedKey &key,
   if (meta_slot == nullptr) return false;
   auto *value = reinterpret_cast<PrivateValueStruct *>(meta_slot);
   auto *metadata = MetadataFromValue(value);
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   LockRow(metadata);
-  if (metadata->is_valid) {
+  if (Access::LoadValid(*metadata)) {
     UnlockRow(metadata);
     return false;
   }
-  metadata->tid = commit_tid;
-  metadata->is_valid = true;
-  metadata->is_data_modified_since_moved_out = true;
-  if (metadata->is_migrated) {
-    if (metadata->migrated_smeta_off == kNullOffset) {
+  Access::StoreTid(*metadata, commit_tid);
+  Access::StoreValid(*metadata, true);
+  Access::StoreDataModified(*metadata, true);
+  if (Access::LoadMigrated(*metadata)) {
+    const RegionOffset migrated_smeta_off =
+        Access::LoadMigratedRow(*metadata);
+    if (migrated_smeta_off == kNullOffset) {
       UnlockRow(metadata);
       throw std::runtime_error("owner insert migrated shared locator vanished");
     }
-    auto *smeta = SharedMetadataFromOffset(metadata->migrated_smeta_off);
+    auto *smeta = SharedMetadataFromOffset(migrated_smeta_off);
     // Preserve master modify_tuple_valid_bit(..., true, true): a concurrent
     // move-in may expose the owner placeholder before this commit.  Publish
     // that SCC row under the original local-metadata-then-smeta lock order.
@@ -381,6 +388,7 @@ star::RowOutcome KVPartition::PutPrivate(std::string_view key,
   if (LookupPrivateOffset(fixed_key, &row_offset)) {
     auto *private_value = ValueFromOffset(row_offset);
     auto *metadata = MetadataFromValue(private_value);
+    using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
     // Reuse the offset-adapted original local write-lock primitive for the
     // private branch.  A migrated row is deliberately reported separately,
     // just as the helper's PrivateRowView contract requires its SCC path.
@@ -394,18 +402,20 @@ star::RowOutcome KVPartition::PutPrivate(std::string_view key,
       mem_access::PrivateMemsetShared(private_value->data, 0, fixed_value_size_);
       mem_access::PrivateCopyLocalToShared(private_value->data, value.data(),
                                            value.size());
-      metadata->is_data_modified_since_moved_out = true;
+      Access::StoreDataModified(*metadata, true);
       star::TwoPLPashaHelper::write_lock_release(
           *metadata, new_tid, fixed_value_size_, owner_shard_,
           [this](const PrivateMetadataLocal &local) {
-            return SharedMetadataFromOffset(local.migrated_smeta_off);
+            return SharedMetadataFromOffset(
+                star::LocalMetadataAccess<PrivateMetadataLocal>::
+                    LoadMigratedRow(local));
           });
       return star::RowOutcome::kDone;
     }
 
     if (!migrated) {
       LockRow(metadata);
-      const bool valid = metadata->is_valid;
+      const bool valid = Access::LoadValid(*metadata);
       UnlockRow(metadata);
       // An invalid existing leaf is the owner-create placeholder, not a
       // stable absence. Preserve the former primitive's Busy outcome so the
@@ -424,7 +434,7 @@ star::RowOutcome KVPartition::PutPrivate(std::string_view key,
     const uint64_t new_tid = NextCommitTid(locked_row.observed_tid);
 
     LockRow(metadata);
-    const RegionOffset smeta_offset = metadata->migrated_smeta_off;
+    const RegionOffset smeta_offset = Access::LoadMigratedRow(*metadata);
     if (smeta_offset == kNullOffset) {
       UnlockRow(metadata);
       ReleaseOwnerNextRowWriteLock(locked_row, 0, false);
@@ -438,7 +448,7 @@ star::RowOutcome KVPartition::PutPrivate(std::string_view key,
       return star::RowOutcome::kBusy;
     }
     LockRow(metadata);
-    metadata->is_data_modified_since_moved_out = true;
+    Access::StoreDataModified(*metadata, true);
     UnlockRow(metadata);
     return star::RowOutcome::kDone;
   }
@@ -483,7 +493,9 @@ StatusCode KVPartition::InsertRemotePlaceholder(std::string_view key,
         star::TwoPLPashaHelper::clear_adjacent_migrated_rows(
             prev, next,
             [this](const PrivateMetadataLocal &local) {
-              return SharedMetadataFromOffset(local.migrated_smeta_off);
+              return SharedMetadataFromOffset(
+                  star::LocalMetadataAccess<PrivateMetadataLocal>::
+                      LoadMigratedRow(local));
             });
         return true;
       });
@@ -525,9 +537,10 @@ StatusCode KVPartition::InsertRemotePlaceholder(std::string_view key,
               placeholder_offset)
             throw std::runtime_error("remote insert rollback row mismatch");
           auto *metadata = static_cast<PrivateMetadataLocal *>(cur_meta);
+          using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
           LockRow(metadata);
-          const bool valid = metadata->is_valid;
-          const bool migrated = metadata->is_migrated;
+          const bool valid = Access::LoadValid(*metadata);
+          const bool migrated = Access::LoadMigrated(*metadata);
           UnlockRow(metadata);
           if (valid || migrated)
             throw std::runtime_error(
@@ -536,7 +549,9 @@ StatusCode KVPartition::InsertRemotePlaceholder(std::string_view key,
               static_cast<PrivateMetadataLocal *>(prev_meta),
               static_cast<PrivateMetadataLocal *>(next_meta),
               [this](const PrivateMetadataLocal &local) {
-                return SharedMetadataFromOffset(local.migrated_smeta_off);
+                return SharedMetadataFromOffset(
+                    star::LocalMetadataAccess<PrivateMetadataLocal>::
+                        LoadMigratedRow(local));
               });
           return true;
         });
@@ -605,6 +620,7 @@ star::RowOutcome KVPartition::GetPrivate(std::string_view key,
     return star::RowOutcome::kMissing;
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   // The non-migrated branch is the original take_read_lock_and_read / release
   // sequence with ValueStruct::meta resolved from an owner-private offset.
   std::string local(fixed_value_size_, '\0');
@@ -614,11 +630,12 @@ star::RowOutcome KVPartition::GetPrivate(std::string_view key,
   star::TwoPLPashaHelper::take_read_lock_and_read(
       *metadata, private_value->data, local.data(), local.size(), local_success,
       [this](const PrivateMetadataLocal &local) {
-        return SharedMetadataFromOffset(local.migrated_smeta_off);
+        return SharedMetadataFromOffset(
+            star::LocalMetadataAccess<PrivateMetadataLocal>::LoadMigratedRow(
+                local));
       },
       owner_shard_, &shared_locked, &migrated);
   if (local_success) {
-    mem_access::PrivateRead(private_value->data, fixed_value_size_);
     if (shared_locked != nullptr) {
       // The original migrated branch owns one shared reader pin.  Keep Clock
       // access inside that pin's lifetime, then release at the latency-safe
@@ -629,7 +646,9 @@ star::RowOutcome KVPartition::GetPrivate(std::string_view key,
       star::TwoPLPashaHelper::read_lock_release(
           *metadata,
           [this](const PrivateMetadataLocal &local) {
-            return SharedMetadataFromOffset(local.migrated_smeta_off);
+            return SharedMetadataFromOffset(
+                star::LocalMetadataAccess<PrivateMetadataLocal>::
+                    LoadMigratedRow(local));
           });
     }
     *value = std::move(local);
@@ -641,8 +660,8 @@ star::RowOutcome KVPartition::GetPrivate(std::string_view key,
     // under the owner-private latch before mapping it to the KV API: a live
     // non-migrated row can only be Busy, never NotFound.
     LockRow(metadata);
-    const bool valid = metadata->is_valid;
-    const bool now_migrated = metadata->is_migrated;
+    const bool valid = Access::LoadValid(*metadata);
+    const bool now_migrated = Access::LoadMigrated(*metadata);
     UnlockRow(metadata);
     if (!valid) return star::RowOutcome::kMissing;
     if (!now_migrated)
@@ -895,6 +914,7 @@ star::RowOutcome KVPartition::CompareExchangePrivate(
   }
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   bool write_locked = false;
   star::TwoPLPashaMetadataShared *shared_locked = nullptr;
   std::string current(fixed_value_size_, '\0');
@@ -902,7 +922,9 @@ star::RowOutcome KVPartition::CompareExchangePrivate(
       star::TwoPLPashaHelper::take_write_lock(
           *metadata, private_value->data, fixed_value_size_, write_locked,
           [this](const PrivateMetadataLocal &local) {
-            return SharedMetadataFromOffset(local.migrated_smeta_off);
+            return SharedMetadataFromOffset(
+                star::LocalMetadataAccess<PrivateMetadataLocal>::
+                    LoadMigratedRow(local));
           }, owner_shard_, &shared_locked);
   if (!write_locked) {
     // The original lmeta→smeta primitive already classified this attempt by
@@ -916,7 +938,7 @@ star::RowOutcome KVPartition::CompareExchangePrivate(
     if (current == expected) {
       mem_access::PrivateCopyLocalToShared(private_value->data, desired.data(),
                                            desired.size());
-      metadata->is_data_modified_since_moved_out = true;
+      Access::StoreDataModified(*metadata, true);
       *exchanged = true;
     }
     star::TwoPLPashaHelper::write_lock_release(
@@ -924,7 +946,9 @@ star::RowOutcome KVPartition::CompareExchangePrivate(
             ? NextCommitTid(observed_tid)
             : observed_tid, fixed_value_size_, owner_shard_,
         [this](const PrivateMetadataLocal &local) {
-          return SharedMetadataFromOffset(local.migrated_smeta_off);
+          return SharedMetadataFromOffset(
+              star::LocalMetadataAccess<PrivateMetadataLocal>::LoadMigratedRow(
+                  local));
         });
     return star::RowOutcome::kDone;
   }
@@ -946,7 +970,7 @@ star::RowOutcome KVPartition::CompareExchangePrivate(
     return star::RowOutcome::kDone;
   }
   LockRow(metadata);
-  metadata->is_data_modified_since_moved_out = true;
+  Access::StoreDataModified(*metadata, true);
   *exchanged = true;
   UnlockRow(metadata);
   return star::RowOutcome::kDone;
@@ -974,6 +998,7 @@ star::RowOutcome KVPartition::IncrementPrivate(std::string_view key,
   }
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   bool write_locked = false;
   star::TwoPLPashaMetadataShared *shared_locked = nullptr;
   std::string current(fixed_value_size_, '\0');
@@ -981,7 +1006,9 @@ star::RowOutcome KVPartition::IncrementPrivate(std::string_view key,
       star::TwoPLPashaHelper::take_write_lock(
           *metadata, private_value->data, fixed_value_size_, write_locked,
           [this](const PrivateMetadataLocal &local) {
-            return SharedMetadataFromOffset(local.migrated_smeta_off);
+            return SharedMetadataFromOffset(
+                star::LocalMetadataAccess<PrivateMetadataLocal>::
+                    LoadMigratedRow(local));
           }, owner_shard_, &shared_locked);
   if (!write_locked) {
     return star::RowOutcome::kBusy;
@@ -1014,7 +1041,7 @@ star::RowOutcome KVPartition::IncrementPrivate(std::string_view key,
       return star::RowOutcome::kBusy;
     }
     LockRow(metadata);
-    metadata->is_data_modified_since_moved_out = true;
+    Access::StoreDataModified(*metadata, true);
     *value = next;
     UnlockRow(metadata);
     return star::RowOutcome::kDone;
@@ -1026,7 +1053,9 @@ star::RowOutcome KVPartition::IncrementPrivate(std::string_view key,
       star::TwoPLPashaHelper::write_lock_release(
           *metadata, observed_tid, fixed_value_size_, owner_shard_,
           [this](const PrivateMetadataLocal &local) {
-            return SharedMetadataFromOffset(local.migrated_smeta_off);
+          return SharedMetadataFromOffset(
+              star::LocalMetadataAccess<PrivateMetadataLocal>::LoadMigratedRow(
+                  local));
           });
       throw std::invalid_argument(
           "increment requires a non-overflowing int64 value");
@@ -1037,19 +1066,23 @@ star::RowOutcome KVPartition::IncrementPrivate(std::string_view key,
       star::TwoPLPashaHelper::write_lock_release(
           *metadata, observed_tid, fixed_value_size_, owner_shard_,
           [this](const PrivateMetadataLocal &local) {
-            return SharedMetadataFromOffset(local.migrated_smeta_off);
+          return SharedMetadataFromOffset(
+              star::LocalMetadataAccess<PrivateMetadataLocal>::LoadMigratedRow(
+                  local));
           });
       throw std::invalid_argument("increment value exceeds fixed value size");
     }
     mem_access::PrivateCopyLocalToShared(private_value->data, encoded.data(),
                                          encoded.size());
-    metadata->is_data_modified_since_moved_out = true;
+    Access::StoreDataModified(*metadata, true);
     *value = next;
     star::TwoPLPashaHelper::write_lock_release(
         *metadata, NextCommitTid(observed_tid),
         fixed_value_size_, owner_shard_,
         [this](const PrivateMetadataLocal &local) {
-          return SharedMetadataFromOffset(local.migrated_smeta_off);
+          return SharedMetadataFromOffset(
+              star::LocalMetadataAccess<PrivateMetadataLocal>::LoadMigratedRow(
+                  local));
         });
     return star::RowOutcome::kDone;
   }
@@ -1093,8 +1126,9 @@ StatusCode KVPartition::EnsureInShared(std::string_view key, uint32_t host_id,
   if (!LookupPrivateOffset(fixed_key, &row_offset)) return StatusCode::kNotFound;
   auto *private_value = ValueFromOffset(row_offset);
   auto *metadata = MetadataFromValue(private_value);
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   LockRow(metadata);
-  const bool absent = !metadata->is_valid;
+  const bool absent = !Access::LoadValid(*metadata);
   UnlockRow(metadata);
   if (absent) return StatusCode::kNotFound;
   // A concurrent owner create can publish the local row after the original
@@ -1144,9 +1178,13 @@ star::migration_result KVPartition::PromotePrivate(
     if (LookupPrivateOffset(fixed_key, &row_offset)) {
       auto *private_value = ValueFromOffset(row_offset);
       auto *metadata = MetadataFromValue(private_value);
+      using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
       LockRow(metadata);
-      if (metadata->is_migrated && metadata->migrated_smeta_off != kNullOffset) {
-        *pinned_existing = SharedMetadataFromOffset(metadata->migrated_smeta_off);
+      const bool migrated = Access::LoadMigrated(*metadata);
+      const RegionOffset migrated_smeta_off =
+          Access::LoadMigratedRow(*metadata);
+      if (migrated && migrated_smeta_off != kNullOffset) {
+        *pinned_existing = SharedMetadataFromOffset(migrated_smeta_off);
       }
       UnlockRow(metadata);
     }
@@ -1195,37 +1233,41 @@ star::migration_result KVPartition::MoveInForMigrationManager(
         auto *prev_lmeta = static_cast<PrivateMetadataLocal *>(prev_meta);
         auto *metadata = static_cast<PrivateMetadataLocal *>(cur_meta);
         auto *next_lmeta = static_cast<PrivateMetadataLocal *>(next_meta);
+        using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
         auto *private_value = reinterpret_cast<PrivateValueStruct *>(
             static_cast<char *>(cur_data) - sizeof(PrivateValueStruct));
         bool prev_migrated = false;
         bool next_migrated = false;
         if (prev_lmeta != nullptr) {
           LockRow(prev_lmeta);
-          prev_migrated = prev_lmeta->is_migrated;
+          prev_migrated = Access::LoadMigrated(*prev_lmeta);
           UnlockRow(prev_lmeta);
         }
         if (next_lmeta != nullptr) {
           LockRow(next_lmeta);
-          next_migrated = next_lmeta->is_migrated;
+          next_migrated = Access::LoadMigrated(*next_lmeta);
           UnlockRow(next_lmeta);
         }
         const auto update_neighbors = [&] {
           star::TwoPLPashaHelper::set_adjacent_migrated_rows(
               prev_lmeta, next_lmeta,
               [this](const PrivateMetadataLocal &local) {
-                return SharedMetadataFromOffset(local.migrated_smeta_off);
+                using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
+                return SharedMetadataFromOffset(
+                    Access::LoadMigratedRow(local));
               });
         };
         LockRow(metadata);
-  if (metadata->is_migrated) {
+  if (Access::LoadMigrated(*metadata)) {
     // Match the original already-migrated branch: it repairs adjacency even
     // when a remote-insert owner mirror has not yet consumed smeta validity.
     // Only a new move-in may reject an invalid private placeholder.
-    if (metadata->migrated_smeta_off == kNullOffset) {
+    const RegionOffset migrated_smeta_off = Access::LoadMigratedRow(*metadata);
+    if (migrated_smeta_off == kNullOffset) {
       UnlockRow(metadata);
       throw std::runtime_error("already-migrated row has null HWCC smeta offset");
     }
-    auto *smeta = SharedMetadataFromOffset(metadata->migrated_smeta_off);
+    auto *smeta = SharedMetadataFromOffset(migrated_smeta_off);
     if (inc_ref_cnt) {
       // Caller (PromotePrivate with pinned_existing) will unpin exactly once.
       // Only report FAIL_ALREADY_IN_CXL when the pin is actually held; a failed
@@ -1237,7 +1279,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
       // while the placeholder is invalid; its later publish consumes that ref.
       if (!star::TwoPLPashaHelper::get_migrated_row(
               smeta, owner_shard_, fixed_value_size_,
-              /*allow_invalid=*/!metadata->is_valid)) {
+              /*allow_invalid=*/!Access::LoadValid(*metadata))) {
         UnlockRow(metadata);
         result = star::migration_result::FAIL_OOM;
         return;
@@ -1275,10 +1317,11 @@ star::migration_result KVPartition::MoveInForMigrationManager(
   // SCC payload allocation across ordinary move-out/move-in cycles.  Only the
   // transient HWCC metadata is retired on move-out; Delete releases the
   // cached payload together with the owner-private row.
-  const bool reuse_cached_payload = metadata->scc_data_off != kNullOffset;
+  const RegionOffset cached_payload_offset = Access::LoadSccData(*metadata);
+  const bool reuse_cached_payload = cached_payload_offset != kNullOffset;
   try {
     if (reuse_cached_payload) {
-      payload_mem = regions_.ResolveSharedPayload(metadata->scc_data_off,
+      payload_mem = regions_.ResolveSharedPayload(cached_payload_offset,
                                                   payload_bytes);
     } else {
       payload_mem = regions_.Allocate(payload_bytes,
@@ -1314,7 +1357,7 @@ star::migration_result KVPartition::MoveInForMigrationManager(
       star::TwoPLPashaHelper::move_from_btree_to_shared_region(
           *metadata, private_value->data, smeta, payload, owner_shard_,
           fixed_value_size_,
-          !reuse_cached_payload || metadata->is_data_modified_since_moved_out,
+          !reuse_cached_payload || Access::LoadDataModified(*metadata),
           inc_ref_cnt, prev_migrated, next_migrated || terminal_sentinel,
           [&] {
             if (!shared_table_->insert(&fixed_key, smeta)) {
@@ -1326,17 +1369,19 @@ star::migration_result KVPartition::MoveInForMigrationManager(
               std::ostringstream detail;
               detail << "move-in shared-index insertion failed partition="
                      << partition_id_ << " owner=" << owner_shard_
-                     << " local_migrated=" << metadata->is_migrated
-                     << " local_smeta=" << metadata->migrated_smeta_off
+                     << " local_migrated=" << Access::LoadMigrated(*metadata)
+                     << " local_smeta=" << Access::LoadMigratedRow(*metadata)
                      << " new_smeta=" << smeta_offset << " indexed="
                      << existing << " indexed_smeta=" << existing_offset;
               throw std::runtime_error(detail.str());
             }
-            metadata->migrated_smeta_off = smeta_offset;
-            if (!reuse_cached_payload)
-              metadata->scc_data_off = regions_.EncodeSharedPayloadOffset(
-                  payload, owner_shard_);
-            metadata->is_migrated = true;
+            Access::StoreMigratedRow(*metadata, smeta_offset);
+            if (!reuse_cached_payload) {
+              Access::StoreSccData(
+                  *metadata,
+                  regions_.EncodeSharedPayloadOffset(payload, owner_shard_));
+            }
+            Access::StoreMigrated(*metadata, true);
           });
   if (publish_result == star::migration_result::FAIL_OOM) {
     UnlockRow(metadata);
@@ -1385,23 +1430,29 @@ bool KVPartition::MoveOutPrivateRaw(std::string_view key, uint32_t host_id) {
         auto *prev_lmeta = static_cast<PrivateMetadataLocal *>(prev_meta);
         auto *metadata = static_cast<PrivateMetadataLocal *>(cur_meta);
         auto *next_lmeta = static_cast<PrivateMetadataLocal *>(next_meta);
+        using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
         auto *private_value = reinterpret_cast<PrivateValueStruct *>(
             static_cast<char *>(cur_data) - sizeof(PrivateValueStruct));
         star::TwoPLPashaHelper::clear_adjacent_migrated_rows(
             prev_lmeta, next_lmeta,
             [this](const PrivateMetadataLocal &local) {
-              return SharedMetadataFromOffset(local.migrated_smeta_off);
+              return SharedMetadataFromOffset(
+                  star::LocalMetadataAccess<PrivateMetadataLocal>::
+                      LoadMigratedRow(local));
             });
         LockRow(metadata);
-  if (!metadata->is_migrated || metadata->migrated_smeta_off == kNullOffset) {
+  const bool migrated = Access::LoadMigrated(*metadata);
+  const RegionOffset migrated_smeta_off =
+      Access::LoadMigratedRow(*metadata);
+  if (!migrated || migrated_smeta_off == kNullOffset) {
     UnlockRow(metadata);
     std::ostringstream detail;
     detail << "Clock move-out victim lost migrated locator partition="
            << partition_id_ << " owner=" << owner_shard_ << " migrated="
-           << metadata->is_migrated << " smeta=" << metadata->migrated_smeta_off;
+           << migrated << " smeta=" << migrated_smeta_off;
     throw std::runtime_error(detail.str());
   }
-  const RegionOffset smeta_offset = metadata->migrated_smeta_off;
+  const RegionOffset smeta_offset = migrated_smeta_off;
   RegionOffset indexed = kNullOffset;
   if (!LookupSharedReference(fixed_key, &indexed) || indexed != smeta_offset) {
     UnlockRow(metadata);
@@ -1495,7 +1546,9 @@ bool KVPartition::ScanLocalPartition(
             *metadata, private_value->data, row->private_value.data(),
             row->private_value.size(), local_read,
             [this](const PrivateMetadataLocal &local) {
-              return SharedMetadataFromOffset(local.migrated_smeta_off);
+              return SharedMetadataFromOffset(
+                  star::LocalMetadataAccess<PrivateMetadataLocal>::
+                      LoadMigratedRow(local));
             },
             owner_shard_, &shared_locked, nullptr, nullptr);
         if (!local_read) {
@@ -1504,7 +1557,6 @@ bool KVPartition::ScanLocalPartition(
           return false;
         }
         if (shared_locked == nullptr) {
-          mem_access::PrivateRead(private_value->data, fixed_value_size_);
           row->private_metadata = metadata;
         } else {
           row->shared_metadata = shared_locked;
@@ -1524,7 +1576,9 @@ bool KVPartition::ScanLocalPartition(
       star::TwoPLPashaHelper::read_lock_release(
           *row->private_metadata,
           [this](const PrivateMetadataLocal &local) {
-            return SharedMetadataFromOffset(local.migrated_smeta_off);
+            return SharedMetadataFromOffset(
+                star::LocalMetadataAccess<PrivateMetadataLocal>::
+                    LoadMigratedRow(local));
           });
     if (row->shared_metadata != nullptr)
       star::TwoPLPashaHelper::remote_read_lock_release(
@@ -1664,7 +1718,6 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
   for (auto &row : rows) {
     if (!row.result_row) continue;
     std::string value(fixed_value_size_, '\0');
-    mem_access::SharedPayloadRead(row.scc_data->data, value.size());
     star::scc_manager->do_read(row.smeta, host_id, value.data(),
                                row.scc_data->data, value.size());
     result.items.emplace_back(KeyString(row.key), std::move(value));
@@ -1687,6 +1740,7 @@ star::RowOutcome KVPartition::DeletePrivate(std::string_view key) {
     return star::RowOutcome::kMissing;
   auto *value = reinterpret_cast<PrivateValueStruct *>(meta_slot);
   auto *metadata = MetadataFromValue(value);
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   OwnerNextRowLock row_lock;
   bool write_locked = false;
   bool migrated = false;
@@ -1707,7 +1761,7 @@ star::RowOutcome KVPartition::DeletePrivate(std::string_view key) {
       return star::RowOutcome::kBusy;
   } else {
     LockRow(metadata);
-    const bool valid = metadata->is_valid;
+    const bool valid = Access::LoadValid(*metadata);
     UnlockRow(metadata);
     if (!valid) return star::RowOutcome::kMissing;
     return star::RowOutcome::kBusy;
@@ -1757,6 +1811,7 @@ bool KVPartition::DeletePrivateForMigrationManager(
   auto *preflight_value =
       reinterpret_cast<PrivateValueStruct *>(preflight_meta_slot);
   auto *preflight_metadata = MetadataFromValue(preflight_value);
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   star::TwoPLPashaMetadataShared *smeta = nullptr;
   RegionOffset smeta_offset = kNullOffset;
   bool initially_migrated = false;
@@ -1767,22 +1822,24 @@ bool KVPartition::DeletePrivateForMigrationManager(
   // ref/write lock is the authority for this remote-delete path, so do not
   // reject that valid migrated placeholder merely because its local mirror
   // has not been made valid.
-  if (!preflight_metadata->is_valid && !requester_prelocked) {
+  if (!Access::LoadValid(*preflight_metadata) && !requester_prelocked) {
     UnlockRow(preflight_metadata);
     return false;
   }
-  initially_migrated = preflight_metadata->is_migrated;
+  initially_migrated = Access::LoadMigrated(*preflight_metadata);
   if (requester_prelocked && !initially_migrated) {
     UnlockRow(preflight_metadata);
     throw std::runtime_error("remote delete lost migrated owner locator");
   }
-  if (preflight_metadata->scc_data_off != kNullOffset) {
+  const RegionOffset cached_payload_offset =
+      Access::LoadSccData(*preflight_metadata);
+  if (cached_payload_offset != kNullOffset) {
     retired_payload = static_cast<star::TwoPLPashaSharedDataSCC *>(
-        regions_.ResolveSharedPayload(preflight_metadata->scc_data_off,
+        regions_.ResolveSharedPayload(cached_payload_offset,
                                       SharedSccBytes(fixed_value_size_)));
   }
   if (initially_migrated) {
-    smeta_offset = preflight_metadata->migrated_smeta_off;
+    smeta_offset = Access::LoadMigratedRow(*preflight_metadata);
     if (smeta_offset == kNullOffset || retired_payload == nullptr) {
       UnlockRow(preflight_metadata);
       throw std::runtime_error("migrated delete has inconsistent shared locator");
@@ -1856,7 +1913,9 @@ bool KVPartition::DeletePrivateForMigrationManager(
           star::TwoPLPashaHelper::clear_adjacent_migrated_rows(
               prev_lmeta, next_lmeta,
               [this](const PrivateMetadataLocal &local) {
-                return SharedMetadataFromOffset(local.migrated_smeta_off);
+                return SharedMetadataFromOffset(
+                    star::LocalMetadataAccess<PrivateMetadataLocal>::
+                        LoadMigratedRow(local));
               });
         } catch (...) {
           release_reserved_shared_write();
@@ -1865,15 +1924,16 @@ bool KVPartition::DeletePrivateForMigrationManager(
 
         LockRow(metadata);
         const auto unlock = [&] { UnlockRow(metadata); };
-        if ((!metadata->is_valid && !requester_prelocked) ||
-            metadata->is_migrated != initially_migrated ||
-            (initially_migrated && metadata->migrated_smeta_off != smeta_offset)) {
+        if ((!Access::LoadValid(*metadata) && !requester_prelocked) ||
+            Access::LoadMigrated(*metadata) != initially_migrated ||
+            (initially_migrated &&
+             Access::LoadMigratedRow(*metadata) != smeta_offset)) {
           unlock();
           release_reserved_shared_write();
           throw std::runtime_error(
               "owner delete row changed after delete preflight");
         }
-        metadata->is_valid = false;
+        Access::StoreValid(*metadata, false);
         if (initially_migrated) {
           const auto shared_result =
               star::TwoPLPashaHelper::delete_and_update_next_key_info(
@@ -1889,13 +1949,13 @@ bool KVPartition::DeletePrivateForMigrationManager(
                 "shared delete contention after adjacency update");
           }
           reserved_shared_write = false;
-          metadata->is_migrated = false;
-          metadata->migrated_smeta_off = kNullOffset;
+          Access::StoreMigrated(*metadata, false);
+          Access::StoreMigratedRow(*metadata, kNullOffset);
           *need_untrack = true;
           *migration_policy_meta = smeta;
           retired_smeta = smeta;
         }
-        metadata->scc_data_off = kNullOffset;
+        Access::StoreSccData(*metadata, kNullOffset);
         retired_value = private_value;
         retired_metadata = metadata;
         unlock();
@@ -1954,9 +2014,10 @@ PrivateClockTrackerNode *KVPartition::ResolveClockTrackerNode(
 }
 
 PrivateClockTrackerNode *KVPartition::AllocateClockTrackerNode() {
-  return new (regions_.AllocateOwnerPrivate(sizeof(PrivateClockTrackerNode),
-                                             partition_id_, owner_shard_))
-      PrivateClockTrackerNode;
+  void *storage = regions_.AllocateOwnerPrivate(sizeof(PrivateClockTrackerNode),
+                                                partition_id_, owner_shard_);
+  return latency_sim::FixedLatencyConstructShared<PrivateClockTrackerNode>(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, storage);
 }
 
 void KVPartition::FreeClockTrackerNode(PrivateClockTrackerNode *node) {
@@ -2006,12 +2067,18 @@ star::TwoPLPashaMetadataShared *KVPartition::ClockTrackerSharedRow(
 
 bool KVPartition::ClockTrackerNodeMatches(
     const PrivateClockTrackerNode &node) const {
-  if (node.value_off == kNullOffset || node.smeta_off == kNullOffset)
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
+  const RegionOffset node_value_offset = latency_sim::FixedLatencyMemoryLoad(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, &node.value_off);
+  const RegionOffset node_smeta_offset = latency_sim::FixedLatencyMemoryLoad(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, &node.smeta_off);
+  if (node_value_offset == kNullOffset || node_smeta_offset == kNullOffset)
     return false;
-  auto *value = ValueFromOffset(node.value_off);
-  if (value == nullptr) return false;
-  auto *metadata = MetadataFromValue(value);
-  return metadata->is_migrated && metadata->migrated_smeta_off == node.smeta_off;
+  auto *resolved_value = ValueFromOffset(node_value_offset);
+  if (resolved_value == nullptr) return false;
+  auto *resolved_metadata = MetadataFromValue(resolved_value);
+  return Access::LoadMigrated(*resolved_metadata) &&
+         Access::LoadMigratedRow(*resolved_metadata) == node_smeta_offset;
 }
 
 uint64_t KVPartition::shared_payload_used_bytes() const {

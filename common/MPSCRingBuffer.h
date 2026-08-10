@@ -337,7 +337,7 @@ class MPSCRingBuffer {
         std::atomic<uint64_t> head;
         std::atomic<uint64_t> tail;
         std::atomic<uint64_t> count;
-        uint64_t entries_buffer_offset = 0;
+        uint64_t entries_buffer_offset;
 };
 
 }

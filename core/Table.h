@@ -374,6 +374,15 @@ struct RawPointerRowStorage {
                 ValueType data;
         };
         using StoredRow = ValueStruct *;
+        static void Store(StoredRow *destination, StoredRow value) {
+                *destination = value;
+        }
+        static StoredRow Load(const StoredRow *source) {
+                return *source;
+        }
+        static void Copy(StoredRow *destination, const StoredRow *source) {
+                *destination = *source;
+        }
         StoredRow Null() const { return nullptr; }
         bool IsNull(StoredRow row) const { return row == nullptr; }
         MetaDataType *Meta(StoredRow row) const { return row == nullptr ? nullptr : &row->meta; }
@@ -431,26 +440,29 @@ class TableBTreeOLC : public ITable {
         // std::atomic has implicitly deleted copy-constructor
         // so we need to define a ValueType that supports it
         struct BTreeOLCValue {
-                BTreeOLCValue() = default;
+                BTreeOLCValue() {
+                        RowStoragePolicy::Store(&row, StoredRow{});
+                }
 
                 BTreeOLCValue(const BTreeOLCValue &value)
                 {
-                        this->row = value.row;
+                        RowStoragePolicy::Copy(&this->row, &value.row);
                 }
 
                 BTreeOLCValue &operator=(const BTreeOLCValue &value)
                 {
-                        this->row = value.row;
+                        RowStoragePolicy::Copy(&this->row, &value.row);
                         return *this;
                 }
 
-                StoredRow row{};
+                StoredRow row;
         };
 
         struct BTreeOLCValueComparator {
                 int operator()(const BTreeOLCValue &a, const BTreeOLCValue &b) const
                 {
-                        if (a.row == b.row)
+                        if (RowStoragePolicy::Load(&a.row) ==
+                            RowStoragePolicy::Load(&b.row))
                                 return 0;
                         else
                                 return 1;
@@ -495,7 +507,9 @@ class TableBTreeOLC : public ITable {
                 bool success = btree_->lookup(k, value);
 
                 if (success == true) {
-                        return std::make_tuple(storage_.Meta(value.row), storage_.Data(value.row));
+                        return std::make_tuple(
+                            storage_.Meta(storage_.Load(&value.row)),
+                            storage_.Data(storage_.Load(&value.row)));
                 } else {
                         return std::make_tuple(nullptr, nullptr);
                 }
@@ -510,7 +524,7 @@ class TableBTreeOLC : public ITable {
                 bool success = btree_->lookup(k, value);
 
                 if (success == true) {
-                        return storage_.Data(value.row);
+                        return storage_.Data(storage_.Load(&value.row));
                 } else {
                         return nullptr;
                 }
@@ -525,7 +539,7 @@ class TableBTreeOLC : public ITable {
                 bool success = btree_->lookup(k, value);
 
                 if (success == true) {
-                        return storage_.Meta(value.row);
+                        return storage_.Meta(storage_.Load(&value.row));
                 } else {
                         return nullptr;
                 }
@@ -552,8 +566,9 @@ class TableBTreeOLC : public ITable {
                 const auto &min_k = *static_cast<const KeyType *>(min_key);
 
                 auto processor = [&](const KeyType &key, BTreeOLCValue &value, bool is_last_tuple) -> bool {
-                        MetaDataType *meta_ptr = storage_.Meta(value.row);
-                        void *data_ptr = storage_.Data(value.row);
+                        const StoredRow row = storage_.Load(&value.row);
+                        MetaDataType *meta_ptr = storage_.Meta(row);
+                        void *data_ptr = storage_.Data(row);
 
                         bool should_end = scan_processor(&key, meta_ptr, data_ptr, is_last_tuple);
 
@@ -596,8 +611,9 @@ class TableBTreeOLC : public ITable {
                 CHECK(is_placeholder == true);
 
                 auto processor = [&](const KeyType *key, BTreeOLCValue *value) -> bool {
-                        MetaDataType *meta_ptr = storage_.Meta(value->row);
-                        void *data_ptr = storage_.Data(value->row);
+                        const StoredRow row = storage_.Load(&value->row);
+                        MetaDataType *meta_ptr = storage_.Meta(row);
+                        void *data_ptr = storage_.Data(row);
 
                         return next_key_processor(key, meta_ptr, data_ptr);
 		};
@@ -640,12 +656,14 @@ class TableBTreeOLC : public ITable {
                         void *prev_data = nullptr, *next_data = nullptr;
 
                         if (prev_value != nullptr) {
-                                prev_meta_ptr = storage_.Meta(prev_value->row);
-                                prev_data = storage_.Data(prev_value->row);
+                                const StoredRow row = storage_.Load(&prev_value->row);
+                                prev_meta_ptr = storage_.Meta(row);
+                                prev_data = storage_.Data(row);
                         }
                         if (next_value != nullptr) {
-                                next_meta_ptr = storage_.Meta(next_value->row);
-                                next_data = storage_.Data(next_value->row);
+                                const StoredRow row = storage_.Load(&next_value->row);
+                                next_meta_ptr = storage_.Meta(row);
+                                next_data = storage_.Data(row);
                         }
 
                         return processor(prev_key, prev_meta_ptr, prev_data, next_key, next_meta_ptr, next_data);
@@ -680,17 +698,19 @@ class TableBTreeOLC : public ITable {
                         void *prev_data = nullptr, *cur_data = nullptr, *next_data = nullptr;
 
                         if (prev_value != nullptr) {
-				prev_meta = storage_.AdjacentMeta(prev_value->row);
-                                prev_data = storage_.Data(prev_value->row);
+                                const StoredRow row = storage_.Load(&prev_value->row);
+                                prev_meta = storage_.AdjacentMeta(row);
+                                prev_data = storage_.Data(row);
                         }
                         if (cur_value != nullptr) {
-                                removed_row = cur_value->row;
-                                cur_meta = storage_.AdjacentMeta(cur_value->row);
-                                cur_data = storage_.Data(cur_value->row);
+                                removed_row = storage_.Load(&cur_value->row);
+                                cur_meta = storage_.AdjacentMeta(removed_row);
+                                cur_data = storage_.Data(removed_row);
                         }
                         if (next_value != nullptr) {
-				next_meta = storage_.AdjacentMeta(next_value->row);
-                                next_data = storage_.Data(next_value->row);
+                                const StoredRow row = storage_.Load(&next_value->row);
+                                next_meta = storage_.AdjacentMeta(row);
+                                next_data = storage_.Data(row);
                         }
 
                         return processor(prev_key, prev_meta, prev_data, cur_key, cur_meta, cur_data, next_key, next_meta, next_data);
@@ -713,8 +733,9 @@ class TableBTreeOLC : public ITable {
                 bool success = btree_->lookup(k, btree_value);
                 CHECK(success == true);
 
-		on_update(key, storage_.Data(btree_value.row));
-		storage_.Update(btree_value.row, value);
+		const StoredRow row = storage_.Load(&btree_value.row);
+		on_update(key, storage_.Data(row));
+		storage_.Update(row, value);
 	}
 
         bool search_and_update_next_key_info(const void *key,
@@ -724,16 +745,19 @@ class TableBTreeOLC : public ITable {
                         void *prev_meta = nullptr, *cur_meta = nullptr, *next_meta = nullptr;
                         void *prev_data = nullptr, *cur_data = nullptr, *next_data = nullptr;
                         if (prev_value != nullptr) {
-				prev_meta = storage_.AdjacentMeta(prev_value->row);
-                                prev_data = storage_.Data(prev_value->row);
+                                const StoredRow row = storage_.Load(&prev_value->row);
+                                prev_meta = storage_.AdjacentMeta(row);
+                                prev_data = storage_.Data(row);
                         }
                         if (cur_value != nullptr) {
-				cur_meta = storage_.AdjacentMeta(cur_value->row);
-                                cur_data = storage_.Data(cur_value->row);
+				const StoredRow row = storage_.Load(&cur_value->row);
+				cur_meta = storage_.AdjacentMeta(row);
+				cur_data = storage_.Data(row);
                         }
                         if (next_value != nullptr) {
-				next_meta = storage_.AdjacentMeta(next_value->row);
-                                next_data = storage_.Data(next_value->row);
+				const StoredRow row = storage_.Load(&next_value->row);
+				next_meta = storage_.AdjacentMeta(row);
+                                next_data = storage_.Data(row);
                         }
                         update_processor(prev_key, prev_meta, prev_data, cur_key, cur_meta, cur_data, next_key, next_meta, next_data);
 		};
@@ -752,7 +776,7 @@ class TableBTreeOLC : public ITable {
                 bool success = btree_->lookup(k, value);
                 CHECK(success == true);
 
-		storage_.Deserialize(value.row, stringPiece);
+		storage_.Deserialize(storage_.Load(&value.row), stringPiece);
 	}
 
 
@@ -800,8 +824,9 @@ class TableBTreeOLC : public ITable {
         void move_all_into_cxl(std::function<bool(ITable *, const void *, std::tuple<MetaDataType *, void *> &, bool)> move_in_func) override
         {
                 auto processor = [&](const KeyType &key, BTreeOLCValue &value, bool) -> bool {
-                        MetaDataType *meta_ptr = storage_.Meta(value.row);
-                        void *data_ptr = storage_.Data(value.row);
+                        const StoredRow row = storage_.Load(&value.row);
+                        MetaDataType *meta_ptr = storage_.Meta(row);
+                        void *data_ptr = storage_.Data(row);
                         std::tuple<MetaDataType *, void *> row_tuple(meta_ptr, data_ptr);
 			bool ret = move_in_func(this, &key, row_tuple, false);
                         return false;
@@ -817,7 +842,7 @@ class TableBTreeOLC : public ITable {
                 BTreeOLCValue value;
                 auto *tree = const_cast<BTree *>(btree_.get());
                 if (!tree->lookup(key, value)) return false;
-                *row = value.row;
+                *row = storage_.Load(&value.row);
                 return !storage_.IsNull(*row);
         }
 
