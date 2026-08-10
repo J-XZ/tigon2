@@ -80,11 +80,16 @@ pool_init=${TIGONKV_POOL_INITER:-$pool_build/cxl_pool_initer}
 shared_size_mb=${TIGONKV_SHARED_SIZE_MB:-$TIGONKV_SHARED_MB}
 shared_numa=${TIGONKV_SHARED_NUMA_NODE:-${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV_SHARED_NUMA%%,*}}}
 timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-1800}}
+deploy_timeout_sec=${TIGONKV_E2E_DEPLOY_TIMEOUT_SEC:-300}
 local_tool_install="$root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"
 remote_tool_install="$remote_root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"
 
 [[ "$vm_count" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_VM_COUNT must be positive" >&2; exit 2; }
 [[ "$threads" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_E2E_THREADS must be positive" >&2; exit 2; }
+[[ "$deploy_timeout_sec" =~ ^[1-9][0-9]*$ && "$deploy_timeout_sec" -le 3600 ]] || {
+  echo "TIGONKV_E2E_DEPLOY_TIMEOUT_SEC must be 1..3600 seconds" >&2
+  exit 2
+}
 [[ "$rounds" =~ ^[1-9][0-9]*$ ]] || { echo "rounds must be positive" >&2; exit 2; }
 if [[ "$checker" == ON && "$rounds" != 1 ]]; then
   echo "latencycheck E2E requires exactly one round" >&2
@@ -115,6 +120,8 @@ control_dir="$runtime_run_dir/ssh"
 mkdir -p "$control_dir"
 control_path="${TIGONKV_E2E_SSH_CONTROL_PATH:-$control_dir/%C}"
 ssh_opts=(-i "$ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o LogLevel=ERROR -o ConnectTimeout=10 -o ConnectionAttempts=1
+  -o ServerAliveInterval=10 -o ServerAliveCountMax=3
   -o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$control_path")
 
 close_ssh_controlmasters() {
@@ -132,12 +139,27 @@ remote() {
   ssh "${ssh_opts[@]}" -p "$((base_port + vm))" root@127.0.0.1 "$@"
 }
 
+deploy_remote() {
+  local vm=$1
+  shift
+  timeout --foreground --kill-after=10s "$deploy_timeout_sec" \
+    ssh "${ssh_opts[@]}" -p "$((base_port + vm))" root@127.0.0.1 "$@"
+}
+
+deploy_scp() {
+  timeout --foreground --kill-after=10s "$deploy_timeout_sec" scp "$@"
+}
+
+deploy_rsync() {
+  timeout --foreground --kill-after=10s "$deploy_timeout_sec" rsync "$@"
+}
+
 kill_guest_suite() {
   local suite=$1 vm=$2 quoted_root
   printf -v quoted_root '%q' "$remote_root"
   # Under Valgrind /proc/<pid>/exe is valgrind, so identify only the exact
   # project runner in the command line and never use a broad pkill.
-  remote "$vm" "for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do cmd=\$(tr '\0' ' ' <\"\$proc/cmdline\" 2>/dev/null || true); case \"\$cmd\" in *\"\$runner\"*) kill -TERM \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; done; sleep 0.1; for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do cmd=\$(tr '\0' ' ' <\"\$proc/cmdline\" 2>/dev/null || true); case \"\$cmd\" in *\"\$runner\"*) kill -KILL \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; done"
+  deploy_remote "$vm" "for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do cmd=\$(tr '\0' ' ' <\"\$proc/cmdline\" 2>/dev/null || true); case \"\$cmd\" in *\"\$runner\"*) kill -TERM \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; done; sleep 0.1; for name in e2e_08 e2e_09 e2e_trace_runner; do runner=$quoted_root/build/\$name; for proc in /proc/[0-9]*; do cmd=\$(tr '\0' ' ' <\"\$proc/cmdline\" 2>/dev/null || true); case \"\$cmd\" in *\"\$runner\"*) kill -KILL \"\${proc##*/}\" 2>/dev/null || true ;; esac; done; done"
 }
 
 stop_phase_guests() {
@@ -172,28 +194,38 @@ sync_latencycheck_prefix() {
     done
     printf -v port_arg '%q' "$port"
     rsync_ssh+=" -p $port_arg"
-    remote "$vm" "mkdir -p '$(dirname "$remote_tool_install")'"
-    scp "${ssh_opts[@]}" -P "$port" "$local_manifest" \
+    deploy_remote "$vm" "mkdir -p '$(dirname "$remote_tool_install")'"
+    deploy_scp "${ssh_opts[@]}" -P "$port" "$local_manifest" \
       "root@127.0.0.1:$remote_manifest.new.$run_id" >/dev/null
-    if remote "$vm" "test -d '$remote_tool_install' && test -f '$remote_manifest' && cmp -s '$remote_manifest' '$remote_manifest.new.$run_id'"; then
-      remote "$vm" "rm -f '$remote_manifest.new.$run_id'"
+    if deploy_remote "$vm" "test -d '$remote_tool_install' && test -f '$remote_manifest' && cmp -s '$remote_manifest' '$remote_manifest.new.$run_id'"; then
+      deploy_remote "$vm" "rm -f '$remote_manifest.new.$run_id'"
     else
-      remote "$vm" "mkdir -p '$(dirname "$remote_tool_install")' '$staging'"
-      rsync -a --delete -e "$rsync_ssh" "$local_tool_install/" \
+      deploy_remote "$vm" "mkdir -p '$(dirname "$remote_tool_install")' '$staging'"
+      deploy_rsync -a --delete -e "$rsync_ssh" "$local_tool_install/" \
         "root@127.0.0.1:$staging/" >/dev/null
-      remote "$vm" "cd '$staging' && sha256sum --status -c '$remote_manifest.new.$run_id'" || {
-        remote "$vm" "rm -rf '$staging' '$remote_manifest.new.$run_id'"
+      deploy_remote "$vm" "cd '$staging' && sha256sum --status -c '$remote_manifest.new.$run_id'" || {
+        deploy_remote "$vm" "rm -rf '$staging' '$remote_manifest.new.$run_id'"
         return 1
       }
-      remote "$vm" "rm -rf '$old'; if [ -d '$remote_tool_install' ]; then mv '$remote_tool_install' '$old'; fi; if mv '$staging' '$remote_tool_install'; then mv '$remote_manifest.new.$run_id' '$remote_manifest'; rm -rf '$old'; else rm -rf '$staging'; if [ -d '$old' ]; then mv '$old' '$remote_tool_install'; fi; rm -f '$remote_manifest.new.$run_id'; exit 1; fi"
+      deploy_remote "$vm" "rm -rf '$old'; if [ -d '$remote_tool_install' ]; then mv '$remote_tool_install' '$old'; fi; if mv '$staging' '$remote_tool_install'; then mv '$remote_manifest.new.$run_id' '$remote_manifest'; rm -rf '$old'; else rm -rf '$staging'; if [ -d '$old' ]; then mv '$old' '$remote_tool_install'; fi; rm -f '$remote_manifest.new.$run_id'; exit 1; fi"
     fi
-    remote "$vm" "test -x '$remote_tool_install/bin/valgrind'"
-    remote "$vm" "VALGRIND_LIB='$remote_tool_install/libexec/valgrind' '$remote_tool_install/bin/valgrind' --tool=latencycheck --version" >/dev/null
+    deploy_remote "$vm" "test -x '$remote_tool_install/bin/valgrind'"
+    deploy_remote "$vm" "VALGRIND_LIB='$remote_tool_install/libexec/valgrind' '$remote_tool_install/bin/valgrind' --tool=latencycheck --version" >/dev/null
   }
   local -a pids=()
   local vm status=0
   for ((vm = 0; vm < vm_count; vm++)); do sync_latencycheck_vm "$vm" & pids+=("$!"); done
-  for vm in "${!pids[@]}"; do wait "${pids[$vm]}" || status=1; done
+  local first_failed=-1 exit_code=0
+  for vm in "${!pids[@]}"; do
+    if wait "${pids[$vm]}"; then
+      :
+    else
+      exit_code=$?
+      (( status == 0 )) && { status=1; first_failed=$vm; }
+      echo "TIGONKV_DEPLOY_FAILED node=$vm stage=deploy exit_code=$exit_code reason=deploy" >&2
+    fi
+  done
+  (( status == 0 )) || echo "TIGONKV_DEPLOY_SUMMARY first_node=$first_failed status=failed" >&2
   return "$status"
 }
 
@@ -210,27 +242,27 @@ sync_guest_binary() {
   sync_guest_binary_vm() {
     local vm=$1 port=$((base_port + vm))
     kill_guest_suite "$suite" "$vm"
-    remote "$vm" "mkdir -p '$remote_root/build'"
+    deploy_remote "$vm" "mkdir -p '$remote_root/build'"
     local remote_binary="$remote_root/build/e2e_${suite}"
     local local_binary_sha remote_binary_sha
     local_binary_sha=$(sha256sum "$binary_dir/e2e_${suite}" | awk '{print $1}')
-    remote_binary_sha=$(remote "$vm" "sha256sum '$remote_binary' 2>/dev/null | awk '{print \$1}'" || true)
+    remote_binary_sha=$(deploy_remote "$vm" "sha256sum '$remote_binary' 2>/dev/null | awk '{print \$1}'" || true)
     if [[ "$local_binary_sha" != "$remote_binary_sha" ]]; then
-      scp "${ssh_opts[@]}" -P "$port" \
+      deploy_scp "${ssh_opts[@]}" -P "$port" \
         "$binary_dir/e2e_${suite}" "root@127.0.0.1:$remote_binary.new.$run_id" >/dev/null
-      remote "$vm" "test \"\$(sha256sum '$remote_binary.new.$run_id' | awk '{print \$1}')\" = '$local_binary_sha'; mv -f '$remote_binary.new.$run_id' '$remote_binary'"
+      deploy_remote "$vm" "test \"\$(sha256sum '$remote_binary.new.$run_id' | awk '{print \$1}')\" = '$local_binary_sha'; mv -f '$remote_binary.new.$run_id' '$remote_binary'"
     fi
     local config_sha remote_config_sha
     config_sha=$(sha256sum "$config" | awk '{print $1}')
-    remote_config_sha=$(remote "$vm" "sha256sum '$remote_config' 2>/dev/null | awk '{print \$1}'" || true)
+    remote_config_sha=$(deploy_remote "$vm" "sha256sum '$remote_config' 2>/dev/null | awk '{print \$1}'" || true)
     if [[ "$config_sha" != "$remote_config_sha" ]]; then
-      scp "${ssh_opts[@]}" -P "$port" \
+      deploy_scp "${ssh_opts[@]}" -P "$port" \
         "$config" "root@127.0.0.1:$remote_config.new.$run_id" >/dev/null
-      remote "$vm" "test \"\$(sha256sum '$remote_config.new.$run_id' | awk '{print \$1}')\" = '$config_sha'; mv -f '$remote_config.new.$run_id' '$remote_config'"
+      deploy_remote "$vm" "test \"\$(sha256sum '$remote_config.new.$run_id' | awk '{print \$1}')\" = '$config_sha'; mv -f '$remote_config.new.$run_id' '$remote_config'"
     fi
     # Confirm sync landed (YCSB may previously leave 32/32 on the guest).
     local remote_value
-    remote_value=$(remote "$vm" "grep -E '\"fixed_value_size\"[[:space:]]*:' '$remote_config' | head -1") || true
+    remote_value=$(deploy_remote "$vm" "grep -E '\"fixed_value_size\"[[:space:]]*:' '$remote_config' | head -1") || true
     local guest_value
     guest_value=$(sed -n -E \
       's/.*"fixed_value_size"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' \
@@ -243,8 +275,17 @@ sync_guest_binary() {
   local -a pids=()
   local vm status=0
   for ((vm = 0; vm < vm_count; vm++)); do sync_guest_binary_vm "$vm" & pids+=("$!"); done
-  for vm in "${!pids[@]}"; do wait "${pids[$vm]}" || status=1; done
-  ((status == 0)) || return "$status"
+  local first_failed=-1 exit_code=0
+  for vm in "${!pids[@]}"; do
+    if wait "${pids[$vm]}"; then
+      :
+    else
+      exit_code=$?
+      (( status == 0 )) && { status=1; first_failed=$vm; }
+      echo "TIGONKV_DEPLOY_FAILED node=$vm stage=deploy exit_code=$exit_code reason=deploy" >&2
+    fi
+  done
+  ((status == 0)) || { echo "TIGONKV_DEPLOY_SUMMARY first_node=$first_failed status=failed" >&2; return "$status"; }
   sync_latencycheck_prefix
 }
 

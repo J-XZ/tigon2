@@ -371,6 +371,7 @@ def authoritative_first_node(root):
         re.compile(r'first checker failure\s+node\s*([0-9]+)',re.IGNORECASE),
         re.compile(r'\bFAIL_FAST\b.*?\bfirst_node=([0-9]+)',re.IGNORECASE),
         re.compile(r'\b(?:TIGONKV_FAIL_FAST|DSIDLE_FAIL_FAST)\b.*?\bfirst_vm=([0-9]+)',re.IGNORECASE),
+        re.compile(r'\b(?:TIGONKV_DEPLOY_FAILED|DSIDLE_DEPLOY_FAILED)\b.*?\bnode=([0-9]+)',re.IGNORECASE),
     )
     for _,_,path in sorted(paths):
         for line in path.read_text(errors='replace').splitlines():

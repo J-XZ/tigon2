@@ -58,6 +58,11 @@ participant="$build/e2e_$suite"; pool_tool="$pool_build/cxl_pool_initer"
 tool_prefix="$root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"; latency_sim="$root/thirdparty_libs/latency_sim"
 latency_sha="$(git -C "$latency_sim" rev-parse HEAD)"; config_sha="$(harness_hash_file "$config")"; source_fingerprint="$(tigonkv_source_state "$root")"; export HARNESS_CLOSURE_STAMPS="$build/tigonkv_latency_sim_build_contract.json"
 remote_root="${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}"; runtime="$root/.tigon2"; vm_count="$TIGONKV_VM_COUNT"; base_port="${TIGONKV_VM_SSH_BASE_PORT:-$TIGONKV_SSH_BASE_PORT}"
+deploy_timeout="${TIGONKV_E2E_DEPLOY_TIMEOUT_SEC:-300}"
+[[ "$deploy_timeout" =~ ^[1-9][0-9]*$ && "$deploy_timeout" -le 3600 ]] || {
+  echo "TIGONKV_E2E_DEPLOY_TIMEOUT_SEC must be 1..3600 seconds" >&2
+  exit 2
+}
 if [[ "$config" == "$root/"* ]]; then
   remote_config="$remote_root/${config#"$root/"}"
 else
@@ -212,7 +217,9 @@ workflow_args=(--out-dir "$out_dir" --rounds "$rounds" --suite "$suite" --config
 if ((prepare_only)); then workflow_args+=(--prepare-only); fi
 set +e
 deploy_start_ms=$(harness_now_ms)
-timeout "$total_timeout" bash "$root/scripts/e2e/run_guest_e2e_workflows.sh" "${workflow_args[@]}" >"$out_dir/logs/runner.log" 2>&1
+TIGONKV_E2E_DEPLOY_TIMEOUT_SEC="$deploy_timeout" \
+  timeout --foreground --kill-after=15s "$total_timeout" \
+  bash "$root/scripts/e2e/run_guest_e2e_workflows.sh" "${workflow_args[@]}" >"$out_dir/logs/runner.log" 2>&1
 runner_status=$?; set -e
 harness_record_runner_exit "$out_dir/run_meta.json" "$runner_status"
 harness_mark_timing "$out_dir/run_meta.json" deploy_ms "$deploy_start_ms"
