@@ -178,7 +178,10 @@ RegionAllocator RegionAllocator::Initialize(void *region, uint64_t region_bytes,
     throw std::invalid_argument("invalid allocator region");
   if (reinterpret_cast<uintptr_t>(region) % kAlignment != 0)
     throw std::invalid_argument("allocator region is not cacheline aligned");
-  std::memset(region, 0, MetadataBytes());
+  latency_sim::FixedLatencyMemsetShared(
+      control_is_hwcc ? latency_sim::MemoryDomain::kHwcc
+                      : latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+      region, 0, MetadataBytes());
   auto *header = new (region) RegionAllocatorHeader;
   header->shard_count = shard_count;
   header->region_bytes = region_bytes;

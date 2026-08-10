@@ -171,6 +171,16 @@ inline void RecordTreeDataWrite(const void *address, uint64_t bytes) {
 		tigonkv::engine::mem_access::PrivateWrite(address, bytes);
 }
 
+inline latency_sim::MemoryDomain TreeDataDomain() {
+	return TreeAccessIsHwcc ? latency_sim::MemoryDomain::kHwcc
+	                        : latency_sim::MemoryDomain::kOwnerPrivateSwcc;
+}
+
+inline void* TreeMemmove(void* dst, const void* src, uint64_t bytes) {
+	return tigonkv::engine::mem_access::SharedMemmove(
+	    TreeDataDomain(), dst, src, bytes);
+}
+
 template <typename T>
 inline T TreeAtomicLoad(const std::atomic<T> &value, std::memory_order order) {
 	return TreeAccessIsHwcc
@@ -837,9 +847,11 @@ class BPlusTree {
 		template <typename T = KeyType> typename std::enable_if<std::is_trivial<T>::value == true, void>::type __adjust_elements_in_erase(int pos)
 		{
 			const size_t moved = this->getCount() - pos - 1;
-			recordEntriesRead(pos + 1, moved);
-			recordEntriesWrite(pos, moved);
-			memmove(keys_ + pos, keys_ + pos + 1, sizeof(KeyType) * (this->getCount() - pos - 1));
+			const size_t key_bytes = sizeof(KeyType) * moved;
+			const size_t value_bytes = sizeof(ValueType) * moved;
+			RecordTreeDataRead(values_ + pos + 1, value_bytes);
+			RecordTreeDataWrite(values_ + pos, value_bytes);
+			TreeMemmove(keys_ + pos, keys_ + pos + 1, key_bytes);
 			// memmove(values_ + pos, values_ + pos + 1, sizeof(ValueType) * (this->getCount() - pos - 1));
                         for (int i = 0; i < this->getCount() - pos - 1; i++) {
                                 values_[pos + i] = values_[pos + 1 + i];

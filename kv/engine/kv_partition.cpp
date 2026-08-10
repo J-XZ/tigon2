@@ -391,9 +391,9 @@ star::RowOutcome KVPartition::PutPrivate(std::string_view key,
                                                 &migrated);
     if (write_locked) {
       const uint64_t new_tid = NextCommitTid(observed_tid);
-      std::memset(private_value->data, 0, fixed_value_size_);
-      std::memcpy(private_value->data, value.data(), value.size());
-      mem_access::PrivateWrite(private_value->data, fixed_value_size_);
+      mem_access::PrivateMemsetShared(private_value->data, 0, fixed_value_size_);
+      mem_access::PrivateCopyLocalToShared(private_value->data, value.data(),
+                                           value.size());
       metadata->is_data_modified_since_moved_out = true;
       star::TwoPLPashaHelper::write_lock_release(
           *metadata, new_tid, fixed_value_size_, owner_shard_,
@@ -911,11 +911,11 @@ star::RowOutcome KVPartition::CompareExchangePrivate(
     return star::RowOutcome::kBusy;
   }
   if (shared_locked == nullptr) {
-    mem_access::PrivateRead(private_value->data, fixed_value_size_);
-    std::memcpy(current.data(), private_value->data, fixed_value_size_);
+    mem_access::PrivateCopySharedToLocal(current.data(), private_value->data,
+                                         fixed_value_size_);
     if (current == expected) {
-      std::memcpy(private_value->data, desired.data(), desired.size());
-      mem_access::PrivateWrite(private_value->data, fixed_value_size_);
+      mem_access::PrivateCopyLocalToShared(private_value->data, desired.data(),
+                                           desired.size());
       metadata->is_data_modified_since_moved_out = true;
       *exchanged = true;
     }
@@ -928,8 +928,8 @@ star::RowOutcome KVPartition::CompareExchangePrivate(
         });
     return star::RowOutcome::kDone;
   }
-  mem_access::PrivateRead(private_value->data, fixed_value_size_);
-  std::memcpy(current.data(), private_value->data, fixed_value_size_);
+  mem_access::PrivateCopySharedToLocal(current.data(), private_value->data,
+                                       fixed_value_size_);
   const bool changed = current == expected;
   if (changed) {
     if (!star::TwoPLPashaHelper::remote_write_lock_update_and_release(
@@ -986,8 +986,8 @@ star::RowOutcome KVPartition::IncrementPrivate(std::string_view key,
   if (!write_locked) {
     return star::RowOutcome::kBusy;
   }
-  mem_access::PrivateRead(private_value->data, fixed_value_size_);
-  std::memcpy(current.data(), private_value->data, fixed_value_size_);
+  mem_access::PrivateCopySharedToLocal(current.data(), private_value->data,
+                                       fixed_value_size_);
   if (shared_locked != nullptr) {
     int64_t next = 0;
     int64_t previous = 0;
@@ -1041,8 +1041,8 @@ star::RowOutcome KVPartition::IncrementPrivate(std::string_view key,
           });
       throw std::invalid_argument("increment value exceeds fixed value size");
     }
-    std::memcpy(private_value->data, encoded.data(), encoded.size());
-    mem_access::PrivateWrite(private_value->data, fixed_value_size_);
+    mem_access::PrivateCopyLocalToShared(private_value->data, encoded.data(),
+                                         encoded.size());
     metadata->is_data_modified_since_moved_out = true;
     *value = next;
     star::TwoPLPashaHelper::write_lock_release(

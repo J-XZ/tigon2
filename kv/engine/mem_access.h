@@ -303,6 +303,27 @@ inline void SharedPayloadWrite(const void* address, size_t bytes) {
          bytes);
 }
 
+inline void* PrivateCopyLocalToShared(void* dst, const void* src, size_t bytes) {
+  return latency_sim::FixedLatencyCopyLocalToShared(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, dst, src, bytes);
+}
+
+inline void* PrivateCopySharedToLocal(void* dst, const void* src, size_t bytes) {
+  return latency_sim::FixedLatencyCopySharedToLocal(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, dst, src, bytes);
+}
+
+inline void* PrivateMemsetShared(void* dst, int value, size_t bytes) {
+  return latency_sim::FixedLatencyMemsetShared(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, dst, value, bytes);
+}
+
+inline void* SharedMemmove(latency_sim::MemoryDomain pool, void* dst,
+                           const void* src, size_t bytes) {
+  return latency_sim::FixedLatencyMemmoveSharedToShared(
+      pool, dst, pool, src, bytes);
+}
+
 template <typename T>
 inline T SharedPayloadAtomicLoad(
     const std::atomic<T>& value,

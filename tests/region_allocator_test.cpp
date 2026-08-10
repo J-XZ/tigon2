@@ -24,6 +24,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -97,7 +98,11 @@ void TestCrossProcessFreeRejected() {
           DomainCounter;
   tigonkv::test::ScopedLatencyPools pools(mapping.base, kBytes, mapping.base,
                                           kBytes);
-  auto allocator = RegionAllocator::Initialize(mapping.base, kBytes, 2, 0, true, true);
+  auto allocator = [&] {
+    tigonkv::engine::mem_access::LatencyScope scope(
+        latency_sim::ExecutionClass::kForeground);
+    return RegionAllocator::Initialize(mapping.base, kBytes, 2, 0, true, true);
+  }();
   void *block = nullptr;
   {
     tigonkv::engine::mem_access::LatencyScope scope(
@@ -484,10 +489,20 @@ void TestAllocatorLatencyAccounting() {
   Mapping hwcc_mapping(true);
   Mapping swcc_mapping(true);
   Mapping dual_mapping(true, 64 * 1024 * 1024);
-  auto hwcc_allocator =
-      RegionAllocator::Initialize(hwcc_mapping.base, kBytes, 2, 0, true, true);
-  auto swcc_allocator =
-      RegionAllocator::Initialize(swcc_mapping.base, kBytes, 2, 0, false, false);
+  auto allocators = [&] {
+    tigonkv::test::ScopedLatencyPools init_pools(
+        swcc_mapping.base, kBytes, hwcc_mapping.base, kBytes);
+    tigonkv::engine::mem_access::LatencyScope init_scope(
+        latency_sim::ExecutionClass::kForeground);
+    auto allocator =
+        RegionAllocator::Initialize(hwcc_mapping.base, kBytes, 2, 0, true, true);
+    auto swcc_allocator =
+        RegionAllocator::Initialize(swcc_mapping.base, kBytes, 2, 0, false, false);
+    return std::pair<RegionAllocator, RegionAllocator>(
+        std::move(allocator), std::move(swcc_allocator));
+  }();
+  auto hwcc_allocator = std::move(allocators.first);
+  auto swcc_allocator = std::move(allocators.second);
   const DualRegionConfig config = TestDualConfig();
   std::unique_ptr<DualRegionAllocator> dual;
   {

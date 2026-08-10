@@ -41,8 +41,7 @@ RegionOffsetRowStorage::StoredRow RegionOffsetRowStorage::AllocateAndConstruct(
       partition->regions_.ToOwnerPrivateOffset(metadata,
                                                partition->partition_id_),
       std::memory_order_release);
-  std::memcpy(row->data, fixed_value.data(), value_size);
-  mem_access::PrivateWrite(row->data, value_size);
+  mem_access::PrivateCopyLocalToShared(row->data, fixed_value.data(), value_size);
   metadata->is_valid = !is_placeholder;
   metadata->tid = partition->NextCommitTid(metadata->tid);
   mem_access::PrivateWrite(
@@ -89,8 +88,8 @@ void *RegionOffsetRowStorage::AdjacentMeta(StoredRow row) const {
 void RegionOffsetRowStorage::Update(StoredRow row, const void *value) const {
   auto *target = partition->ValueFromOffset(row);
   if (target == nullptr) throw std::runtime_error("invalid row offset");
-  std::memcpy(target->data, TableValue(value, value_size).data(), value_size);
-  mem_access::PrivateWrite(target->data, value_size);
+  const auto fixed_value = TableValue(value, value_size);
+  mem_access::PrivateCopyLocalToShared(target->data, fixed_value.data(), value_size);
 }
 
 void RegionOffsetRowStorage::Deserialize(StoredRow row,
