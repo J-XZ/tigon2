@@ -227,6 +227,7 @@ workflow_args=(--out-dir "$out_dir" --rounds "$rounds" --suite "$suite" --config
 if ((prepare_only)); then workflow_args+=(--prepare-only); fi
 set +e
 deploy_start_ms=$(harness_now_ms)
+TIGONKV_E2E_TIMEOUT_SEC="$round_timeout" \
 TIGONKV_E2E_DEPLOY_TIMEOUT_SEC="$deploy_timeout" \
   timeout --foreground --kill-after=15s "$total_timeout" \
   bash "$root/scripts/e2e/run_guest_e2e_workflows.sh" "${workflow_args[@]}" >"$out_dir/logs/runner.log" 2>&1
