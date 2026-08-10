@@ -535,7 +535,8 @@ DualRegionAllocator DualRegionAllocator::Initialize(void *pool,
   auto *base = static_cast<std::byte *>(pool);
   if (reinterpret_cast<uintptr_t>(base) % RegionAllocator::kAlignment != 0)
     throw std::invalid_argument("dual-region pool is not cacheline aligned");
-  auto *header = new (base + config.hwcc_offset_bytes) DualRegionPersistentHeader;
+  auto *header = latency_sim::FixedLatencyConstructShared<DualRegionPersistentHeader>(
+      latency_sim::MemoryDomain::kHwcc, base + config.hwcc_offset_bytes);
   // magic is the immutable-layout publication flag.  Keep it clear while
   // this VM fills the remaining fixed fields, so joining VMs cannot validate
   // a half-constructed default header.
