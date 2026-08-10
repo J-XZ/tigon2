@@ -105,6 +105,9 @@ build_start_ms=$(harness_now_ms)
   cmake --build "$build" --target e2e_trace_runner
   cmake --build "$build" --target ycsb_partition_splits
   cmake --build "$pool_build" --target cxl_pool_initer
+  if [[ "$checker" == ON ]]; then
+    LATENCY_SIM_VALGRIND_CHECK=ON bash "$latency_sim/scripts/build_latencycheck.sh"
+  fi
 } >"$out_dir/logs/build.log" 2>&1 || build_status=$?
 harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
 if ((build_status != 0)); then
