@@ -30,6 +30,20 @@ freeze_config="$tmp/freeze.config"; printf '{}\n' >"$freeze_config"; freeze_conf
 printf 'node=0 boot_id=00000000-0000-0000-0000-000000000000 participant=%s config=%s tool=none\n' "$after_sha" "$freeze_config_sha" >"$tmp/freeze.probe"
 harness_probe_matches "$tmp/freeze.probe" 1 "$after_sha" "$freeze_config_sha" none
 
+# Regression: final metadata refresh must preserve probe detail recorded before
+# the post-freeze source/prepared-state update.
+harness_write_common_meta "$tmp/meta.json" tigon2 08 latencycheck 4096 "$freeze_config" source-a latency-a refreshed /root/tigon2
+harness_update_meta "$tmp/meta.json" 'per_node_observed_json=[{"node":0,"participant":"old","boot_id":"boot-a"}]'
+harness_write_common_meta "$tmp/meta.json" tigon2 08 latencycheck 4096 "$freeze_config" source-b latency-b hit /root/tigon2
+python3 - "$tmp/meta.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data['source_fingerprint'] == 'source-b'
+assert data['prepared_state'] == 'hit'
+assert data['per_node_observed'][0]['boot_id'] == 'boot-a'
+assert data['remote_root'] == '/root/tigon2'
+PY
+
 state="$tmp/runtime/e2e/prepared_state.json"
 harness_write_state "$state" project_id=tigon2 participant_elf_sha256="$(harness_hash_file "$elf")"
 harness_state_matches "$state" project_id=tigon2 participant_elf_sha256="$(harness_hash_file "$elf")"

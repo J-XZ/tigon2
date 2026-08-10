@@ -93,17 +93,20 @@ if ((execute == 0)); then
   printf 'build_type=Debug optimization=O0 compile_off=false valgrind_check=%s ndebug=%s extra_check=false valgrind_lib=%s\n' "$([[ "$checker" == ON ]] && echo true || echo false)" "$([[ "$e2e_ndebug" == ON ]] && echo true || echo false)" "$([[ "$checker" == ON ]] && printf '%s' "$tool_prefix/libexec/valgrind" || printf '%s' none)"
   exit 0
 fi
-export HARNESS_PROJECT_RUNTIME="$runtime"; harness_acquire_lock "$config" "$vm_count" "$base_port" "$runtime"; harness_prepare_output "$root" "$requested_out" tigon2 trace "$record_count"
+export HARNESS_PROJECT_RUNTIME="$runtime"; total_start_ms=$(harness_now_ms); harness_acquire_lock "$config" "$vm_count" "$base_port" "$runtime"; harness_prepare_output "$root" "$requested_out" tigon2 trace "$record_count"
 out_dir="$HARNESS_OUT_DIR"; run_id="$HARNESS_RUN_ID"; run_runtime="$HARNESS_RUNTIME_RUN_DIR"
 mkdir -p "$out_dir/logs" "$out_dir/round_logs"
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 trace "$profile" "$record_count" "$config" unknown "$latency_sha" refreshed "$remote_root"
 harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=$trace_workers" "failed_stage=resolve" "reason=resolved"
+harness_mark_timing "$out_dir/run_meta.json" resolve_ms "$total_start_ms"
 build_status=0
+build_start_ms=$(harness_now_ms)
 {
   cmake --build "$build" --target e2e_trace_runner
   cmake --build "$build" --target ycsb_partition_splits
   cmake --build "$pool_build" --target cxl_pool_initer
 } >"$out_dir/logs/build.log" 2>&1 || build_status=$?
+harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
 if ((build_status != 0)); then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=build" "reason=host-build" "runner_exit_code=$build_status"
   harness_emit_result "$out_dir" HARNESS_INVALID build "" failed host-build
@@ -122,6 +125,7 @@ trap 'harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"' EX
 export TIGONKV_E2E_RUN_ID="$run_id" TIGONKV_E2E_RUNTIME_DIR="$run_runtime" TIGONKV_VM_REMOTE_ROOT="$remote_root" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config"
 export LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug"
 participant_manifest="$run_runtime/participants.manifest"
+freeze_start_ms=$(harness_now_ms)
 if ! harness_manifest "$participant_manifest" "$runner" "$pool_tool" >"$out_dir/logs/freeze.log" 2>&1; then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=freeze" "reason=participant-manifest"
   harness_emit_result "$out_dir" HARNESS_INVALID freeze "" failed participant-manifest
@@ -129,12 +133,14 @@ if ! harness_manifest "$participant_manifest" "$runner" "$pool_tool" >"$out_dir/
 fi
 participant_sha="$(harness_manifest_sha "$participant_manifest")"
 closure_manifest="$run_runtime/closure.manifest"
+closure_start_ms=$(harness_now_ms)
 if ! harness_closure_manifest "$runtime" "$profile:$build:$remote_root:trace" "$closure_manifest" "$runner" "$pool_tool" >"$out_dir/logs/closure.log" 2>&1; then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=closure" "reason=closure"
   harness_emit_result "$out_dir" HARNESS_INVALID closure "" failed closure
   exit 125
 fi
 closure_sha="$(harness_manifest_sha "$closure_manifest")"
+harness_mark_timing "$out_dir/run_meta.json" closure_ms "$closure_start_ms"
 tool_manifest="$run_runtime/latencycheck.manifest"
 if [[ "$checker" == ON ]]; then
   if ! harness_manifest "$tool_manifest" "$tool_prefix" >"$out_dir/logs/latencycheck-manifest.log" 2>&1; then
@@ -150,6 +156,7 @@ if [[ "$checker" == ON ]]; then
     exit 125
   fi
 else : >"$tool_manifest"; tool_sha=none; tool_binary_sha=none; fi
+harness_mark_timing "$out_dir/run_meta.json" freeze_ms "$freeze_start_ms"
 backing_real="$(realpath -m "$TIGONKV_SHARED_BACKING")"; backing_inode=missing; backing_size=missing
 if [[ -e "$backing_real" && ! -L "$backing_real" ]]; then backing_inode="$(stat -c '%i' "$backing_real")"; backing_size="$(stat -c '%s' "$backing_real")"; fi
 state="$runtime/e2e/prepared_state.json"; config_sha="$(harness_hash_file "$config")"; state_common=("project_id=tigon2" "repo_root=$root" "latency_sim_fingerprint=$latency_sha" "build_fingerprint=$source_fingerprint" "compile_contract=Debug/O0/compile-on/checker-$checker/ndebug-$e2e_ndebug" "vm_count=$vm_count" "ssh_base_port=$base_port" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size" "participant_targets=e2e_trace_runner,cxl_pool_initer" "participant_elf_sha256=$participant_sha" "runtime_closure_manifest_sha=$closure_sha" "experiment_config_sha256=$config_sha" "trace_config_sha256=$trace_config_sha" "latencycheck_prefix_manifest_sha=$tool_sha" "guest_participant_sha256=$(harness_hash_file "$runner")" "guest_config_sha256=$config_sha" "guest_tool_sha256=$tool_binary_sha" "remote_root=$remote_root")
@@ -160,6 +167,7 @@ if [[ "$checker" == ON ]]; then probe_command+=" tool_sha=\$(sha256sum '$q_tool_
 probe_command+=" printf 'node={node} boot_id=%s participant=%s config=%s tool=%s\\n' \"\$boot_id\" \"\$participant_sha\" \"\$config_sha\" \"\$tool_sha\""
 guest_participant_sha="$(harness_hash_file "$runner")"
 guest_probe_file="$run_runtime/guest_probe.txt"; guest_probe_sha=""
+prepare_start_ms=$(harness_now_ms)
 if guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" && \
    harness_probe_matches "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"; then echo "GUEST_PROBE_OK sha=$guest_probe_sha"; else echo "GUEST_PROBE_INVALID reason=unreachable_or_artifact_mismatch" >&2; fi
 harness_record_probe_meta "$out_dir/run_meta.json" "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"
@@ -168,6 +176,7 @@ guest_boot_ids=""
 prepared_state=refreshed
 state_expected=("${state_common[@]}" "guest_artifact_manifest_sha256=$guest_probe_sha" "vm_boot_ids=$guest_boot_ids")
 if [[ -n "$guest_probe_sha" ]] && harness_state_matches "$state" "${state_expected[@]}"; then prepared_state=hit; echo PREPARED_STATE_HIT; else echo "PREPARED_STATE_MISS reason=manifest_or_trace_config_changed"; fi
+harness_mark_timing "$out_dir/run_meta.json" prepare_ms "$prepare_start_ms"
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 trace "$profile" "$record_count" "$config" "$source_fingerprint" "$latency_sha" "$prepared_state" "$remote_root"
 python3 - "$out_dir/run_meta.json" "$vm_count" "$record_count" "$operation_count" "$trace_workers" "$load_policy" "$rounds" "$checker" "$e2e_ndebug" "$trace_config" <<'PY'
 import json,sys
@@ -189,11 +198,24 @@ harness_update_meta "$out_dir/run_meta.json" \
   "latencycheck_prefix_manifest_sha256=$tool_sha"
 : >"$out_dir/actual_events.jsonl"
 trace_dir="$out_dir/traces"; mkdir -p "$trace_dir"
+deploy_start_ms=$(harness_now_ms)
 env TIGONKV_E2E_TRACE_BUILD_DIR="$build" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" TIGONKV_VM_COUNT="$vm_count" TIGONKV_YCSB_WORKLOADS="$workloads" YCSB_RECORD_COUNT="$record_count" YCSB_OPERATION_COUNT="$operation_count" YCSB_WORKERS="$trace_workers" bash "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" "$trace_dir" >"$out_dir/logs/trace_prepare.log" 2>&1 || { harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=trace-generation"; harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed trace-generation; exit 125; }
-if ((prepare_only)); then harness_emit_result "$out_dir" PREPARED prepare-only "" verified; exit 0; fi
+harness_mark_timing "$out_dir/run_meta.json" deploy_ms "$deploy_start_ms"
+if ((prepare_only)); then
+  cleanup_start_ms=$(harness_now_ms)
+  trap - EXIT
+  harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"
+  harness_mark_timing "$out_dir/run_meta.json" cleanup_ms "$cleanup_start_ms"
+  harness_mark_timing "$out_dir/run_meta.json" total_prepare_ms "$total_start_ms"
+  harness_emit_result "$out_dir" PREPARED prepare-only "" verified
+  exit 0
+fi
 set +e
+deploy_start_ms=$(harness_now_ms)
 timeout "$total_timeout" env TIGONKV_E2E_TRACE_RUNNER="$runner" TIGONKV_POOL_INITER="$pool_tool" TIGONKV_E2E_TRACE_TOOL_INSTALL="$tool_prefix" TIGONKV_E2E_TRACE_TOOL_MANIFEST="${TIGONKV_E2E_TOOL_MANIFEST:-}" TIGONKV_YCSB_THREADS_PER_VM="$trace_workers" TIGONKV_YCSB_WORKLOADS="$workloads" TIGONKV_E2E_LOAD_POLICY="$load_policy" TIGONKV_E2E_TRACE_PREPARE_ONLY="$prepare_only" LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" bash "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$trace_dir" "$out_dir" "$rounds" "$workloads" >"$out_dir/logs/runner.log" 2>&1
 runner_status=$?; set -e
+harness_mark_timing "$out_dir/run_meta.json" deploy_ms "$deploy_start_ms"
+probe_start_ms=$(harness_now_ms)
 if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" || \
    ! harness_probe_matches "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"; then
   harness_record_probe_meta "$out_dir/run_meta.json" "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"
@@ -205,10 +227,16 @@ if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_contr
 fi
 guest_boot_ids="$(harness_probe_boot_ids "$guest_probe_file")"
 harness_record_probe_meta "$out_dir/run_meta.json" "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"
+harness_mark_timing "$out_dir/run_meta.json" probe_ms "$probe_start_ms"
 harness_write_state "$state" "${state_common[@]}" "guest_artifact_manifest_sha256=$guest_probe_sha" "vm_boot_ids=$guest_boot_ids"
 [[ "$prepared_state" == hit ]] || echo "PREPARED_STATE_REFRESHED"
 status="$(harness_classify_status "$out_dir" "$runner_status" "$checker")"
 failed_stage=
 [[ "$status" == CHECK_MISMATCH ]] && failed_stage=checker
+cleanup_start_ms=$(harness_now_ms)
+trap - EXIT
+harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"
+harness_mark_timing "$out_dir/run_meta.json" cleanup_ms "$cleanup_start_ms"
+harness_mark_timing "$out_dir/run_meta.json" total_prepare_ms "$total_start_ms"
 harness_emit_result "$out_dir" "$status" "$failed_stage" "" verified
 case "$status" in CHECK_CLEAN) exit 0;; CHECK_MISMATCH) exit 1;; *) exit 125;; esac

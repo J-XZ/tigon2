@@ -10,6 +10,12 @@ harness_resolve_cli_path() {
   if [[ "$value" = /* ]]; then realpath -m -- "$value"; else realpath -m -- "$root/$value"; fi
 }
 harness_hash_file() { sha256sum -- "$1" | awk '{print $1}'; }
+harness_now_ms() { date +%s%3N; }
+harness_mark_timing() {
+  local meta=$1 field=$2 started=$3 elapsed
+  elapsed=$(( $(harness_now_ms) - started ))
+  harness_update_meta "$meta" "$field=$elapsed"
+}
 harness_manifest() {
   local output=$1 input path
   shift
@@ -165,23 +171,29 @@ harness_write_common_meta() {
   local path=$1 project=$2 suite=$3 profile=$4 records=$5 config=$6 source=$7 latency_sha=$8 prepared=$9
   local remote_root=; if (( $# >= 10 )); then remote_root=${10:-}; fi
   python3 - "$path" "$project" "$suite" "$profile" "$records" "$config" "$source" "$latency_sha" "$prepared" "$remote_root" <<'PY'
-import hashlib, json, sys
+import hashlib, json, os, sys
 from pathlib import Path
 path, project, suite, profile, records, config, source, latency_sha, prepared, remote_root=sys.argv[1:]
 path=Path(path); cfg=Path(config)
-payload={'project':project,'suite':suite,'profile':profile,'record_count':int(records),'operation_count':None,
+payload=json.loads(path.read_text()) if path.exists() else {}
+payload.update({'project':project,'suite':suite,'profile':profile,'record_count':int(records),'operation_count':None,
  'logical_operation_count':int(records),'physical_operation_count':int(records),'vm_count':None,
  'workers_per_vm':None,'source_fingerprint':source,'latency_sim_sha':latency_sha,
  'config_sha256':hashlib.sha256(cfg.read_bytes()).hexdigest(),'prepared_state':prepared,
- 'reason':'','failed_stage':'','first_node':None,'cleanup_status':'pending',
- 'runner_exit_code':None,'pool_reset_count':0,
- 'participant_manifest_sha256':None,'runtime_closure_manifest_sha256':None,
- 'latencycheck_prefix_manifest_sha256':None,'participant_expected_sha256':None,
- 'participant_observed_sha256':None,'per_node_expected':None,'per_node_observed':None,
- 'first_mismatch':None,
- 'run_id':path.parent.name,'remote_root':remote_root}
+ 'remote_root':remote_root})
+defaults={'reason':'','failed_stage':'','first_node':None,'cleanup_status':'pending',
+ 'runner_exit_code':None,'pool_reset_count':0,'participant_manifest_sha256':None,
+ 'runtime_closure_manifest_sha256':None,'latencycheck_prefix_manifest_sha256':None,
+ 'participant_expected_sha256':None,'participant_observed_sha256':None,
+ 'per_node_expected':None,'per_node_observed':None,'first_mismatch':None,
+ 'resolve_ms':0,'build_ms':0,'freeze_ms':0,'closure_ms':0,'prepare_ms':0,'deploy_ms':0,
+ 'probe_ms':0,'pool_reset_ms':0,'cleanup_ms':0,'total_prepare_ms':0,
+ 'run_id':path.parent.name}
+for key,value in defaults.items(): payload.setdefault(key,value)
 payload['config']=str(cfg.resolve())
-path.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
+temporary=path.with_name(path.name+f'.new.{os.getpid()}')
+temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+os.replace(temporary,path)
 PY
 }
 
@@ -195,7 +207,9 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 data = json.loads(path.read_text())
-integer_fields = {"vm_count", "workers_per_vm", "first_node", "runner_exit_code", "pool_reset_count"}
+integer_fields = {"vm_count", "workers_per_vm", "first_node", "runner_exit_code", "pool_reset_count",
+                  "resolve_ms", "build_ms", "freeze_ms", "closure_ms", "prepare_ms", "deploy_ms",
+                  "probe_ms", "pool_reset_ms", "cleanup_ms", "total_prepare_ms"}
 for item in sys.argv[2:]:
     key, value = item.split("=", 1)
     if key in integer_fields:
@@ -249,6 +263,9 @@ data.update({"participant_expected_sha256": [r["participant"] for r in expected]
              "participant_observed_sha256": [r["participant"] for r in observed],
              "per_node_expected": expected, "per_node_observed": observed,
              "expected_config_sha256": expected_config, "expected_tool_sha256": expected_tool})
+data["vm_boot_ids"] = ",".join(
+    f"node{row['node']}:{row['boot_id']}" for row in observed if row["boot_id"]
+)
 Path(meta_path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PY
 }

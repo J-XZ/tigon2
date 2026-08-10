@@ -84,17 +84,20 @@ if ((execute == 0)); then
     "$([[ "$checker" == ON ]] && printf '%s' "$tool_prefix/libexec/valgrind" || printf '%s' none)"
   exit 0
 fi
-export HARNESS_PROJECT_RUNTIME="$runtime"; harness_acquire_lock "$config" "$vm_count" "$base_port" "$runtime"
+export HARNESS_PROJECT_RUNTIME="$runtime"; total_start_ms=$(harness_now_ms); harness_acquire_lock "$config" "$vm_count" "$base_port" "$runtime"
 harness_prepare_output "$root" "$requested_out" tigon2 "$suite" "$record_count"
 out_dir="$HARNESS_OUT_DIR"; run_id="$HARNESS_RUN_ID"; run_runtime="$HARNESS_RUNTIME_RUN_DIR"
 mkdir -p "$out_dir/logs" "$out_dir/round_logs"
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$config" unknown "$latency_sha" refreshed "$remote_root"
 harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=4" "failed_stage=resolve" "reason=resolved"
+harness_mark_timing "$out_dir/run_meta.json" resolve_ms "$total_start_ms"
 build_status=0
+build_start_ms=$(harness_now_ms)
 {
   cmake --build "$build" --target "e2e_$suite"
   cmake --build "$pool_build" --target cxl_pool_initer
 } >"$out_dir/logs/build.log" 2>&1 || build_status=$?
+harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
 if ((build_status != 0)); then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=build" "reason=host-build" "runner_exit_code=$build_status"
   harness_emit_result "$out_dir" HARNESS_INVALID build "" failed host-build
@@ -114,6 +117,7 @@ export TIGONKV_E2E_RUN_ID="$run_id" TIGONKV_E2E_RUNTIME_DIR="$run_runtime" TIGON
 export TIGONKV_VM_REMOTE_ROOT="$remote_root" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config"
 export LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" TIGONKV_E2E08_TOTAL_KEYS="$record_count"
 participant_manifest="$run_runtime/participants.manifest"
+freeze_start_ms=$(harness_now_ms)
 if ! harness_manifest "$participant_manifest" "$participant" "$pool_tool" >"$out_dir/logs/freeze.log" 2>&1; then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=freeze" "reason=participant-manifest"
   harness_emit_result "$out_dir" HARNESS_INVALID freeze "" failed participant-manifest
@@ -121,12 +125,14 @@ if ! harness_manifest "$participant_manifest" "$participant" "$pool_tool" >"$out
 fi
 participant_sha="$(harness_manifest_sha "$participant_manifest")"
 closure_manifest="$run_runtime/closure.manifest"
+closure_start_ms=$(harness_now_ms)
 if ! harness_closure_manifest "$runtime" "$profile:$build:$remote_root:suite$suite" "$closure_manifest" "$participant" "$pool_tool" >"$out_dir/logs/closure.log" 2>&1; then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=closure" "reason=closure"
   harness_emit_result "$out_dir" HARNESS_INVALID closure "" failed closure
   exit 125
 fi
 closure_sha="$(harness_manifest_sha "$closure_manifest")"
+harness_mark_timing "$out_dir/run_meta.json" closure_ms "$closure_start_ms"
 tool_manifest="$run_runtime/latencycheck.manifest"
 if [[ "$checker" == ON ]]; then
   if ! harness_manifest "$tool_manifest" "$tool_prefix" >"$out_dir/logs/latencycheck-manifest.log" 2>&1; then
@@ -142,6 +148,7 @@ if [[ "$checker" == ON ]]; then
     exit 125
   fi
 else : >"$tool_manifest"; tool_sha=none; tool_binary_sha=none; fi
+harness_mark_timing "$out_dir/run_meta.json" freeze_ms "$freeze_start_ms"
 backing_real="$(realpath -m "$TIGONKV_SHARED_BACKING")"; backing_inode=missing; backing_size=missing
 if [[ -e "$backing_real" && ! -L "$backing_real" ]]; then backing_inode="$(stat -c '%i' "$backing_real")"; backing_size="$(stat -c '%s' "$backing_real")"; fi
 state="$runtime/e2e/prepared_state.json"; state_common=(
@@ -158,6 +165,7 @@ if [[ "$checker" == ON ]]; then probe_command+=" test -d '$q_tool_prefix/libexec
 probe_command+=" printf 'node={node} boot_id=%s participant=%s config=%s tool=%s\\n' \"\$boot_id\" \"\$participant_sha\" \"\$config_sha\" \"\$tool_sha\""
 guest_participant_sha="$(harness_hash_file "$participant")"
 guest_probe_file="$out_dir/logs/guest_probe.txt"; guest_probe_sha=""
+prepare_start_ms=$(harness_now_ms)
 if guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" && \
    harness_probe_matches "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha" \
      2>"$out_dir/logs/probe_check_initial.log"; then
@@ -174,6 +182,7 @@ if [[ -n "$guest_probe_sha" ]] && harness_state_matches "$state" "${state_expect
 else
   echo "PREPARED_STATE_MISS reason=manifest_or_build_or_config_changed"
 fi
+harness_mark_timing "$out_dir/run_meta.json" prepare_ms "$prepare_start_ms"
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$config" "$source_fingerprint" "$latency_sha" "$prepared_state" "$remote_root"
 python3 - "$out_dir/run_meta.json" "$vm_count" "$record_count" "$checker" "$e2e_ndebug" "$tool_prefix" <<'PY'
 import json,sys
@@ -198,9 +207,12 @@ PY
 workflow_args=(--out-dir "$out_dir" --rounds "$rounds" --suite "$suite" --config "$config" --records "$record_count")
 if ((prepare_only)); then workflow_args+=(--prepare-only); fi
 set +e
+deploy_start_ms=$(harness_now_ms)
 timeout "$total_timeout" bash "$root/scripts/e2e/run_guest_e2e_workflows.sh" "${workflow_args[@]}" >"$out_dir/logs/runner.log" 2>&1
 runner_status=$?; set -e
+harness_mark_timing "$out_dir/run_meta.json" deploy_ms "$deploy_start_ms"
 if ((prepare_only)); then
+  probe_start_ms=$(harness_now_ms)
   if ((runner_status != 0)); then
     harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=deploy" "runner_exit_code=$runner_status"
     harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed deploy
@@ -218,11 +230,18 @@ if ((prepare_only)); then
   fi
   guest_boot_ids="$(harness_probe_boot_ids "$guest_probe_file")"
   harness_record_probe_meta "$out_dir/run_meta.json" "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"
+  harness_mark_timing "$out_dir/run_meta.json" probe_ms "$probe_start_ms"
   harness_write_state "$state" "${state_common[@]}" "guest_artifact_manifest_sha256=$guest_probe_sha" "vm_boot_ids=$guest_boot_ids"
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=" "reason=prepared"
+  cleanup_start_ms=$(harness_now_ms)
+  trap - EXIT
+  harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"
+  harness_mark_timing "$out_dir/run_meta.json" cleanup_ms "$cleanup_start_ms"
+  harness_mark_timing "$out_dir/run_meta.json" total_prepare_ms "$total_start_ms"
   harness_emit_result "$out_dir" PREPARED prepare-only "" verified prepared
   exit 0
 fi
+probe_start_ms=$(harness_now_ms)
 if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" || \
    ! harness_probe_matches "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha" \
      2>"$out_dir/logs/probe_check_after_run.log"; then
@@ -235,11 +254,17 @@ if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_contr
 else
   guest_boot_ids="$(harness_probe_boot_ids "$guest_probe_file")"
   harness_record_probe_meta "$out_dir/run_meta.json" "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"
+  harness_mark_timing "$out_dir/run_meta.json" probe_ms "$probe_start_ms"
   harness_write_state "$state" "${state_common[@]}" "guest_artifact_manifest_sha256=$guest_probe_sha" "vm_boot_ids=$guest_boot_ids"
   [[ "$prepared_state" == hit ]] || echo "PREPARED_STATE_REFRESHED"
 fi
 status="$(harness_classify_status "$out_dir" "$runner_status" "$checker")"
 failed_stage=
 [[ "$status" == CHECK_MISMATCH ]] && failed_stage=checker
+cleanup_start_ms=$(harness_now_ms)
+trap - EXIT
+harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"
+harness_mark_timing "$out_dir/run_meta.json" cleanup_ms "$cleanup_start_ms"
+harness_mark_timing "$out_dir/run_meta.json" total_prepare_ms "$total_start_ms"
 harness_emit_result "$out_dir" "$status" "$failed_stage" "" verified
 case "$status" in CHECK_CLEAN) exit 0;; CHECK_MISMATCH) exit 1;; *) exit 125;; esac
