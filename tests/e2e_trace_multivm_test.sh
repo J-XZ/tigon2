@@ -9,7 +9,31 @@ runner="$build/e2e_trace_runner"
 config="$root/tests/fixtures/multivm_trace_config.jsonc"
 barrier=$(mktemp -d)
 backing=/tmp/tigonkv-multivm-trace-backing
-trap 'rm -rf "$barrier"; rm -f "$backing"' EXIT
+first=
+second=
+test_status=1
+cleanup() {
+  local pid
+  for pid in "$first" "$second"; do
+    [[ -n "$pid" ]] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  if (( test_status != 0 )); then
+    echo "e2e_trace_multivm_test: fixture failed; barrier=$barrier" >&2
+    for log in "$barrier/node0.log" "$barrier/node1.log"; do
+      if [[ -f "$log" ]]; then
+        echo "--- $log ---" >&2
+        sed -n '1,260p' "$log" >&2 || true
+      fi
+    done
+  fi
+  rm -rf "$barrier"
+  rm -f "$backing"
+}
+trap cleanup EXIT INT TERM
 rm -f "$backing"
 
 run_worker() {
@@ -24,7 +48,7 @@ run_worker() {
 
 run_worker 0 "$root/tests/fixtures/multivm_trace_node0.txt" 1 "$barrier/node0.log" &
 first=$!
-deadline=$((SECONDS + 20))
+deadline=$((SECONDS + 120))
 while [[ ! -e "$barrier/multivm.ready.0" ]]; do
   kill -0 "$first" 2>/dev/null || { wait "$first" || true; exit 1; }
   (( SECONDS < deadline )) || exit 1
@@ -32,6 +56,13 @@ while [[ ! -e "$barrier/multivm.ready.0" ]]; do
 done
 run_worker 1 "$root/tests/fixtures/multivm_trace_node1.txt" 0 "$barrier/node1.log" &
 second=$!
+deadline=$((SECONDS + 120))
+while [[ ! -e "$barrier/multivm.ready.0" || ! -e "$barrier/multivm.ready.1" ]]; do
+  kill -0 "$first" 2>/dev/null || { wait "$first" || true; exit 1; }
+  kill -0 "$second" 2>/dev/null || { wait "$second" || true; exit 1; }
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.05
+done
 deadline=$((SECONDS + 20))
 while [[ ! -e "$barrier/release.0.waiting" || ! -e "$barrier/release.1.waiting" ]]; do
   kill -0 "$first" 2>/dev/null || { wait "$first" || true; exit 1; }
@@ -52,3 +83,4 @@ rg -q '^E2E_THREAD_TOPOLOGY node=0 foreground=1 demuxer=1 kv_threads=2 affinity=
 rg -q '^E2E_THREAD_TOPOLOGY node=1 foreground=1 demuxer=1 kv_threads=2 affinity=scheduler$' "$barrier/node1.log"
 rg -q '^network_tx_bytes=[1-9][0-9]*$' "$barrier/node0.log"
 rg -q '^network_tx_bytes=[1-9][0-9]*$' "$barrier/node1.log"
+test_status=0

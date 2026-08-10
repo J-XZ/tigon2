@@ -337,8 +337,10 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
   for (uint64_t worker = 0; worker < workers; ++worker) {
     threads.emplace_back([&, worker] {
       bool ready_published = false;
+      bool worker_bound = false;
       try {
         store->BindWorker(static_cast<uint32_t>(worker));
+        worker_bound = true;
         std::mt19937_64 rng(value_seed ^ (static_cast<uint64_t>(trace_first + worker) << 32) ^
                             worker);
         ready_workers.fetch_add(1, std::memory_order_release);
@@ -363,6 +365,7 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
           std::this_thread::yield();
         }
         store->ReleaseWorker();
+        worker_bound = false;
       } catch (...) {
         if (!ready_published)
           ready_workers.fetch_add(1, std::memory_order_release);
@@ -377,13 +380,18 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
         // inbox while peers are still awaiting replies.  The orchestrator
         // observes replay_done, releases every worker, and then rethrows the
         // recorded error on its control thread.
-        if (ready_published) {
+        if (worker_bound && ready_published) {
           while (!workers_release.load(std::memory_order_acquire)) {
             const Status status = store->PollTransport();
             if (!status.ok()) break;
             std::this_thread::yield();
           }
-          store->ReleaseWorker();
+        }
+        if (worker_bound) {
+          try {
+            store->ReleaseWorker();
+          } catch (...) {
+          }
         }
       }
     });
@@ -467,6 +475,7 @@ int RunMultiTrace(const Config &config, bool reset, const std::string &phase,
 
 int main(int argc, char **argv) {
   std::unique_ptr<KVStore> store;
+  bool direct_worker_bound = false;
   std::string trace;
   std::string phase;
   std::string last_op;
@@ -518,6 +527,7 @@ int main(int argc, char **argv) {
         Env("TIGONKV_E2E_TRACE_FIRST", "CXLKV_E2E_TRACE_FIRST", "0"), "trace first"));
     store = KVStore::Create(config, reset);
     store->BindWorker(0);
+    direct_worker_bound = true;
     std::ifstream input(trace);
     if (!input) Fail("cannot open trace: " + trace);
     Barrier(phase, config.node_id, false);
@@ -589,6 +599,8 @@ int main(int argc, char **argv) {
     WaitForHostRelease(phase, *store);
     DrainTransport(*store);
     Barrier(phase, config.node_id, true, store.get());
+    store->ReleaseWorker();
+    direct_worker_bound = false;
     PrintThreadTopology(config.node_id, 1, config.cpu_affinity);
     PrintTraceTime(phase, config.node_id, ops, duration_us, trace_first, 1, batch_ops);
     PrintScanRows(config.node_id, scan_ops, scan_rows);
@@ -596,6 +608,13 @@ int main(int argc, char **argv) {
     std::cout << "e2e_trace_runner[node" << config.node_id << "]: passed.\n";
     return 0;
   } catch (const std::exception &e) {
+    if (store && direct_worker_bound) {
+      try {
+        store->ReleaseWorker();
+        direct_worker_bound = false;
+      } catch (...) {
+      }
+    }
     std::cerr << "e2e_trace_runner: hard failure: " << e.what() << "\n";
     std::cerr << "E2E_TRACE_FAILURE\n"
               << "node=" << node << "\n"
