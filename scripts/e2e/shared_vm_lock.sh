@@ -111,5 +111,16 @@ if [[ "${1:-}" == --exec ]]; then
   }
   shared_vm_lock_acquire "$2" "$3" "$4" "$5" "$6" "$7" "$8"
   shift 9
-  exec "$@"
+  # Keep the lock in this supervisor while the command runs, but do not pass
+  # the descriptor to daemonized QEMU or other descendants.  A daemon that
+  # inherits the descriptor would keep the resource lock held after this
+  # invocation has finished and make the next canonical harness fail closed.
+  set +e
+  (
+    eval "exec ${SHARED_VM_LOCK_FD}>&-"
+    "$@"
+  )
+  command_status=$?
+  shared_vm_lock_release
+  exit "$command_status"
 fi
