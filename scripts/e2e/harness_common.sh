@@ -30,6 +30,17 @@ harness_manifest() {
   sort -u -o "$output" "$output"
 }
 harness_manifest_sha() { harness_hash_file "$1"; }
+harness_ssh_control_path() {
+  local runtime=$1 project=$2 config_sha=$3
+  local config_prefix=${config_sha:0:2}
+  local path="$runtime/s/${config_prefix}-%p"
+  local worst_case=${path//%p/99999}
+  if (( ${#worst_case} + 17 >= 108 )); then
+    echo "HARNESS_INVALID failed_stage=ssh-control-path path_too_long=$worst_case" >&2
+    return 125
+  fi
+  printf '%s\n' "$path"
+}
 harness_closure_manifest() {
   local runtime=$1 variant=$2 output=$3
   shift 3
@@ -152,7 +163,7 @@ harness_acquire_lock() {
 }
 harness_write_common_meta() {
   local path=$1 project=$2 suite=$3 profile=$4 records=$5 config=$6 source=$7 latency_sha=$8 prepared=$9
-  local remote_root=; if (( $# >= 10 )); then remote_root=$10; fi
+  local remote_root=; if (( $# >= 10 )); then remote_root=${10:-}; fi
   python3 - "$path" "$project" "$suite" "$profile" "$records" "$config" "$source" "$latency_sha" "$prepared" "$remote_root" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
@@ -162,24 +173,99 @@ payload={'project':project,'suite':suite,'profile':profile,'record_count':int(re
  'logical_operation_count':int(records),'physical_operation_count':int(records),'vm_count':None,
  'workers_per_vm':None,'source_fingerprint':source,'latency_sim_sha':latency_sha,
  'config_sha256':hashlib.sha256(cfg.read_bytes()).hexdigest(),'prepared_state':prepared,
- 'failed_stage':'','first_node':None,'cleanup_status':'pending','first_mismatch':None,
+ 'reason':'','failed_stage':'','first_node':None,'cleanup_status':'pending',
+ 'runner_exit_code':None,'pool_reset_count':0,
+ 'participant_manifest_sha256':None,'runtime_closure_manifest_sha256':None,
+ 'latencycheck_prefix_manifest_sha256':None,'participant_expected_sha256':None,
+ 'participant_observed_sha256':None,'per_node_expected':None,'per_node_observed':None,
+ 'first_mismatch':None,
  'run_id':path.parent.name,'remote_root':remote_root}
 payload['config']=str(cfg.resolve())
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
 PY
 }
+
+harness_update_meta() {
+  local path=$1
+  shift
+  python3 - "$path" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+integer_fields = {"vm_count", "workers_per_vm", "first_node", "runner_exit_code", "pool_reset_count"}
+for item in sys.argv[2:]:
+    key, value = item.split("=", 1)
+    if key in integer_fields:
+        data[key] = None if value == "null" else int(value)
+    elif value == "null":
+        data[key] = None
+    elif key.endswith("_json"):
+        data[key[:-5]] = json.loads(value)
+    else:
+        data[key] = value
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PY
+}
+harness_record_probe_meta() {
+  local meta=$1 output=$2 expected_nodes=$3 expected_participants=$4 expected_config=$5 expected_tool=$6
+  python3 - "$meta" "$output" "$expected_nodes" "$expected_participants" "$expected_config" "$expected_tool" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+meta_path, probe_path, node_count, participant_csv, expected_config, expected_tool = sys.argv[1:]
+data = json.loads(Path(meta_path).read_text())
+count = int(node_count)
+parts = participant_csv.split(",")
+if len(parts) == 1:
+    parts *= count
+expected = [{"node": n, "participant": parts[n] if n < len(parts) else None,
+             "config": expected_config, "tool": expected_tool} for n in range(count)]
+observed = [{"node": n, "participant": None, "config": None, "tool": None,
+             "boot_id": None, "status": "missing"} for n in range(count)]
+try:
+    lines = Path(probe_path).read_text(errors="replace").splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    match = re.search(r"\bnode=(\d+)\b", line)
+    if not match or not 0 <= int(match.group(1)) < count:
+        continue
+    row = observed[int(match.group(1))]
+    for key, pattern in (("participant", r"\bparticipant=([^ ]+)"),
+                         ("config", r"\bconfig=([^ ]+)"),
+                         ("tool", r"\btool=([^ ]+)"),
+                         ("boot_id", r"\bboot_id=([^ ]+)"),
+                         ("status", r"\bprobe_status=([^ ]+)")):
+        value = re.search(pattern, line)
+        if value:
+            row[key] = value.group(1)
+    if row["status"] == "missing":
+        row["status"] = "observed"
+data.update({"participant_expected_sha256": [r["participant"] for r in expected],
+             "participant_observed_sha256": [r["participant"] for r in observed],
+             "per_node_expected": expected, "per_node_observed": observed,
+             "expected_config_sha256": expected_config, "expected_tool_sha256": expected_tool})
+Path(meta_path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PY
+}
+
 harness_emit_result() {
-  local out=$1 status=$2 failed_stage=$3 first_node=$4 cleanup=$5
-  python3 - "$out/run_result.json" "$status" "$failed_stage" "$first_node" "$cleanup" <<'PY'
+  local out=$1 status=$2 failed_stage=$3 first_node=$4 cleanup=$5 reason=${6:-}
+  python3 - "$out/run_result.json" "$status" "$failed_stage" "$first_node" "$cleanup" "$reason" <<'PY'
 import json, re, sys
 from pathlib import Path
 result_path=Path(sys.argv[1])
 if result_path.exists(): data=json.loads(result_path.read_text())
 else: data=json.loads((result_path.parent/'run_meta.json').read_text())
-status, failed_stage, first_node, cleanup=sys.argv[2:]
+status, failed_stage, first_node, cleanup, reason=sys.argv[2:]
 data.update({'status':status,'failed_stage':failed_stage,
              'first_node':None if first_node in ('','-1') else int(first_node),
              'cleanup_status':cleanup})
+data['reason']=reason
 def first_mismatch(root):
     for path in sorted(root.rglob('*')):
         if not path.is_file() or path.name in {'run_result.json','run_meta.json'}:
@@ -224,6 +310,14 @@ data['first_mismatch']=first_mismatch(result_path.parent) if status == 'CHECK_MI
 if data['first_mismatch'] is not None and data.get('first_node') is None:
     data['first_node']=data['first_mismatch'].get('node')
 result_path.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
+meta_path = result_path.parent/'run_meta.json'
+if meta_path.exists():
+    meta = json.loads(meta_path.read_text())
+    meta.update({'status': status, 'failed_stage': failed_stage,
+                 'first_node': data['first_node'],
+                 'cleanup_status': cleanup, 'reason': reason,
+                 'first_mismatch': data['first_mismatch']})
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + '\n')
 (result_path.parent/'run_complete.meta').write_text(f"status={status} run_id={data['run_id']} failed_stage={failed_stage}\n")
 print(f"{status} out_dir={result_path.parent}")
 PY
@@ -311,14 +405,33 @@ harness_probe_guest() {
     local port=$((base_port + node)) command
     command=${command_template//\{node\}/$node}
     ssh -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+      -o LogLevel=ERROR \
       -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
       -o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$control_path" \
       -p "$port" root@127.0.0.1 "$command" >"$output.node$node" 2>&1 &
     pids+=($!)
   done
-  local status=0 pid
-  for pid in "${pids[@]}"; do wait "$pid" || status=1; done
-  if ((status != 0)); then rm -f -- "$output.node"*; return 1; fi
+  local status=0 pid node_status
+  : >"$output"
+  for node in $(seq 0 $((vm_count - 1))); do
+    pid=${pids[$node]}
+    node_status=0
+    wait "$pid" || node_status=$?
+    if ((node_status != 0)); then
+      status=1
+      printf 'node=%s probe_status=%s\n' "$node" "$node_status" >>"$output"
+    fi
+  done
+  if ((status != 0)); then
+    for node in $(seq 0 $((vm_count - 1))); do
+      if [[ -f "$output.node$node" ]]; then
+        printf 'node=%s probe_detail_begin\n' "$node" >>"$output"
+        cat "$output.node$node" >>"$output"
+        printf 'node=%s probe_detail_end\n' "$node" >>"$output"
+      fi
+    done
+    return 1
+  fi
   for ((node=0; node<vm_count; ++node)); do cat "$output.node$node" >>"$output"; done
   rm -f -- "$output.node"*
   harness_hash_file "$output"
@@ -332,21 +445,38 @@ from pathlib import Path
 path, expected_nodes, participant_csv, expected_config, expected_tool = sys.argv[1:]
 lines = [line.strip() for line in Path(path).read_text(errors="replace").splitlines() if line.strip()]
 expected_node_ids = set(range(int(expected_nodes)))
-if len(lines) != int(expected_nodes): raise SystemExit(1)
+if len(lines) != int(expected_nodes):
+    print(f"PROBE_MISMATCH field=node_count expected={expected_nodes} observed={len(lines)}", file=sys.stderr)
+    raise SystemExit(1)
 participant_values = participant_csv.split(",")
 if len(participant_values) not in (1, int(expected_nodes)):
     raise SystemExit(1)
 seen_nodes = set()
 for line in lines:
     node_match = re.search(r"\bnode=(\d+)\b", line)
-    if not node_match or not re.search(r"\bboot_id=[0-9a-f-]+\b", line): raise SystemExit(1)
+    if not node_match or not re.search(r"\bboot_id=[0-9a-f-]+\b", line):
+        print(f"PROBE_MISMATCH field=node_or_boot observed={line}", file=sys.stderr)
+        raise SystemExit(1)
     node = int(node_match.group(1))
-    if node not in expected_node_ids or node in seen_nodes: raise SystemExit(1)
+    if node not in expected_node_ids or node in seen_nodes:
+        print(f"PROBE_MISMATCH node={node} field=node_identity", file=sys.stderr)
+        raise SystemExit(1)
     seen_nodes.add(node)
     participant = re.search(r"\bparticipant=([0-9a-f]{64})\b", line); config = re.search(r"\bconfig=([0-9a-f]{64})\b", line); tool = re.search(r"\btool=([^ ]+)\b", line)
     expected_participant = participant_values[node] if len(participant_values) == int(expected_nodes) else participant_values[0]
-    if not participant or participant.group(1) != expected_participant or not config or config.group(1) != expected_config or not tool or tool.group(1) != expected_tool: raise SystemExit(1)
-if seen_nodes != expected_node_ids: raise SystemExit(1)
+    observed = {
+        "participant": participant.group(1) if participant else "missing",
+        "config": config.group(1) if config else "missing",
+        "tool": tool.group(1) if tool else "missing",
+    }
+    expected = {"participant": expected_participant, "config": expected_config, "tool": expected_tool}
+    for field, value in expected.items():
+        if observed[field] != value:
+            print(f"PROBE_MISMATCH node={node} field={field} expected={value} observed={observed[field]}", file=sys.stderr)
+            raise SystemExit(1)
+if seen_nodes != expected_node_ids:
+    print(f"PROBE_MISMATCH field=missing_nodes expected={sorted(expected_node_ids)} observed={sorted(seen_nodes)}", file=sys.stderr)
+    raise SystemExit(1)
 raise SystemExit(0)
 PY
 }
@@ -366,6 +496,19 @@ if not rows or len({node for node, _ in rows}) != len(rows):
     raise SystemExit(1)
 print(",".join(f"node{node}:{boot}" for node, boot in sorted(rows)))
 PY
+}
+
+harness_probe_first_failed_node() {
+  awk '/probe_status=[0-9]+/ { if (match($0, /node=[0-9]+/)) { print substr($0, RSTART + 5, RLENGTH - 5); exit } }' "$1"
+}
+
+harness_probe_failure_reason() {
+  local output=$1
+  if [[ ! -f "$output" ]]; then printf 'ssh\n';
+  elif grep -q 'probe_status=' "$output"; then printf 'ssh\n';
+  elif grep -q 'runtime_dependency=missing' "$output"; then printf 'runtime-dependency\n';
+  elif grep -q 'latencycheck' "$output"; then printf 'latencycheck-tool\n';
+  else printf 'guest-participant-sha\n'; fi
 }
 
 harness_close_ssh_masters() {

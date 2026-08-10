@@ -21,6 +21,15 @@ third="$(harness_closure_manifest "$tmp/runtime" profile-a "$tmp/closure-c" "$tm
 set_changed="$(harness_closure_manifest "$tmp/runtime" profile-a-set "$tmp/closure-set" "$elf" "$tmp/changed.elf")"
 [[ "$set_changed" == *CLOSURE_CACHE_MISS* ]]
 
+# Regression: freeze must record the post-build participant SHA.
+freeze_elf="$tmp/freeze.elf"; printf 'pre-build\n' >"$freeze_elf"; before_sha="$(harness_hash_file "$freeze_elf")"
+printf 'post-build\n' >"$freeze_elf"; after_sha="$(harness_hash_file "$freeze_elf")"
+harness_manifest "$tmp/freeze.manifest" "$freeze_elf"
+grep -q "^$after_sha  " "$tmp/freeze.manifest"; ! grep -q "^$before_sha  " "$tmp/freeze.manifest"
+freeze_config="$tmp/freeze.config"; printf '{}\n' >"$freeze_config"; freeze_config_sha="$(harness_hash_file "$freeze_config")"
+printf 'node=0 boot_id=00000000-0000-0000-0000-000000000000 participant=%s config=%s tool=none\n' "$after_sha" "$freeze_config_sha" >"$tmp/freeze.probe"
+harness_probe_matches "$tmp/freeze.probe" 1 "$after_sha" "$freeze_config_sha" none
+
 state="$tmp/runtime/e2e/prepared_state.json"
 harness_write_state "$state" project_id=tigon2 participant_elf_sha256="$(harness_hash_file "$elf")"
 harness_state_matches "$state" project_id=tigon2 participant_elf_sha256="$(harness_hash_file "$elf")"
@@ -30,6 +39,9 @@ mkdir -p "$tmp/project/exp_data/existing"
 if harness_prepare_output "$tmp/project" "$tmp/project/exp_data/existing" tigon2 08 4096; then exit 1; fi
 
 config="$tmp/config.jsonc"; printf '{}\n' >"$config"
+control_path="$(harness_ssh_control_path "$tmp/runtime/e2e/run-id" tigon2 "$(harness_hash_file "$config")")"
+control_worst=${control_path//%p/99999}
+[[ "$control_path" =~ /run-id/s/[0-9a-f]{2}-%p$ && ${#control_worst} -lt 91 ]]
 (
   source "$script_dir/harness_common.sh"
   harness_acquire_lock "$config" 4 10022 "$tmp/runtime"

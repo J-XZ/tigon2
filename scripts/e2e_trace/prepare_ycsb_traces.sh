@@ -6,7 +6,7 @@ source "$root/scripts/tigonkv_ycsb_cpp_pin.sh"
 # shellcheck source=scripts/tigonkv_build_helpers.sh
 source "$root/scripts/tigonkv_build_helpers.sh"
 tigonkv_check_ycsb_cpp_pin
-build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${LATENCY_SIM_COMPILE_OFF:-OFF}")
+build=${TIGONKV_E2E_TRACE_BUILD_DIR:-$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${LATENCY_SIM_COMPILE_OFF:-OFF}")}
 ycsb="$root/thirdparty_libs/YCSB-cpp"
 if [[ ! -x "$ycsb/scripts/generate_cxlkv_trace.sh" ]]; then
   echo "YCSB-cpp submodule is not checked out at $ycsb" >&2

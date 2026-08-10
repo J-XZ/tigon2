@@ -76,27 +76,80 @@ else
   exit 2
 fi
 export TIGONKV_VM_REMOTE_CONFIG="$remote_config"
-[[ -x "$runner" && -x "$pool_tool" ]] || { echo "HARNESS_INVALID failed_stage=participant_missing" >&2; exit 125; }
-if [[ "$checker" == ON ]]; then
-  [[ -x "$tool_prefix/bin/valgrind" ]] || { echo "HARNESS_INVALID failed_stage=latencycheck_install" >&2; exit 125; }
-  tigonkv_verify_e2e_compile_contract "$build" ON ON e2e_trace_runner; tigonkv_verify_e2e_compile_contract "$pool_build" OFF ON cxl_pool_initer
-else
-  tigonkv_verify_e2e_compile_contract "$build" OFF OFF e2e_trace_runner; tigonkv_verify_e2e_compile_contract "$pool_build" OFF OFF cxl_pool_initer
-fi
+validate_participants() {
+  [[ -x "$runner" && -x "$pool_tool" ]] || return 125
+  if [[ "$checker" == ON ]]; then
+    [[ -x "$tool_prefix/bin/valgrind" && -d "$tool_prefix/libexec/valgrind" ]] || return 125
+    tigonkv_verify_e2e_compile_contract "$build" ON ON e2e_trace_runner || return 125
+    tigonkv_verify_e2e_compile_contract "$pool_build" OFF ON cxl_pool_initer || return 125
+  else
+    tigonkv_verify_e2e_compile_contract "$build" OFF OFF e2e_trace_runner || return 125
+    tigonkv_verify_e2e_compile_contract "$pool_build" OFF OFF cxl_pool_initer || return 125
+  fi
+}
 if ((execute == 0)); then
+  validate_participants || { echo "HARNESS_INVALID failed_stage=compile-contract" >&2; exit 125; }
   harness_plan_line tigon2 trace "$profile" "$record_count" false "${requested_out:-<new exp_data directory>}"
   printf 'build_type=Debug optimization=O0 compile_off=false valgrind_check=%s ndebug=%s extra_check=false valgrind_lib=%s\n' "$([[ "$checker" == ON ]] && echo true || echo false)" "$([[ "$e2e_ndebug" == ON ]] && echo true || echo false)" "$([[ "$checker" == ON ]] && printf '%s' "$tool_prefix/libexec/valgrind" || printf '%s' none)"
   exit 0
 fi
 export HARNESS_PROJECT_RUNTIME="$runtime"; harness_acquire_lock "$config" "$vm_count" "$base_port" "$runtime"; harness_prepare_output "$root" "$requested_out" tigon2 trace "$record_count"
 out_dir="$HARNESS_OUT_DIR"; run_id="$HARNESS_RUN_ID"; run_runtime="$HARNESS_RUNTIME_RUN_DIR"
-trap 'harness_close_ssh_masters "$vm_count" "$base_port" "$run_runtime/ssh/%C"' EXIT
+mkdir -p "$out_dir/logs" "$out_dir/round_logs"
+harness_write_common_meta "$out_dir/run_meta.json" tigon2 trace "$profile" "$record_count" "$config" unknown "$latency_sha" refreshed "$remote_root"
+harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=$trace_workers" "failed_stage=resolve" "reason=resolved"
+build_status=0
+{
+  cmake --build "$build" --target e2e_trace_runner
+  cmake --build "$build" --target ycsb_partition_splits
+  cmake --build "$pool_build" --target cxl_pool_initer
+} >"$out_dir/logs/build.log" 2>&1 || build_status=$?
+if ((build_status != 0)); then
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=build" "reason=host-build" "runner_exit_code=$build_status"
+  harness_emit_result "$out_dir" HARNESS_INVALID build "" failed host-build
+  exit 125
+fi
+source_fingerprint="$(tigonkv_source_state "$root")"
+harness_update_meta "$out_dir/run_meta.json" "source_fingerprint=$source_fingerprint" "failed_stage=freeze" "reason=build-complete"
+validate_participants || {
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=compile-contract" "reason=compile-contract"
+  harness_emit_result "$out_dir" HARNESS_INVALID compile-contract "" failed compile-contract
+  exit 125
+}
+ssh_control_path="$(harness_ssh_control_path "$run_runtime" tigon2 "$config_sha")"
+export TIGONKV_E2E_SSH_CONTROL_PATH="$ssh_control_path"
+trap 'harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"' EXIT
 export TIGONKV_E2E_RUN_ID="$run_id" TIGONKV_E2E_RUNTIME_DIR="$run_runtime" TIGONKV_VM_REMOTE_ROOT="$remote_root" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config"
 export LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug"
-participant_manifest="$run_runtime/participants.manifest"; harness_manifest "$participant_manifest" "$runner" "$pool_tool"; participant_sha="$(harness_manifest_sha "$participant_manifest")"
-closure_manifest="$run_runtime/closure.manifest"; harness_closure_manifest "$runtime" "$profile:$build:$remote_root:trace" "$closure_manifest" "$runner" "$pool_tool"; closure_sha="$(harness_manifest_sha "$closure_manifest")"
+participant_manifest="$run_runtime/participants.manifest"
+if ! harness_manifest "$participant_manifest" "$runner" "$pool_tool" >"$out_dir/logs/freeze.log" 2>&1; then
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=freeze" "reason=participant-manifest"
+  harness_emit_result "$out_dir" HARNESS_INVALID freeze "" failed participant-manifest
+  exit 125
+fi
+participant_sha="$(harness_manifest_sha "$participant_manifest")"
+closure_manifest="$run_runtime/closure.manifest"
+if ! harness_closure_manifest "$runtime" "$profile:$build:$remote_root:trace" "$closure_manifest" "$runner" "$pool_tool" >"$out_dir/logs/closure.log" 2>&1; then
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=closure" "reason=closure"
+  harness_emit_result "$out_dir" HARNESS_INVALID closure "" failed closure
+  exit 125
+fi
+closure_sha="$(harness_manifest_sha "$closure_manifest")"
 tool_manifest="$run_runtime/latencycheck.manifest"
-if [[ "$checker" == ON ]]; then harness_manifest "$tool_manifest" "$tool_prefix"; tool_sha="$(harness_manifest_sha "$tool_manifest")"; tool_binary_sha="$(harness_hash_file "$tool_prefix/bin/valgrind")"; export TIGONKV_E2E_TOOL_MANIFEST="$tool_manifest"; VALGRIND_LIB="$tool_prefix/libexec/valgrind" "$tool_prefix/bin/valgrind" --tool=latencycheck --version >"$run_runtime/logs/latencycheck_host_probe.log" 2>&1; else : >"$tool_manifest"; tool_sha=none; tool_binary_sha=none; fi
+if [[ "$checker" == ON ]]; then
+  if ! harness_manifest "$tool_manifest" "$tool_prefix" >"$out_dir/logs/latencycheck-manifest.log" 2>&1; then
+    harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=latencycheck-tool"
+    harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed latencycheck-tool
+    exit 125
+  fi
+  tool_sha="$(harness_manifest_sha "$tool_manifest")"; tool_binary_sha="$(harness_hash_file "$tool_prefix/bin/valgrind")"
+  export TIGONKV_E2E_TOOL_MANIFEST="$tool_manifest"
+  if ! VALGRIND_LIB="$tool_prefix/libexec/valgrind" "$tool_prefix/bin/valgrind" --tool=latencycheck --version >"$out_dir/logs/latencycheck_host_probe.log" 2>&1; then
+    harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=latencycheck-tool"
+    harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed latencycheck-tool
+    exit 125
+  fi
+else : >"$tool_manifest"; tool_sha=none; tool_binary_sha=none; fi
 backing_real="$(realpath -m "$TIGONKV_SHARED_BACKING")"; backing_inode=missing; backing_size=missing
 if [[ -e "$backing_real" && ! -L "$backing_real" ]]; then backing_inode="$(stat -c '%i' "$backing_real")"; backing_size="$(stat -c '%s' "$backing_real")"; fi
 state="$runtime/e2e/prepared_state.json"; config_sha="$(harness_hash_file "$config")"; state_common=("project_id=tigon2" "repo_root=$root" "latency_sim_fingerprint=$latency_sha" "build_fingerprint=$source_fingerprint" "compile_contract=Debug/O0/compile-on/checker-$checker/ndebug-$e2e_ndebug" "vm_count=$vm_count" "ssh_base_port=$base_port" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size" "participant_targets=e2e_trace_runner,cxl_pool_initer" "participant_elf_sha256=$participant_sha" "runtime_closure_manifest_sha=$closure_sha" "experiment_config_sha256=$config_sha" "trace_config_sha256=$trace_config_sha" "latencycheck_prefix_manifest_sha=$tool_sha" "guest_participant_sha256=$(harness_hash_file "$runner")" "guest_config_sha256=$config_sha" "guest_tool_sha256=$tool_binary_sha" "remote_root=$remote_root")
@@ -107,8 +160,9 @@ if [[ "$checker" == ON ]]; then probe_command+=" tool_sha=\$(sha256sum '$q_tool_
 probe_command+=" printf 'node={node} boot_id=%s participant=%s config=%s tool=%s\\n' \"\$boot_id\" \"\$participant_sha\" \"\$config_sha\" \"\$tool_sha\""
 guest_participant_sha="$(harness_hash_file "$runner")"
 guest_probe_file="$run_runtime/guest_probe.txt"; guest_probe_sha=""
-if guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$run_runtime/ssh/%C" "$guest_probe_file" "$probe_command")" && \
+if guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" && \
    harness_probe_matches "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"; then echo "GUEST_PROBE_OK sha=$guest_probe_sha"; else echo "GUEST_PROBE_INVALID reason=unreachable_or_artifact_mismatch" >&2; fi
+harness_record_probe_meta "$out_dir/run_meta.json" "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"
 guest_boot_ids=""
 [[ -f "$guest_probe_file" ]] && guest_boot_ids="$(harness_probe_boot_ids "$guest_probe_file" || true)"
 prepared_state=refreshed
@@ -129,19 +183,28 @@ p = Path(sys.argv[1]); d = json.loads(p.read_text())
 d["trace_config_sha256"] = sys.argv[2]
 p.write_text(json.dumps(d, indent=2, sort_keys=True) + "\n")
 PY
+harness_update_meta "$out_dir/run_meta.json" \
+  "participant_manifest_sha256=$participant_sha" \
+  "runtime_closure_manifest_sha256=$closure_sha" \
+  "latencycheck_prefix_manifest_sha256=$tool_sha"
 : >"$out_dir/actual_events.jsonl"
 trace_dir="$out_dir/traces"; mkdir -p "$trace_dir"
-env TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" TIGONKV_VM_COUNT="$vm_count" TIGONKV_YCSB_WORKLOADS="$workloads" YCSB_RECORD_COUNT="$record_count" YCSB_OPERATION_COUNT="$operation_count" YCSB_WORKERS="$trace_workers" bash "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" "$trace_dir" >"$out_dir/logs/trace_prepare.log" 2>&1 || { harness_emit_result "$out_dir" HARNESS_INVALID trace-generation "" failed; exit 125; }
-if ((prepare_only)); then harness_emit_result "$out_dir" PREPARED prepare-only "" verified; printf 'PREPARED out_dir=%s\n' "$out_dir"; exit 0; fi
+env TIGONKV_E2E_TRACE_BUILD_DIR="$build" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" TIGONKV_VM_COUNT="$vm_count" TIGONKV_YCSB_WORKLOADS="$workloads" YCSB_RECORD_COUNT="$record_count" YCSB_OPERATION_COUNT="$operation_count" YCSB_WORKERS="$trace_workers" bash "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" "$trace_dir" >"$out_dir/logs/trace_prepare.log" 2>&1 || { harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=trace-generation"; harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed trace-generation; exit 125; }
+if ((prepare_only)); then harness_emit_result "$out_dir" PREPARED prepare-only "" verified; exit 0; fi
 set +e
-timeout "$total_timeout" env TIGONKV_E2E_TRACE_RUNNER="$runner" TIGONKV_POOL_INITER="$pool_tool" TIGONKV_E2E_TRACE_TOOL_INSTALL="$tool_prefix" TIGONKV_E2E_TRACE_TOOL_MANIFEST="${TIGONKV_E2E_TOOL_MANIFEST:-}" TIGONKV_YCSB_THREADS_PER_VM="$trace_workers" TIGONKV_YCSB_WORKLOADS="$workloads" TIGONKV_E2E_LOAD_POLICY="$load_policy" LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" bash "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$trace_dir" "$out_dir" "$rounds" "$workloads" >"$out_dir/logs/runner.log" 2>&1
+timeout "$total_timeout" env TIGONKV_E2E_TRACE_RUNNER="$runner" TIGONKV_POOL_INITER="$pool_tool" TIGONKV_E2E_TRACE_TOOL_INSTALL="$tool_prefix" TIGONKV_E2E_TRACE_TOOL_MANIFEST="${TIGONKV_E2E_TOOL_MANIFEST:-}" TIGONKV_YCSB_THREADS_PER_VM="$trace_workers" TIGONKV_YCSB_WORKLOADS="$workloads" TIGONKV_E2E_LOAD_POLICY="$load_policy" TIGONKV_E2E_TRACE_PREPARE_ONLY="$prepare_only" LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" bash "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$trace_dir" "$out_dir" "$rounds" "$workloads" >"$out_dir/logs/runner.log" 2>&1
 runner_status=$?; set -e
-if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$run_runtime/ssh/%C" "$guest_probe_file" "$probe_command")" || \
+if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" || \
    ! harness_probe_matches "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"; then
-  harness_emit_result "$out_dir" HARNESS_INVALID guest-probe "" failed
+  harness_record_probe_meta "$out_dir/run_meta.json" "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"
+  first_probe_node="$(harness_probe_first_failed_node "$guest_probe_file" || true)"
+  probe_reason="$(harness_probe_failure_reason "$guest_probe_file")"
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=probe" "reason=$probe_reason"
+  harness_emit_result "$out_dir" HARNESS_INVALID probe "${first_probe_node:-}" failed "$probe_reason"
   exit 125
 fi
 guest_boot_ids="$(harness_probe_boot_ids "$guest_probe_file")"
+harness_record_probe_meta "$out_dir/run_meta.json" "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"
 harness_write_state "$state" "${state_common[@]}" "guest_artifact_manifest_sha256=$guest_probe_sha" "vm_boot_ids=$guest_boot_ids"
 [[ "$prepared_state" == hit ]] || echo "PREPARED_STATE_REFRESHED"
 status="$(harness_classify_status "$out_dir" "$runner_status" "$checker")"

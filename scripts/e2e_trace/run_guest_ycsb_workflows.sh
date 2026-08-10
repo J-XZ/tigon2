@@ -349,6 +349,17 @@ run_ycsb_phase() {
       echo "TIGONKV_GUEST_YCSB round=$round workload=$wl phase=$phase pass"
 }
 
+if [[ "${TIGONKV_E2E_TRACE_PREPARE_ONLY:-0}" == 1 ]]; then
+  read -r -a selected_workloads <<<"$workloads"
+  for workload in "${selected_workloads[@]}"; do
+    wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
+    sync_traces 1 "$wl" load
+    sync_traces 1 "$wl" run
+  done
+  echo "TIGONKV_GUEST_YCSB_PREPARED"
+  exit 0
+fi
+
 for ((round = 1; round <= rounds; round++)); do
   read -r -a selected_workloads <<<"$workloads"
   [[ "${#selected_workloads[@]}" -gt 0 ]] || {

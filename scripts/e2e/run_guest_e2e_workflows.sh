@@ -10,6 +10,7 @@ checker="${LATENCY_SIM_VALGRIND_CHECK:-OFF}"
 compile_off="${LATENCY_SIM_COMPILE_OFF:-OFF}"
 e2e_ndebug="${LATENCY_SIM_E2E_NDEBUG:-OFF}"
 log_root=""
+prepare_only=0
 rounds="${TIGONKV_E2E_ROUNDS:-10}"
 suites="${TIGONKV_E2E_SUITES:-08 09}"
 records_override=""
@@ -18,7 +19,7 @@ compile_off_arg=0
 e2e_ndebug_arg=0
 config_arg=0
 usage() {
-  echo "usage: $0 --out-dir DIR --rounds N --suite LIST --config PATH --records N [shared latency flags]" >&2
+  echo "usage: $0 --out-dir DIR --rounds N --suite LIST --config PATH --records N [--prepare-only] [shared latency flags]" >&2
 }
 while (($#)); do
   case "$1" in
@@ -27,6 +28,7 @@ while (($#)); do
     --suite|--suites) (($# >= 2)) || { usage; exit 2; }; suites=$2; shift 2 ;;
     --records) (($# >= 2)) || { usage; exit 2; }; records_override=$2; shift 2 ;;
     --config) (($# >= 2)) || { usage; exit 2; }; config=$2; config_arg=1; shift 2 ;;
+    --prepare-only) prepare_only=1; shift ;;
     --latency-sim-compile-off=*) compile_off="${1#*=}"; compile_off_arg=1; shift ;;
     --latency-sim-valgrind-check=*) checker="${1#*=}"; checker_arg=1; shift ;;
     --latency-sim-e2e-ndebug=*) e2e_ndebug="${1#*=}"; e2e_ndebug_arg=1; shift ;;
@@ -163,10 +165,14 @@ sync_latencycheck_prefix() {
     local remote_manifest="$remote_tool_install.manifest"
     local staging="$remote_tool_install.new.$run_id"
     local old="$remote_tool_install.old.$run_id"
-    local rsync_ssh port_arg
-    printf -v rsync_ssh 'ssh %q ' "${ssh_opts[@]}"
+    local rsync_ssh=ssh port_arg opt quoted
+    for opt in "${ssh_opts[@]}"; do
+      printf -v quoted '%q' "$opt"
+      rsync_ssh+=" $quoted"
+    done
     printf -v port_arg '%q' "$port"
-    rsync_ssh+="-p $port_arg"
+    rsync_ssh+=" -p $port_arg"
+    remote "$vm" "mkdir -p '$(dirname "$remote_tool_install")'"
     scp "${ssh_opts[@]}" -P "$port" "$local_manifest" \
       "root@127.0.0.1:$remote_manifest.new.$run_id" >/dev/null
     if remote "$vm" "test -d '$remote_tool_install' && test -f '$remote_manifest' && cmp -s '$remote_manifest' '$remote_manifest.new.$run_id'"; then
@@ -480,6 +486,15 @@ TIGONKV_WORKFLOW_FAILED_STAGE=""
 TIGONKV_WORKFLOW_FIRST_VM=-1
 TIGONKV_WORKFLOW_FIRST_EXIT=0
 TIGONKV_WORKFLOW_CLEANUP_STATUS=-1
+if ((prepare_only)); then
+  for suite in $suites; do
+    case "$suite" in 08|09) ;; *) echo "unsupported suite: $suite" >&2; exit 2 ;; esac
+    [[ -x "$binary_dir/e2e_${suite}" ]] || { echo "missing $binary_dir/e2e_${suite}" >&2; exit 2; }
+    sync_guest_binary "$suite"
+  done
+  echo "TIGONKV_PREPARED out_dir=$log_root"
+  exit 0
+fi
 for suite in $suites; do
   case "$suite" in
     08) phases=(fill read) ;;
