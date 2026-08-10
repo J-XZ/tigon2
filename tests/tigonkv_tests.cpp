@@ -214,8 +214,9 @@ int main(int argc, char **argv) {
   // comments, and the library must still see the surrounding JSONC comments.
   const std::string jsonc_string_path = latency_config_path + ".string";
   const std::string jsonc_with_string_comment = ReplaceOnce(
-      ReplaceOnce(base_config_text, "\"path\": \"/mnt/xz_shared_mem\"",
-                  "\"path\": \"https://example.test/a//b\", // URL data"),
+      ReplaceOnce(base_config_text,
+                  "\"backing_path\": \"/mnt/xz_shared_mem/ivshmem_shared_mem\"",
+                  "\"backing_path\": \"https://example.test/a//b\", // URL data"),
       "\"fixed_latency\": {",
       "/* fixed-latency object comment */ \"fixed_latency\": {");
   {
