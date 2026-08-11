@@ -7,9 +7,9 @@
 
 ```bash
 bash scripts/e2e/run_vm_trace.sh --execute --prepare-only --profile native \
-  --config experiment_config.jsonc --trace-config tests/fixtures/multivm_trace_config.jsonc \
-  --record-count 4096 --operation-count 4096 --trace-workers-per-vm 4 \
-  --workloads workloada --load-policy per-round --rounds 1 \
+  --config experiment_config.jsonc --trace-config tests/fixtures/trace_config.jsonc \
+  --record-count 100000 --operation-count 100000 --trace-workers-per-vm 4 \
+  --workloads a,b,c,d,e --load-policy per-workload --rounds 1 \
   --out-dir exp_data/trace_runs/<new-run>
 ```
 
@@ -19,13 +19,13 @@ zero; `SCAN` uses `LEN` as its limit. `e2e_trace_runner` reads one file per work
 through `TIGONKV_E2E_TRACE_FILE` and accepts the `TIGONKV_*` variables before the
 corresponding `CXLKV_*` compatibility variables.
 
-`prepare_ycsb_traces.sh` generates A/B/C/D by default; set
-`TIGONKV_YCSB_WORKLOADS="A B C D E"` to generate E as well.
-`run_ycsb_workflows.sh` accepts A/B/C/D/E by default and therefore expects those
-directories to exist; set the same variable explicitly when using a smaller generated
-set. The local workflow is a sequential, single-VM shared-backing smoke only. Multi-VM
-and multi-worker runs must use `run_guest_ycsb_workflows.sh`, which preserves one
-transport consumer (demuxer) per VM.
+`scripts/e2e/run_vm_trace.sh` resolves the common contract in the order CLI > public
+environment > trace config > defaults. `--workloads` is lowercase comma-separated
+`a,b,c,d,e`; `--load-policy` is exactly `per-workload`, `per-round`, or `once`.
+`record-count` and `operation-count` are cluster totals. The generated manifest records
+the physical command count separately, including UPDATE expansion. The local workflow
+is an internal sequential smoke only; multi-VM and multi-worker runs are owned by the
+canonical entry and its `run_guest_ycsb_workflows.sh` implementation.
 
 For a real multi-worker replay, set `TIGONKV_E2E_BARRIER_DIR`,
 `TIGONKV_E2E_WORKER_COUNT`, and unique `TIGONKV_E2E_WORKER_ID` values. The runner then

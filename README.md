@@ -75,9 +75,9 @@ bash scripts/e2e/run_vm_e2e.sh --execute --profile latencycheck --suite 08 \
   --config experiment_config.jsonc --rounds 1 --record-count 4096 \
   --out-dir exp_data/e2e08_runs/<new-run>
 bash scripts/e2e/run_vm_trace.sh --execute --prepare-only --profile native \
-  --config experiment_config.jsonc --trace-config tests/fixtures/multivm_trace_config.jsonc \
-  --record-count 4096 --operation-count 4096 --trace-workers-per-vm 4 \
-  --workloads workloada --load-policy per-round --rounds 1 \
+  --config experiment_config.jsonc --trace-config tests/fixtures/trace_config.jsonc \
+  --record-count 100000 --operation-count 100000 --trace-workers-per-vm 4 \
+  --workloads a,b,c,d,e --load-policy per-workload --rounds 1 \
   --out-dir exp_data/trace_runs/<new-run>
 ```
 

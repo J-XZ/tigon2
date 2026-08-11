@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Classify one Tigon2 E2E08 latencycheck run from its current logs."""
+"""Classify one Tigon2 suite 08/09 latencycheck run from its current logs."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ def valid_nonzero_summary(line: str | None, sticky: bool | None = None) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("log_root", type=Path)
+    parser.add_argument("--suite", choices=("08", "09"), default="08")
     parser.add_argument("--vm-count", type=int, required=True)
     parser.add_argument("--workflow-status", type=int, default=0)
     parser.add_argument("--failed-stage", default="")
@@ -45,8 +46,8 @@ def main() -> int:
     if args.vm_count <= 0:
         parser.error("--vm-count must be positive")
 
-    suite_root = args.log_root / "round1" / "e2e_08"
-    phases = ("init", "fill", "read")
+    suite_root = args.log_root / "round1" / f"e2e_{args.suite}"
+    phases = ("init", "fill", "read") if args.suite == "08" else ("init", "fill", "update", "read")
     logs = sorted(suite_root.glob("*/vm*.log"))
     summaries = {path: read_last_summary(path) for path in logs}
     mismatch_paths = []
@@ -76,7 +77,7 @@ def main() -> int:
             for path in phase_logs:
                 line = summaries.get(path)
                 text = path.read_text(errors="replace")
-                passed = ("e2e_08_vm[node" in text or
+                passed = (f"e2e_{args.suite}_vm[node" in text or
                           "TIGONKV_E2E_MULTI_VM_INIT node=" in text)
                 if not passed or not valid_nonzero_summary(line, sticky=False):
                     clean = False
@@ -88,8 +89,8 @@ def main() -> int:
         status = "CHECK_CLEAN"
         exit_code = 0
     elif args.workflow_status != 0 and mismatch_paths and cleanup_ok:
-        status = "CHECKER_WORKING_MISMATCH_FOUND"
-        exit_code = 0
+        status = "CHECK_MISMATCH"
+        exit_code = 1
     else:
         status = "HARNESS_INVALID"
         exit_code = 1
@@ -105,7 +106,7 @@ def main() -> int:
         f"cleanup_ok={str(cleanup_ok).lower()}",
     ]
     print("TIGONKV_LATENCYCHECK " + " ".join(result))
-    if status == "CHECKER_WORKING_MISMATCH_FOUND":
+    if status == "CHECK_MISMATCH":
         first = mismatch_paths[0]
         text = first.read_text(errors="replace")
         first_line = next(

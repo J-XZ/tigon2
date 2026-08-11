@@ -58,7 +58,11 @@ tigonkv_prepare_build_environment "$root" "$build_type" "$compile_off" "$checker
 build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker" "$e2e_ndebug")
 binary_dir=${TIGONKV_E2E_BINARY_DIR:-$build}
 if [[ "$checker" == ON ]]; then
-  tigonkv_verify_e2e_compile_contract "$build" ON ON e2e_08 e2e_trace_runner
+  checker_targets=()
+  for suite in $suites; do
+    case "$suite" in 08|09) checker_targets+=("e2e_$suite") ;; *) echo "unsupported checker suite: $suite" >&2; exit 2 ;; esac
+  done
+  tigonkv_verify_e2e_compile_contract "$build" ON ON "${checker_targets[@]}" e2e_trace_runner
 fi
 vm_count=${TIGONKV_VM_COUNT}
 threads=${TIGONKV_E2E_THREADS:-${TIGONKV_E2E_WORKERS:-4}}
@@ -102,9 +106,10 @@ fi
 if [[ "$checker" == ON ]]; then
   tigonkv_verify_e2e_compile_contract "$pool_build" OFF ON cxl_pool_initer
 fi
-if [[ "$checker" == ON && "$suites" != 08 ]]; then
-  echo "latencycheck E2E requires suite 08 only" >&2
-  exit 2
+if [[ "$checker" == ON ]]; then
+  for suite in $suites; do
+    case "$suite" in 08|09) ;; *) echo "latencycheck E2E supports suites 08 and 09" >&2; exit 2 ;; esac
+  done
 fi
 [[ "$vm_count" == 4 && "$threads" == 4 ]] || {
   echo "cxlkv-aligned guest e2e requires 4 VMs × 4 threads (got ${vm_count}×${threads})" >&2
@@ -584,10 +589,10 @@ for suite in $suites; do
   (( workflow_status == 0 )) || break
 done
 
-if [[ "$checker" == ON && "$suites" == 08 && "$rounds" == 1 ]]; then
+if [[ "$checker" == ON && "$rounds" == 1 && "$suites" =~ ^(08|09)$ ]]; then
   summary_status=0
   if python3 "$root/scripts/e2e/summarize_latencycheck_e2e08.py" \
-      "$log_root" --vm-count "$vm_count" --workflow-status "$workflow_status" \
+      "$log_root" --suite "$suites" --vm-count "$vm_count" --workflow-status "$workflow_status" \
       --failed-stage "$TIGONKV_WORKFLOW_FAILED_STAGE" \
       --first-vm "$TIGONKV_WORKFLOW_FIRST_VM" \
       --cleanup-status "$TIGONKV_WORKFLOW_CLEANUP_STATUS"; then

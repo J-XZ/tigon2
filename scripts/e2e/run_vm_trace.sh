@@ -6,9 +6,10 @@ source "$script_dir/harness_common.sh"
 source "$root/scripts/tigonkv_vm_common.sh"
 source "$root/scripts/tigonkv_build_helpers.sh"
 
-execute=0; prepare_only=0; profile=native; config="$root/experiment_config.jsonc"; trace_config="$root/tests/fixtures/multivm_trace_config.jsonc"
-record_count=4096; operation_count=4096; trace_workers=4; workloads=workloada; load_policy=per-round; warmup_rounds=0; rounds=1
-round_timeout=1800; total_timeout=86400; requested_out=""
+execute=0; prepare_only=0; profile=native; config="$root/experiment_config.jsonc"; trace_config="$root/tests/fixtures/trace_config.jsonc"
+record_count=""; operation_count=""; trace_workers=""; workloads=""; load_policy=""; warmup_rounds=""; rounds=""
+round_timeout=""; total_timeout=""; batch_ops=""; value_seed=""
+skip_build=0; skip_vm_init=0; skip_trace_generation=0; skip_deploy=0; requested_out=""
 usage() {
   cat <<'USAGE'
 Usage: scripts/e2e/run_vm_trace.sh [options]
@@ -25,6 +26,12 @@ Usage: scripts/e2e/run_vm_trace.sh [options]
   --rounds N
   --round-timeout SEC
   --total-timeout SEC
+  --batch-ops N
+  --value-seed N
+  --skip-build
+  --skip-vm-init
+  --skip-trace-generation
+  --skip-deploy
   --out-dir DIR
 USAGE
 }
@@ -45,6 +52,12 @@ while (($#)); do
     --rounds) need_value "$@"; rounds=$2; shift 2 ;;
     --round-timeout) need_value "$@"; round_timeout=$2; shift 2 ;;
     --total-timeout) need_value "$@"; total_timeout=$2; shift 2 ;;
+    --batch-ops) need_value "$@"; batch_ops=$2; shift 2 ;;
+    --value-seed) need_value "$@"; value_seed=$2; shift 2 ;;
+    --skip-build) skip_build=1; shift ;;
+    --skip-vm-init) skip_vm_init=1; shift ;;
+    --skip-trace-generation) skip_trace_generation=1; shift ;;
+    --skip-deploy) skip_deploy=1; shift ;;
     --out-dir) need_value "$@"; requested_out=$2; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -55,19 +68,62 @@ if ((prepare_only && !execute)); then
   exit 2
 fi
 case "$profile" in native|latencycheck) ;; *) echo "invalid --profile" >&2; exit 2 ;; esac
-case "$load_policy" in per-workload|per-round|once) ;; *) echo "invalid --load-policy" >&2; exit 2 ;; esac
-[[ "$workloads" =~ ^[a-z]+(,[a-z]+)*$ ]] || { echo "--workloads must be lowercase comma-separated names" >&2; exit 2; }
-for pair in "record-count:$record_count" "operation-count:$operation_count" "trace-workers-per-vm:$trace_workers" "rounds:$rounds" "round-timeout:$round_timeout" "total-timeout:$total_timeout"; do harness_require_positive "${pair%%:*}" "${pair#*:}"; done
-[[ "$warmup_rounds" =~ ^[0-9]+$ ]] || { echo "--warmup-rounds must be non-negative" >&2; exit 2; }
-if [[ "$profile" == latencycheck ]]; then [[ "$rounds" == 1 ]] || { echo "latencycheck profile requires --rounds 1" >&2; exit 2; }; fi
 config="$(harness_resolve_cli_path "$root" "$config")"; trace_config="$(harness_resolve_cli_path "$root" "$trace_config")"
 [[ -f "$config" && -f "$trace_config" ]] || { echo "missing config or trace config" >&2; exit 2; }
+contract_args=(resolve --trace-config "$trace_config" --profile "$profile")
+for pair in \
+  "record-count:$record_count" "operation-count:$operation_count" \
+  "trace-workers-per-vm:$trace_workers" "workloads:$workloads" \
+  "load-policy:$load_policy" "warmup-rounds:$warmup_rounds" \
+  "rounds:$rounds" "round-timeout-sec:$round_timeout" \
+  "total-timeout-sec:$total_timeout" "batch-ops:$batch_ops" \
+  "value-seed:$value_seed"; do
+  name="$(printf '%s\n' "$pair" | cut -d: -f1)"
+  value="$(printf '%s\n' "$pair" | cut -d: -f2-)"
+  [[ -n "$value" ]] && contract_args+=(--"$name" "$value")
+done
+trace_contract_json="$(python3 "$script_dir/trace_contract.py" "${contract_args[@]}")" || exit 2
+contract_value() {
+  python3 - "$trace_contract_json" "$1" <<'PY'
+import json, sys
+value = json.loads(sys.argv[1])
+for part in sys.argv[2].split("."):
+    value = value[part]
+if isinstance(value, list):
+    print(",".join(value))
+elif isinstance(value, dict):
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+else:
+    print(value)
+PY
+}
+record_count="$(contract_value values.record_count)"
+operation_count="$(contract_value values.operation_count)"
+trace_workers="$(contract_value values.trace_workers_per_vm)"
+workloads="$(contract_value values.workloads)"
+load_policy="$(contract_value values.load_policy)"
+warmup_rounds="$(contract_value values.warmup_rounds)"
+rounds="$(contract_value values.rounds)"
+round_timeout="$(contract_value values.round_timeout_sec)"
+total_timeout="$(contract_value values.total_timeout_sec)"
+batch_ops="$(contract_value values.batch_ops)"
+value_seed="$(contract_value values.value_seed)"
+trace_config_sha="$(contract_value trace_config_sha256)"
+if [[ "$profile" == latencycheck && "$rounds" != 1 ]]; then
+  echo "latencycheck profile requires rounds=1" >&2
+  exit 2
+fi
+if ((skip_build || skip_vm_init || skip_trace_generation || skip_deploy)) && ((execute == 0)); then
+  echo "skip options require --execute" >&2
+  exit 2
+fi
 tigonkv_load_vm_config "$config"; tigonkv_validate_vm_config
 if [[ "$profile" == latencycheck ]]; then checker=ON; compile_off=OFF; e2e_ndebug=ON; else checker=OFF; compile_off=OFF; e2e_ndebug=OFF; fi
 tigonkv_prepare_build_environment "$root" Debug "$compile_off" "$checker" "$e2e_ndebug" >/dev/null
 build="$(tigonkv_canonical_build_dir "$root" Debug "$compile_off" "$checker" "$e2e_ndebug")"; pool_build="$(tigonkv_canonical_build_dir "$root" Debug OFF OFF "$e2e_ndebug")"
 runner="$build/e2e_trace_runner"; pool_tool="$pool_build/cxl_pool_initer"; tool_prefix="$root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"; latency_sim="$root/thirdparty_libs/latency_sim"
-latency_sha="$(git -C "$latency_sim" rev-parse HEAD)"; config_sha="$(harness_hash_file "$config")"; trace_config_sha="$(harness_hash_file "$trace_config")"; source_fingerprint="$(tigonkv_source_state "$root")"; export HARNESS_CLOSURE_STAMPS="$build/tigonkv_latency_sim_build_contract.json"
+latency_sha="$(git -C "$latency_sim" rev-parse HEAD)"; source_config_sha="$(harness_hash_file "$config")"; config_sha="$source_config_sha"; trace_config_sha="$(harness_hash_file "$trace_config")"; source_fingerprint="$(tigonkv_source_state "$root")"; export HARNESS_CLOSURE_STAMPS="$build/tigonkv_latency_sim_build_contract.json"
+trace_contract_sha="$(printf '%s' "$trace_contract_json" | sha256sum | awk '{print $1}')"
 remote_root="${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}"; runtime="$root/.tigon2"; vm_count="$TIGONKV_VM_COUNT"; base_port="$TIGONKV_SSH_BASE_PORT"
 storage="$TIGONKV_VM_STORAGE"; backing="$TIGONKV_SHARED_BACKING"
 shared_vm_resources_validate "$storage" "$backing" "$base_port" "$vm_count" "$execute"
@@ -109,15 +165,18 @@ harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_v
 harness_mark_timing "$out_dir/run_meta.json" resolve_ms "$total_start_ms"
 build_status=0
 build_start_ms=$(harness_now_ms)
-{
-  cmake --build "$build" --target e2e_trace_runner
-  cmake --build "$build" --target ycsb_partition_splits
-  cmake --build "$pool_build" --target cxl_pool_initer
-  if [[ "$checker" == ON ]]; then
-    LATENCY_SIM_VALGRIND_CHECK=ON bash "$latency_sim/scripts/build_latencycheck.sh"
-  fi
-} >"$out_dir/logs/build.log" 2>&1 || build_status=$?
-harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
+if ((skip_build == 0)); then
+  {
+    cmake --build "$build" --target e2e_trace_runner ycsb_partition_splits
+    cmake --build "$pool_build" --target cxl_pool_initer
+    if [[ "$checker" == ON ]]; then
+      LATENCY_SIM_VALGRIND_CHECK=ON bash "$latency_sim/scripts/build_latencycheck.sh"
+    fi
+  } >"$out_dir/logs/build.log" 2>&1 || build_status=$?
+  harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
+else
+  harness_update_meta "$out_dir/run_meta.json" "build_ms=0" "build_reused=true"
+fi
 if ((build_status != 0)); then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=build" "reason=host-build" "runner_exit_code=$build_status"
   harness_emit_result "$out_dir" HARNESS_INVALID build "" failed host-build
@@ -130,10 +189,44 @@ validate_participants || {
   harness_emit_result "$out_dir" HARNESS_INVALID compile-contract "" failed compile-contract
   exit 125
 }
+
+# The partition splitter updates the experiment config with its computed
+# ranges.  It must operate on an invocation-local copy before the final
+# manifest is frozen; otherwise the source config hash and the guest config
+# hash can describe different files in the same invocation.
+trace_dir="$out_dir/traces"
+trace_runtime_config="$out_dir/trace_experiment_config.jsonc"
+mkdir -p "$trace_dir"
+cp -- "$config" "$trace_runtime_config"
+if ((skip_trace_generation)); then
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=trace-generation-reuse-not-available"
+  harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed trace-generation-reuse-not-available
+  exit 125
+fi
+trace_prepare_start_ms=$(harness_now_ms)
+if ! TIGONKV_E2E_TRACE_BUILD_DIR="$build" TIGONKV_EXPERIMENT_CONFIG_JSONC="$trace_runtime_config" TIGONKV_VM_COUNT="$vm_count" \
+  bash "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" \
+  --out-dir "$trace_dir" --trace-config "$trace_config" --record-count "$record_count" \
+  --operation-count "$operation_count" --trace-workers-per-vm "$trace_workers" \
+  --workloads "$workloads" --batch-ops "$batch_ops" --value-seed "$value_seed" \
+  >"$out_dir/logs/trace_prepare.log" 2>&1; then
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=trace-generation"
+  harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed trace-generation
+  exit 125
+fi
+source_trace_config="$trace_config"
+trace_config="$trace_dir/trace_config.jsonc"
+trace_config_sha="$(harness_hash_file "$trace_config")"
+config_sha="$(harness_hash_file "$trace_runtime_config")"
+remote_config="$remote_root/trace_experiment_config.jsonc"
+export TIGONKV_EXPERIMENT_CONFIG_JSONC="$trace_runtime_config" TIGONKV_VM_REMOTE_CONFIG="$remote_config"
+harness_mark_timing "$out_dir/run_meta.json" trace_generation_ms "$trace_prepare_start_ms"
+
 ssh_control_path="$(harness_ssh_control_path "$run_runtime" tigon2 "$config_sha")"
 export TIGONKV_E2E_SSH_CONTROL_PATH="$ssh_control_path"
 trap 'harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"' EXIT
-export TIGONKV_E2E_RUN_ID="$run_id" TIGONKV_E2E_RUNTIME_DIR="$run_runtime" TIGONKV_VM_REMOTE_ROOT="$remote_root" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config"
+export TIGONKV_E2E_RUN_ID="$run_id" TIGONKV_E2E_RUNTIME_DIR="$run_runtime" TIGONKV_VM_REMOTE_ROOT="$remote_root"
+export TIGONKV_E2E_TRACE_CONFIG_JSONC="$trace_config" TIGONKV_E2E_TRACE_BATCH_OPS="$batch_ops" TIGONKV_E2E_TRACE_VALUE_SEED="$value_seed"
 export LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug"
 participant_manifest="$run_runtime/participants.manifest"
 freeze_start_ms=$(harness_now_ms)
@@ -171,8 +264,9 @@ harness_mark_timing "$out_dir/run_meta.json" freeze_ms "$freeze_start_ms"
 backing_real="$(realpath -m "$TIGONKV_SHARED_BACKING")"; backing_inode=missing; backing_size=missing
 if [[ -e "$backing_real" && ! -L "$backing_real" ]]; then backing_inode="$(stat -c '%i' "$backing_real")"; backing_size="$(stat -c '%s' "$backing_real")"; fi
 storage_real="$(realpath -m "$storage")"; storage_source="$(findmnt -n -T "$storage_real" -o SOURCE 2>/dev/null || true)"; storage_fstype="$(findmnt -n -T "$storage_real" -o FSTYPE 2>/dev/null || true)"; storage_source=${storage_source:-missing}; storage_fstype=${storage_fstype:-missing}
-state="$runtime/e2e/prepared_state.json"; config_sha="$(harness_hash_file "$config")"; state_common=("project_id=tigon2" "repo_root=$root" "latency_sim_fingerprint=$latency_sha" "build_fingerprint=$source_fingerprint" "compile_contract=Debug/O0/compile-on/checker-$checker/ndebug-$e2e_ndebug" "vm_count=$vm_count" "ssh_base_port=$base_port" "storage_path=$storage_real" "storage_source=$storage_source" "storage_fstype=$storage_fstype" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size" "participant_targets=e2e_trace_runner,cxl_pool_initer" "participant_elf_sha256=$participant_sha" "runtime_closure_manifest_sha=$closure_sha" "experiment_config_sha256=$config_sha" "trace_config_sha256=$trace_config_sha" "latencycheck_prefix_manifest_sha=$tool_sha" "guest_participant_sha256=$(harness_hash_file "$runner")" "guest_config_sha256=$config_sha" "guest_tool_sha256=$tool_binary_sha" "remote_root=$remote_root")
+state="$runtime/e2e/prepared_state.json"; state_common=("project_id=tigon2" "repo_root=$root" "latency_sim_fingerprint=$latency_sha" "build_fingerprint=$source_fingerprint" "compile_contract=Debug/O0/compile-on/checker-$checker/ndebug-$e2e_ndebug" "vm_count=$vm_count" "ssh_base_port=$base_port" "storage_path=$storage_real" "storage_source=$storage_source" "storage_fstype=$storage_fstype" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size" "participant_targets=e2e_trace_runner,cxl_pool_initer" "participant_elf_sha256=$participant_sha" "runtime_closure_manifest_sha=$closure_sha" "experiment_config_sha256=$source_config_sha" "runtime_experiment_config_sha256=$config_sha" "trace_config_sha256=$trace_config_sha" "source_trace_config_sha256=$(harness_hash_file "$source_trace_config")" "trace_contract_sha256=$trace_contract_sha" "latencycheck_prefix_manifest_sha=$tool_sha" "guest_participant_sha256=$(harness_hash_file "$runner")" "guest_config_sha256=$config_sha" "guest_tool_sha256=$tool_binary_sha" "remote_root=$remote_root")
 printf -v q_remote_root '%q' "$remote_root"
+printf -v q_remote_config '%q' "$remote_config"
 printf -v q_tool_prefix '%q' "$remote_root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"
 probe_command="set -eu; boot_id=\$(cat /proc/sys/kernel/random/boot_id); participant_sha=\$(sha256sum '$q_remote_root/build/e2e_trace_runner' | awk '{print \$1}'); config_sha=\$(sha256sum '$q_remote_config' | awk '{print \$1}'); tool_sha=none;"
 if [[ "$checker" == ON ]]; then probe_command+=" tool_sha=\$(sha256sum '$q_tool_prefix/bin/valgrind' | awk '{print \$1}'); VALGRIND_LIB='$q_tool_prefix/libexec/valgrind' '$q_tool_prefix/bin/valgrind' --tool=latencycheck --version >/dev/null;"; else probe_command+=" :;"; fi
@@ -190,11 +284,22 @@ state_expected=("${state_common[@]}" "guest_artifact_manifest_sha256=$guest_prob
 if [[ -n "$guest_probe_sha" ]] && harness_state_matches "$state" "${state_expected[@]}"; then prepared_state=hit; echo PREPARED_STATE_HIT; else echo "PREPARED_STATE_MISS reason=manifest_or_trace_config_changed"; fi
 harness_mark_timing "$out_dir/run_meta.json" prepare_ms "$prepare_start_ms"
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 trace "$profile" "$record_count" "$config" "$source_fingerprint" "$latency_sha" "$prepared_state" "$remote_root"
-python3 - "$out_dir/run_meta.json" "$vm_count" "$record_count" "$operation_count" "$trace_workers" "$load_policy" "$rounds" "$checker" "$e2e_ndebug" "$trace_config" <<'PY'
+python3 - "$out_dir/run_meta.json" "$vm_count" "$record_count" "$operation_count" "$trace_workers" "$load_policy" "$rounds" "$checker" "$e2e_ndebug" "$trace_dir/trace_config.jsonc" "$trace_config" "$trace_contract_json" "$trace_dir/trace_manifest.json" "$batch_ops" "$value_seed" <<'PY'
+import hashlib
 import json,sys
 from pathlib import Path
 p=Path(sys.argv[1]); d=json.loads(p.read_text()); checker=sys.argv[8]=='ON'; ndebug=sys.argv[9]=='ON'
-d.update({'vm_count':int(sys.argv[2]),'record_count':int(sys.argv[3]),'operation_count':int(sys.argv[4]),'logical_operation_count':int(sys.argv[4]),'physical_operation_count':None,'trace_workers_per_vm':int(sys.argv[5]),'load_policy':sys.argv[6],'rounds':int(sys.argv[7]),'build_contract':'Debug/O0/NDEBUG' if ndebug else 'Debug/O0/asserts-on','compile_off':False,'valgrind_check':checker,'ndebug':ndebug,'extra_check':False,'trace_config':sys.argv[10]})
+contract=json.loads(sys.argv[12]); manifest_path=Path(sys.argv[13]); manifest=json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+generated_path = Path(sys.argv[10])
+d.update({'vm_count':int(sys.argv[2]),'record_count':int(sys.argv[3]),'operation_count':int(sys.argv[4]),'logical_operation_count':int(sys.argv[4]),
+          'physical_operation_count':manifest.get('physical_operation_count'),'physical_trace_command_count':manifest.get('physical_trace_command_count'),'load_physical_command_count':manifest.get('load_physical_command_count'),
+          'trace_workers_per_vm':int(sys.argv[5]),'load_policy':sys.argv[6],'warmup_rounds':int(contract['values']['warmup_rounds']),'rounds':int(sys.argv[7]),
+          'round_timeout_sec':int(contract['values']['round_timeout_sec']),'total_timeout_sec':int(contract['values']['total_timeout_sec']),
+          'build_contract':'Debug/O0/NDEBUG' if ndebug else 'Debug/O0/asserts-on','compile_off':False,'valgrind_check':checker,'ndebug':ndebug,'extra_check':False,
+          'trace_config':sys.argv[10],'source_trace_config':sys.argv[11],'generated_trace_config':sys.argv[10],
+          'generated_trace_config_sha256':hashlib.sha256(generated_path.read_bytes()).hexdigest() if generated_path.is_file() else None,
+          'trace_contract':contract,'trace_contract_sha256':hashlib.sha256(sys.argv[12].encode()).hexdigest(),'trace_contract_sources':contract.get('sources',{}),
+          'batch_ops':int(sys.argv[14]),'value_seed':int(sys.argv[15]),'phase_physical_command_counts':manifest.get('phase_physical_command_counts',{})})
 p.write_text(json.dumps(d,indent=2,sort_keys=True)+'\n')
 PY
 python3 - "$out_dir/run_meta.json" "$trace_config_sha" <<'PY'
@@ -207,13 +312,21 @@ PY
 harness_update_meta "$out_dir/run_meta.json" \
   "participant_manifest_sha256=$participant_sha" \
   "runtime_closure_manifest_sha256=$closure_sha" \
-  "latencycheck_prefix_manifest_sha256=$tool_sha"
+  "latencycheck_prefix_manifest_sha256=$tool_sha" \
+  "experiment_config_sha256=$source_config_sha" \
+  "runtime_experiment_config=$trace_runtime_config" \
+  "runtime_experiment_config_sha256=$config_sha" \
+  "source_trace_config=$source_trace_config" \
+  "source_trace_config_sha256=$(harness_hash_file "$source_trace_config")" \
+  "generated_trace_config=$trace_config"
 : >"$out_dir/actual_events.jsonl"
-trace_dir="$out_dir/traces"; mkdir -p "$trace_dir"
+set +e
 deploy_start_ms=$(harness_now_ms)
-env TIGONKV_E2E_TRACE_BUILD_DIR="$build" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config" TIGONKV_VM_COUNT="$vm_count" TIGONKV_YCSB_WORKLOADS="$workloads" YCSB_RECORD_COUNT="$record_count" YCSB_OPERATION_COUNT="$operation_count" YCSB_WORKERS="$trace_workers" bash "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" "$trace_dir" >"$out_dir/logs/trace_prepare.log" 2>&1 || { harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=trace-generation"; harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed trace-generation; exit 125; }
+timeout "$total_timeout" env TIGONKV_E2E_TIMEOUT_SEC="$round_timeout" TIGONKV_E2E_TRACE_RUNNER="$runner" TIGONKV_POOL_INITER="$pool_tool" TIGONKV_E2E_TRACE_TOOL_INSTALL="$tool_prefix" TIGONKV_E2E_TRACE_TOOL_MANIFEST="${TIGONKV_E2E_TOOL_MANIFEST:-}" TIGONKV_E2E_TRACE_CONFIG_JSONC="$trace_dir/trace_config.jsonc" TIGONKV_E2E_TRACE_BATCH_OPS="$batch_ops" TIGONKV_E2E_TRACE_VALUE_SEED="$value_seed" TIGONKV_E2E_WARMUP_ROUNDS="$warmup_rounds" TIGONKV_YCSB_THREADS_PER_VM="$trace_workers" TIGONKV_YCSB_WORKLOADS="$workloads" TIGONKV_E2E_LOAD_POLICY="$load_policy" TIGONKV_E2E_TRACE_PREPARE_ONLY="$prepare_only" LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" bash "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$trace_dir" "$out_dir" "$rounds" "$workloads" >"$out_dir/logs/runner.log" 2>&1
+runner_status=$?; set -e
+harness_record_runner_exit "$out_dir/run_meta.json" "$runner_status"
 harness_mark_timing "$out_dir/run_meta.json" deploy_ms "$deploy_start_ms"
-if ((prepare_only)); then
+if ((prepare_only && runner_status == 0)); then
   cleanup_start_ms=$(harness_now_ms)
   trap - EXIT
   harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"
@@ -222,12 +335,6 @@ if ((prepare_only)); then
   harness_emit_result "$out_dir" PREPARED prepare-only "" verified
   exit 0
 fi
-set +e
-deploy_start_ms=$(harness_now_ms)
-timeout "$total_timeout" env TIGONKV_E2E_TIMEOUT_SEC="$round_timeout" TIGONKV_E2E_TRACE_RUNNER="$runner" TIGONKV_POOL_INITER="$pool_tool" TIGONKV_E2E_TRACE_TOOL_INSTALL="$tool_prefix" TIGONKV_E2E_TRACE_TOOL_MANIFEST="${TIGONKV_E2E_TOOL_MANIFEST:-}" TIGONKV_YCSB_THREADS_PER_VM="$trace_workers" TIGONKV_YCSB_WORKLOADS="$workloads" TIGONKV_E2E_LOAD_POLICY="$load_policy" TIGONKV_E2E_TRACE_PREPARE_ONLY="$prepare_only" LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" bash "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$trace_dir" "$out_dir" "$rounds" "$workloads" >"$out_dir/logs/runner.log" 2>&1
-runner_status=$?; set -e
-harness_record_runner_exit "$out_dir/run_meta.json" "$runner_status"
-harness_mark_timing "$out_dir/run_meta.json" deploy_ms "$deploy_start_ms"
 probe_start_ms=$(harness_now_ms)
 if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" || \
    ! harness_probe_matches "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"; then

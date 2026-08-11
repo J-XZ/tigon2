@@ -200,7 +200,8 @@ PY
 
 "$script_dir/run_vm_e2e.sh" --help >/dev/null
 "$script_dir/run_vm_trace.sh" --help >/dev/null
-if "$script_dir/run_vm_e2e.sh" --profile latencycheck --suite 09 >/dev/null 2>&1; then exit 1; fi
+! rg -q 'suite 08 only' "$script_dir/run_vm_e2e.sh"
+rg -q 'supports suites 08 and 09' "$script_dir/run_vm_e2e.sh"
 if "$script_dir/run_vm_e2e.sh" --profile latencycheck --rounds 2 >/dev/null 2>&1; then exit 1; fi
 if "$script_dir/run_vm_trace.sh" --prepare-only >/dev/null 2>&1; then exit 1; fi
 printf 'TIGON2_HARNESS_CONTRACT_OK\n'

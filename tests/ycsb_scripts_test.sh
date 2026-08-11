@@ -96,7 +96,7 @@ rg -q 'TIGONKV_E2E_RELEASE_FILE=' "$guest_workflow"
 rg -q 'TIGONKV_E2E_SCAN_EXPECT_NONEMPTY=' "$guest_workflow"
 rg -q 'TIGONKV_E2E_TEST_VALUE_HEX=' "$guest_workflow"
 rg -q 'TIGONKV_E2E_REQUIRE_GET_FOUND=' "$guest_workflow"
-rg -Fq 'workloads=${TIGONKV_YCSB_WORKLOADS:-"A B C D E"}' \
+rg -Fq 'workloads="${E2E_WORKLOADS:-a,b,c,d,e}"' \
   "$root/scripts/e2e_trace/prepare_ycsb_traces.sh"
 rg -Fq "workloads='a,b,c,d,e'" "$root/tigonkv_run_ycsb_experiment.sh"
 rg -q 'E2E_SCAN_ROWS_RETURNED' "$root/tools/e2e_trace_runner.cpp"

@@ -44,7 +44,7 @@ for pair in "rounds:$rounds" "record-count:$record_count" "round-timeout:$round_
   harness_require_positive "${pair%%:*}" "${pair#*:}"
 done
 if [[ "$profile" == latencycheck ]]; then
-  [[ "$suite" == 08 ]] || { echo "latencycheck profile is fixed to suite 08" >&2; exit 2; }
+  [[ "$suite" == 08 || "$suite" == 09 ]] || { echo "latencycheck profile supports suites 08 and 09" >&2; exit 2; }
   [[ "$rounds" == 1 ]] || { echo "latencycheck profile requires --rounds 1" >&2; exit 2; }
 fi
 config="$(harness_resolve_cli_path "$root" "$config")"

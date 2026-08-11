@@ -51,10 +51,15 @@ if (( need_prepare )); then
   }
   TIGONKV_EXPERIMENT_CONFIG_JSONC="$prepare_config" \
   TIGONKV_YCSB_PARTITION_SPLITS="$splitter" \
-  TIGONKV_YCSB_WORKLOADS=a TIGONKV_VM_COUNT=4 \
-  YCSB_RECORD_COUNT="${TIGONKV_E2E10_RECORD_COUNT:-100000}" \
-  YCSB_OPERATION_COUNT="${TIGONKV_E2E10_OPERATION_COUNT:-100000}" \
-  YCSB_WORKERS=4 "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" "$traces"
+  TIGONKV_VM_COUNT=4 "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" \
+    --out-dir "$traces" \
+    --trace-config "$root/tests/fixtures/trace_config.jsonc" \
+    --record-count "${TIGONKV_E2E10_RECORD_COUNT:-100000}" \
+    --operation-count "${TIGONKV_E2E10_OPERATION_COUNT:-100000}" \
+    --trace-workers-per-vm 4 \
+    --workloads a \
+    --batch-ops 4096 \
+    --value-seed 4851300051586183745
 fi
 
 echo "TIGONKV_E2E_YCSB_CTEST log_root=$logs traces=$traces"

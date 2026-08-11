@@ -1,0 +1,21 @@
+{
+  "record_count": 100000,
+  "operation_count": 100000,
+  "trace_workers_per_vm": 4,
+  "workloads": "a,b,c,d,e",
+  "load_policy": "per-workload",
+  "warmup_rounds": 0,
+  "rounds": 1,
+  "round_timeout_sec": 7200,
+  "total_timeout_sec": 86400,
+  "batch_ops": 4096,
+  "value_seed": 4851300051586183745,
+  "phases": {
+    "load": {"trace_dir": "traces/load"},
+    "workloada": {"trace_dir": "traces/workloada"},
+    "workloadb": {"trace_dir": "traces/workloadb"},
+    "workloadc": {"trace_dir": "traces/workloadc"},
+    "workloadd": {"trace_dir": "traces/workloadd"},
+    "workloade": {"trace_dir": "traces/workloade"}
+  }
+}

@@ -6,11 +6,11 @@ config=${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}
 source "$root/scripts/tigonkv_vm_common.sh"
 source "$root/scripts/tigonkv_build_helpers.sh"
 tigonkv_load_vm_config "$config"
-build=$(tigonkv_canonical_build_dir "$root" RelWithDebInfo "${LATENCY_SIM_COMPILE_OFF:-OFF}")
+build=$(tigonkv_canonical_build_dir "$root" Debug "${LATENCY_SIM_COMPILE_OFF:-OFF}" "${LATENCY_SIM_VALGRIND_CHECK:-OFF}" "${LATENCY_SIM_E2E_NDEBUG:-OFF}")
 trace_root=${1:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 log_root=${2:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 rounds=${3:-${TIGONKV_E2E_ROUNDS:-10}}
-workloads=${4:-${TIGONKV_YCSB_WORKLOADS:-"A B C D E"}}
+workloads=${4:-${TIGONKV_YCSB_WORKLOADS:-"a,b,c,d,e"}}
 vm_count=${TIGONKV_VM_COUNT}
 threads_per_vm=${TIGONKV_YCSB_THREADS_PER_VM:-${TIGONKV_E2E_THREADS:-${TIGONKV_E2E_WORKERS:-4}}}
 base_port=$TIGONKV_SSH_BASE_PORT
@@ -26,6 +26,9 @@ shared_numa=${TIGONKV_SHARED_NUMA_NODE:-${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV
 timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-600}}
 checker=${LATENCY_SIM_VALGRIND_CHECK:-OFF}
 load_policy=${TIGONKV_E2E_LOAD_POLICY:-per-round}
+trace_batch_ops=${TIGONKV_E2E_TRACE_BATCH_OPS:-4096}
+trace_value_seed=${TIGONKV_E2E_TRACE_VALUE_SEED:-4851300051586183745}
+warmup_rounds=${TIGONKV_E2E_WARMUP_ROUNDS:-0}
 run_id="${TIGONKV_E2E_RUN_ID:-manual-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 runtime_run_dir="${TIGONKV_E2E_RUNTIME_DIR:-$root/.tigon2/e2e/$run_id}"
 control_dir="$runtime_run_dir/ssh"
@@ -33,6 +36,8 @@ mkdir -p "$control_dir"
 control_path="${TIGONKV_E2E_SSH_CONTROL_PATH:-$control_dir/%C}"
 local_tool_install="${TIGONKV_E2E_TRACE_TOOL_INSTALL:-$root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install}"
 remote_tool_install="$remote_root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"
+trace_config_local="${TIGONKV_E2E_TRACE_CONFIG_JSONC:-$trace_root/trace_config.jsonc}"
+remote_trace_config="$remote_root/trace_config.jsonc"
 
 [[ -d "$trace_root" ]] || { echo "missing trace root: $trace_root" >&2; exit 2; }
 case "$load_policy" in per-workload|per-round|once) ;; *) echo "TIGONKV_E2E_LOAD_POLICY must be per-workload, per-round, or once" >&2; exit 2 ;; esac
@@ -41,13 +46,19 @@ case "$load_policy" in per-workload|per-round|once) ;; *) echo "TIGONKV_E2E_LOAD
 [[ -f "$ssh_key" ]] || { echo "missing SSH key: $ssh_key" >&2; exit 2; }
 [[ "$vm_count" =~ ^[1-9][0-9]*$ ]] || { echo "TIGONKV_VM_COUNT must be positive" >&2; exit 2; }
 [[ "$rounds" =~ ^[1-9][0-9]*$ ]] || { echo "rounds must be positive" >&2; exit 2; }
+[[ "$warmup_rounds" =~ ^[0-9]+$ ]] || { echo "warmup_rounds must be non-negative" >&2; exit 2; }
 [[ "$vm_count" == 4 && "$threads_per_vm" == 4 ]] || {
   echo "cxlkv-aligned guest YCSB requires 4 VMs × 4 threads (got ${vm_count}×${threads_per_vm})" >&2
+  exit 2
+}
+[[ "$workloads" =~ ^[abcde](,[abcde])*$ ]] || {
+  echo "workloads must be lowercase comma-separated a,b,c,d,e" >&2
   exit 2
 }
 
 mkdir -p "$log_root"
 ssh_opts=(-i "$ssh_key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=4
   -o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$control_path")
 close_ssh_controlmasters() {
   local vm
@@ -105,6 +116,13 @@ sync_guest_runtime() {
     if [[ "$config_sha" != "$guest_sha" ]]; then
       scp "${ssh_opts[@]}" -P "$port" "$config" "root@127.0.0.1:$remote_config.new.$run_id" >/dev/null
       remote "$vm" "test \"\$(sha256sum '$remote_config.new.$run_id' | awk '{print \$1}')\" = '$config_sha'; mv -f '$remote_config.new.$run_id' '$remote_config'"
+    fi
+    [[ -f "$trace_config_local" ]] || { echo "missing trace config: $trace_config_local" >&2; return 2; }
+    config_sha=$(sha256sum "$trace_config_local" | awk '{print $1}')
+    guest_sha=$(remote "$vm" "sha256sum '$remote_trace_config' 2>/dev/null | awk '{print \$1}'" || true)
+    if [[ "$config_sha" != "$guest_sha" ]]; then
+      scp "${ssh_opts[@]}" -P "$port" "$trace_config_local" "root@127.0.0.1:$remote_trace_config.new.$run_id" >/dev/null
+      remote "$vm" "test \"\$(sha256sum '$remote_trace_config.new.$run_id' | awk '{print \$1}')\" = '$config_sha'; mv -f '$remote_trace_config.new.$run_id' '$remote_trace_config'"
     fi
   }
   local -a pids=()
@@ -206,9 +224,9 @@ run_fixed() {
   scan_env="$scan_env TIGONKV_E2E_REQUIRE_GET_FOUND=$require_get_found"
   local command
   if [[ "$checker" == ON ]]; then
-    command="env VALGRIND_LIB='$remote_tool_install/libexec/valgrind' TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck '$remote_runner'"
+    command="env VALGRIND_LIB='$remote_tool_install/libexec/valgrind' TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_CONFIG_JSONC='$remote_trace_config' TIGONKV_E2E_TRACE_BATCH_OPS=$trace_batch_ops TIGONKV_E2E_TRACE_VALUE_SEED=$trace_value_seed TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck '$remote_runner'"
   else
-    command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed '$remote_runner'"
+    command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_CONFIG_JSONC='$remote_trace_config' TIGONKV_E2E_TRACE_BATCH_OPS=$trace_batch_ops TIGONKV_E2E_TRACE_VALUE_SEED=$trace_value_seed TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed '$remote_runner'"
   fi
   # Pre-create the log so the host wait loop never races rg against ENOENT.
   : >"$log"
@@ -350,7 +368,7 @@ run_ycsb_phase() {
 }
 
 if [[ "${TIGONKV_E2E_TRACE_PREPARE_ONLY:-0}" == 1 ]]; then
-  read -r -a selected_workloads <<<"$workloads"
+  IFS=, read -r -a selected_workloads <<<"$workloads"
   for workload in "${selected_workloads[@]}"; do
     wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
     sync_traces 1 "$wl" load
@@ -360,13 +378,14 @@ if [[ "${TIGONKV_E2E_TRACE_PREPARE_ONLY:-0}" == 1 ]]; then
   exit 0
 fi
 
-for ((round = 1; round <= rounds; round++)); do
-  read -r -a selected_workloads <<<"$workloads"
+run_ycsb_round() {
+  local round=$1
+  IFS=, read -r -a selected_workloads <<<"$workloads"
   [[ "${#selected_workloads[@]}" -gt 0 ]] || {
     echo "at least one YCSB workload is required" >&2
     exit 2
   }
-  if [[ "$load_policy" == once && "$round" -gt 1 ]]; then
+  if [[ "$load_policy" == once && "$load_done" == 1 ]]; then
     for workload in "${selected_workloads[@]}"; do
       wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
       run_ycsb_phase "$round" "$wl" run
@@ -383,11 +402,22 @@ for ((round = 1; round <= rounds; round++)); do
     # selected workloads consume that dataset. `once` keeps the first round's
     # dataset for subsequent rounds.
     first_workload=$(printf '%s' "${selected_workloads[0]}" | tr '[:upper:]' '[:lower:]')
-    if [[ "$load_policy" != once || "$round" == 1 ]]; then pool_reset; fi
-    run_ycsb_phase "$round" "$first_workload" load
+    if [[ "$load_policy" != once || "$load_done" == 0 ]]; then
+      pool_reset
+      run_ycsb_phase "$round" "$first_workload" load
+      load_done=1
+    fi
     for workload in "${selected_workloads[@]}"; do
       wl=$(printf '%s' "$workload" | tr '[:upper:]' '[:lower:]')
       run_ycsb_phase "$round" "$wl" run
     done
   fi
+}
+
+load_done=0
+for ((round = 1; round <= warmup_rounds; round++)); do
+  run_ycsb_round "warmup_${round}"
+done
+for ((round = 1; round <= rounds; round++)); do
+  run_ycsb_round "$round"
 done
