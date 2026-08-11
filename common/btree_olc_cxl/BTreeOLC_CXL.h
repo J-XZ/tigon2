@@ -2999,7 +2999,14 @@ restart:
 		if (quit == false && nextLeaf != nullptr) {
 			// versionNode = nextLeaf->readLockOrRestart(needRestart);
 			if (nextLeaf->getCount() > 0) {
-				lowKey = nextLeaf->keys_[0];
+				const KeyType *next_key = &nextLeaf->keys_[0];
+				if (IsTreeDataAddress(next_key)) {
+					latency_sim::FixedLatencyCopySharedToLocal(
+					    TreeDataDomain(), &lowKey, next_key,
+					    sizeof(lowKey));
+				} else {
+					lowKey = *next_key;
+				}
 			} else {
 				quit = true;
 			}

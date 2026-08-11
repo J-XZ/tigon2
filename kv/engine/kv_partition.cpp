@@ -27,7 +27,8 @@ uint32_t ReadHwccConfigField(const uint32_t *field) {
 }
 
 bool IsInternalMaxSentinel(const FixedKey &key, uint32_t fixed_key_size) {
-  return key.Compare(FixedKey::InternalMax(fixed_key_size)) == 0;
+  return btreeolc_cxl::SharedBytewiseComparator<FixedKey>()(
+             key, FixedKey::InternalMax(fixed_key_size)) == 0;
 }
 
 constexpr uint64_t SharedSccBytes(uint64_t value_bytes) {
@@ -1532,7 +1533,9 @@ bool KVPartition::ScanLocalPartition(
         auto *private_value = reinterpret_cast<PrivateValueStruct *>(
             static_cast<char *>(data) - sizeof(PrivateValueStruct));
         auto *metadata = MetadataFromValue(private_value);
-        row->key = key;
+        latency_sim::FixedLatencyCopySharedToLocal(
+            btreeolc_cxl::TreeDataDomain(), &row->key, &key,
+            sizeof(row->key));
         row->output = !boundary &&
                       !IsInternalMaxSentinel(key, fixed_key_size_);
         bool local_read = false;
@@ -1622,6 +1625,11 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
     bool result_row = false;
   };
   bool corruption = false;
+  const auto compare_shared_key =
+      [](const FixedKey &left, const FixedKey &right) {
+        return btreeolc_cxl::SharedBytewiseComparator<FixedKey>()(left,
+                                                                   right);
+      };
   const auto adjacency_ok =
       [&](const void *raw_key, void *raw_smeta, bool /*is_last_tuple*/,
           size_t result_count, bool /*locking_next_tuple*/) -> bool {
@@ -1638,10 +1646,10 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
     // [min, island) is still private-only.
     const bool lower_bound_left_boundary =
         allow_lower_bound_left_boundary && result_count == 0 &&
-        key.Compare(min_key) >= 0;
+        compare_shared_key(key, min_key) >= 0;
     smeta->lock();
     const bool adj_ok = star::TwoPLPashaHelper::scan_row_adjacency_ok(
-        key.Compare(min_key) == 0 || lower_bound_left_boundary,
+        compare_shared_key(key, min_key) == 0 || lower_bound_left_boundary,
         result_count == output_limit,
         smeta->get_prev_key_real_bit(),
         smeta->get_next_key_real_bit());
@@ -1666,7 +1674,11 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
     if (!shared_locked) {
       return false;
     }
-    *row = {key, smeta, scc_data, !locking_next_tuple};
+    latency_sim::FixedLatencyCopySharedToLocal(
+        btreeolc_cxl::TreeDataDomain(), &row->key, &key, sizeof(row->key));
+    row->smeta = smeta;
+    row->scc_data = scc_data;
+    row->result_row = !locking_next_tuple;
     return true;
   };
   std::vector<Pinned> rows;
@@ -1676,9 +1688,9 @@ KVPartition::SharedScanResult KVPartition::ScanSharedPartition(
   bool migration_required = false;
   bool scan_busy = false;
   star::TwoPLPashaHelper::scan_remote_fragment(
-      [](const void *left, const void *right) {
-        return FixedKeyComparator()(*static_cast<const FixedKey *>(left),
-                                    *static_cast<const FixedKey *>(right));
+      [&](const void *left, const void *right) {
+        return compare_shared_key(*static_cast<const FixedKey *>(left),
+                                  *static_cast<const FixedKey *>(right));
       }, *shared_table_, &min_key, &max_key, output_limit, rows, &next_row,
       has_next_row, scan_success, migration_required, scan_busy, adjacency_ok,
       acquire, [](const Pinned &row) -> const void * { return &row.key; });

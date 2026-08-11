@@ -570,6 +570,25 @@ class TwoPLPashaMessageHandler {
                 // Extracted from master data_migration_request_for_scan_handler
                 // (scan + per-key move_row_in). KV owns response / move_out order.
                 std::vector<ITable::row_entity> scan_results;
+                const auto append_scan_row =
+                    [&](const void *key, ITable::MetaDataType *meta,
+                        void *data) {
+                        if (btreeolc_cxl::IsTreeDataAddress(key)) {
+                                scan_results.emplace_back();
+                                auto &row = scan_results.back();
+                                row.key_size = table.key_size();
+                                row.meta = meta;
+                                row.data = data;
+                                row.row_size = table.value_size();
+                                latency_sim::FixedLatencyCopySharedToLocal(
+                                    btreeolc_cxl::TreeDataDomain(), row.key,
+                                    key, row.key_size);
+                        } else {
+                                scan_results.emplace_back(
+                                    key, table.key_size(), meta, data,
+                                    table.value_size());
+                        }
+                    };
                 table.scan(min_key, [&](const void *key,
                                         ITable::MetaDataType *meta,
                                         void *data, bool) -> bool {
@@ -595,8 +614,7 @@ class TwoPLPashaMessageHandler {
                         } else {
                                 return false;
                         }
-                        scan_results.emplace_back(key, table.key_size(), meta, data,
-                                                  table.value_size());
+                        append_scan_row(key, meta, data);
                         return migrating_next_key;
                 });
                 for (int i = 0; i < static_cast<int>(scan_results.size()); i++) {
