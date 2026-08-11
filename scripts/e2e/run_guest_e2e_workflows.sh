@@ -589,6 +589,13 @@ for suite in $suites; do
   (( workflow_status == 0 )) || break
 done
 
+# Every phase child has been reaped on the successful path, so the workflow
+# owns an explicit successful cleanup result rather than leaving the sentinel
+# value (-1) for the checker summarizer.
+if (( workflow_status == 0 )); then
+  TIGONKV_WORKFLOW_CLEANUP_STATUS=0
+fi
+
 if [[ "$checker" == ON && "$rounds" == 1 && "$suites" =~ ^(08|09)$ ]]; then
   summary_status=0
   if python3 "$root/scripts/e2e/summarize_latencycheck_e2e08.py" \

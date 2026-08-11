@@ -67,7 +67,8 @@ def main() -> int:
 
     cleanup_ok = args.cleanup_status == 0
 
-    clean = args.workflow_status == 0 and len(logs) == args.vm_count * len(phases)
+    clean = (cleanup_ok and args.workflow_status == 0 and
+             len(logs) == args.vm_count * len(phases))
     if clean:
         for phase in phases:
             phase_logs = sorted((suite_root / phase).glob("vm*.log"))
