@@ -67,6 +67,12 @@ close_ssh_controlmasters() {
   done
   find -P "$control_dir" -maxdepth 1 -type s -delete 2>/dev/null || true
 }
+rsync_ssh_command() {
+  local port=$1 rsync_ssh port_arg
+  printf -v rsync_ssh '%q ' ssh "${ssh_opts[@]}"
+  printf -v port_arg '%q' "$port"
+  printf '%s-p %s' "$rsync_ssh" "$port_arg"
+}
 trap close_ssh_controlmasters EXIT
 remote() {
   local vm=$1
@@ -144,8 +150,8 @@ sync_guest_runtime() {
       if remote "$vm" "test -d '$remote_tool_install' && test -f '$remote_tool_install.manifest' && cmp -s '$remote_tool_install.manifest' '$remote_tool_install.manifest.new.$run_id'"; then
         remote "$vm" "rm -f '$remote_tool_install.manifest.new.$run_id'"
       else
-        local rsync_ssh port_arg
-        printf -v rsync_ssh 'ssh %q ' "${ssh_opts[@]}"; printf -v port_arg '%q' "$port"; rsync_ssh+="-p $port_arg"
+        local rsync_ssh
+        rsync_ssh=$(rsync_ssh_command "$port")
         remote "$vm" "mkdir -p '$staging'"
         rsync -a --delete -e "$rsync_ssh" "$local_tool_install/" "root@127.0.0.1:$staging/" >/dev/null
         remote "$vm" "cd '$staging' && sha256sum --status -c '$remote_tool_install.manifest.new.$run_id'" || { remote "$vm" "rm -rf '$staging' '$remote_tool_install.manifest.new.$run_id'"; return 1; }
@@ -171,8 +177,8 @@ sync_traces() {
     local vm=$1 port=$((base_port + vm))
     local target="$remote_root/ycsb-guest-traces/round$round/workload$wl/$phase"
     local stage="$target.new.$run_id" old="$target.old.$run_id"
-    local rsync_ssh port_arg
-    printf -v rsync_ssh 'ssh %q ' "${ssh_opts[@]}"; printf -v port_arg '%q' "$port"; rsync_ssh+="-p $port_arg"
+    local rsync_ssh
+    rsync_ssh=$(rsync_ssh_command "$port")
     remote "$vm" "mkdir -p '$stage'"
     for ((worker = 0; worker < threads_per_vm; worker++)); do
       if [[ "$phase" == load ]]; then

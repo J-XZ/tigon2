@@ -164,6 +164,24 @@ assert data['pool_reset_count'] == 1 and data['pool_reset_ms'] == 11
 assert data['first_mismatch'] is None
 PY
 
+# A runner failure without an authoritative node must keep the empty node
+# machine-readable instead of allowing Bash IFS folding to shift fields.
+runner_no_node="$tmp/runner-no-node"; mkdir -p "$runner_no_node/logs"
+harness_write_common_meta "$runner_no_node/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
+harness_record_runner_exit "$runner_no_node/run_meta.json" 1
+printf 'plain workflow failure\n' >"$runner_no_node/logs/runner.log"
+IFS=$'\t' read -r no_node_stage no_node no_node_cleanup no_node_reason \
+  <<<"$(harness_runner_failure_fields "$runner_no_node")"
+[[ "$no_node_stage" == runner && "$no_node" == -1 && "$no_node_cleanup" == failed && "$no_node_reason" == runner ]]
+harness_emit_result "$runner_no_node" HARNESS_INVALID "$no_node_stage" "$no_node" "$no_node_cleanup" "$no_node_reason" >/dev/null
+python3 - "$runner_no_node/run_result.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data['status'] == 'HARNESS_INVALID'
+assert data['first_node'] is None
+assert data['runner_exit_code'] == 1
+PY
+
 clean="$tmp/clean"; mkdir -p "$clean"
 harness_write_common_meta "$clean/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
 harness_update_meta "$clean/run_meta.json" "vm_count=1"

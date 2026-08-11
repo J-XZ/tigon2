@@ -583,7 +583,7 @@ for path in paths:
                               cleanup, "runner")))
             raise SystemExit(0)
 
-print("runner\t\tfailed\trunner")
+print("runner\t-1\tfailed\trunner")
 PY
 }
 
