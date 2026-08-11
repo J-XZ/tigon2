@@ -320,6 +320,7 @@ harness_update_meta "$out_dir/run_meta.json" \
   "source_trace_config_sha256=$(harness_hash_file "$source_trace_config")" \
   "generated_trace_config=$trace_config"
 : >"$out_dir/actual_events.jsonl"
+export TIGONKV_E2E_ACTUAL_EVENTS="$out_dir/actual_events.jsonl"
 set +e
 deploy_start_ms=$(harness_now_ms)
 timeout "$total_timeout" env TIGONKV_E2E_TIMEOUT_SEC="$round_timeout" TIGONKV_E2E_TRACE_RUNNER="$runner" TIGONKV_POOL_INITER="$pool_tool" TIGONKV_E2E_TRACE_TOOL_INSTALL="$tool_prefix" TIGONKV_E2E_TRACE_TOOL_MANIFEST="${TIGONKV_E2E_TOOL_MANIFEST:-}" TIGONKV_E2E_TRACE_CONFIG_JSONC="$trace_dir/trace_config.jsonc" TIGONKV_E2E_TRACE_BATCH_OPS="$batch_ops" TIGONKV_E2E_TRACE_VALUE_SEED="$value_seed" TIGONKV_E2E_WARMUP_ROUNDS="$warmup_rounds" TIGONKV_YCSB_THREADS_PER_VM="$trace_workers" TIGONKV_YCSB_WORKLOADS="$workloads" TIGONKV_E2E_LOAD_POLICY="$load_policy" TIGONKV_E2E_TRACE_PREPARE_ONLY="$prepare_only" LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" bash "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh" "$trace_dir" "$out_dir" "$rounds" "$workloads" >"$out_dir/logs/runner.log" 2>&1
@@ -334,6 +335,15 @@ if ((prepare_only && runner_status == 0)); then
   harness_mark_timing "$out_dir/run_meta.json" total_prepare_ms "$total_start_ms"
   harness_emit_result "$out_dir" PREPARED prepare-only "" verified
   exit 0
+fi
+set +e
+harness_record_pool_reset_meta "$out_dir/run_meta.json" "$out_dir/actual_events.jsonl"
+pool_reset_status=$?
+set -e
+if ((pool_reset_status != 0 && (runner_status == 0 || pool_reset_status == 1))); then
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=pool-reset" "reason=pool-reset"
+  harness_emit_result "$out_dir" HARNESS_INVALID pool-reset "" verified pool-reset
+  exit 125
 fi
 probe_start_ms=$(harness_now_ms)
 if ! guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" || \

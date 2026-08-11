@@ -199,8 +199,24 @@ sync_traces() {
 }
 
 pool_reset() {
-  numactl --cpunodebind="$shared_numa" --membind="$shared_numa" \
-    "$pool_init" "$backing" "$shared_size_mb" >/dev/null
+  local events_path=${TIGONKV_E2E_ACTUAL_EVENTS:-}
+  local start_ms end_ms elapsed_ms status count
+  start_ms=$(date +%s%3N)
+  if numactl --cpunodebind="$shared_numa" --membind="$shared_numa" \
+      "$pool_init" "$backing" "$shared_size_mb" >/dev/null; then
+    status=success
+    count=1
+  else
+    status=failed
+    count=0
+  fi
+  end_ms=$(date +%s%3N)
+  elapsed_ms=$((end_ms - start_ms))
+  if [[ -n "$events_path" ]]; then
+    printf '{"kind":"pool_reset","owner":"tigon2-trace-runner","count":%s,"elapsed_ms":%s,"status":"%s"}\n' \
+      "$count" "$elapsed_ms" "$status" >>"$events_path"
+  fi
+  [[ "$status" == success ]]
 }
 
 run_fixed() {
