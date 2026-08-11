@@ -246,7 +246,11 @@ run_fixed() {
   scan_env="$scan_env TIGONKV_E2E_REQUIRE_GET_FOUND=$require_get_found"
   local command
   if [[ "$checker" == ON ]]; then
-    command="env VALGRIND_LIB='$remote_tool_install/libexec/valgrind' TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_CONFIG_JSONC='$remote_trace_config' TIGONKV_E2E_TRACE_BATCH_OPS=$trace_batch_ops TIGONKV_E2E_TRACE_VALUE_SEED=$trace_value_seed TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck '$remote_runner'"
+    # Fair checker scheduling prevents one guest worker from retaining
+    # Valgrind's global scheduler lock long enough to starve the transport
+    # response/flush service.  This changes only checker-side scheduling;
+    # the guest binary, workload and real memory operations are unchanged.
+    command="env VALGRIND_LIB='$remote_tool_install/libexec/valgrind' TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_CONFIG_JSONC='$remote_trace_config' TIGONKV_E2E_TRACE_BATCH_OPS=$trace_batch_ops TIGONKV_E2E_TRACE_VALUE_SEED=$trace_value_seed TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck --fair-sched=yes '$remote_runner'"
   else
     command="env TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_TRACE_CONFIG_JSONC='$remote_trace_config' TIGONKV_E2E_TRACE_BATCH_OPS=$trace_batch_ops TIGONKV_E2E_TRACE_VALUE_SEED=$trace_value_seed TIGONKV_E2E_TRACE_PHASE=$phase TIGONKV_E2E_TRACE_DIR='$trace_dir' TIGONKV_E2E_TRACE_WORKERS=$threads_per_vm TIGONKV_E2E_TRACE_FIRST=$trace_first TIGONKV_E2E_STAGE_MARKERS=1 TIGONKV_E2E_TRACE_HEARTBEAT_SEC=5 TIGONKV_E2E_RESET=$reset TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $scan_env $zeroed '$remote_runner'"
   fi
