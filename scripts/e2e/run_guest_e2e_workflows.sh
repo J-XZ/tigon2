@@ -326,7 +326,7 @@ run_remote() {
   local remote_binary="$remote_root/build/e2e_${suite}"
   local command
   if [[ "$checker" == ON ]]; then
-    command="env VALGRIND_LIB='$remote_tool_install/libexec/valgrind' TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck --fair-sched=yes '$remote_binary'"
+    command="env VALGRIND_LIB='$remote_tool_install/libexec/valgrind' TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra timeout '$timeout_sec' '$remote_tool_install/bin/valgrind' --tool=latencycheck '$remote_binary'"
   else
     command="env TIGONKV_E2E_MULTI_VM=1 $total_env TIGONKV_E2E_PHASE=$phase TIGONKV_E2E_THREADS=$threads TIGONKV_E2E_RESET=$reset TIGONKV_NODE_ID=$vm TIGONKV_EXPERIMENT_CONFIG_JSONC='$remote_config' TIGONKV_E2E_RELEASE_FILE='$release_file' TIGONKV_E2E_RELEASE_TIMEOUT_SEC=$timeout_sec $extra '$remote_binary'"
   fi
