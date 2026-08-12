@@ -280,6 +280,26 @@ assert data['pool_reset_count'] == 0
 assert data['first_node'] is None
 PY
 
+stage_fail="$tmp/stage-fail"; mkdir -p "$stage_fail"
+harness_write_common_meta "$stage_fail/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
+harness_update_meta "$stage_fail/run_meta.json" "failed_stage=build" "reason=host-build" "build_exit_code=7"
+harness_emit_result "$stage_fail" HARNESS_INVALID build '' failed host-build >/dev/null
+python3 - "$stage_fail/run_result.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data['runner_exit_code'] is None
+assert data['build_exit_code'] == 7
+PY
+harness_update_meta "$stage_fail/run_meta.json" "failed_stage=deploy" "reason=deploy" "deploy_exit_code=9"
+harness_emit_result "$stage_fail" HARNESS_INVALID deploy 2 failed deploy >/dev/null
+python3 - "$stage_fail/run_result.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data['runner_exit_code'] is None
+assert data['deploy_exit_code'] == 9
+assert data['first_node'] == 2
+PY
+
 "$script_dir/run_vm_e2e.sh" --help >/dev/null
 "$script_dir/run_vm_trace.sh" --help >/dev/null
 rg -q 'prepare_tigon_trace_set\(\)' "$script_dir/run_vm_trace.sh"

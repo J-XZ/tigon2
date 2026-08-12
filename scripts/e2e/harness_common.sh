@@ -254,7 +254,8 @@ payload.update({'project':project,'suite':suite,'profile':profile,'record_count'
  'config_sha256':hashlib.sha256(cfg.read_bytes()).hexdigest(),'prepared_state':prepared,
  'remote_root':remote_root})
 defaults={'reason':'','failed_stage':'','first_node':None,'cleanup_status':'pending',
- 'runner_exit_code':None,'pool_reset_count':0,'pool_reset_ms':0,'pool_reset_owner':None,
+ 'runner_exit_code':None,'build_exit_code':None,'deploy_exit_code':None,
+ 'pool_reset_count':0,'pool_reset_ms':0,'pool_reset_owner':None,
  'pool_reset_event_count':0,'pool_reset_status':'missing','participant_manifest_sha256':None,
  'runtime_closure_manifest_sha256':None,'latencycheck_prefix_manifest_sha256':None,
  'participant_expected_sha256':None,'participant_observed_sha256':None,
@@ -280,7 +281,7 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 data = json.loads(path.read_text())
-integer_fields = {"vm_count", "workers_per_vm", "first_node", "runner_exit_code", "pool_reset_count",
+integer_fields = {"vm_count", "workers_per_vm", "first_node", "runner_exit_code", "build_exit_code", "deploy_exit_code", "pool_reset_count",
                   "resolve_ms", "build_ms", "freeze_ms", "closure_ms", "prepare_ms", "deploy_ms",
                   "probe_ms", "pool_reset_ms", "cleanup_ms", "total_prepare_ms"}
 for item in sys.argv[2:]:

@@ -249,7 +249,7 @@ else
   harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
 fi
 if ((build_status != 0)); then
-  harness_update_meta "$out_dir/run_meta.json" "failed_stage=build" "reason=host-build" "runner_exit_code=$build_status"
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=build" "reason=host-build" "build_exit_code=$build_status"
   harness_emit_result "$out_dir" HARNESS_INVALID build "" failed host-build
   exit 125
 fi
@@ -574,8 +574,7 @@ fi
 set -e
 harness_mark_timing "$out_dir/run_meta.json" deploy_ms "$deploy_start_ms"
 if ((deploy_status != 0)); then
-  harness_record_runner_exit "$out_dir/run_meta.json" "$deploy_status"
-  harness_update_meta "$out_dir/run_meta.json" "failed_stage=deploy" "reason=deploy" "runner_exit_code=$deploy_status"
+  harness_update_meta "$out_dir/run_meta.json" "failed_stage=deploy" "reason=deploy" "deploy_exit_code=$deploy_status"
   harness_emit_result "$out_dir" HARNESS_INVALID deploy "" failed deploy
   exit 125
 fi
