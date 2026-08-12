@@ -91,20 +91,6 @@ class ForegroundScopeSuspension {
 
 #endif  // LATENCY_SIM_COMPILE_OFF
 
-inline void Record(latency_sim::MemoryDomain pool, latency_sim::AccessKind kind,
-                   const void* address, size_t bytes) {
-  latency_sim::FixedLatencyChargeRange(pool, kind, address, bytes);
-}
-
-inline void PrivateRead(const void* address, size_t bytes) {
-  Record(latency_sim::MemoryDomain::kOwnerPrivateSwcc,
-         latency_sim::AccessKind::kRead, address, bytes);
-}
-inline void PrivateWrite(const void* address, size_t bytes) {
-  Record(latency_sim::MemoryDomain::kOwnerPrivateSwcc,
-         latency_sim::AccessKind::kWrite, address, bytes);
-}
-
 template <typename T>
 inline T PrivateAtomicLoad(const std::atomic<T>& value,
                            std::memory_order order = std::memory_order_seq_cst) {
@@ -170,14 +156,6 @@ inline bool PrivateAtomicCompareExchangeStrong(
       latency_sim::MemoryDomain::kOwnerPrivateSwcc);
 }
 
-inline void HwccRead(const void* address, size_t bytes) {
-  Record(latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead, address,
-         bytes);
-}
-inline void HwccWrite(const void* address, size_t bytes) {
-  Record(latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kWrite, address,
-         bytes);
-}
 template <typename T>
 inline T HwccLoad(const T* address) {
   return latency_sim::FixedLatencyMemoryLoad(
@@ -263,21 +241,6 @@ inline bool HwccAtomicCompareExchangeStrong(
   return latency_sim::FixedLatencyAtomicCompareExchangeStrong(
       value, expected, desired, success, failure,
       latency_sim::MemoryDomain::kHwcc);
-}
-
-inline void TransportRead(const void* address, size_t bytes) {
-  HwccRead(address, bytes);
-}
-inline void TransportWrite(const void* address, size_t bytes) {
-  HwccWrite(address, bytes);
-}
-inline void SharedPayloadRead(const void* address, size_t bytes) {
-  Record(latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kRead, address,
-         bytes);
-}
-inline void SharedPayloadWrite(const void* address, size_t bytes) {
-  Record(latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kWrite, address,
-         bytes);
 }
 
 inline void* PrivateCopyLocalToShared(void* dst, const void* src, size_t bytes) {

@@ -54,7 +54,7 @@ struct TestBuffers {
 void ThrowsOnEarlyExit(TestBuffers *buffers) {
   tigonkv::engine::mem_access::LatencyScope scope(
       latency_sim::ExecutionClass::kForeground);
-  tigonkv::engine::mem_access::Record(
+  latency_sim::FixedLatencyChargeRange(
       latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kWrite,
       buffers->hwcc, 128);
   throw std::runtime_error("scope cleanup");
@@ -95,11 +95,21 @@ int main() {
     assert(tigonkv::engine::mem_access::HwccAtomicFetchAdd(
                *value, uint64_t{3}, std::memory_order_relaxed) == 7);
     assert(value->load(std::memory_order_relaxed) == 10);
-    tigonkv::engine::mem_access::HwccRead(buffers.hwcc, 64);
-    tigonkv::engine::mem_access::HwccWrite(buffers.hwcc, 64);
-    tigonkv::engine::mem_access::TransportRead(buffers.hwcc, 64);
-    tigonkv::engine::mem_access::SharedPayloadRead(buffers.swcc, 64);
-    tigonkv::engine::mem_access::PrivateWrite(buffers.swcc, 64);
+    latency_sim::FixedLatencyChargeRange(
+        latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
+        buffers.hwcc, 64);
+    latency_sim::FixedLatencyChargeRange(
+        latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kWrite,
+        buffers.hwcc, 64);
+    latency_sim::FixedLatencyChargeRange(
+        latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
+        buffers.hwcc, 64);
+    latency_sim::FixedLatencyChargeRange(
+        latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kRead,
+        buffers.swcc, 64);
+    latency_sim::FixedLatencyChargeRange(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+        latency_sim::AccessKind::kWrite, buffers.swcc, 64);
   }
   return 0;
 #else

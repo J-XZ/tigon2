@@ -311,8 +311,12 @@ uint64_t RunOrdinary(bool wrapped, BenchmarkEngine &bench) {
   for (uint64_t i = 0; i < kIterations; ++i) {
     auto &value = values[i & 255u];
     if (wrapped) {
-      tigonkv::engine::mem_access::HwccRead(&value, sizeof(value));
-      tigonkv::engine::mem_access::HwccWrite(&value, sizeof(value));
+      latency_sim::FixedLatencyChargeRange(
+          latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
+          &value, sizeof(value));
+      latency_sim::FixedLatencyChargeRange(
+          latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kWrite,
+          &value, sizeof(value));
     }
     value += i + 1;
     checksum ^= value;
@@ -339,8 +343,8 @@ uint64_t RunAtomic(bool wrapped, BenchmarkEngine &bench) {
   return checksum;
 }
 
-// Real B+Tree domain/atomic adapters (btreeolc_cxl::RecordTreeDataRead and
-// TreeAtomicFetchAdd); the node array and the counter live in HWCC.
+// Real B+Tree domain/atomic adapters (typed range charge and TreeAtomicFetchAdd);
+// the node array and the counter live in HWCC.
 uint64_t RunBtreeDomainAdapter(bool wrapped, BenchmarkEngine &bench) {
   auto *nodes = bench.btree_nodes();
   auto *counter =
@@ -348,7 +352,11 @@ uint64_t RunBtreeDomainAdapter(bool wrapped, BenchmarkEngine &bench) {
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
     auto &node = nodes[(i * 17) & 255u];
-    if (wrapped) btreeolc_cxl::RecordTreeDataRead(&node, sizeof(node));
+    if (wrapped) {
+      latency_sim::FixedLatencyChargeRange(
+          latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
+          &node, sizeof(node));
+    }
     node = node * 3 + i;
     checksum += wrapped
         ? btreeolc_cxl::TreeAtomicFetchAdd(*counter, uint64_t{1},
@@ -421,10 +429,14 @@ uint64_t RunSccBulk(bool wrapped, BenchmarkEngine &bench, uint64_t bytes) {
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
     src[0] = static_cast<char>(i);
-    tigonkv::engine::mem_access::SharedPayloadWrite(payload->data, bytes);
+    latency_sim::FixedLatencyChargeRange(
+        latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kWrite,
+        payload->data, bytes);
     star::scc_manager->do_write(smeta, 0, payload->data, src.data(), bytes);
     star::scc_manager->finish_write(smeta, 0, payload, bytes);
-    tigonkv::engine::mem_access::SharedPayloadRead(payload->data, bytes);
+    latency_sim::FixedLatencyChargeRange(
+        latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kRead,
+        payload->data, bytes);
     star::scc_manager->do_read(smeta, 0, dst.data(), payload->data, bytes);
     checksum += dst[0];
   }
