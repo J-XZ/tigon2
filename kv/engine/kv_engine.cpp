@@ -1041,7 +1041,6 @@ Status KVEngine::Delete(std::string_view key) {
                            "remote delete control slot is not empty");
     }
     pending_guard.Publish(sequence);
-    mem_access::DeferTransportSettlement defer_settlement;
     Status deleted;
     deleted.code = StatusCode::kCorruption;
     try {
@@ -1904,17 +1903,6 @@ void KVEngine::PollTransport() {
   // let the background guard settle only after each narrowed EBR dispatch has
   // been destroyed.  The suspension then restores the foreground scope.
   mem_access::ForegroundScopeSuspension suspend_foreground;
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-  // Deferred mode (remote delete critical state): the RAII guard routes the
-  // poll's budget into the single deferred segment instead of settling, so no
-  // busy-wait happens while the caller still holds the row's write lock /
-  // invalid state; the merged deferred budget settles exactly once at the
-  // outermost scope exit, after the delete commit/rollback released the lock
-  // and the SCC guards.  The guard is exception-safe: a throwing poll body
-  // still restores the thread's scope state before the exception propagates
-  // to the delete rollback path.
-  mem_access::DeferredTransportPollScope deferred_poll;
-#endif
   latency_sim::ScopeGuard background_scope(
       latency_sim::ExecutionClass::kBackground);
   PollTransportImpl();

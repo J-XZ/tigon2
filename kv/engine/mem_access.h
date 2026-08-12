@@ -15,15 +15,6 @@
 
 namespace tigonkv::engine::mem_access {
 
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-// Non-zero while the current thread is inside a remote-delete critical state
-// (row write_locked with valid cleared): every transport poll must defer its
-// settlement into the single deferred segment instead of busy-waiting, so
-// nothing settles until the commit/rollback releases the row lock and SCC
-// guards.
-inline thread_local int TlsDeferTransportSettlementDepth = 0;
-#endif
-
 // Thin project-scoped alias over the library ScopeGuard.  The library settles
 // the pending delay at the outermost safe scope exit; this wrapper only maps
 // tigonkv::LatencyScope to latency_sim::ScopeGuard.
@@ -74,44 +65,6 @@ class ForegroundScopeSuspension {
 
  private:
   std::optional<latency_sim::ScopeSuspension> suspension_;
-};
-
-// RAII for the remote-delete critical state (deferred transport settlement
-// mode).  Any return or exception decrements the defer depth exactly once.
-class DeferTransportSettlement {
- public:
-  DeferTransportSettlement() {
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    ++TlsDeferTransportSettlementDepth;
-#endif
-  }
-  ~DeferTransportSettlement() {
-#if !defined(LATENCY_SIM_COMPILE_OFF)
-    --TlsDeferTransportSettlementDepth;
-#endif
-  }
-  DeferTransportSettlement(const DeferTransportSettlement&) = delete;
-  DeferTransportSettlement& operator=(const DeferTransportSettlement&) =
-      delete;
-};
-
-// RAII for one transport poll executed inside the remote-delete critical
-// state.  The poll must not settle (no busy-wait while the row is
-// write_locked/invalid): the guard temporarily resumes the enclosing scope as
-// a background-class scope so the poll charges into the same deferred
-// segment, then suspends it again and restores the original thread scope
-// state.  The destructor runs on every path, including a throwing poll body,
-// so TLS depth/class/generation and the pending budget are never stranded.
-class DeferredTransportPollScope {
- public:
-  // The outer ForegroundScopeSuspension owns the deferred segment.  The poll
-  // itself is opened by KVEngine as a temporary public background ScopeGuard;
-  // no project code reaches into simulator TLS or maintains a second ledger.
-  DeferredTransportPollScope() = default;
-  ~DeferredTransportPollScope() = default;
-  DeferredTransportPollScope(const DeferredTransportPollScope&) = delete;
-  DeferredTransportPollScope& operator=(const DeferredTransportPollScope&) =
-      delete;
 };
 
 inline void Record(latency_sim::MemoryDomain pool, latency_sim::AccessKind kind,
