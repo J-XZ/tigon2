@@ -9,7 +9,7 @@ source "$root/scripts/tigonkv_build_helpers.sh"
 execute=0; prepare_only=0; profile=fixed-latency; config="$root/experiment_config.jsonc"; trace_config="$root/tests/fixtures/trace_config.jsonc"
 record_count=""; operation_count=""; trace_workers=""; workloads=""; load_policy=""; warmup_rounds=""; rounds=""
 round_timeout=""; total_timeout=""; batch_ops=""; value_seed=""
-skip_build=0; skip_vm_init=0; skip_trace_generation=0; skip_deploy=0; requested_out=""
+requested_out=""
 usage() {
   cat <<'USAGE'
 Usage: scripts/e2e/run_vm_trace.sh [options]
@@ -28,10 +28,6 @@ Usage: scripts/e2e/run_vm_trace.sh [options]
   --total-timeout SEC
   --batch-ops N
   --value-seed N
-  --skip-build
-  --skip-vm-init
-  --skip-trace-generation
-  --skip-deploy
   --out-dir DIR
   --help
 USAGE
@@ -55,10 +51,6 @@ while (($#)); do
     --total-timeout) need_value "$@"; total_timeout=$2; shift 2 ;;
     --batch-ops) need_value "$@"; batch_ops=$2; shift 2 ;;
     --value-seed) need_value "$@"; value_seed=$2; shift 2 ;;
-    --skip-build) skip_build=1; shift ;;
-    --skip-vm-init) skip_vm_init=1; shift ;;
-    --skip-trace-generation) skip_trace_generation=1; shift ;;
-    --skip-deploy) skip_deploy=1; shift ;;
     --out-dir) need_value "$@"; requested_out=$2; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -112,10 +104,6 @@ value_seed="$(contract_value values.value_seed)"
 trace_config_sha="$(contract_value trace_config_sha256)"
 if [[ "$profile" == latencycheck && "$rounds" != 1 ]]; then
   echo "latencycheck profile requires rounds=1" >&2
-  exit 2
-fi
-if ((skip_build || skip_vm_init || skip_trace_generation || skip_deploy)) && ((execute == 0)); then
-  echo "skip options require --execute" >&2
   exit 2
 fi
 tigonkv_load_vm_config "$config"; tigonkv_validate_vm_config
@@ -176,18 +164,14 @@ harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_v
 harness_mark_timing "$out_dir/run_meta.json" resolve_ms "$total_start_ms"
 build_status=0
 build_start_ms=$(harness_now_ms)
-if ((skip_build == 0)); then
-  {
-    cmake --build "$build" --target e2e_trace_runner ycsb_partition_splits
-    cmake --build "$pool_build" --target cxl_pool_initer
-    if [[ "$checker" == ON ]]; then
-      LATENCY_SIM_VALGRIND_CHECK=ON bash "$latency_sim/scripts/build_latencycheck.sh"
-    fi
-  } >"$out_dir/logs/build.log" 2>&1 || build_status=$?
-  harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
-else
-  harness_update_meta "$out_dir/run_meta.json" "build_ms=0" "build_reused=true"
-fi
+{
+  cmake --build "$build" --target e2e_trace_runner ycsb_partition_splits
+  cmake --build "$pool_build" --target cxl_pool_initer
+  if [[ "$checker" == ON ]]; then
+    LATENCY_SIM_VALGRIND_CHECK=ON bash "$latency_sim/scripts/build_latencycheck.sh"
+  fi
+} >"$out_dir/logs/build.log" 2>&1 || build_status=$?
+harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
 if ((build_status != 0)); then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=build" "reason=host-build" "runner_exit_code=$build_status"
   harness_emit_result "$out_dir" HARNESS_INVALID build "" failed host-build
@@ -209,11 +193,6 @@ trace_dir="$out_dir/traces"
 trace_runtime_config="$out_dir/trace_experiment_config.jsonc"
 mkdir -p "$trace_dir"
 cp -- "$config" "$trace_runtime_config"
-if ((skip_trace_generation)); then
-  harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=trace-generation-reuse-not-available"
-  harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed trace-generation-reuse-not-available
-  exit 125
-fi
 trace_prepare_start_ms=$(harness_now_ms)
 if ! TIGONKV_E2E_TRACE_BUILD_DIR="$build" TIGONKV_EXPERIMENT_CONFIG_JSONC="$trace_runtime_config" TIGONKV_VM_COUNT="$vm_count" \
   bash "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" \

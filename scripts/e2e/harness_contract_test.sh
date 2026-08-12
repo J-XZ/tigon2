@@ -283,6 +283,8 @@ assert 'if ((skip_deploy == 0)); then' in workflow
 assert 'sync_guest_binary "$suite"' in workflow
 PY
 rg -q 'TIGONKV_E2E_ACTUAL_EVENTS=' "$script_dir/run_vm_trace.sh"
+! rg -q -- '--skip-build|--skip-vm-init|--skip-trace-generation|--skip-deploy' "$script_dir/run_vm_trace.sh"
+! rg -q 'skip_build=|skip_vm_init=|skip_trace_generation=|skip_deploy=' "$script_dir/run_vm_trace.sh"
 rg -q 'kind":"pool_reset"' "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh"
 rg -q -- '--tool=latencycheck --fair-sched=yes' "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh"
 ! rg -q 'suite 08 only' "$script_dir/run_vm_e2e.sh"
