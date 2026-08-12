@@ -17,7 +17,29 @@ namespace tigonkv::engine::mem_access {
 
 // Thin project-scoped alias over the library ScopeGuard.  The library settles
 // the pending delay at the outermost safe scope exit; this wrapper only maps
-// tigonkv::LatencyScope to latency_sim::ScopeGuard.
+// tigonkv::LatencyScope to latency_sim::ScopeGuard when simulation is compiled
+// in.  The compile-off branch is deliberately an empty type: it must not
+// retain project TLS or RAII bookkeeping at Debug/O0.
+#if defined(LATENCY_SIM_COMPILE_OFF)
+
+class LatencyScope {
+ public:
+  LATENCY_SIM_FORCE_INLINE explicit LatencyScope(
+      latency_sim::ExecutionClass) {}
+  LatencyScope(const LatencyScope&) = delete;
+  LatencyScope& operator=(const LatencyScope&) = delete;
+};
+
+class ForegroundScopeSuspension {
+ public:
+  ForegroundScopeSuspension() = default;
+  ForegroundScopeSuspension(const ForegroundScopeSuspension&) = delete;
+  ForegroundScopeSuspension& operator=(const ForegroundScopeSuspension&) =
+      delete;
+};
+
+#else
+
 class LatencyScope {
  public:
   explicit LatencyScope(latency_sim::ExecutionClass scope)
@@ -66,6 +88,8 @@ class ForegroundScopeSuspension {
  private:
   std::optional<latency_sim::ScopeSuspension> suspension_;
 };
+
+#endif  // LATENCY_SIM_COMPILE_OFF
 
 inline void Record(latency_sim::MemoryDomain pool, latency_sim::AccessKind kind,
                    const void* address, size_t bytes) {
