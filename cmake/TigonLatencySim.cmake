@@ -69,7 +69,7 @@ function(tigonkv_enable_latency_sim)
       "latency_sim benchmarks are verified by the library repo itself" FORCE)
   set(LATENCY_SIM_BUILD_EXAMPLES OFF CACHE BOOL
       "latency_sim examples are verified by the library repo itself" FORCE)
-  set(LATENCY_SIM_OPTIMIZATION_PROFILE "cxlkv" CACHE STRING
+  set(LATENCY_SIM_OPTIMIZATION_PROFILE "optimized" CACHE STRING
       "latency_sim optimization profile used by Tigon2 consumers" FORCE)
   set(LATENCY_SIM_ENABLE_LTO ON CACHE BOOL
       "Full LTO on latency_sim and its final consumers (Tigon2 policy)" FORCE)
