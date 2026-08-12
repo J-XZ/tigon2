@@ -151,7 +151,11 @@ def derive_e2e(source_path: str, overlay_path: str, output_path: str) -> None:
             raise ValueError(f"E2E overlay is missing tigon_kv.{key}")
         source_kv[key] = overlay_kv[key]
     Path(output_path).write_text(
-        json.dumps(source, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        # Keep the source field order.  The C++ E2E config reader intentionally
+        # reads the top-level shared_memory.size_mb before nested hwcc/swcc
+        # members; sorting keys would put hwcc.size_mb first and change the
+        # meaning of an otherwise identical config for that reader.
+        json.dumps(source, indent=2, sort_keys=False) + "\n", encoding="utf-8"
     )
 
 

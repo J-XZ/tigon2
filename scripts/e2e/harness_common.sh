@@ -653,7 +653,7 @@ for path in paths:
             node = match.group("node")
             cleanup = "verified" if match.group("cleanup") == "0" else "failed"
             print("\t".join((match.group("stage"),
-                              "" if node == "-1" else node,
+                              node,
                               cleanup, "runner")))
             raise SystemExit(0)
         match = status_line.search(line)
@@ -661,7 +661,7 @@ for path in paths:
             node = match.group("node")
             cleanup = "verified" if match.group("cleanup").lower() == "true" else "failed"
             print("\t".join((match.group("stage"),
-                              "" if node == "-1" else node,
+                              node,
                               cleanup, "runner")))
             raise SystemExit(0)
 

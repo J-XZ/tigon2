@@ -202,6 +202,26 @@ assert data['first_node'] is None
 assert data['runner_exit_code'] == 1
 PY
 
+# A runner status line with first_vm=-1 must not lose the empty-node field
+# when Bash reads the tab-separated failure record.
+runner_status_no_node="$tmp/runner-status-no-node"; mkdir -p "$runner_status_no_node/logs"
+harness_write_common_meta "$runner_status_no_node/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
+harness_record_runner_exit "$runner_status_no_node/run_meta.json" 1
+printf 'TIGONKV_LATENCYCHECK status=HARNESS_INVALID logs=4 summaries=4 workflow_exit=1 failed_stage=none first_vm=-1 mismatch_logs=0 cleanup_ok=false\n' >"$runner_status_no_node/logs/runner.log"
+IFS=$'\t' read -r status_no_node_stage status_no_node status_no_node_cleanup status_no_node_reason \
+  <<<"$(harness_runner_failure_fields "$runner_status_no_node")"
+[[ "$status_no_node_stage" == none && "$status_no_node" == -1 && "$status_no_node_cleanup" == failed && "$status_no_node_reason" == runner ]]
+harness_emit_result "$runner_status_no_node" HARNESS_INVALID none -1 failed runner >/dev/null
+python3 - "$runner_status_no_node/run_result.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data['status'] == 'HARNESS_INVALID'
+assert data['failed_stage'] == 'none'
+assert data['first_node'] is None
+assert data['cleanup_status'] == 'failed'
+assert data['runner_exit_code'] == 1
+PY
+
 clean="$tmp/clean"; mkdir -p "$clean"
 harness_write_common_meta "$clean/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
 harness_update_meta "$clean/run_meta.json" "vm_count=1"
