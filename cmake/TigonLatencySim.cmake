@@ -13,7 +13,7 @@ include_guard(GLOBAL)
 #     consumer target in that process.
 #  3. Subproject mode turns off the tool library's own tests/benchmarks/
 #     examples; those are verified by the library repo itself.
-#  4. LATENCY_SIM_OPTIMIZATION_PROFILE=cxlkv and full LTO on the library for
+#  4. LATENCY_SIM_OPTIMIZATION_PROFILE=optimized and full LTO on the library for
 #     Release/RelWithDebInfo (Debug stays -O0 -g3 without LTO).
 #  5. No global compiler/flags are modified; the library keeps all options
 #     target-local.
