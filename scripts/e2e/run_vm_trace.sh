@@ -361,7 +361,7 @@ PY
       --workloads "$workloads" --batch-ops "$batch_ops" --value-seed "$value_seed"; then
       return 1
     fi
-    python3 - "$generated" "$cache_key" "$record_count" "$operation_count" "$trace_workers" "$workloads" <<'PY'
+    python3 - "$generated" "$cache_key" "$record_count" "$operation_count" "$trace_workers" "$workloads" "$vm_count" <<'PY'
 import hashlib
 import json
 import sys
