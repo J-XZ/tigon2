@@ -61,16 +61,20 @@ harness_manifest_valid() {
 }
 harness_ssh_control_path() {
   local invocation_runtime=$1 project=$2 config_sha=$3
-  # OpenSSH limits the expanded ControlPath to 108 bytes.  Keep the socket
-  # under the project runtime directory, but hash the complete invocation
-  # runtime path so long run IDs do not make the path unusable.  The runtime
-  # path, project, and config fingerprint make the token invocation-specific;
-  # it is never reused across runs or projects.
-  local runtime_root="$(dirname "$invocation_runtime")"
-  local token
+  # OpenSSH limits the expanded ControlPath to 108 bytes.  Hash the complete
+  # invocation identity and keep this run in its own socket directory so a
+  # long run ID cannot make the path unusable or broaden cleanup scope.
+  local runtime_root token path socket_root
+  runtime_root=$(dirname -- "$invocation_runtime")
   token="$(printf '%s\n%s\n%s\n' "$invocation_runtime" "$project" "$config_sha" | sha256sum | cut -c1-24)"
-  local path="$runtime_root/s/${token}-%p"
+  socket_root=$runtime_root
+  path="$socket_root/s/$token/%p"
   local worst_case=${path//%p/99999}
+  if (( ${#worst_case} + 17 >= 108 )); then
+    socket_root="${HARNESS_SSH_SOCKET_ROOT:-${TMPDIR:-/tmp}/shared-vm-e2e-sockets}"
+    path="$socket_root/$token/%p"
+    worst_case=${path//%p/99999}
+  fi
   if (( ${#worst_case} + 17 >= 108 )); then
     echo "HARNESS_INVALID failed_stage=ssh-control-path path_too_long=$worst_case" >&2
     return 125

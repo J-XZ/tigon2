@@ -87,7 +87,12 @@ config="$tmp/config.jsonc"; printf '{}\n' >"$config"
 export SHARED_VM_E2E_LOCK_PATH="$tmp/shared-vm.lock"
 control_path="$(harness_ssh_control_path "$tmp/runtime/e2e/run-id" tigon2 "$(harness_hash_file "$config")")"
 control_worst=${control_path//%p/99999}
-[[ "$control_path" =~ /e2e/s/[0-9a-f]{24}-%p$ && ${#control_worst} -lt 108 ]]
+[[ "$control_path" =~ /e2e/s/[0-9a-f]{24}/%p$ && ${#control_worst} -lt 108 ]]
+long_runtime="$tmp/$(printf 'long-run-%015d' 1)/e2e/$(printf 'invocation-%015d' 1)"
+export HARNESS_SSH_SOCKET_ROOT="$tmp/ssh-sockets"
+long_control_path="$(harness_ssh_control_path "$long_runtime" tigon2 "$(harness_hash_file "$config")")"
+long_control_worst=${long_control_path//%p/99999}
+[[ "$long_control_path" == "$HARNESS_SSH_SOCKET_ROOT/"*/*%p && ${#long_control_worst} -lt 108 ]]
 (
   source "$script_dir/harness_common.sh"
   harness_acquire_lock tigon2 "$config" 4 10022 "$tmp/runtime" holder /mnt/xz_vm_storage /mnt/xz_shared_mem/ivshmem_shared_mem
