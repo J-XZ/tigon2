@@ -271,6 +271,10 @@ PY
 
 "$script_dir/run_vm_e2e.sh" --help >/dev/null
 "$script_dir/run_vm_trace.sh" --help >/dev/null
+rg -q 'prepare_tigon_trace_set\(\)' "$script_dir/run_vm_trace.sh"
+rg -q 'TRACE_CACHE_HIT|TRACE_CACHE_REFRESHED' "$script_dir/run_vm_trace.sh"
+rg -q 'trace_generation_mode=' "$script_dir/run_vm_trace.sh"
+rg -q 'trace_cache_meta.json' "$script_dir/run_vm_trace.sh"
 python3 - "$script_dir/run_vm_e2e.sh" "$root/scripts/e2e/run_guest_e2e_workflows.sh" <<'PY'
 import sys
 from pathlib import Path

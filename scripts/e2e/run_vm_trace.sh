@@ -271,13 +271,153 @@ trace_dir="$out_dir/traces"
 trace_runtime_config="$out_dir/trace_experiment_config.jsonc"
 mkdir -p "$trace_dir"
 cp -- "$config" "$trace_runtime_config"
+
+prepare_tigon_trace_set() {
+  local cache_root="$runtime/e2e/trace-cache"
+  local ycsb_root="$root/thirdparty_libs/YCSB-cpp"
+  local generator="$ycsb_root/scripts/generate_cxlkv_trace.sh"
+  local source_trace_sha generator_sha splitter_sha ycsb_head ycsb_diff_sha
+  local cache_key cache generated
+  source_trace_sha="$(harness_hash_file "$source_trace_config")"
+  generator_sha="$(harness_hash_file "$generator")"
+  splitter_sha="$(harness_hash_file "$trace_helper")"
+  ycsb_head="$(git -C "$ycsb_root" rev-parse HEAD 2>/dev/null || printf missing)"
+  ycsb_diff_sha="$({ git -C "$ycsb_root" diff HEAD --no-ext-diff --binary; } | sha256sum | awk '{print $1}')"
+  cache_key="$({
+    printf 'schema=1\nproject=tigon2\nsource_trace_sha=%s\nsource_config_sha=%s\n' \
+      "$source_trace_sha" "$source_config_sha"
+    printf 'records=%s\noperations=%s\nworkers=%s\nworkloads=%s\nbatch=%s\nseed=%s\nvm_count=%s\n' \
+      "$record_count" "$operation_count" "$trace_workers" "$workloads" \
+      "$batch_ops" "$value_seed" "$vm_count"
+    printf 'generator_sha=%s\nsplitter_sha=%s\nycsb_head=%s\nycsb_diff_sha=%s\n' \
+      "$generator_sha" "$splitter_sha" "$ycsb_head" "$ycsb_diff_sha"
+  } | sha256sum | awk '{print $1}')"
+  cache="$cache_root/$cache_key"
+  mkdir -p "$cache_root"
+
+  if [[ -d "$cache" ]] && python3 - "$cache" "$cache_key" "$record_count" "$operation_count" "$trace_workers" "$workloads" "$vm_count" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected = {
+    "cache_key": sys.argv[2],
+    "record_count": int(sys.argv[3]),
+    "operation_count": int(sys.argv[4]),
+    "trace_workers_per_vm": int(sys.argv[5]),
+    "workloads": sys.argv[6].split(","),
+    "vm_count": int(sys.argv[7]),
+}
+try:
+    meta = json.loads((root / "trace_cache_meta.json").read_text())
+    if any(meta.get(key) != value for key, value in expected.items()):
+        raise ValueError("cache input contract changed")
+    for row in meta["files"]:
+        path = root / row["path"]
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"missing cached artifact: {row['path']}")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]:
+            raise ValueError(f"cached artifact changed: {row['path']}")
+    required = {"trace_config.jsonc", "trace_manifest.json"}
+    if not required.issubset({row["path"] for row in meta["files"]}):
+        raise ValueError("cache is missing trace metadata")
+    manifest = json.loads((root / "trace_manifest.json").read_text())
+    if manifest.get("record_count") != expected["record_count"]:
+        raise ValueError("trace manifest record count changed")
+    if manifest.get("operation_count") != expected["operation_count"]:
+        raise ValueError("trace manifest operation count changed")
+    if manifest.get("trace_workers_per_vm") != expected["trace_workers_per_vm"]:
+        raise ValueError("trace manifest worker count changed")
+    if manifest.get("vm_count") != expected["vm_count"]:
+        raise ValueError("trace manifest VM count changed")
+    if not set(expected["workloads"]).issubset(set(manifest.get("workloads", []))):
+        raise ValueError("trace manifest workload set changed")
+    for phase in ["load", *(f"workload{item}" for item in expected["workloads"])] :
+        phase_dir = root / phase
+        workers = sorted(phase_dir.glob("worker*.txt"))
+        if len(workers) != expected["vm_count"] * expected["trace_workers_per_vm"]:
+            raise ValueError(f"phase {phase} has the wrong worker count")
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    print(f"trace cache invalid: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+  then
+    trace_generation_mode=reused
+    echo "TRACE_CACHE_HIT key=$cache_key"
+  else
+    trace_generation_mode=generated
+    generated="$run_runtime/trace-generated"
+    if [[ -e "$generated" ]]; then
+      mv -- "$generated" "$run_runtime/trace-generated.stale.$run_id"
+    fi
+    mkdir -p "$generated"
+    if ! TIGONKV_E2E_TRACE_BUILD_DIR="$build" TIGONKV_E2E_TRACE_CONFIG_JSONC="$trace_runtime_config" \
+      TIGONKV_EXPERIMENT_CONFIG_JSONC="$trace_runtime_config" TIGONKV_VM_COUNT="$vm_count" \
+      bash "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" \
+      --out-dir "$generated" --trace-config "$source_trace_config" --record-count "$record_count" \
+      --operation-count "$operation_count" --trace-workers-per-vm "$trace_workers" \
+      --workloads "$workloads" --batch-ops "$batch_ops" --value-seed "$value_seed"; then
+      return 1
+    fi
+    python3 - "$generated" "$cache_key" "$record_count" "$operation_count" "$trace_workers" "$workloads" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+files = []
+for path in sorted(root.rglob("*")):
+    if path.is_file() and not path.is_symlink():
+        files.append({
+            "path": str(path.relative_to(root)),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        })
+payload = {
+    "schema_version": 1,
+    "cache_key": sys.argv[2],
+    "record_count": int(sys.argv[3]),
+    "operation_count": int(sys.argv[4]),
+    "trace_workers_per_vm": int(sys.argv[5]),
+    "workloads": sys.argv[6].split(","),
+    "vm_count": int(sys.argv[7]),
+    "files": files,
+}
+(root / "trace_cache_meta.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+    if [[ -e "$cache" ]]; then
+      mv -- "$cache" "$cache.invalid.$run_id"
+    fi
+    mv -- "$generated" "$cache"
+    echo "TRACE_CACHE_REFRESHED key=$cache_key"
+  fi
+
+  python3 - "$cache" "$trace_dir" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+source, target = map(Path, sys.argv[1:])
+target.mkdir(parents=True, exist_ok=True)
+for path in sorted(source.rglob("*")):
+    if not path.is_file() or path.name == "trace_cache_meta.json":
+        continue
+    destination = target / path.relative_to(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, destination)
+PY
+  # A cache hit still needs an invocation-local partition update.  This is
+  # the same operation the generator performs on a cold trace preparation.
+  if [[ "$trace_generation_mode" == reused ]]; then
+    "$trace_helper" --trace-dir "$trace_dir/load" --config "$trace_runtime_config" \
+      --workers "$((vm_count * trace_workers))" --fixed-key-size 32
+  fi
+}
+
 trace_prepare_start_ms=$(harness_now_ms)
-if ! TIGONKV_E2E_TRACE_BUILD_DIR="$build" TIGONKV_EXPERIMENT_CONFIG_JSONC="$trace_runtime_config" TIGONKV_VM_COUNT="$vm_count" \
-  bash "$root/scripts/e2e_trace/prepare_ycsb_traces.sh" \
-  --out-dir "$trace_dir" --trace-config "$trace_config" --record-count "$record_count" \
-  --operation-count "$operation_count" --trace-workers-per-vm "$trace_workers" \
-  --workloads "$workloads" --batch-ops "$batch_ops" --value-seed "$value_seed" \
-  >"$out_dir/logs/trace_prepare.log" 2>&1; then
+if ! prepare_tigon_trace_set >"$out_dir/logs/trace_prepare.log" 2>&1; then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=trace-generation"
   harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed trace-generation
   exit 125
@@ -288,6 +428,7 @@ trace_config_sha="$(harness_hash_file "$trace_config")"
 config_sha="$(harness_hash_file "$trace_runtime_config")"
 remote_config="$remote_root/trace_experiment_config.jsonc"
 export TIGONKV_EXPERIMENT_CONFIG_JSONC="$trace_runtime_config" TIGONKV_VM_REMOTE_CONFIG="$remote_config"
+harness_update_meta "$out_dir/run_meta.json" "trace_generation_mode=$trace_generation_mode"
 harness_mark_timing "$out_dir/run_meta.json" trace_generation_ms "$trace_prepare_start_ms"
 
 ssh_control_path="$(harness_ssh_control_path "$run_runtime" tigon2 "$config_sha")"
