@@ -30,6 +30,26 @@ freeze_config="$tmp/freeze.config"; printf '{}\n' >"$freeze_config"; freeze_conf
 printf 'node=0 boot_id=00000000-0000-0000-0000-000000000000 participant=%s config=%s tool=none\n' "$after_sha" "$freeze_config_sha" >"$tmp/freeze.probe"
 harness_probe_matches "$tmp/freeze.probe" 1 "$after_sha" "$freeze_config_sha" none
 
+# The public topology config must remain the source of VM fields while the
+# E2E participant contract is derived in an invocation-local JSON file.
+derived_config="$tmp/derived-e2e.jsonc"
+python3 "$root/scripts/tigonkv_config.py" derive-e2e \
+  "$root/experiment_config.jsonc" "$root/tests/fixtures/e2e_multivm_config.jsonc" \
+  "$derived_config"
+python3 - "$derived_config" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text())
+assert config["vm"]["storage_path"] == "/mnt/xz_vm_storage"
+assert config["vm"]["ssh_base_port"] == 10022
+assert config["shared_memory"]["backing_path"] == "/mnt/xz_shared_mem/ivshmem_shared_mem"
+assert config["tigon_kv"]["fixed_key_size"] == 32
+assert config["tigon_kv"]["fixed_value_size"] == 1000
+assert len(config["tigon_kv"]["partitioning"]["ranges"]) == 4
+PY
+
 # Regression: final metadata refresh must preserve probe detail recorded before
 # the post-freeze source/prepared-state update.
 harness_write_common_meta "$tmp/meta.json" tigon2 08 latencycheck 4096 "$freeze_config" source-a latency-a refreshed /root/tigon2
@@ -56,7 +76,7 @@ config="$tmp/config.jsonc"; printf '{}\n' >"$config"
 export SHARED_VM_E2E_LOCK_PATH="$tmp/shared-vm.lock"
 control_path="$(harness_ssh_control_path "$tmp/runtime/e2e/run-id" tigon2 "$(harness_hash_file "$config")")"
 control_worst=${control_path//%p/99999}
-[[ "$control_path" =~ /run-id/s/[0-9a-f]{2}-%p$ && ${#control_worst} -lt 91 ]]
+[[ "$control_path" =~ /e2e/s/[0-9a-f]{24}-%p$ && ${#control_worst} -lt 108 ]]
 (
   source "$script_dir/harness_common.sh"
   harness_acquire_lock tigon2 "$config" 4 10022 "$tmp/runtime" holder /mnt/xz_vm_storage /mnt/xz_shared_mem/ivshmem_shared_mem

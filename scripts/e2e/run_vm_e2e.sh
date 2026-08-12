@@ -63,7 +63,7 @@ build="$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$chec
 pool_build="$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" OFF ON)"
 participant="$build/e2e_$suite"; pool_tool="$pool_build/cxl_pool_initer"
 tool_prefix="$root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"
-latency_sha="$(git -C "$latency_sim" rev-parse HEAD)"; config_sha="$(harness_hash_file "$config")"; source_fingerprint="$(tigonkv_source_state "$root")"; export HARNESS_CLOSURE_STAMPS="$build/tigonkv_latency_sim_build_contract.json"
+latency_sha="$(git -C "$latency_sim" rev-parse HEAD)"; source_config="$config"; source_config_sha="$(harness_hash_file "$source_config")"; config_sha="$source_config_sha"; source_fingerprint="$(tigonkv_source_state "$root")"; export HARNESS_CLOSURE_STAMPS="$build/tigonkv_latency_sim_build_contract.json"
 remote_root="${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}"; runtime="$root/.tigon2"; vm_count="$TIGONKV_VM_COUNT"; base_port="$TIGONKV_SSH_BASE_PORT"
 storage="$TIGONKV_VM_STORAGE"; backing="$TIGONKV_SHARED_BACKING"
 shared_vm_resources_validate "$storage" "$backing" "$base_port" "$vm_count" "$execute"
@@ -109,7 +109,28 @@ if ! harness_acquire_lock tigon2 "$config" "$vm_count" "$base_port" "$runtime" "
   harness_emit_result "$out_dir" HARNESS_INVALID resolve "" failed shared-vm-resources-busy
   exit 125
 fi
+# The root experiment config is the VM/topology source.  Guest E2E08/E2E09
+# uses the existing multi-VM participant contract (32-byte keys, 1000-byte
+# values and its matching range splits), so derive an invocation-local config
+# without changing the caller's topology file.
+runtime_config="$run_runtime/e2e_experiment_config.jsonc"
+if ! python3 "$root/scripts/tigonkv_config.py" derive-e2e \
+    "$source_config" "$root/tests/fixtures/e2e_multivm_config.jsonc" "$runtime_config" \
+    >"$out_dir/logs/config_prepare.log" 2>&1; then
+  harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$source_config" unknown "$latency_sha" miss "$remote_root"
+  harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=4" "failed_stage=resolve" "reason=config-derive"
+  harness_emit_result "$out_dir" HARNESS_INVALID resolve "" failed config-derive
+  exit 125
+fi
+config="$runtime_config"
+config_sha="$(harness_hash_file "$config")"
+# The prepared artifact has a stable final guest path so a later invocation
+# can probe and reuse it.  Deployment still uses .new.<run-id> staging and an
+# atomic rename; run-scoped paths are for staging, logs, and release markers.
+remote_config="$remote_root/e2e-runtime/experiment_config.jsonc"
+export TIGONKV_VM_REMOTE_CONFIG="$remote_config"
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$config" unknown "$latency_sha" refreshed "$remote_root"
+harness_update_meta "$out_dir/run_meta.json" "source_config=$source_config" "source_config_sha256=$source_config_sha" "runtime_config=$config" "runtime_config_sha256=$config_sha"
 harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=4" "failed_stage=resolve" "reason=resolved"
 harness_mark_timing "$out_dir/run_meta.json" resolve_ms "$total_start_ms"
 state="$runtime/e2e/prepared_state.json"
@@ -149,7 +170,8 @@ if [[ -s "$state" && -x "$participant" && -x "$pool_tool" ]]; then
       "storage_source=$storage_source" "storage_fstype=$storage_fstype"
       "participant_targets=e2e_$suite,cxl_pool_initer"
       "participant_elf_sha256=$(harness_hash_file "$participant")"
-      "participant_manifest_sha256=$current_participant_manifest_sha" "experiment_config_sha256=$config_sha"
+      "participant_manifest_sha256=$current_participant_manifest_sha"
+      "source_config_sha256=$source_config_sha" "experiment_config_sha256=$config_sha"
       "remote_root=$remote_root" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size"
       "guest_tool_sha256=$fast_tool_binary_sha"
     )
@@ -257,7 +279,7 @@ state="$runtime/e2e/prepared_state.json"; state_common=(
   "build_fingerprint=$source_fingerprint" "compile_contract=$build_type/$optimization/compile-$compile_off/checker-$checker/ndebug-$e2e_ndebug/lto-$lto"
   "vm_count=$vm_count" "ssh_base_port=$base_port"
   "storage_path=$storage_real" "storage_source=$storage_source" "storage_fstype=$storage_fstype"
-  "participant_elf_sha256=$(harness_hash_file "$participant")" "participant_manifest_sha256=$participant_sha" "runtime_closure_manifest_path=$HARNESS_CLOSURE_CACHE_MANIFEST" "runtime_closure_cache_key=$HARNESS_CLOSURE_CACHE_KEY" "runtime_closure_manifest_sha256=$closure_sha" "runtime_closure_manifest_sha=$closure_sha" "experiment_config_sha256=$config_sha"
+  "participant_elf_sha256=$(harness_hash_file "$participant")" "participant_manifest_sha256=$participant_sha" "runtime_closure_manifest_path=$HARNESS_CLOSURE_CACHE_MANIFEST" "runtime_closure_cache_key=$HARNESS_CLOSURE_CACHE_KEY" "runtime_closure_manifest_sha256=$closure_sha" "runtime_closure_manifest_sha=$closure_sha" "source_config_sha256=$source_config_sha" "experiment_config_sha256=$config_sha"
   "latencycheck_prefix_manifest_path=$([[ "$checker" == ON ]] && printf '%s' "$runtime/e2e/tool-cache/latencycheck.manifest" || printf '%s' none)" "latencycheck_prefix_manifest_sha256=$tool_sha" "latencycheck_prefix_manifest_sha=$tool_sha" "guest_participant_sha256=$(harness_hash_file "$participant")" "guest_config_sha256=$config_sha" "guest_tool_sha256=$tool_binary_sha" "remote_root=$remote_root" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size")
 printf -v q_remote_root '%q' "$remote_root"
 printf -v q_remote_config '%q' "$remote_config"
