@@ -1407,25 +1407,34 @@ void DualRegionAllocator::Retire(uint32_t owner_shard, uint32_t queue_partition,
   auto *record = static_cast<OwnerPrivateRetireRecord *>(
       AllocateOwnerPrivate(sizeof(OwnerPrivateRetireRecord), queue_partition,
                            owner_shard));
-  new (record) OwnerPrivateRetireRecord;
-  mem_access::PrivateWrite(record, sizeof(OwnerPrivateRetireRecord));
-  record->bytes = bytes;
-  record->domain = domain;
-  record->private_partition = private_partition;
-  record->record_partition = queue_partition;
-  record->object_offset =
+  latency_sim::FixedLatencyConstructShared<OwnerPrivateRetireRecord>(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, record);
+  latency_sim::FixedLatencyMemoryStore(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, &record->bytes, bytes);
+  latency_sim::FixedLatencyMemoryStore(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, &record->domain, domain);
+  latency_sim::FixedLatencyMemoryStore(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+      &record->private_partition, private_partition);
+  latency_sim::FixedLatencyMemoryStore(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc,
+      &record->record_partition, queue_partition);
+  const RegionOffset object_offset =
       private_partition != UINT32_MAX
           ? SwccToOffset(pointer)
           : (domain == AllocationDomain::kSharedPayloadSwcc
                  ? EncodeSharedPayloadOffset(pointer, owner_shard)
                  : (IsHwccDomain(domain) ? hwcc_.ToOffset(pointer)
                                           : SwccToOffset(pointer)));
+  latency_sim::FixedLatencyMemoryStore(
+      latency_sim::MemoryDomain::kOwnerPrivateSwcc, &record->object_offset,
+      object_offset);
   auto &head = control->retire_heads[worker_id][epoch];
   RegionOffset previous = mem_access::PrivateAtomicLoad(
       head, std::memory_order_relaxed);
   do {
-    record->next = previous;
-    mem_access::PrivateWrite(&record->next, sizeof(record->next));
+    latency_sim::FixedLatencyMemoryStore(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &record->next, previous);
   } while (!mem_access::PrivateAtomicCompareExchangeWeak(
       head, previous, SwccToOffset(record), std::memory_order_release,
       std::memory_order_relaxed));
@@ -1454,9 +1463,11 @@ std::vector<OwnerPrivateRetireRecord> DualRegionAllocator::TakeRetired(
       std::memory_order_acq_rel);
   while (offset != kNullOffset) {
     auto *record = static_cast<OwnerPrivateRetireRecord *>(SwccFromOffset(offset));
-    mem_access::PrivateRead(record, sizeof(OwnerPrivateRetireRecord));
-    const OwnerPrivateRetireRecord copy = *record;
-    const RegionOffset next = record->next;
+    OwnerPrivateRetireRecord copy;
+    latency_sim::FixedLatencyCopySharedToLocal(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &copy, record,
+        sizeof(copy));
+    const RegionOffset next = copy.next;
     retired.push_back(copy);
     if (copy.record_partition >= header_->layout.partition_count)
       throw std::runtime_error("owner-private EBR record has invalid queue partition");

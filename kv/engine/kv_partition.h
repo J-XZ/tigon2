@@ -194,6 +194,8 @@ class KVPartition {
   star::TwoPLPashaMetadataShared *ClockTrackerSharedRow(
       RegionOffset smeta_offset) const;
   bool ClockTrackerNodeMatches(const PrivateClockTrackerNode &node) const;
+  bool ClockTrackerNodeMatches(RegionOffset node_value_offset,
+                               RegionOffset node_smeta_offset) const;
   uint64_t shared_payload_used_bytes() const;
   uint64_t shared_payload_capacity_bytes() const;
 

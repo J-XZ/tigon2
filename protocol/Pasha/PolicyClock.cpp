@@ -98,32 +98,42 @@ class PolicyClock::ClockTracker {
   ClockTrackerNode *move_forward_and_get_cursor(ITable *table) {
     if (table == nullptr) throw std::invalid_argument("null Clock table");
     auto *control = partition_.ClockTrackerControl();
-    tigonkv::engine::mem_access::PrivateRead(&control->cursor,
-                                             sizeof(control->cursor));
-    if (control->cursor == tigonkv::engine::kNullOffset) {
-      tigonkv::engine::mem_access::PrivateRead(&control->head,
-                                               sizeof(control->head));
-      control->cursor = control->head;
+    const auto cursor = latency_sim::FixedLatencyMemoryLoad(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &control->cursor);
+    tigonkv::engine::RegionOffset next_cursor =
+        tigonkv::engine::kNullOffset;
+    if (cursor == tigonkv::engine::kNullOffset) {
+      next_cursor = latency_sim::FixedLatencyMemoryLoad(
+          latency_sim::MemoryDomain::kOwnerPrivateSwcc, &control->head);
     } else {
-      auto *current = partition_.ResolveClockTrackerNode(control->cursor);
+      auto *current = partition_.ResolveClockTrackerNode(cursor);
       if (current == nullptr) throw std::runtime_error("Clock cursor offset is invalid");
-      tigonkv::engine::mem_access::PrivateRead(current, sizeof(*current));
-      control->cursor = current->next_off;
+      next_cursor = latency_sim::FixedLatencyMemoryLoad(
+          latency_sim::MemoryDomain::kOwnerPrivateSwcc, &current->next_off);
     }
-    tigonkv::engine::mem_access::PrivateWrite(&control->cursor,
-                                              sizeof(control->cursor));
-    if (control->cursor == tigonkv::engine::kNullOffset) return nullptr;
-    auto *node = partition_.ResolveClockTrackerNode(control->cursor);
+    latency_sim::FixedLatencyMemoryStore(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &control->cursor,
+        next_cursor);
+    if (next_cursor == tigonkv::engine::kNullOffset) return nullptr;
+    auto *node = partition_.ResolveClockTrackerNode(next_cursor);
     if (node == nullptr) throw std::runtime_error("Clock candidate offset is invalid");
-    tigonkv::engine::mem_access::PrivateRead(node, sizeof(*node));
-    if (!partition_.ClockTrackerNodeMatches(*node))
+    const auto node_value_offset = latency_sim::FixedLatencyMemoryLoad(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &node->value_off);
+    const auto node_smeta_offset = latency_sim::FixedLatencyMemoryLoad(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &node->smeta_off);
+    if (!partition_.ClockTrackerNodeMatches(node_value_offset,
+                                             node_smeta_offset))
       throw std::runtime_error("Clock tracker node/local-row mismatch");
-    node_.node_offset = control->cursor;
-    node_.row_entity = MigrationManager::migrated_row_entity(
-        table, node->key.bytes, partition_.ClockTrackerLocalRow(node->value_off),
-        /*metadata_size=*/0);
+    node_.node_offset = next_cursor;
+    node_.row_entity.table = table;
+    node_.row_entity.metadata_size = 0;
+    node_.row_entity.local_row =
+        partition_.ClockTrackerLocalRow(node_value_offset);
     node_.row_entity.migration_manager_meta =
-        partition_.ClockTrackerSharedRow(node->smeta_off);
+        partition_.ClockTrackerSharedRow(node_smeta_offset);
+    latency_sim::FixedLatencyCopySharedToLocal(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, node_.row_entity.key,
+        node->key.bytes, table->key_size());
     return &node_;
   }
 
@@ -138,14 +148,16 @@ class PolicyClock::ClockTracker {
         tigonkv::engine::FixedKey::From(
             std::string_view(static_cast<const char *>(key), 32), 32);
     auto *control = partition_.ClockTrackerControl();
-    tigonkv::engine::mem_access::PrivateRead(&control->head,
-                                             sizeof(control->head));
-    for (auto offset = control->head; offset != tigonkv::engine::kNullOffset;) {
+    auto offset = latency_sim::FixedLatencyMemoryLoad(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &control->head);
+    for (; offset != tigonkv::engine::kNullOffset;) {
       auto *node = partition_.ResolveClockTrackerNode(offset);
       if (node == nullptr) throw std::runtime_error("Clock node offset is invalid");
-      tigonkv::engine::mem_access::PrivateRead(node, sizeof(*node));
-      const auto next = node->next_off;
-      if (node->key.Compare(fixed_key) == 0) {
+      const auto next = latency_sim::FixedLatencyMemoryLoad(
+          latency_sim::MemoryDomain::kOwnerPrivateSwcc, &node->next_off);
+      if (latency_sim::FixedLatencyMemcmpSharedToLocal(
+              latency_sim::MemoryDomain::kOwnerPrivateSwcc, node->key.bytes,
+              fixed_key.bytes, sizeof(node->key.bytes)) == 0) {
         unlink_and_free(offset);
         return;
       }
@@ -155,9 +167,9 @@ class PolicyClock::ClockTracker {
 
   void reset_cursor() {
     auto *control = partition_.ClockTrackerControl();
-    tigonkv::engine::mem_access::PrivateWrite(&control->cursor,
-                                              sizeof(control->cursor));
-    control->cursor = tigonkv::engine::kNullOffset;
+    latency_sim::FixedLatencyMemoryStore(
+        latency_sim::MemoryDomain::kOwnerPrivateSwcc, &control->cursor,
+        tigonkv::engine::kNullOffset);
   }
 
  private:

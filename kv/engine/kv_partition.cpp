@@ -2079,11 +2079,16 @@ star::TwoPLPashaMetadataShared *KVPartition::ClockTrackerSharedRow(
 
 bool KVPartition::ClockTrackerNodeMatches(
     const PrivateClockTrackerNode &node) const {
-  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   const RegionOffset node_value_offset = latency_sim::FixedLatencyMemoryLoad(
       latency_sim::MemoryDomain::kOwnerPrivateSwcc, &node.value_off);
   const RegionOffset node_smeta_offset = latency_sim::FixedLatencyMemoryLoad(
       latency_sim::MemoryDomain::kOwnerPrivateSwcc, &node.smeta_off);
+  return ClockTrackerNodeMatches(node_value_offset, node_smeta_offset);
+}
+
+bool KVPartition::ClockTrackerNodeMatches(
+    RegionOffset node_value_offset, RegionOffset node_smeta_offset) const {
+  using Access = star::LocalMetadataAccess<PrivateMetadataLocal>;
   if (node_value_offset == kNullOffset || node_smeta_offset == kNullOffset)
     return false;
   auto *resolved_value = ValueFromOffset(node_value_offset);
