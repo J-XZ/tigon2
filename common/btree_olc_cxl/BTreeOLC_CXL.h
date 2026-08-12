@@ -97,7 +97,8 @@ class PersistentOffset {
   PersistentOffset(std::nullptr_t) {
     store_offset(tigonkv::engine::kNullOffset);
   }
-  PersistentOffset(std::nullptr_t, latency_sim::MemoryDomain domain) {
+  LATENCY_SIM_FORCE_INLINE PersistentOffset(
+      std::nullptr_t, latency_sim::MemoryDomain domain) {
     latency_sim::FixedLatencyMemoryStore(
         domain, &offset_, tigonkv::engine::kNullOffset);
   }

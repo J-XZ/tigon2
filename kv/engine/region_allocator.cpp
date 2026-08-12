@@ -23,9 +23,9 @@ bool RangeContains(uint64_t begin, uint64_t length, uint64_t offset,
                    uint64_t bytes);
 
 
-uint64_t CheckedAtomicSubtract(std::atomic<uint64_t> *counter, uint64_t bytes,
-                               const char *detail,
-                               latency_sim::MemoryDomain domain) {
+LATENCY_SIM_FORCE_INLINE uint64_t CheckedAtomicSubtract(
+    std::atomic<uint64_t> *counter, uint64_t bytes, const char *detail,
+    latency_sim::MemoryDomain domain) {
   uint64_t before = latency_sim::FixedLatencyAtomicLoad(
       *counter, std::memory_order_relaxed, domain);
   for (;;) {
