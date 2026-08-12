@@ -14,6 +14,7 @@
 // once configured, so the wrapped path is the only runtime variant.
 #include <latency_sim/config.h>
 #include <latency_sim/simulator.h>
+#include <latency_sim/testing.h>
 #include "common/CXLMemory.h"
 #include "common/MPSCRingBuffer.h"
 #include "kv/engine/kv_partition.h"
@@ -311,10 +312,10 @@ uint64_t RunOrdinary(bool wrapped, BenchmarkEngine &bench) {
   for (uint64_t i = 0; i < kIterations; ++i) {
     auto &value = values[i & 255u];
     if (wrapped) {
-      latency_sim::FixedLatencyChargeRange(
+      latency_sim::testing::ChargeRangeForTest(
           latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
           &value, sizeof(value));
-      latency_sim::FixedLatencyChargeRange(
+      latency_sim::testing::ChargeRangeForTest(
           latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kWrite,
           &value, sizeof(value));
     }
@@ -353,7 +354,7 @@ uint64_t RunBtreeDomainAdapter(bool wrapped, BenchmarkEngine &bench) {
   for (uint64_t i = 0; i < kIterations; ++i) {
     auto &node = nodes[(i * 17) & 255u];
     if (wrapped) {
-      latency_sim::FixedLatencyChargeRange(
+      latency_sim::testing::ChargeRangeForTest(
           latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
           &node, sizeof(node));
     }
@@ -429,12 +430,12 @@ uint64_t RunSccBulk(bool wrapped, BenchmarkEngine &bench, uint64_t bytes) {
   uint64_t checksum = 0;
   for (uint64_t i = 0; i < kIterations; ++i) {
     src[0] = static_cast<char>(i);
-    latency_sim::FixedLatencyChargeRange(
+    latency_sim::testing::ChargeRangeForTest(
         latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kWrite,
         payload->data, bytes);
     star::scc_manager->do_write(smeta, 0, payload->data, src.data(), bytes);
     star::scc_manager->finish_write(smeta, 0, payload, bytes);
-    latency_sim::FixedLatencyChargeRange(
+    latency_sim::testing::ChargeRangeForTest(
         latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kRead,
         payload->data, bytes);
     star::scc_manager->do_read(smeta, 0, dst.data(), payload->data, bytes);

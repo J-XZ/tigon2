@@ -54,7 +54,7 @@ struct TestBuffers {
 void ThrowsOnEarlyExit(TestBuffers *buffers) {
   tigonkv::engine::mem_access::LatencyScope scope(
       latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(
+  latency_sim::testing::ChargeRangeForTest(
       latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kWrite,
       buffers->hwcc, 128);
   throw std::runtime_error("scope cleanup");
@@ -95,19 +95,19 @@ int main() {
     assert(tigonkv::engine::mem_access::HwccAtomicFetchAdd(
                *value, uint64_t{3}, std::memory_order_relaxed) == 7);
     assert(value->load(std::memory_order_relaxed) == 10);
-    latency_sim::FixedLatencyChargeRange(
+    latency_sim::testing::ChargeRangeForTest(
         latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
         buffers.hwcc, 64);
-    latency_sim::FixedLatencyChargeRange(
+    latency_sim::testing::ChargeRangeForTest(
         latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kWrite,
         buffers.hwcc, 64);
-    latency_sim::FixedLatencyChargeRange(
+    latency_sim::testing::ChargeRangeForTest(
         latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
         buffers.hwcc, 64);
-    latency_sim::FixedLatencyChargeRange(
+    latency_sim::testing::ChargeRangeForTest(
         latency_sim::MemoryDomain::kSwcc, latency_sim::AccessKind::kRead,
         buffers.swcc, 64);
-    latency_sim::FixedLatencyChargeRange(
+    latency_sim::testing::ChargeRangeForTest(
         latency_sim::MemoryDomain::kOwnerPrivateSwcc,
         latency_sim::AccessKind::kWrite, buffers.swcc, 64);
   }
@@ -134,7 +134,7 @@ int main() {
   // scope is required and bookkeeping still runs; the pending delay is zero.
   // (ScopedLatencyPools already applied the 0/0 model above.)
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 256);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
   assert(simulator.HasActiveScopeForCurrentThread());
@@ -146,18 +146,18 @@ int main() {
   // are charged by covered line on every call.
   ReopenWith(&buffers, Fixed(7, 13));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 0);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 1, 1);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 63, 2);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 1, 1);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kWrite,
                         static_cast<std::byte *>(buffers.hwcc) + 127, 2);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 54);  // 4*7 + 2*13
@@ -165,7 +165,7 @@ int main() {
   // Nested scopes share one worker-local pending delay and settle only at the
   // outer safe point.
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 1);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 67);
   simulator.EndScopeAndDelay();
@@ -212,11 +212,11 @@ int main() {
   // into the foreground thread.
   ReopenWith(&buffers, Fixed(17, 19));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 64);
   std::thread worker([&] {
     simulator.BeginScope(latency_sim::ExecutionClass::kBackground);
-    latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+    latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                           latency_sim::AccessKind::kRead, buffers.swcc, 64);
     assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 17);
     simulator.EndScopeAndDelay();
@@ -239,16 +239,16 @@ int main() {
   // 0.4 + 0.4 + 0.2 = 1ns while each access alone would round to 0ns.
   ReopenWith(&buffers, Fixed(0.4, 0.2));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64 * 5);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayPsForTest() == 2000);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 2);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 64, 64);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 64);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead,
                         static_cast<std::byte *>(buffers.swcc) + 128, 64);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayPsForTest() == 3000);
@@ -257,7 +257,7 @@ int main() {
 
   ReopenWith(&buffers, Fixed(1.25, 0.0));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64 * 4);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayPsForTest() == 5000);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 5);
@@ -270,7 +270,7 @@ int main() {
   latency_sim::detail::SetDelaySpinBackendForTest(&NoOpDelaySpin);
   ReopenWith(&buffers, Fixed(1.0e16, 0.0));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayPsForTest() == 10000000000000000000ull);
   simulator.EndScopeAndDelay();
@@ -282,7 +282,7 @@ int main() {
   if (fork() == 0) {
     {
       latency_sim::ScopeGuard scope(latency_sim::ExecutionClass::kForeground);
-      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+      latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                             latency_sim::AccessKind::kRead, buffers.swcc, 128);
     }  // scope exit settles: 2 x 1e19 ps overflows -> abort before _exit
     _exit(0);
@@ -297,9 +297,9 @@ int main() {
   if (fork() == 0) {
     {
       latency_sim::ScopeGuard scope(latency_sim::ExecutionClass::kForeground);
-      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+      latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                             latency_sim::AccessKind::kRead, buffers.swcc, 64);
-      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+      latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                             latency_sim::AccessKind::kRead, buffers.hwcc, 64);
     }  // scope exit settles: 1e19 + 1e19 ps overflows -> abort before _exit
     _exit(0);
@@ -311,7 +311,7 @@ int main() {
   // Always-active access outside an explicit scope hard fails.
   ReopenWith(&buffers, Fixed(3, 11));
   if (fork() == 0) {
-    latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+    latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                           latency_sim::AccessKind::kRead, buffers.hwcc, 64);
     _exit(0);
   }
@@ -323,14 +323,14 @@ int main() {
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
   if (debug_range_checks) {
     if (fork() == 0) {
-      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+      latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                             latency_sim::AccessKind::kRead, buffers.hwcc, 64);
       _exit(0);
     }
     assert(waitpid(-1, &status, 0) > 0);
     assert(WIFSIGNALED(status));
     if (fork() == 0) {
-      latency_sim::FixedLatencyChargeRange(
+      latency_sim::testing::ChargeRangeForTest(
           latency_sim::MemoryDomain::kHwcc, latency_sim::AccessKind::kRead,
           static_cast<std::byte *>(buffers.hwcc) + kPage - 1, 2);
       _exit(0);
@@ -348,7 +348,7 @@ int main() {
   // still-alive guard) and no deferred segment is lost or duplicated.
   ReopenWith(&buffers, Fixed(9, 9));
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 64);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 9);
   const std::uint64_t foreground_generation =
@@ -357,7 +357,7 @@ int main() {
   assert(!simulator.HasActiveScopeForCurrentThread());
   assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 0);
   simulator.BeginScope(latency_sim::ExecutionClass::kBackground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kSwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kSwcc,
                         latency_sim::AccessKind::kRead, buffers.swcc, 64);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 9);
   // V6 contract: a second suspension while already suspended is a lifecycle
@@ -380,7 +380,7 @@ int main() {
   ReopenWith(&buffers, Fixed(3, 3));
   simulator.BeginScope(latency_sim::ExecutionClass::kBackground);
   simulator.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                         latency_sim::AccessKind::kRead, buffers.hwcc, 64);
   assert(latency_sim::testing::Accessor(simulator).PendingDelayNsForTest() == 3);
   {
@@ -415,7 +415,7 @@ int main() {
   global.RegisterPool(latency_sim::MemoryDomain::kHwcc, gen1, kPage);
   global.Configure(Fixed(1, 1));
   global.BeginScope(latency_sim::ExecutionClass::kForeground);
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                      latency_sim::AccessKind::kRead, gen1, 64);
   assert(latency_sim::testing::Accessor(global).PendingDelayNsForTest() == 1);
   global.EndScopeAndDelay();
@@ -428,14 +428,14 @@ int main() {
   global.BeginScope(latency_sim::ExecutionClass::kForeground);
   if (debug_range_checks) {
     if (fork() == 0) {
-      latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+      latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                          latency_sim::AccessKind::kRead, gen1, 64);
       _exit(0);
     }
     assert(waitpid(-1, &status, 0) > 0);
     assert(WIFSIGNALED(status));
   }
-  latency_sim::FixedLatencyChargeRange(latency_sim::MemoryDomain::kHwcc,
+  latency_sim::testing::ChargeRangeForTest(latency_sim::MemoryDomain::kHwcc,
                      latency_sim::AccessKind::kRead, gen2, 64);
   assert(latency_sim::testing::Accessor(global).PendingDelayNsForTest() == 1);
   global.EndScopeAndDelay();
