@@ -5,7 +5,7 @@ root="$(cd "$script_dir/../.." && pwd)"
 source "$script_dir/harness_common.sh"
 source "$root/scripts/tigonkv_vm_common.sh"
 source "$root/scripts/tigonkv_build_helpers.sh"
-execute=0; prepare_only=0; profile=fixed-latency; suite=08; config="$root/experiment_config.jsonc"; rounds=1; record_count=4096; round_timeout=1800; total_timeout=86400; requested_out=""
+execute=0; prepare_only=0; profile=fixed-latency; suite=08; config="$root/experiment_config.jsonc"; rounds=1; record_count=4096; round_timeout=1800; total_timeout=7200; requested_out=""
 usage() {
   cat <<'USAGE'
 Usage: scripts/e2e/run_vm_e2e.sh [options]

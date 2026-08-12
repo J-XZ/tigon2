@@ -271,6 +271,17 @@ PY
 
 "$script_dir/run_vm_e2e.sh" --help >/dev/null
 "$script_dir/run_vm_trace.sh" --help >/dev/null
+python3 - "$script_dir/run_vm_e2e.sh" "$root/scripts/e2e/run_guest_e2e_workflows.sh" <<'PY'
+import sys
+from pathlib import Path
+
+canonical = Path(sys.argv[1]).read_text()
+workflow = Path(sys.argv[2]).read_text()
+assert 'total_timeout=7200' in canonical
+assert '--skip-deploy' in canonical
+assert 'if ((skip_deploy == 0)); then' in workflow
+assert 'sync_guest_binary "$suite"' in workflow
+PY
 rg -q 'TIGONKV_E2E_ACTUAL_EVENTS=' "$script_dir/run_vm_trace.sh"
 rg -q 'kind":"pool_reset"' "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh"
 rg -q -- '--tool=latencycheck --fair-sched=yes' "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh"

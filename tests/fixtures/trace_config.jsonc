@@ -7,7 +7,7 @@
   "warmup_rounds": 0,
   "rounds": 1,
   "round_timeout_sec": 7200,
-  "total_timeout_sec": 86400,
+  "total_timeout_sec": 14400,
   "batch_ops": 4096,
   "value_seed": 4851300051586183745,
   "phases": {

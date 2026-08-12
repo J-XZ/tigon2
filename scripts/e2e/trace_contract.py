@@ -27,7 +27,7 @@ DEFAULTS: dict[str, Any] = {
     "warmup_rounds": 0,
     "rounds": 1,
     "round_timeout_sec": 7_200,
-    "total_timeout_sec": 86_400,
+    "total_timeout_sec": 14_400,
     "batch_ops": 4_096,
     "value_seed": 4_851_300_051_586_183_745,
 }
