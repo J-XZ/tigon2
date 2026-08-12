@@ -511,7 +511,13 @@ guest_participant_sha="$(harness_hash_file "$runner")"
 guest_probe_file="$run_runtime/guest_probe.txt"; guest_probe_sha=""
 prepare_start_ms=$(harness_now_ms)
 if guest_probe_sha="$(harness_probe_guest "$vm_count" "$base_port" "$ssh_control_path" "$guest_probe_file" "$probe_command")" && \
-   harness_probe_matches "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"; then echo "GUEST_PROBE_OK sha=$guest_probe_sha"; else echo "GUEST_PROBE_INVALID reason=unreachable_or_artifact_mismatch" >&2; fi
+   harness_probe_matches "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"; then
+  echo "GUEST_PREDEPLOY_PROBE_MATCH sha=$guest_probe_sha"
+  harness_update_meta "$out_dir/run_meta.json" "predeploy_probe_status=match"
+else
+  echo "GUEST_PREDEPLOY_PROBE_NOT_AUTHORITATIVE reason=unreachable_or_stale_artifact" >&2
+  harness_update_meta "$out_dir/run_meta.json" "predeploy_probe_status=stale_or_unavailable"
+fi
 harness_record_probe_meta "$out_dir/run_meta.json" "$guest_probe_file" "$vm_count" "$guest_participant_sha" "$config_sha" "$tool_binary_sha"
 guest_boot_ids=""
 [[ -f "$guest_probe_file" ]] && guest_boot_ids="$(harness_probe_boot_ids "$guest_probe_file" || true)"

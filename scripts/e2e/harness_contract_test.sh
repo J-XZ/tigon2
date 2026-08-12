@@ -53,6 +53,17 @@ PY
 # Regression: final metadata refresh must preserve probe detail recorded before
 # the post-freeze source/prepared-state update.
 harness_write_common_meta "$tmp/meta.json" tigon2 08 latencycheck 4096 "$freeze_config" source-a latency-a refreshed /root/tigon2
+python3 - "$tmp/meta.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data['operation_count'] == 4096
+assert data['predeploy_probe_status'] == 'not-run'
+PY
+harness_update_meta "$tmp/meta.json" "predeploy_probe_status=stale_or_unavailable"
+python3 - "$tmp/meta.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))['predeploy_probe_status'] == 'stale_or_unavailable'
+PY
 harness_update_meta "$tmp/meta.json" 'per_node_observed_json=[{"node":0,"participant":"old","boot_id":"boot-a"}]'
 harness_write_common_meta "$tmp/meta.json" tigon2 08 latencycheck 4096 "$freeze_config" source-b latency-b hit /root/tigon2
 python3 - "$tmp/meta.json" <<'PY'

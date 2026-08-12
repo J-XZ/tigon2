@@ -248,7 +248,7 @@ from pathlib import Path
 path, project, suite, profile, records, config, source, latency_sha, prepared, remote_root=sys.argv[1:]
 path=Path(path); cfg=Path(config)
 payload=json.loads(path.read_text()) if path.exists() else {}
-payload.update({'project':project,'suite':suite,'profile':profile,'record_count':int(records),'operation_count':None,
+payload.update({'project':project,'suite':suite,'profile':profile,'record_count':int(records),'operation_count':int(records),
  'logical_operation_count':int(records),'physical_operation_count':int(records),'vm_count':None,
  'workers_per_vm':None,'source_fingerprint':source,'latency_sim_sha':latency_sha,
  'config_sha256':hashlib.sha256(cfg.read_bytes()).hexdigest(),'prepared_state':prepared,
@@ -261,7 +261,7 @@ defaults={'reason':'','failed_stage':'','first_node':None,'cleanup_status':'pend
  'per_node_expected':None,'per_node_observed':None,'first_mismatch':None,
  'resolve_ms':0,'build_ms':0,'freeze_ms':0,'closure_ms':0,'prepare_ms':0,'deploy_ms':0,
  'probe_ms':0,'cleanup_ms':0,
- 'run_id':path.parent.name}
+ 'run_id':path.parent.name,'predeploy_probe_status':'not-run'}
 for key,value in defaults.items(): payload.setdefault(key,value)
 payload['config']=str(cfg.resolve())
 temporary=path.with_name(path.name+f'.new.{os.getpid()}')
