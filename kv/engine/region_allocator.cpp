@@ -37,6 +37,7 @@ uint64_t CheckedAtomicSubtract(std::atomic<uint64_t> *counter, uint64_t bytes,
   }
 }
 
+#if !defined(LATENCY_SIM_COMPILE_OFF)
 latency_sim::MemoryDomain AtomicDomainFor(bool hwcc, bool /*shared_payload*/) {
   // Shared-payload allocator control is still owner-local metadata.  Mapping
   // it to the owner-private bucket records the executed operation without
@@ -44,35 +45,64 @@ latency_sim::MemoryDomain AtomicDomainFor(bool hwcc, bool /*shared_payload*/) {
   return hwcc ? latency_sim::MemoryDomain::kHwcc
               : latency_sim::MemoryDomain::kOwnerPrivateSwcc;
 }
+#endif
 
 template <typename T>
-T FixedLatencyLoadFor(const std::atomic<T> &value, bool hwcc, bool shared_payload,
-                 std::memory_order order) {
+LATENCY_SIM_FORCE_INLINE T FixedLatencyLoadFor(
+    const std::atomic<T> &value, bool hwcc, bool shared_payload,
+    std::memory_order order) {
+#if defined(LATENCY_SIM_COMPILE_OFF)
+  (void)hwcc;
+  (void)shared_payload;
+  return value.load(order);
+#else
   return latency_sim::FixedLatencyAtomicLoad(
       value, order, AtomicDomainFor(hwcc, shared_payload));
+#endif
 }
 
 template <typename T>
-void FixedLatencyStoreFor(std::atomic<T> &value, T desired, bool hwcc,
-                     bool shared_payload, std::memory_order order) {
+LATENCY_SIM_FORCE_INLINE void FixedLatencyStoreFor(
+    std::atomic<T> &value, T desired, bool hwcc, bool shared_payload,
+    std::memory_order order) {
+#if defined(LATENCY_SIM_COMPILE_OFF)
+  (void)hwcc;
+  (void)shared_payload;
+  value.store(desired, order);
+#else
   latency_sim::FixedLatencyAtomicStore(
       value, desired, order, AtomicDomainFor(hwcc, shared_payload));
+#endif
 }
 
 template <typename T>
-T FixedLatencyFetchAddFor(std::atomic<T> &value, T operand, bool hwcc,
-                     bool shared_payload, std::memory_order order) {
+LATENCY_SIM_FORCE_INLINE T FixedLatencyFetchAddFor(
+    std::atomic<T> &value, T operand, bool hwcc, bool shared_payload,
+    std::memory_order order) {
+#if defined(LATENCY_SIM_COMPILE_OFF)
+  (void)hwcc;
+  (void)shared_payload;
+  return value.fetch_add(operand, order);
+#else
   return latency_sim::FixedLatencyAtomicFetchAdd(
       value, operand, order, AtomicDomainFor(hwcc, shared_payload));
+#endif
 }
 
 template <typename T>
-bool FixedLatencyCasWeakFor(std::atomic<T> &value, T &expected, T desired,
-                       bool hwcc, bool shared_payload,
-                       std::memory_order success, std::memory_order failure) {
+LATENCY_SIM_FORCE_INLINE bool FixedLatencyCasWeakFor(
+    std::atomic<T> &value, T &expected, T desired, bool hwcc,
+    bool shared_payload, std::memory_order success,
+    std::memory_order failure) {
+#if defined(LATENCY_SIM_COMPILE_OFF)
+  (void)hwcc;
+  (void)shared_payload;
+  return value.compare_exchange_weak(expected, desired, success, failure);
+#else
   return latency_sim::FixedLatencyAtomicCompareExchangeWeak(
       value, expected, desired, success, failure,
       AtomicDomainFor(hwcc, shared_payload));
+#endif
 }
 
 #ifndef NDEBUG
