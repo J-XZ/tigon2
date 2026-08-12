@@ -73,6 +73,7 @@ function(tigonkv_enable_latency_sim)
       "latency_sim optimization profile used by Tigon2 consumers" FORCE)
   set(LATENCY_SIM_ENABLE_LTO ON CACHE BOOL
       "Full LTO on latency_sim and its final consumers (Tigon2 policy)" FORCE)
+  include("${TIGONKV_LATENCY_SIM_SOURCE_DIR}/cmake/LatencySimBuildOptions.cmake")
   add_subdirectory("${TIGONKV_LATENCY_SIM_SOURCE_DIR}"
                    "${CMAKE_CURRENT_BINARY_DIR}/latency_sim_build"
                    EXCLUDE_FROM_ALL)
