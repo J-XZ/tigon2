@@ -37,6 +37,28 @@ harness_manifest() {
   sort -u -o "$output" "$output"
 }
 harness_manifest_sha() { harness_hash_file "$1"; }
+harness_state_value() {
+  local state=$1 key=$2
+  python3 - "$state" "$key" <<'PY'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text())
+value = data.get(sys.argv[2], '')
+if isinstance(value, (dict, list)):
+    raise SystemExit(2)
+print('' if value is None else value)
+PY
+}
+harness_manifest_valid() {
+  local manifest=$1 expected_sha=$2
+  [[ -s "$manifest" ]] || return 1
+  [[ "$(harness_hash_file "$manifest")" == "$expected_sha" ]] || return 1
+  local expected path
+  while read -r expected path; do
+    [[ -n "$expected" && -n "$path" ]] || continue
+    [[ -f "$path" && "$expected" == "$(harness_hash_file "$path")" ]] || return 1
+  done <"$manifest"
+}
 harness_ssh_control_path() {
   local runtime=$1 project=$2 config_sha=$3
   local config_prefix=${config_sha:0:2}
@@ -53,6 +75,61 @@ harness_closure_manifest() {
   shift 3
   local cache_dir="$runtime/e2e/closure-cache"
   mkdir -p "$cache_dir"
+  local key
+  key=$(harness_closure_cache_key "$runtime" "$variant" "$@") || return $?
+  local cache="$cache_dir/$key.manifest"
+  local valid=0
+  if [[ -s "$cache" ]]; then
+    valid=1
+    while read -r expected path; do
+      if [[ -z "$path" || ! -f "$path" || "$expected" != "$(harness_hash_file "$path")" ]]; then
+        valid=0
+        break
+      fi
+    done <"$cache"
+  fi
+  if ((valid)); then
+    cp -- "$cache" "$output"
+    HARNESS_CLOSURE_CACHE_KEY=$key
+    HARNESS_CLOSURE_CACHE_MANIFEST=$cache
+    echo "CLOSURE_CACHE_HIT key=$key"
+    return 0
+  fi
+  local tmp="$cache.tmp.$$"
+  : >"$tmp"
+  local -a queue=("$@")
+  local queue_index=0
+  declare -A seen=()
+  while ((queue_index < ${#queue[@]})); do
+    local queue_elf=${queue[$queue_index]}
+    queue_index=$((queue_index + 1))
+    [[ -n "$queue_elf" ]] || continue
+    local current
+    current=$(realpath -e -- "$queue_elf" 2>/dev/null || true)
+    [[ -n "$current" && -f "$current" ]] || continue
+    if [[ -n "${seen[$current]:-}" ]]; then continue; fi
+    seen[$current]=1
+    printf '%s  %s\n' "$(harness_hash_file "$current")" "$current" >>"$tmp"
+    local dep
+    while IFS= read -r dep; do
+      if [[ -n "$dep" && -f "$dep" ]]; then
+        dep=$(realpath -e -- "$dep" 2>/dev/null || true)
+        [[ -n "$dep" ]] && queue+=("$dep")
+      fi
+    done < <({ ldd "$current" 2>/dev/null || true; readelf -l "$current" 2>/dev/null || true; } |
+      awk '/=> \// {print $3} /^[[:space:]]*\// {print $1}' | sed 's/[][]//g' | sort -u)
+  done
+  sort -u -o "$tmp" "$tmp"
+  mv -f -- "$tmp" "$cache"
+  cp -- "$cache" "$output"
+  HARNESS_CLOSURE_CACHE_KEY=$key
+  HARNESS_CLOSURE_CACHE_MANIFEST=$cache
+  echo "CLOSURE_CACHE_MISS key=$key"
+}
+
+harness_closure_cache_key() {
+  local runtime=$1 variant=$2
+  shift 2
   local key_input="$variant"$'\n'"runtime=$(realpath -m "$runtime")"$'\n'"$(sha256sum "$BASH_SOURCE" | awk '{print $1}')"
   key_input+=$'\n'"ldd=$(ldd --version 2>&1 | head -n 1)"
   key_input+=$'\n'"LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}"
@@ -73,44 +150,34 @@ harness_closure_manifest() {
     key_input+=$'\n'$(harness_hash_file "$elf")$'\n'$(realpath "$elf")
     key_input+=$'\n'"$(readelf -l -d "$elf" 2>/dev/null | sed -n '/INTERP\|RPATH\|RUNPATH/p')"
   done
-  local key cache valid=0
-  key=$(printf '%s' "$key_input" | sha256sum | awk '{print $1}')
-  cache="$cache_dir/$key.manifest"
-  if [[ -s "$cache" ]]; then
-    valid=1
-    while read -r expected path; do
-      if [[ -z "$path" || ! -f "$path" || "$expected" != "$(harness_hash_file "$path")" ]]; then valid=0; break; fi
-    done <"$cache"
+  printf '%s' "$key_input" | sha256sum | awk '{print $1}'
+}
+
+harness_closure_cache_valid() {
+  local cache=$1 expected_sha=$2 expected_key=${3:-}
+  [[ -s "$cache" ]] || return 1
+  [[ "$(harness_hash_file "$cache")" == "$expected_sha" ]] || return 1
+  if [[ -n "$expected_key" ]]; then
+    [[ "$(basename "$cache")" == "$expected_key.manifest" ]] || return 1
   fi
-  if ((valid)); then cp -- "$cache" "$output"; echo "CLOSURE_CACHE_HIT key=$key"; return 0; fi
-  local tmp="$cache.tmp.$$"
-  : >"$tmp"
-  local -a queue=("$@")
-  local queue_index=0
-  declare -A seen=()
-  while ((queue_index < ${#queue[@]})); do
-    elf=${queue[$queue_index]}
-    queue_index=$((queue_index + 1))
-    [[ -n "$elf" ]] || continue
-    local current
-    current=$(realpath -e -- "$elf" 2>/dev/null || true)
-    [[ -n "$current" && -f "$current" ]] || continue
-    if [[ -n "${seen[$current]:-}" ]]; then continue; fi
-    seen[$current]=1
-    printf '%s  %s\n' "$(harness_hash_file "$current")" "$current" >>"$tmp"
-    local dep
-    while IFS= read -r dep; do
-      if [[ -n "$dep" && -f "$dep" ]]; then
-        dep=$(realpath -e -- "$dep" 2>/dev/null || true)
-        if [[ -n "$dep" ]]; then queue+=("$dep"); fi
-      fi
-    done < <({ ldd "$current" 2>/dev/null || true; readelf -l "$current" 2>/dev/null || true; } |
-      awk '/=> \// {print $3} /^[[:space:]]*\// {print $1}' | sed 's/[][]//g' | sort -u)
-  done
-  sort -u -o "$tmp" "$tmp"
-  mv -f -- "$tmp" "$cache"
-  cp -- "$cache" "$output"
-  echo "CLOSURE_CACHE_MISS key=$key"
+  local expected path
+  while read -r expected path; do
+    [[ -n "$expected" && -n "$path" ]] || continue
+    [[ -f "$path" && "$expected" == "$(harness_hash_file "$path")" ]] || return 1
+  done <"$cache"
+}
+harness_prepared_host_state_matches() {
+  local state=$1 participant_manifest=$2 closure_path=$3 closure_sha=$4 closure_key=$5
+  local tool_manifest=$6 tool_sha=$7 checker=$8
+  shift 8
+  harness_state_matches "$state" "$@" || return 1
+  local participant_sha
+  participant_sha=$(harness_state_value "$state" participant_elf_sha256) || return 1
+  harness_manifest_valid "$participant_manifest" "$participant_sha" || return 1
+  harness_closure_cache_valid "$closure_path" "$closure_sha" "$closure_key" || return 1
+  if [[ "$checker" == ON ]]; then
+    harness_manifest_valid "$tool_manifest" "$tool_sha" || return 1
+  fi
 }
 harness_state_matches() {
   local state=$1

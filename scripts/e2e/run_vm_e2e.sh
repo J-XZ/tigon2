@@ -112,16 +112,73 @@ fi
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$config" unknown "$latency_sha" refreshed "$remote_root"
 harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=4" "failed_stage=resolve" "reason=resolved"
 harness_mark_timing "$out_dir/run_meta.json" resolve_ms "$total_start_ms"
-build_status=0
-build_start_ms=$(harness_now_ms)
-{
-  cmake --build "$build" --target "e2e_$suite"
-  cmake --build "$pool_build" --target cxl_pool_initer
-  if [[ "$checker" == ON ]]; then
-    LATENCY_SIM_VALGRIND_CHECK=ON bash "$latency_sim/scripts/build_latencycheck.sh"
+state="$runtime/e2e/prepared_state.json"
+participant_manifest="$run_runtime/participants.manifest"
+tool_manifest="$runtime/e2e/tool-cache/latencycheck.manifest"
+mkdir -p "$(dirname "$tool_manifest")"
+host_prepared_hit=0
+fast_closure_path=; fast_closure_key=; fast_closure_sha=; fast_tool_sha=none; fast_tool_binary_sha=none
+backing_real="$(realpath -m "$backing")"; backing_inode=missing; backing_size=missing
+if [[ -e "$backing_real" && ! -L "$backing_real" ]]; then
+  backing_inode="$(stat -c '%i' "$backing_real")"; backing_size="$(stat -c '%s' "$backing_real")"
+fi
+storage_real="$(realpath -m "$storage")"
+storage_source="$(findmnt -n -T "$storage_real" -o SOURCE 2>/dev/null || true)"
+storage_fstype="$(findmnt -n -T "$storage_real" -o FSTYPE 2>/dev/null || true)"
+storage_source=${storage_source:-missing}; storage_fstype=${storage_fstype:-missing}
+if [[ -s "$state" && -x "$participant" && -x "$pool_tool" ]]; then
+  if harness_manifest "$participant_manifest" "$participant" "$pool_tool" >"$out_dir/logs/host-manifest.log" 2>&1; then
+    current_participant_manifest_sha="$(harness_manifest_sha "$participant_manifest")"
+    fast_closure_path="$(harness_state_value "$state" runtime_closure_manifest_path 2>/dev/null || true)"
+    fast_closure_key="$(harness_state_value "$state" runtime_closure_cache_key 2>/dev/null || true)"
+    fast_closure_sha="$(harness_state_value "$state" runtime_closure_manifest_sha256 2>/dev/null || true)"
+    [[ -n "$fast_closure_sha" ]] || fast_closure_sha="$(harness_state_value "$state" runtime_closure_manifest_sha 2>/dev/null || true)"
+    fast_tool_manifest_path="$(harness_state_value "$state" latencycheck_prefix_manifest_path 2>/dev/null || true)"
+    fast_tool_sha="$(harness_state_value "$state" latencycheck_prefix_manifest_sha256 2>/dev/null || true)"
+    [[ -n "$fast_tool_sha" ]] || fast_tool_sha="$(harness_state_value "$state" latencycheck_prefix_manifest_sha 2>/dev/null || true)"
+    if [[ "$checker" == ON && -x "$tool_prefix/bin/valgrind" ]]; then
+      fast_tool_binary_sha="$(harness_hash_file "$tool_prefix/bin/valgrind")"
+    fi
+    fast_variant="$profile:$build:$remote_root:suite$suite"
+    fast_closure_key_current="$(harness_closure_cache_key "$runtime" "$fast_variant" "$participant" "$pool_tool" 2>/dev/null || true)"
+    fast_contract="$build_type/$optimization/compile-$compile_off/checker-$checker/ndebug-$e2e_ndebug/lto-$lto"
+    host_pairs=(
+      "project_id=tigon2" "repo_root=$root" "latency_sim_fingerprint=$latency_sha"
+      "build_fingerprint=$source_fingerprint" "compile_contract=$fast_contract"
+      "vm_count=$vm_count" "ssh_base_port=$base_port" "storage_path=$storage_real"
+      "storage_source=$storage_source" "storage_fstype=$storage_fstype"
+      "participant_targets=e2e_$suite,cxl_pool_initer"
+      "participant_elf_sha256=$(harness_hash_file "$participant")"
+      "participant_manifest_sha256=$current_participant_manifest_sha" "experiment_config_sha256=$config_sha"
+      "remote_root=$remote_root" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size"
+      "guest_tool_sha256=$fast_tool_binary_sha"
+    )
+    if validate_participants >"$out_dir/logs/host-contract.log" 2>&1 &&
+       harness_state_matches "$state" "${host_pairs[@]}" &&
+       [[ "$fast_closure_key" == "$fast_closure_key_current" && -n "$fast_closure_path" && -n "$fast_closure_sha" ]] &&
+       harness_closure_cache_valid "$fast_closure_path" "$fast_closure_sha" "$fast_closure_key_current" >/dev/null 2>&1 &&
+       { [[ "$checker" != ON ]] || { [[ -n "$fast_tool_manifest_path" && -n "$fast_tool_sha" ]] && harness_manifest_valid "$fast_tool_manifest_path" "$fast_tool_sha"; }; }; then
+      host_prepared_hit=1
+      HARNESS_CLOSURE_CACHE_KEY="$fast_closure_key"
+      HARNESS_CLOSURE_CACHE_MANIFEST="$fast_closure_path"
+      echo "PREPARED_HOST_STATE_HIT"
+    fi
   fi
-} >"$out_dir/logs/build.log" 2>&1 || build_status=$?
-harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
+fi
+build_status=0
+if ((host_prepared_hit)); then
+  harness_update_meta "$out_dir/run_meta.json" "build_reused=true" "build_ms=0"
+else
+  build_start_ms=$(harness_now_ms)
+  {
+    cmake --build "$build" --target "e2e_$suite"
+    cmake --build "$pool_build" --target cxl_pool_initer
+    if [[ "$checker" == ON ]]; then
+      LATENCY_SIM_VALGRIND_CHECK=ON bash "$latency_sim/scripts/build_latencycheck.sh"
+    fi
+  } >"$out_dir/logs/build.log" 2>&1 || build_status=$?
+  harness_mark_timing "$out_dir/run_meta.json" build_ms "$build_start_ms"
+fi
 if ((build_status != 0)); then
   harness_update_meta "$out_dir/run_meta.json" "failed_stage=build" "reason=host-build" "runner_exit_code=$build_status"
   harness_emit_result "$out_dir" HARNESS_INVALID build "" failed host-build
@@ -143,29 +200,47 @@ export TIGONKV_E2E_BUILD_TYPE="$build_type" TIGONKV_E2E_PROFILE="$profile" TIGON
 export LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" TIGONKV_E2E08_TOTAL_KEYS="$record_count"
 participant_manifest="$run_runtime/participants.manifest"
 freeze_start_ms=$(harness_now_ms)
-if ! harness_manifest "$participant_manifest" "$participant" "$pool_tool" >"$out_dir/logs/freeze.log" 2>&1; then
-  harness_update_meta "$out_dir/run_meta.json" "failed_stage=freeze" "reason=participant-manifest"
-  harness_emit_result "$out_dir" HARNESS_INVALID freeze "" failed participant-manifest
-  exit 125
+if ((host_prepared_hit)); then
+  : # The participant manifest was generated while validating the host state.
+else
+  if ! harness_manifest "$participant_manifest" "$participant" "$pool_tool" >"$out_dir/logs/freeze.log" 2>&1; then
+    harness_update_meta "$out_dir/run_meta.json" "failed_stage=freeze" "reason=participant-manifest"
+    harness_emit_result "$out_dir" HARNESS_INVALID freeze "" failed participant-manifest
+    exit 125
+  fi
 fi
 participant_sha="$(harness_manifest_sha "$participant_manifest")"
 closure_manifest="$run_runtime/closure.manifest"
 closure_start_ms=$(harness_now_ms)
-if ! harness_closure_manifest "$runtime" "$profile:$build:$remote_root:suite$suite" "$closure_manifest" "$participant" "$pool_tool" >"$out_dir/logs/closure.log" 2>&1; then
-  harness_update_meta "$out_dir/run_meta.json" "failed_stage=closure" "reason=closure"
-  harness_emit_result "$out_dir" HARNESS_INVALID closure "" failed closure
-  exit 125
+if ((host_prepared_hit)); then
+  cp -- "$fast_closure_path" "$closure_manifest"
+  HARNESS_CLOSURE_CACHE_KEY="$fast_closure_key"
+  HARNESS_CLOSURE_CACHE_MANIFEST="$fast_closure_path"
+  echo "CLOSURE_CACHE_HIT key=$fast_closure_key" >"$out_dir/logs/closure.log"
+else
+  if ! harness_closure_manifest "$runtime" "$profile:$build:$remote_root:suite$suite" "$closure_manifest" "$participant" "$pool_tool" >"$out_dir/logs/closure.log" 2>&1; then
+    harness_update_meta "$out_dir/run_meta.json" "failed_stage=closure" "reason=closure"
+    harness_emit_result "$out_dir" HARNESS_INVALID closure "" failed closure
+    exit 125
+  fi
 fi
 closure_sha="$(harness_manifest_sha "$closure_manifest")"
 harness_mark_timing "$out_dir/run_meta.json" closure_ms "$closure_start_ms"
 tool_manifest="$run_runtime/latencycheck.manifest"
 if [[ "$checker" == ON ]]; then
-  if ! harness_manifest "$tool_manifest" "$tool_prefix" >"$out_dir/logs/latencycheck-manifest.log" 2>&1; then
-    harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=latencycheck-tool"
-    harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed latencycheck-tool
-    exit 125
+  if ((host_prepared_hit)); then
+    cp -- "$fast_tool_manifest_path" "$tool_manifest"
+    tool_sha="$fast_tool_sha"
+  else
+    if ! harness_manifest "$tool_manifest" "$tool_prefix" >"$out_dir/logs/latencycheck-manifest.log" 2>&1; then
+      harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=latencycheck-tool"
+      harness_emit_result "$out_dir" HARNESS_INVALID prepare "" failed latencycheck-tool
+      exit 125
+    fi
+    tool_sha="$(harness_manifest_sha "$tool_manifest")"
+    cp -- "$tool_manifest" "$runtime/e2e/tool-cache/latencycheck.manifest"
   fi
-  tool_sha="$(harness_manifest_sha "$tool_manifest")"; tool_binary_sha="$(harness_hash_file "$tool_prefix/bin/valgrind")"
+  tool_binary_sha="$(harness_hash_file "$tool_prefix/bin/valgrind")"
   export TIGONKV_E2E_TOOL_MANIFEST="$tool_manifest"
   if ! VALGRIND_LIB="$tool_prefix/libexec/valgrind" "$tool_prefix/bin/valgrind" --tool=latencycheck --version >"$out_dir/logs/latencycheck_host_probe.log" 2>&1; then
     harness_update_meta "$out_dir/run_meta.json" "failed_stage=prepare" "reason=latencycheck-tool"
@@ -182,8 +257,8 @@ state="$runtime/e2e/prepared_state.json"; state_common=(
   "build_fingerprint=$source_fingerprint" "compile_contract=$build_type/$optimization/compile-$compile_off/checker-$checker/ndebug-$e2e_ndebug/lto-$lto"
   "vm_count=$vm_count" "ssh_base_port=$base_port"
   "storage_path=$storage_real" "storage_source=$storage_source" "storage_fstype=$storage_fstype"
-  "participant_elf_sha256=$participant_sha" "runtime_closure_manifest_sha=$closure_sha" "experiment_config_sha256=$config_sha"
-  "latencycheck_prefix_manifest_sha=$tool_sha" "guest_participant_sha256=$(harness_hash_file "$participant")" "guest_config_sha256=$config_sha" "guest_tool_sha256=$tool_binary_sha" "remote_root=$remote_root" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size")
+  "participant_elf_sha256=$(harness_hash_file "$participant")" "participant_manifest_sha256=$participant_sha" "runtime_closure_manifest_path=$HARNESS_CLOSURE_CACHE_MANIFEST" "runtime_closure_cache_key=$HARNESS_CLOSURE_CACHE_KEY" "runtime_closure_manifest_sha256=$closure_sha" "runtime_closure_manifest_sha=$closure_sha" "experiment_config_sha256=$config_sha"
+  "latencycheck_prefix_manifest_path=$([[ "$checker" == ON ]] && printf '%s' "$runtime/e2e/tool-cache/latencycheck.manifest" || printf '%s' none)" "latencycheck_prefix_manifest_sha256=$tool_sha" "latencycheck_prefix_manifest_sha=$tool_sha" "guest_participant_sha256=$(harness_hash_file "$participant")" "guest_config_sha256=$config_sha" "guest_tool_sha256=$tool_binary_sha" "remote_root=$remote_root" "backing_path=$backing_real" "backing_inode=$backing_inode" "backing_size=$backing_size")
 printf -v q_remote_root '%q' "$remote_root"
 printf -v q_remote_config '%q' "$remote_config"
 printf -v q_tool_prefix '%q' "$remote_root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install"
