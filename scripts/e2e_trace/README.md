@@ -6,7 +6,7 @@
 准备阶段示例：
 
 ```bash
-bash scripts/e2e/run_vm_trace.sh --execute --prepare-only --profile native \
+bash scripts/e2e/run_vm_trace.sh --execute --prepare-only --profile fixed-latency \
   --config experiment_config.jsonc --trace-config tests/fixtures/trace_config.jsonc \
   --record-count 100000 --operation-count 100000 --trace-workers-per-vm 4 \
   --workloads a,b,c,d,e --load-policy per-workload --rounds 1 \
@@ -73,7 +73,7 @@ cmake --build build-relwithdebinfo-ninja-clang18-co_off -j"$(nproc)"
 Legacy alias `build-rel` is not the formal path.
 
 ```sh
-bash scripts/e2e/run_vm_e2e.sh --execute --profile native --suite 08 \
+bash scripts/e2e/run_vm_e2e.sh --execute --profile fixed-latency --suite 08 \
   --config experiment_config.jsonc --rounds 1 --record-count 4096 \
   --out-dir exp_data/e2e08_runs/<new-run>
 ```

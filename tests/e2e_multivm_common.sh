@@ -41,9 +41,9 @@ tigonkv_e2e_multivm_preflight() {
   export LATENCY_SIM_VALGRIND_CHECK="$checker"
   export LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug"
   if [[ "$checker" == ON ]]; then
-    tigonkv_verify_e2e_compile_contract "$build" ON ON e2e_08 e2e_trace_runner
+    tigonkv_verify_e2e_compile_contract "$build" Debug OFF ON ON e2e_08 e2e_trace_runner
     pool_build=$(tigonkv_canonical_build_dir "$root" Debug OFF OFF ON)
-    tigonkv_verify_e2e_compile_contract "$pool_build" OFF ON cxl_pool_initer
+    tigonkv_verify_e2e_compile_contract "$pool_build" Debug OFF OFF ON cxl_pool_initer
     export TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$pool_build/cxl_pool_initer}"
   fi
   export TIGONKV_POOL_INITER="${TIGONKV_POOL_INITER:-$build/cxl_pool_initer}"

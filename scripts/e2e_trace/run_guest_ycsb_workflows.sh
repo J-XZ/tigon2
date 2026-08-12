@@ -6,7 +6,8 @@ config=${TIGONKV_EXPERIMENT_CONFIG_JSONC:-$root/experiment_config.jsonc}
 source "$root/scripts/tigonkv_vm_common.sh"
 source "$root/scripts/tigonkv_build_helpers.sh"
 tigonkv_load_vm_config "$config"
-build=$(tigonkv_canonical_build_dir "$root" Debug "${LATENCY_SIM_COMPILE_OFF:-OFF}" "${LATENCY_SIM_VALGRIND_CHECK:-OFF}" "${LATENCY_SIM_E2E_NDEBUG:-OFF}")
+build_type="${TIGONKV_E2E_BUILD_TYPE:-Debug}"
+build=$(tigonkv_canonical_build_dir "$root" "$build_type" "${LATENCY_SIM_COMPILE_OFF:-OFF}" "${LATENCY_SIM_VALGRIND_CHECK:-OFF}" "${LATENCY_SIM_E2E_NDEBUG:-OFF}")
 trace_root=${1:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 log_root=${2:?usage: $0 TRACE_ROOT LOG_ROOT [ROUNDS] [WORKLOADS]}
 rounds=${3:-${TIGONKV_E2E_ROUNDS:-10}}
@@ -25,6 +26,7 @@ shared_size_mb=${TIGONKV_SHARED_SIZE_MB:-$TIGONKV_SHARED_MB}
 shared_numa=${TIGONKV_SHARED_NUMA_NODE:-${TIGONKV_SHARED_NUMA_PRIMARY:-${TIGONKV_SHARED_NUMA%%,*}}}
 timeout_sec=${TIGONKV_E2E_TIMEOUT_SEC:-${TIGONKV_SYNC_TIMEOUT_SEC:-600}}
 checker=${LATENCY_SIM_VALGRIND_CHECK:-OFF}
+skip_deploy=${TIGONKV_E2E_SKIP_DEPLOY:-0}
 load_policy=${TIGONKV_E2E_LOAD_POLICY:-per-round}
 trace_batch_ops=${TIGONKV_E2E_TRACE_BATCH_OPS:-4096}
 trace_value_seed=${TIGONKV_E2E_TRACE_VALUE_SEED:-4851300051586183745}
@@ -41,6 +43,7 @@ remote_trace_config="$remote_root/trace_config.jsonc"
 
 [[ -d "$trace_root" ]] || { echo "missing trace root: $trace_root" >&2; exit 2; }
 case "$load_policy" in per-workload|per-round|once) ;; *) echo "TIGONKV_E2E_LOAD_POLICY must be per-workload, per-round, or once" >&2; exit 2 ;; esac
+case "$skip_deploy" in 0|1) ;; *) echo "TIGONKV_E2E_SKIP_DEPLOY must be 0 or 1" >&2; exit 2 ;; esac
 [[ -x "$runner" ]] || { echo "missing trace runner: $runner" >&2; exit 2; }
 [[ -x "$pool_init" ]] || { echo "build cxl_pool_initer first: $pool_init" >&2; exit 2; }
 [[ -f "$ssh_key" ]] || { echo "missing SSH key: $ssh_key" >&2; exit 2; }
@@ -168,7 +171,9 @@ sync_guest_runtime() {
 
 tigonkv_assert_host_test_isolated
 tigonkv_assert_qemu_group expected
-sync_guest_runtime
+if [[ "$skip_deploy" == 0 ]]; then
+  sync_guest_runtime
+fi
 
 sync_traces() {
   local round=$1 workload=$2 phase=$3 vm worker trace remote_dir wl
@@ -326,7 +331,9 @@ run_ycsb_phase() {
       for ((vm = 0; vm < vm_count; vm++)); do
         kill_guest_runners "$vm" >/dev/null 2>&1
       done
-      sync_traces "$round" "$wl" "$phase"
+      if [[ "$skip_deploy" == 0 ]]; then
+        sync_traces "$round" "$wl" "$phase"
+      fi
       phase_log="$log_root/round${round}-workload${wl}-${phase}"
       mkdir -p "$phase_log"
       pids=()

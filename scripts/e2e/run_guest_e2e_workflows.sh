@@ -11,6 +11,7 @@ compile_off="${LATENCY_SIM_COMPILE_OFF:-OFF}"
 e2e_ndebug="${LATENCY_SIM_E2E_NDEBUG:-OFF}"
 log_root=""
 prepare_only=0
+skip_deploy=0
 rounds="${TIGONKV_E2E_ROUNDS:-10}"
 suites="${TIGONKV_E2E_SUITES:-08 09}"
 records_override=""
@@ -19,7 +20,7 @@ compile_off_arg=0
 e2e_ndebug_arg=0
 config_arg=0
 usage() {
-  echo "usage: $0 --out-dir DIR --rounds N --suite LIST --config PATH --records N [--prepare-only] [shared latency flags]" >&2
+  echo "usage: $0 --out-dir DIR --rounds N --suite LIST --config PATH --records N [--prepare-only|--skip-deploy] [shared latency flags]" >&2
 }
 while (($#)); do
   case "$1" in
@@ -29,6 +30,7 @@ while (($#)); do
     --records) (($# >= 2)) || { usage; exit 2; }; records_override=$2; shift 2 ;;
     --config) (($# >= 2)) || { usage; exit 2; }; config=$2; config_arg=1; shift 2 ;;
     --prepare-only) prepare_only=1; shift ;;
+    --skip-deploy) skip_deploy=1; shift ;;
     --latency-sim-compile-off=*) compile_off="${1#*=}"; compile_off_arg=1; shift ;;
     --latency-sim-valgrind-check=*) checker="${1#*=}"; checker_arg=1; shift ;;
     --latency-sim-e2e-ndebug=*) e2e_ndebug="${1#*=}"; e2e_ndebug_arg=1; shift ;;
@@ -42,10 +44,17 @@ while (($#)); do
   esac
 done
 [[ -n "$log_root" ]] || { usage; exit 2; }
+((prepare_only && skip_deploy == 1)) && { echo "--prepare-only conflicts with --skip-deploy" >&2; exit 2; }
 tigonkv_load_vm_config "$config"
-case "$checker" in
-  ON) build_type=Debug ;;
-  OFF) build_type=RelWithDebInfo ;;
+case "${TIGONKV_E2E_BUILD_TYPE:-}" in
+  Debug|RelWithDebInfo|Release) build_type="$TIGONKV_E2E_BUILD_TYPE" ;;
+  '')
+    case "$checker" in
+      ON) build_type=Debug ;;
+      OFF) build_type=RelWithDebInfo ;;
+      *) echo "LATENCY_SIM_VALGRIND_CHECK must be ON or OFF" >&2; exit 2 ;;
+    esac
+    ;;
   *) echo "LATENCY_SIM_VALGRIND_CHECK must be ON or OFF" >&2; exit 2 ;;
 esac
 case "$compile_off" in ON|OFF) ;; *) echo "LATENCY_SIM_COMPILE_OFF must be ON or OFF" >&2; exit 2;; esac
@@ -62,7 +71,7 @@ if [[ "$checker" == ON ]]; then
   for suite in $suites; do
     case "$suite" in 08|09) checker_targets+=("e2e_$suite") ;; *) echo "unsupported checker suite: $suite" >&2; exit 2 ;; esac
   done
-  tigonkv_verify_e2e_compile_contract "$build" ON ON "${checker_targets[@]}" e2e_trace_runner
+  tigonkv_verify_e2e_compile_contract "$build" "$build_type" "$compile_off" ON ON "${checker_targets[@]}"
 fi
 vm_count=${TIGONKV_VM_COUNT}
 threads=${TIGONKV_E2E_THREADS:-${TIGONKV_E2E_WORKERS:-4}}
@@ -104,7 +113,7 @@ if [[ "$checker" == ON && "$compile_off" != OFF ]]; then
   exit 2
 fi
 if [[ "$checker" == ON ]]; then
-  tigonkv_verify_e2e_compile_contract "$pool_build" OFF ON cxl_pool_initer
+  tigonkv_verify_e2e_compile_contract "$pool_build" Debug OFF OFF ON cxl_pool_initer
 fi
 if [[ "$checker" == ON ]]; then
   for suite in $suites; do
@@ -227,7 +236,6 @@ sync_latencycheck_prefix() {
     else
       exit_code=$?
       (( status == 0 )) && { status=1; first_failed=$vm; }
-      echo "TIGONKV_DEPLOY_FAILED node=$vm stage=deploy exit_code=$exit_code reason=deploy" >&2
     fi
   done
   (( status == 0 )) || echo "TIGONKV_DEPLOY_SUMMARY first_node=$first_failed status=failed" >&2
@@ -566,7 +574,9 @@ for suite in $suites; do
     *) echo "unsupported suite: $suite" >&2; exit 2 ;;
   esac
   [[ -x "$binary_dir/e2e_${suite}" ]] || { echo "missing $binary_dir/e2e_${suite}" >&2; exit 2; }
-  sync_guest_binary "$suite"
+  if ((skip_deploy == 0)); then
+    sync_guest_binary "$suite"
+  fi
   for ((round = 1; round <= rounds; round++)); do
     reset_pool
     if run_init "$suite" "$round"; then

@@ -259,23 +259,31 @@ if events_path.is_file():
         if item.get("kind") == "pool_reset":
             rows.append(item)
 
-if len(rows) == 1:
-    row = rows[0]
-    try:
-        elapsed = int(row.get("elapsed_ms", 0))
-        count = int(row.get("count", 0))
-    except (TypeError, ValueError):
-        elapsed, count = 0, 0
-    success = row.get("status") == "success" and count == 1 and elapsed > 0
+if rows:
+    total_count = 0
+    total_elapsed = 0
+    all_success = True
+    owners = set()
+    for row in rows:
+        try:
+            elapsed = int(row.get("elapsed_ms", 0))
+            count = int(row.get("count", 0))
+        except (TypeError, ValueError):
+            elapsed, count = 0, 0
+        total_count += max(count, 0)
+        total_elapsed += max(elapsed, 0)
+        all_success = all_success and row.get("status") == "success" and count == 1 and elapsed > 0
+        if row.get("owner") is not None:
+            owners.add(row["owner"])
     data.update({
-        "pool_reset_count": 1 if success else 0,
-        "pool_reset_ms": elapsed if elapsed >= 0 else 0,
-        "pool_reset_owner": row.get("owner"),
-        "pool_reset_event_count": 1,
-        "pool_reset_status": "success" if success else "failed",
+        "pool_reset_count": total_count if all_success else 0,
+        "pool_reset_ms": total_elapsed,
+        "pool_reset_owner": next(iter(owners)) if len(owners) == 1 else None,
+        "pool_reset_event_count": len(rows),
+        "pool_reset_status": "success" if all_success else "failed",
     })
     meta_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    raise SystemExit(0 if success else 1)
+    raise SystemExit(0 if all_success else 1)
 
 data.update({
     "pool_reset_count": 0,

@@ -54,7 +54,7 @@ trace_config=$(realpath -m "$trace_config")
 }
 [[ "$workloads" =~ ^[abcde](,[abcde])*$ ]] || { echo "--workloads must be lowercase comma-separated a,b,c,d,e" >&2; exit 2; }
 IFS=, read -r -a selected_workloads <<<"$workloads"
-contract_json=$(python3 "$root/scripts/e2e/trace_contract.py" resolve --trace-config "$trace_config" --profile native --record-count "$records" --operation-count "$ops" --trace-workers-per-vm "$workers" --workloads "$workloads" --batch-ops "$batch_ops" --value-seed "$value_seed")
+contract_json=$(python3 "$root/scripts/e2e/trace_contract.py" resolve --trace-config "$trace_config" --profile fixed-latency --record-count "$records" --operation-count "$ops" --trace-workers-per-vm "$workers" --workloads "$workloads" --batch-ops "$batch_ops" --value-seed "$value_seed")
 mapfile -t contract_phase_dirs < <(python3 - "$contract_json" <<'PY'
 import json, sys
 data=json.loads(sys.argv[1])

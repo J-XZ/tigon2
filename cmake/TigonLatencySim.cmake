@@ -76,6 +76,7 @@ function(tigonkv_enable_latency_sim)
   add_subdirectory("${TIGONKV_LATENCY_SIM_SOURCE_DIR}"
                    "${CMAKE_CURRENT_BINARY_DIR}/latency_sim_build"
                    EXCLUDE_FROM_ALL)
+  latency_sim_remove_implicit_optimization_flags()
   if(LATENCY_SIM_VALGRIND_CHECK STREQUAL "ON")
     # The submodule is built in this consumer's Debug checker variant too;
     # keep its target-local debug info readable by the pinned Valgrind 3.18.1.

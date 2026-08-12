@@ -181,8 +181,9 @@ tigonkv_verify_cmake_cache() {
 # Delegate all cache/compile-command policy to the common latency_sim tool.
 # The project contributes only its participant targets.
 tigonkv_verify_e2e_compile_contract() {
-  local build_dir="$1" checker="${2:-ON}" e2e_ndebug="${3:-ON}" root
-  shift 3
+  local build_dir="$1" build_type="${2:-Debug}" compile_off="${3:-OFF}"
+  local checker="${4:-ON}" e2e_ndebug="${5:-ON}" root
+  shift 5
   local targets=("$@")
   if ((${#targets[@]} == 0)); then
     targets=(e2e_08 e2e_trace_runner)
@@ -191,14 +192,20 @@ tigonkv_verify_e2e_compile_contract() {
   local tool="$root/thirdparty_libs/latency_sim/tools/verify_e2e_compile_contract.py"
   local valgrind_lib="$root/thirdparty_libs/latency_sim/.latency_sim/latencycheck/install/libexec/valgrind"
   [[ -x "$tool" ]] || { echo "missing common compile contract tool: $tool" >&2; return 1; }
-  local args=(--build-dir "$build_dir" --build-type Debug
-    --compile-off OFF --valgrind-check "$checker" --e2e-ndebug "$e2e_ndebug"
-    --valgrind-lib "$valgrind_lib" --extra-check false)
-  if [[ "$checker" == OFF ]]; then
-    args=(--build-dir "$build_dir" --build-type Debug
-      --compile-off OFF --valgrind-check OFF --e2e-ndebug "$e2e_ndebug"
-      --valgrind-lib "$valgrind_lib" --extra-check false)
+  local optimization=O0
+  local require_lto=()
+  if [[ "$build_type" == RelWithDebInfo || "$build_type" == Release ]]; then
+    optimization=O3
+    require_lto=(--require-lto)
   fi
+  local args=(--build-dir "$build_dir" --build-type "$build_type"
+    --optimization "$optimization" --compile-off "$compile_off"
+    --valgrind-check "$checker" --e2e-ndebug "$e2e_ndebug"
+    --extra-check false)
+  if [[ "$checker" == ON ]]; then
+    args+=(--valgrind-lib "$valgrind_lib")
+  fi
+  args+=("${require_lto[@]}")
   local target
   for target in "${targets[@]}"; do args+=(--target "$target"); done
   python3 "$tool" "${args[@]}"

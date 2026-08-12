@@ -204,7 +204,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("resolve", choices=["resolve"])
     parser.add_argument("--trace-config", required=True)
-    parser.add_argument("--profile", choices=["native", "latencycheck"], default="native")
+    parser.add_argument(
+        "--profile",
+        choices=["production", "fixed-latency", "latencycheck"],
+        default="fixed-latency",
+    )
     for name in DEFAULTS:
         parser.add_argument("--" + name.replace("_", "-"), dest=name, default=None)
     args = parser.parse_args()

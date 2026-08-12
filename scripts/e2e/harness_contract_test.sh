@@ -199,6 +199,19 @@ assert data['pool_reset_count'] == 1 and data['pool_reset_ms'] == 9
 assert data['first_mismatch'] is None
 PY
 
+multi="$tmp/multi-reset"; mkdir -p "$multi"
+harness_write_common_meta "$multi/run_meta.json" tigon2 trace latencycheck 4096 "$config" source latency refreshed /root/tigon2
+printf '{"kind":"pool_reset","owner":"round-runner","count":1,"elapsed_ms":5,"status":"success"}\n{"kind":"pool_reset","owner":"round-runner","count":1,"elapsed_ms":7,"status":"success"}\n' >"$multi/actual_events.jsonl"
+harness_record_pool_reset_meta "$multi/run_meta.json" "$multi/actual_events.jsonl"
+python3 - "$multi/run_meta.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data['pool_reset_count'] == 2
+assert data['pool_reset_ms'] == 12
+assert data['pool_reset_event_count'] == 2
+assert data['pool_reset_status'] == 'success'
+PY
+
 reset_fail="$tmp/reset-fail"; mkdir -p "$reset_fail"
 harness_write_common_meta "$reset_fail/run_meta.json" tigon2 08 latencycheck 4096 "$config" source latency refreshed /root/tigon2
 printf '{"kind":"pool_reset","owner":"round-runner","count":0,"elapsed_ms":4,"status":"failed"}\n' >"$reset_fail/actual_events.jsonl"
@@ -222,7 +235,7 @@ rg -q 'TIGONKV_E2E_ACTUAL_EVENTS=' "$script_dir/run_vm_trace.sh"
 rg -q 'kind":"pool_reset"' "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh"
 rg -q -- '--tool=latencycheck --fair-sched=yes' "$root/scripts/e2e_trace/run_guest_ycsb_workflows.sh"
 ! rg -q 'suite 08 only' "$script_dir/run_vm_e2e.sh"
-rg -q 'supports suites 08 and 09' "$script_dir/run_vm_e2e.sh"
+rg -q -- '--suite 08\|09' "$script_dir/run_vm_e2e.sh"
 if "$script_dir/run_vm_e2e.sh" --profile latencycheck --rounds 2 >/dev/null 2>&1; then exit 1; fi
 if "$script_dir/run_vm_trace.sh" --prepare-only >/dev/null 2>&1; then exit 1; fi
 printf 'TIGON2_HARNESS_CONTRACT_OK\n'
