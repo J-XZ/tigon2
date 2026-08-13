@@ -229,6 +229,7 @@ trap 'harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"' EX
 export TIGONKV_E2E_RUN_ID="$run_id" TIGONKV_E2E_RUNTIME_DIR="$run_runtime" TIGONKV_E2E_LOG_DIR="$out_dir" TIGONKV_E2E_THREADS="$foreground_workers"
 export TIGONKV_VM_REMOTE_ROOT="$remote_root" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config"
 export TIGONKV_E2E_BUILD_TYPE="$build_type" TIGONKV_E2E_PROFILE="$profile" TIGONKV_E2E_LTO="$lto" TIGONKV_E2E_WORKERS="$foreground_workers"
+export TIGONKV_E2E_CANONICAL_BUILD_DIR="$build" TIGONKV_E2E_CANONICAL_POOL_BUILD_DIR="$pool_build" TIGONKV_E2E_CANONICAL_FROZEN=1
 export LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" TIGONKV_E2E08_TOTAL_KEYS="$record_count"
 participant_manifest="$run_runtime/participants.manifest"
 freeze_start_ms=$(harness_now_ms)
@@ -344,7 +345,7 @@ export TIGONKV_E2E_ACTUAL_EVENTS="$out_dir/actual_events.jsonl"
 deploy_status=0
 deploy_start_ms=$(harness_now_ms)
 if [[ "$prepared_state" != hit ]]; then
-  deploy_args=(--out-dir "$out_dir" --rounds "$rounds" --suite "$suite" --config "$config" --records "$record_count" --prepare-only)
+  deploy_args=(--out-dir "$out_dir" --rounds "$rounds" --suite "$suite" --config "$config" --records "$record_count" --deploy-only)
   set +e
   TIGONKV_E2E_TIMEOUT_SEC="$round_timeout" \
   TIGONKV_E2E_DEPLOY_TIMEOUT_SEC="$deploy_timeout" \
@@ -384,7 +385,7 @@ if ((prepare_only)); then
   harness_emit_result "$out_dir" PREPARED prepare-only "" verified prepared
   exit 0
 fi
-workflow_args=(--out-dir "$out_dir" --rounds "$rounds" --suite "$suite" --config "$config" --records "$record_count" --skip-deploy)
+workflow_args=(--out-dir "$out_dir" --rounds "$rounds" --suite "$suite" --config "$config" --records "$record_count" --run-only)
 set +e
 TIGONKV_E2E_TIMEOUT_SEC="$round_timeout" \
 TIGONKV_E2E_DEPLOY_TIMEOUT_SEC="$deploy_timeout" \
@@ -393,7 +394,7 @@ TIGONKV_E2E_DEPLOY_TIMEOUT_SEC="$deploy_timeout" \
 runner_status=$?; set -e
 harness_record_runner_exit "$out_dir/run_meta.json" "$runner_status"
 set +e
-harness_record_pool_reset_meta "$out_dir/run_meta.json" "$out_dir/actual_events.jsonl"
+harness_record_pool_reset_meta "$out_dir/run_meta.json" "$out_dir/actual_events.jsonl" "$rounds"
 pool_reset_status=$?
 set -e
 if ((pool_reset_status != 0)); then

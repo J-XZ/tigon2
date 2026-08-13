@@ -306,27 +306,27 @@ harness_record_runner_exit() {
   local meta=$1 status=$2
   harness_update_meta "$meta" "runner_exit_code=$status"
   local result="${meta%/run_meta.json}/run_result.json"
-  if [[ -f "$result" ]]; then
-    python3 - "$result" "$status" <<'PY'
+  python3 - "$meta" "$result" "$status" <<'PY'
 import json
 import sys
 from pathlib import Path
-path = Path(sys.argv[1])
-data = json.loads(path.read_text())
-data["runner_exit_code"] = int(sys.argv[2])
+meta_path = Path(sys.argv[1])
+path = Path(sys.argv[2])
+data = json.loads(path.read_text()) if path.exists() else json.loads(meta_path.read_text())
+data["runner_exit_code"] = int(sys.argv[3])
 path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PY
-  fi
 }
 
 harness_record_pool_reset_meta() {
-  local meta=$1 events=$2
-  python3 - "$meta" "$events" <<'PY'
+  local meta=$1 events=$2 expected_count=${3:-}
+  python3 - "$meta" "$events" "$expected_count" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-meta_path, events_path = map(Path, sys.argv[1:])
+meta_path, events_path = map(Path, sys.argv[1:3])
+expected_count = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
 data = json.loads(meta_path.read_text())
 rows = []
 if events_path.is_file():
@@ -337,6 +337,15 @@ if events_path.is_file():
             continue
         if item.get("kind") == "pool_reset":
             rows.append(item)
+
+def persist(update):
+    data.update(update)
+    meta_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    result_path = meta_path.parent / "run_result.json"
+    if result_path.is_file():
+        result = json.loads(result_path.read_text())
+        result.update(update)
+        result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
 if rows:
     total_count = 0
@@ -354,24 +363,24 @@ if rows:
         all_success = all_success and row.get("status") == "success" and count == 1 and elapsed > 0
         if row.get("owner") is not None:
             owners.add(row["owner"])
-    data.update({
+    if expected_count is not None:
+        all_success = all_success and len(rows) == expected_count
+    persist({
         "pool_reset_count": total_count if all_success else 0,
         "pool_reset_ms": total_elapsed,
         "pool_reset_owner": next(iter(owners)) if len(owners) == 1 else None,
         "pool_reset_event_count": len(rows),
         "pool_reset_status": "success" if all_success else "failed",
     })
-    meta_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     raise SystemExit(0 if all_success else 1)
 
-data.update({
+persist({
     "pool_reset_count": 0,
     "pool_reset_ms": 0,
     "pool_reset_owner": None,
     "pool_reset_event_count": len(rows),
     "pool_reset_status": "missing" if not rows else "ambiguous",
 })
-meta_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 raise SystemExit(2)
 PY
 }

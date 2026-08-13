@@ -11,6 +11,8 @@ compile_off="${LATENCY_SIM_COMPILE_OFF:-OFF}"
 e2e_ndebug="${LATENCY_SIM_E2E_NDEBUG:-OFF}"
 log_root=""
 prepare_only=0
+deploy_only=0
+run_only=0
 skip_deploy=0
 rounds="${TIGONKV_E2E_ROUNDS:-10}"
 suites="${TIGONKV_E2E_SUITES:-08 09}"
@@ -20,7 +22,7 @@ compile_off_arg=0
 e2e_ndebug_arg=0
 config_arg=0
 usage() {
-  echo "usage: $0 --out-dir DIR --rounds N --suite LIST --config PATH --records N [--prepare-only|--skip-deploy] [shared latency flags]" >&2
+  echo "usage: $0 --out-dir DIR --rounds N --suite LIST --config PATH --records N [--prepare-only|--deploy-only|--run-only|--skip-deploy] [shared latency flags]" >&2
 }
 while (($#)); do
   case "$1" in
@@ -30,6 +32,8 @@ while (($#)); do
     --records) (($# >= 2)) || { usage; exit 2; }; records_override=$2; shift 2 ;;
     --config) (($# >= 2)) || { usage; exit 2; }; config=$2; config_arg=1; shift 2 ;;
     --prepare-only) prepare_only=1; shift ;;
+    --deploy-only) deploy_only=1; shift ;;
+    --run-only) run_only=1; shift ;;
     --skip-deploy) skip_deploy=1; shift ;;
     --latency-sim-compile-off=*) compile_off="${1#*=}"; compile_off_arg=1; shift ;;
     --latency-sim-valgrind-check=*) checker="${1#*=}"; checker_arg=1; shift ;;
@@ -44,7 +48,13 @@ while (($#)); do
   esac
 done
 [[ -n "$log_root" ]] || { usage; exit 2; }
-((prepare_only && skip_deploy == 1)) && { echo "--prepare-only conflicts with --skip-deploy" >&2; exit 2; }
+((prepare_only && (skip_deploy == 1 || deploy_only == 1 || run_only == 1))) && { echo "--prepare-only conflicts with another lifecycle mode" >&2; exit 2; }
+((deploy_only && (skip_deploy == 1 || run_only == 1))) && { echo "--deploy-only conflicts with another lifecycle mode" >&2; exit 2; }
+((run_only && skip_deploy == 1)) && { echo "--run-only conflicts with --skip-deploy" >&2; exit 2; }
+if ((deploy_only || run_only)) && [[ "${TIGONKV_E2E_CANONICAL_FROZEN:-0}" != 1 ]]; then
+  echo "--deploy-only/--run-only require canonical frozen manifest" >&2
+  exit 2
+fi
 tigonkv_load_vm_config "$config"
 case "${TIGONKV_E2E_BUILD_TYPE:-}" in
   Debug|RelWithDebInfo|Release) build_type="$TIGONKV_E2E_BUILD_TYPE" ;;
@@ -63,10 +73,15 @@ if [[ "$checker" == ON && "$e2e_ndebug" != ON ]]; then
   echo "latencycheck E2E requires LATENCY_SIM_E2E_NDEBUG=ON" >&2
   exit 2
 fi
-tigonkv_prepare_build_environment "$root" "$build_type" "$compile_off" "$checker" "$e2e_ndebug" >/dev/null
-build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker" "$e2e_ndebug")
+if ((deploy_only || run_only)); then
+  build="${TIGONKV_E2E_CANONICAL_BUILD_DIR:-}"
+  [[ -n "$build" ]] || { echo "canonical build directory is missing" >&2; exit 2; }
+else
+  tigonkv_prepare_build_environment "$root" "$build_type" "$compile_off" "$checker" "$e2e_ndebug" >/dev/null
+  build=$(tigonkv_canonical_build_dir "$root" "$build_type" "$compile_off" "$checker" "$e2e_ndebug")
+fi
 binary_dir=${TIGONKV_E2E_BINARY_DIR:-$build}
-if [[ "$checker" == ON ]]; then
+if [[ "$checker" == ON && "$run_only" != 1 ]]; then
   checker_targets=()
   for suite in $suites; do
     case "$suite" in 08|09) checker_targets+=("e2e_$suite") ;; *) echo "unsupported checker suite: $suite" >&2; exit 2 ;; esac
@@ -80,8 +95,8 @@ ssh_key=${TIGONKV_VM_SSH_KEY:-/root/.ssh/id_rsa}
 remote_root=${TIGONKV_VM_REMOTE_ROOT:-/root/tigon2}
 remote_config=${TIGONKV_VM_REMOTE_CONFIG:-$remote_root/experiment_config.jsonc}
 backing=$TIGONKV_SHARED_BACKING
-pool_build="$build"
-if [[ "$checker" == ON ]]; then
+pool_build="${TIGONKV_E2E_CANONICAL_POOL_BUILD_DIR:-$build}"
+if [[ "$checker" == ON && -z "${TIGONKV_E2E_CANONICAL_POOL_BUILD_DIR:-}" ]]; then
   pool_build=$(tigonkv_canonical_build_dir "$root" Debug OFF OFF ON)
 fi
 if [[ -n "$records_override" ]]; then
@@ -112,7 +127,7 @@ if [[ "$checker" == ON && "$compile_off" != OFF ]]; then
   echo "latencycheck E2E requires LATENCY_SIM_COMPILE_OFF=OFF" >&2
   exit 2
 fi
-if [[ "$checker" == ON ]]; then
+if [[ "$checker" == ON && "$run_only" != 1 ]]; then
   tigonkv_verify_e2e_compile_contract "$pool_build" Debug OFF OFF ON cxl_pool_initer
 fi
 if [[ "$checker" == ON ]]; then
@@ -549,13 +564,17 @@ TIGONKV_WORKFLOW_FAILED_STAGE=""
 TIGONKV_WORKFLOW_FIRST_VM=-1
 TIGONKV_WORKFLOW_FIRST_EXIT=0
 TIGONKV_WORKFLOW_CLEANUP_STATUS=-1
-if ((prepare_only)); then
+if ((prepare_only || deploy_only)); then
   for suite in $suites; do
     case "$suite" in 08|09) ;; *) echo "unsupported suite: $suite" >&2; exit 2 ;; esac
     [[ -x "$binary_dir/e2e_${suite}" ]] || { echo "missing $binary_dir/e2e_${suite}" >&2; exit 2; }
     sync_guest_binary "$suite"
   done
-  echo "TIGONKV_PREPARED out_dir=$log_root"
+  if ((deploy_only)); then
+    echo "TIGONKV_DEPLOYED out_dir=$log_root"
+  else
+    echo "TIGONKV_PREPARED out_dir=$log_root"
+  fi
   exit 0
 fi
 for suite in $suites; do
@@ -574,7 +593,7 @@ for suite in $suites; do
     *) echo "unsupported suite: $suite" >&2; exit 2 ;;
   esac
   [[ -x "$binary_dir/e2e_${suite}" ]] || { echo "missing $binary_dir/e2e_${suite}" >&2; exit 2; }
-  if ((skip_deploy == 0)); then
+  if ((skip_deploy == 0 && run_only == 0)); then
     sync_guest_binary "$suite"
   fi
   for ((round = 1; round <= rounds; round++)); do

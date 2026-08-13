@@ -140,7 +140,7 @@ for node in 0 1 2 3; do printf 'LATENCYCHECK_SUMMARY target_accesses=2 expectati
 [[ "$(harness_classify_status "$run" 0 ON)" == CHECK_CLEAN ]]
 
 fakebin="$tmp/fakebin"; mkdir -p "$fakebin"
-printf '%b' '#!/usr/bin/env bash\nport=0\nwhile (($#)); do [[ "$1" == -p ]] && port=$2 && shift 2 || shift; done\n[[ "${FAKE_SSH_FAIL_PORT:-}" != "$port" ]] || exit 1\nprintf "node=%s boot_id=00000000-0000-0000-0000-000000000000 participant=%s config=%s tool=%s\\n" "$((port - 10022))" "$FAKE_SSH_PARTICIPANT" "$FAKE_SSH_CONFIG" "$FAKE_SSH_TOOL"\n' >"$fakebin/ssh"
+printf '%b' '#!/usr/bin/env bash\nport=0\nwhile (($#)); do case "$1" in -p|--port) port=$2; shift 2 ;; *) shift ;; esac; done\n[[ "${FAKE_SSH_FAIL_PORT:-}" != "$port" ]] || exit 1\nprintf "node=%s boot_id=00000000-0000-0000-0000-000000000000 participant=%s config=%s tool=%s\\n" "$((port - 10022))" "$FAKE_SSH_PARTICIPANT" "$FAKE_SSH_CONFIG" "$FAKE_SSH_TOOL"\n' >"$fakebin/ssh"
 chmod +x "$fakebin/ssh"; old_path="$PATH"; export PATH="$fakebin:$PATH" FAKE_SSH_PARTICIPANT="$(harness_hash_file "$elf")" FAKE_SSH_CONFIG="$(harness_hash_file "$config")" FAKE_SSH_TOOL=none
 printf 'stale-node=0\nstale-node=1\nstale-node=2\nstale-node=3\n' >"$tmp/probe.node0"
 harness_probe_guest 4 10022 "$tmp/runtime/ssh/%C" "$tmp/probe" 'node={node}' >/dev/null; harness_probe_matches "$tmp/probe" 4 "$FAKE_SSH_PARTICIPANT" "$FAKE_SSH_CONFIG" none
@@ -324,8 +324,8 @@ from pathlib import Path
 canonical = Path(sys.argv[1]).read_text()
 workflow = Path(sys.argv[2]).read_text()
 assert 'total_timeout=7200' in canonical
-assert '--skip-deploy' in canonical
-assert 'if ((skip_deploy == 0)); then' in workflow
+assert '--run-only' in canonical
+assert 'if ((skip_deploy == 0 && run_only == 0)); then' in workflow
 assert 'sync_guest_binary "$suite"' in workflow
 PY
 rg -q 'TIGONKV_E2E_ACTUAL_EVENTS=' "$script_dir/run_vm_trace.sh"
