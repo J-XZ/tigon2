@@ -142,6 +142,7 @@ for node in 0 1 2 3; do printf 'LATENCYCHECK_SUMMARY target_accesses=2 expectati
 fakebin="$tmp/fakebin"; mkdir -p "$fakebin"
 printf '%b' '#!/usr/bin/env bash\nport=0\nwhile (($#)); do [[ "$1" == -p ]] && port=$2 && shift 2 || shift; done\n[[ "${FAKE_SSH_FAIL_PORT:-}" != "$port" ]] || exit 1\nprintf "node=%s boot_id=00000000-0000-0000-0000-000000000000 participant=%s config=%s tool=%s\\n" "$((port - 10022))" "$FAKE_SSH_PARTICIPANT" "$FAKE_SSH_CONFIG" "$FAKE_SSH_TOOL"\n' >"$fakebin/ssh"
 chmod +x "$fakebin/ssh"; old_path="$PATH"; export PATH="$fakebin:$PATH" FAKE_SSH_PARTICIPANT="$(harness_hash_file "$elf")" FAKE_SSH_CONFIG="$(harness_hash_file "$config")" FAKE_SSH_TOOL=none
+printf 'stale-node=0\nstale-node=1\nstale-node=2\nstale-node=3\n' >"$tmp/probe.node0"
 harness_probe_guest 4 10022 "$tmp/runtime/ssh/%C" "$tmp/probe" 'node={node}' >/dev/null; harness_probe_matches "$tmp/probe" 4 "$FAKE_SSH_PARTICIPANT" "$FAKE_SSH_CONFIG" none
 [[ "$(harness_probe_boot_ids "$tmp/probe")" == node0:*node1:*node2:*node3:* ]]
 cp "$tmp/probe" "$tmp/probe-duplicate-node"; sed -i '2s/node=1/node=0/' "$tmp/probe-duplicate-node"

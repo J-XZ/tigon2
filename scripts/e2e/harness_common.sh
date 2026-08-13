@@ -679,6 +679,7 @@ harness_probe_guest() {
   local control_dir
   control_dir=$(dirname "$control_path")
   mkdir -p "$control_dir"
+  rm -f -- "$output.node"*
   : >"$output"
   local -a pids=()
   local node
