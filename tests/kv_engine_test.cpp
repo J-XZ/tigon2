@@ -868,8 +868,8 @@ int main(int argc, char **argv) {
         latency_sim::ExecutionClass::kBackground);
     engine->BindWorker(0);
     assert(star::CXLMemory::bound_owner_shard() == 0);
-    for (const std::string key : {FixedKeyText("H-route"),
-                                  FixedKeyText("a-route")}) {
+    for (const std::string& key : {FixedKeyText("H-route"),
+                                   FixedKeyText("a-route")}) {
       const uint32_t partition = engine->PartitionForKey(key);
       assert(engine->OwnerForKey(key) == partition % node_zero.vm_count);
     }

@@ -23,10 +23,12 @@ class RecordingScc final : public star::SCCManager {
     static_cast<star::TwoPLPashaMetadataShared *>(meta)->clear_all_scc_bits();
     static_cast<star::TwoPLPashaMetadataShared *>(meta)->set_scc_bit(host);
   }
-  void do_read(void *, std::size_t, void *dst, const void *src, uint64_t bytes) override {
+  void do_read(void *, std::size_t, void *dst, const void *src, uint64_t bytes,
+               star::SCCManager::ReadDestination) override {
     ++reads; std::memcpy(dst, src, bytes);
   }
-  void do_write(void *, std::size_t, void *dst, const void *src, uint64_t bytes) override {
+  void do_write(void *, std::size_t, void *dst, const void *src, uint64_t bytes,
+                star::SCCManager::WriteSource) override {
     ++writes; std::memcpy(dst, src, bytes);
   }
   void prepare_read(void *, std::size_t, void *, uint64_t bytes) override {

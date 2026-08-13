@@ -15,9 +15,16 @@
 // KVPartition handle; the engine's partition map is private, so this test
 // relaxes access for the KVEngine header only (test-only, mirrors the cxlkv
 // test0 pattern).
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
 #define private public
 #include "kv/engine/kv_engine.h"
 #undef private
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #include <latency_sim/simulator.h>
 
