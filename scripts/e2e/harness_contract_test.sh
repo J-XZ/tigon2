@@ -309,6 +309,9 @@ PY
 
 "$script_dir/run_vm_e2e.sh" --help >/dev/null
 "$script_dir/run_vm_trace.sh" --help >/dev/null
+grep -q -- '--foreground-workers-per-vm' "$script_dir/run_vm_e2e.sh"
+if "$script_dir/run_vm_e2e.sh" --foreground-workers-per-vm 3 >/dev/null 2>&1; then exit 1; fi
+if "$script_dir/run_vm_e2e.sh" --prepare-only >/dev/null 2>&1; then exit 1; fi
 rg -q 'prepare_tigon_trace_set\(\)' "$script_dir/run_vm_trace.sh"
 rg -q 'TRACE_CACHE_HIT|TRACE_CACHE_REFRESHED' "$script_dir/run_vm_trace.sh"
 rg -q 'trace_generation_mode=' "$script_dir/run_vm_trace.sh"

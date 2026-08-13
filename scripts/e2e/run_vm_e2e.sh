@@ -5,7 +5,7 @@ root="$(cd "$script_dir/../.." && pwd)"
 source "$script_dir/harness_common.sh"
 source "$root/scripts/tigonkv_vm_common.sh"
 source "$root/scripts/tigonkv_build_helpers.sh"
-execute=0; prepare_only=0; profile=fixed-latency; suite=08; config="$root/experiment_config.jsonc"; rounds=1; record_count=4096; round_timeout=1800; total_timeout=7200; requested_out=""
+execute=0; prepare_only=0; profile=fixed-latency; suite=08; config="$root/experiment_config.jsonc"; rounds=1; record_count=4096; round_timeout=1800; total_timeout=7200; requested_out=""; foreground_workers=""
 usage() {
   cat <<'USAGE'
 Usage: scripts/e2e/run_vm_e2e.sh [options]
@@ -15,6 +15,7 @@ Usage: scripts/e2e/run_vm_e2e.sh [options]
   --config PATH
   --rounds N
   --record-count N
+  --foreground-workers-per-vm N
   --round-timeout SEC
   --total-timeout SEC
   --out-dir DIR
@@ -31,6 +32,7 @@ while (($#)); do
     --config) need_value "$@"; config=$2; shift 2 ;;
     --rounds) need_value "$@"; rounds=$2; shift 2 ;;
     --record-count) need_value "$@"; record_count=$2; shift 2 ;;
+    --foreground-workers-per-vm) need_value "$@"; foreground_workers=$2; shift 2 ;;
     --round-timeout) need_value "$@"; round_timeout=$2; shift 2 ;;
     --total-timeout) need_value "$@"; total_timeout=$2; shift 2 ;;
     --out-dir) need_value "$@"; requested_out=$2; shift 2 ;;
@@ -39,6 +41,7 @@ while (($#)); do
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+((prepare_only == 0 || execute == 1)) || { echo "--prepare-only requires --execute" >&2; exit 2; }
 case "$profile" in production|fixed-latency|latencycheck) ;; *) echo "--profile must be production, fixed-latency, or latencycheck" >&2; exit 2 ;; esac
 case "$suite" in 08|09) ;; *) echo "--suite must use 08 or 09" >&2; exit 2 ;; esac
 for pair in "rounds:$rounds" "record-count:$record_count" "round-timeout:$round_timeout" "total-timeout:$total_timeout"; do
@@ -51,6 +54,13 @@ fi
 config="$(harness_resolve_cli_path "$root" "$config")"
 [[ -f "$config" ]] || { echo "missing experiment config: $config" >&2; exit 2; }
 tigonkv_load_vm_config "$config"; tigonkv_validate_vm_config
+configured_foreground_workers="$TIGONKV_E2E_WORKERS"
+if [[ -z "$foreground_workers" ]]; then foreground_workers="$configured_foreground_workers"; fi
+harness_require_positive foreground-workers-per-vm "$foreground_workers"
+[[ "$foreground_workers" == "$configured_foreground_workers" ]] || {
+  echo "--foreground-workers-per-vm must match e2e.foreground_worker_count_per_vm=$configured_foreground_workers" >&2
+  exit 2
+}
 latency_sim="$root/thirdparty_libs/latency_sim"
 declare -A profile_values=()
 while IFS='=' read -r profile_key profile_value; do profile_values["$profile_key"]=$profile_value; done \
@@ -105,7 +115,7 @@ out_dir="$HARNESS_OUT_DIR"; run_id="$HARNESS_RUN_ID"; run_runtime="$HARNESS_RUNT
 mkdir -p "$out_dir/logs" "$out_dir/round_logs"
 if ! harness_acquire_lock tigon2 "$config" "$vm_count" "$base_port" "$runtime" "$run_id" "$storage" "$backing"; then
   harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$config" unknown "$latency_sha" miss "$remote_root"
-  harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=4" "failed_stage=resolve" "reason=shared-vm-resources-busy"
+  harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=$foreground_workers" "failed_stage=resolve" "reason=shared-vm-resources-busy"
   harness_emit_result "$out_dir" HARNESS_INVALID resolve "" failed shared-vm-resources-busy
   exit 125
 fi
@@ -118,7 +128,7 @@ if ! python3 "$root/scripts/tigonkv_config.py" derive-e2e \
     "$source_config" "$root/tests/fixtures/e2e_multivm_config.jsonc" "$runtime_config" \
     >"$out_dir/logs/config_prepare.log" 2>&1; then
   harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$source_config" unknown "$latency_sha" miss "$remote_root"
-  harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=4" "failed_stage=resolve" "reason=config-derive"
+  harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=$foreground_workers" "failed_stage=resolve" "reason=config-derive"
   harness_emit_result "$out_dir" HARNESS_INVALID resolve "" failed config-derive
   exit 125
 fi
@@ -131,7 +141,7 @@ remote_config="$remote_root/e2e-runtime/experiment_config.jsonc"
 export TIGONKV_VM_REMOTE_CONFIG="$remote_config"
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$config" unknown "$latency_sha" refreshed "$remote_root"
 harness_update_meta "$out_dir/run_meta.json" "source_config=$source_config" "source_config_sha256=$source_config_sha" "runtime_config=$config" "runtime_config_sha256=$config_sha"
-harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=4" "failed_stage=resolve" "reason=resolved"
+harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=$foreground_workers" "failed_stage=resolve" "reason=resolved"
 harness_mark_timing "$out_dir/run_meta.json" resolve_ms "$total_start_ms"
 state="$runtime/e2e/prepared_state.json"
 participant_manifest="$run_runtime/participants.manifest"
@@ -216,9 +226,9 @@ validate_participants || {
 ssh_control_path="$(harness_ssh_control_path "$run_runtime" tigon2 "$config_sha")"
 export TIGONKV_E2E_SSH_CONTROL_PATH="$ssh_control_path"
 trap 'harness_close_ssh_masters "$vm_count" "$base_port" "$ssh_control_path"' EXIT
-export TIGONKV_E2E_RUN_ID="$run_id" TIGONKV_E2E_RUNTIME_DIR="$run_runtime" TIGONKV_E2E_LOG_DIR="$out_dir" TIGONKV_E2E_THREADS="${TIGONKV_E2E_THREADS:-4}"
+export TIGONKV_E2E_RUN_ID="$run_id" TIGONKV_E2E_RUNTIME_DIR="$run_runtime" TIGONKV_E2E_LOG_DIR="$out_dir" TIGONKV_E2E_THREADS="$foreground_workers"
 export TIGONKV_VM_REMOTE_ROOT="$remote_root" TIGONKV_EXPERIMENT_CONFIG_JSONC="$config"
-export TIGONKV_E2E_BUILD_TYPE="$build_type" TIGONKV_E2E_PROFILE="$profile" TIGONKV_E2E_LTO="$lto"
+export TIGONKV_E2E_BUILD_TYPE="$build_type" TIGONKV_E2E_PROFILE="$profile" TIGONKV_E2E_LTO="$lto" TIGONKV_E2E_WORKERS="$foreground_workers"
 export LATENCY_SIM_COMPILE_OFF="$compile_off" LATENCY_SIM_VALGRIND_CHECK="$checker" LATENCY_SIM_E2E_NDEBUG="$e2e_ndebug" TIGONKV_E2E08_TOTAL_KEYS="$record_count"
 participant_manifest="$run_runtime/participants.manifest"
 freeze_start_ms=$(harness_now_ms)
@@ -310,11 +320,11 @@ else
 fi
 harness_mark_timing "$out_dir/run_meta.json" prepare_ms "$prepare_start_ms"
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 "$suite" "$profile" "$record_count" "$config" "$source_fingerprint" "$latency_sha" "$prepared_state" "$remote_root"
-python3 - "$out_dir/run_meta.json" "$vm_count" "$record_count" "$build_type" "$optimization" "$compile_off" "$checker" "$e2e_ndebug" "$lto" "$tool_prefix" <<'PY'
+python3 - "$out_dir/run_meta.json" "$vm_count" "$record_count" "$build_type" "$optimization" "$compile_off" "$checker" "$e2e_ndebug" "$lto" "$tool_prefix" "$foreground_workers" <<'PY'
 import json,sys
 from pathlib import Path
 p=Path(sys.argv[1]); d=json.loads(p.read_text()); build_type=sys.argv[4]; optimization=sys.argv[5]; compile_off=sys.argv[6]; checker=sys.argv[7]=='ON'; ndebug=sys.argv[8]=='ON'
-d.update({'vm_count':int(sys.argv[2]),'workers_per_vm':4,'record_count':int(sys.argv[3]),'logical_operation_count':int(sys.argv[3]),'physical_operation_count':int(sys.argv[3]),'build_contract':f'{build_type}/{optimization}/'+('NDEBUG' if ndebug else 'asserts-on'),'build_type':build_type,'optimization':optimization,'compile_off':compile_off=='ON','valgrind_check':checker,'ndebug':ndebug,'lto':sys.argv[9]=='ON','extra_check':False,'valgrind_lib':sys.argv[10]+'/libexec/valgrind' if checker else 'none','load_policy':'once'})
+d.update({'vm_count':int(sys.argv[2]),'workers_per_vm':int(sys.argv[11]),'record_count':int(sys.argv[3]),'logical_operation_count':int(sys.argv[3]),'physical_operation_count':int(sys.argv[3]),'build_contract':f'{build_type}/{optimization}/'+('NDEBUG' if ndebug else 'asserts-on'),'build_type':build_type,'optimization':optimization,'compile_off':compile_off=='ON','valgrind_check':checker,'ndebug':ndebug,'lto':sys.argv[9]=='ON','extra_check':False,'valgrind_lib':sys.argv[10]+'/libexec/valgrind' if checker else 'none','load_policy':'once'})
 p.write_text(json.dumps(d,indent=2,sort_keys=True)+'\n')
 PY
 harness_update_meta "$out_dir/run_meta.json" \
