@@ -666,8 +666,9 @@ void ParseStrictLatencyConfig(std::string_view text, std::string_view raw_text,
         "config field must be object: tigon_kv.latency_inject.fixed_latency");
   try {
     config->hardware_simulation =
-        latency_sim::ParseFixedLatencyJsonc(raw_text,
-                                            latency_sim::ConfigLayout::kTigon2)
+        latency_sim::ParseFixedLatencyJsonc(
+                                            raw_text,
+                                            "/tigon_kv/latency_inject/fixed_latency")
             .config;
   } catch (const std::exception &error) {
     throw std::invalid_argument(std::string("invalid fixed latency config: ") +
