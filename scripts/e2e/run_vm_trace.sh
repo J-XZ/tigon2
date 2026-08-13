@@ -166,12 +166,12 @@ out_dir="$HARNESS_OUT_DIR"; run_id="$HARNESS_RUN_ID"; run_runtime="$HARNESS_RUNT
 mkdir -p "$out_dir/logs" "$out_dir/round_logs"
 if ! harness_acquire_lock tigon2 "$config" "$vm_count" "$base_port" "$runtime" "$run_id" "$storage" "$backing"; then
   harness_write_common_meta "$out_dir/run_meta.json" tigon2 trace "$profile" "$record_count" "$config" unknown "$latency_sha" miss "$remote_root"
-  harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=$trace_workers" "failed_stage=resolve" "reason=shared-vm-resources-busy"
+  harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=$trace_workers" "ssh_base_port=$base_port" "storage_path=$(realpath -m "$storage")" "backing_path=$(realpath -m "$backing")" "failed_stage=resolve" "reason=shared-vm-resources-busy"
   harness_emit_result "$out_dir" HARNESS_INVALID resolve "" failed shared-vm-resources-busy
   exit 125
 fi
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 trace "$profile" "$record_count" "$config" unknown "$latency_sha" refreshed "$remote_root"
-harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=$trace_workers" "failed_stage=resolve" "reason=resolved"
+harness_update_meta "$out_dir/run_meta.json" "vm_count=$vm_count" "workers_per_vm=$trace_workers" "ssh_base_port=$base_port" "storage_path=$(realpath -m "$storage")" "backing_path=$(realpath -m "$backing")" "failed_stage=resolve" "reason=resolved"
 harness_mark_timing "$out_dir/run_meta.json" resolve_ms "$total_start_ms"
 state="$runtime/e2e/prepared_state.json"
 participant_manifest="$run_runtime/participants.manifest"
@@ -526,6 +526,7 @@ state_expected=("${state_common[@]}" "guest_artifact_manifest_sha256=$guest_prob
 if [[ -n "$guest_probe_sha" ]] && harness_state_matches "$state" "${state_expected[@]}"; then prepared_state=hit; echo PREPARED_STATE_HIT; else echo "PREPARED_STATE_MISS reason=manifest_or_trace_config_changed"; fi
 harness_mark_timing "$out_dir/run_meta.json" prepare_ms "$prepare_start_ms"
 harness_write_common_meta "$out_dir/run_meta.json" tigon2 trace "$profile" "$record_count" "$config" "$source_fingerprint" "$latency_sha" "$prepared_state" "$remote_root"
+harness_update_meta "$out_dir/run_meta.json" "ssh_base_port=$base_port" "storage_path=$storage_real" "backing_path=$backing_real"
 python3 - "$out_dir/run_meta.json" "$vm_count" "$record_count" "$operation_count" "$trace_workers" "$load_policy" "$rounds" "$checker" "$e2e_ndebug" "$build_type" "$optimization" "$compile_off" "$lto" "$trace_dir/trace_config.jsonc" "$trace_config" "$trace_contract_json" "$trace_dir/trace_manifest.json" "$batch_ops" "$value_seed" <<'PY'
 import hashlib
 import json,sys
