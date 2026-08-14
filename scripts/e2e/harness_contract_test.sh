@@ -321,14 +321,43 @@ rg -q 'trace_generation_mode=' "$script_dir/run_vm_trace.sh"
 rg -q 'trace_cache_meta.json' "$script_dir/run_vm_trace.sh"
 python3 - "$script_dir/run_vm_e2e.sh" "$root/scripts/e2e/run_guest_e2e_workflows.sh" <<'PY'
 import sys
+import ast
+import re
 from pathlib import Path
 
 canonical = Path(sys.argv[1]).read_text()
 workflow = Path(sys.argv[2]).read_text()
-assert 'total_timeout=7200' in canonical
+assert re.search(r'round_timeout=1800', canonical)
+assert re.search(r'total_timeout=7200', canonical)
 assert '--run-only' in canonical
 assert 'if ((skip_deploy == 0 && run_only == 0)); then' in workflow
 assert 'sync_guest_binary "$suite"' in workflow
+PY
+python3 - "$script_dir/trace_contract.py" <<'PY'
+import ast
+import sys
+from pathlib import Path
+
+tree = ast.parse(Path(sys.argv[1]).read_text())
+defaults = None
+for node in tree.body:
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+    if any(isinstance(target, ast.Name) and target.id == 'DEFAULTS' for target in targets):
+        defaults = ast.literal_eval(node.value)
+        break
+assert defaults == {
+    'record_count': 100_000,
+    'operation_count': 100_000,
+    'trace_workers_per_vm': 4,
+    'workloads': ['a', 'b', 'c', 'd', 'e'],
+    'load_policy': 'per-workload',
+    'warmup_rounds': 0,
+    'rounds': 1,
+    'round_timeout_sec': 7_200,
+    'total_timeout_sec': 14_400,
+    'batch_ops': 4_096,
+    'value_seed': 4_851_300_051_586_183_745,
+}
 PY
 rg -q 'TIGONKV_E2E_ACTUAL_EVENTS=' "$script_dir/run_vm_trace.sh"
 ! rg -q -- '--skip-build|--skip-vm-init|--skip-trace-generation|--skip-deploy' "$script_dir/run_vm_trace.sh"

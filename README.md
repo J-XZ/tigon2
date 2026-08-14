@@ -85,6 +85,16 @@ bash scripts/e2e/run_vm_trace.sh --execute --prepare-only --profile fixed-latenc
 配置中的 `shared_memory.backing_path` 是宿主机精确 backing 文件，
 `shared_memory.device_path` 是 guest 字符设备；不得再用一个 path 字段表达两者。
 
+未显式传入覆盖值时，普通 E2E 的共享默认合同为：`profile=fixed-latency`、`suite=08`、
+`rounds=1`、集群 `record-count=4096`、`round-timeout=1800`、
+`total-timeout=7200`；前台 worker 数取根配置的
+`e2e.foreground_worker_count_per_vm`（当前为每 VM 4）。Trace/YCSB 默认合同为：
+集群 `record-count=100000`、`operation-count=100000`、每 VM 4 个 trace worker、
+workloads `a,b,c,d,e`、`load-policy=per-workload`、`warmup-rounds=0`、`rounds=1`、
+`round-timeout=7200`、`total-timeout=14400`、`batch-ops=4096`，以及统一的
+`value-seed=4851300051586183745`。这些默认值与 CXLKV canonical 入口一致；只有显式
+命令行/config/env 覆盖时才改变。
+
 标准工具链入口：`clang-18`/`clang++-18`（调用者显式指定其它编译器时保留其选择，
 GCC 仍可用，此时 LTO 使用 `-flto`），Ninja 生成器（命令中显式 `-G Ninja`），
 检测到 `ccache` 时自动作为 compiler launcher。单配置构建未指定
