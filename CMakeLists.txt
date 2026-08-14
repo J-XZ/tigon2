@@ -232,7 +232,13 @@ add_test(NAME btree_binding_test COMMAND btree_binding_test)
 add_test(NAME kv_partition_test COMMAND kv_partition_test)
 add_test(NAME kv_engine_test COMMAND kv_engine_test)
 add_test(NAME kv_startup_test COMMAND kv_startup_test)
-add_test(NAME open_failpoint_test COMMAND open_failpoint_test)
+# open_failpoint_test exercises NDEBUG-gated host failpoints.  It must run
+# only with the ordinary assert-enabled library; an E2E_NDEBUG participant
+# build intentionally links the production-like library and must not register
+# this host-only test against it.
+if(NOT LATENCY_SIM_E2E_NDEBUG STREQUAL "ON")
+  add_test(NAME open_failpoint_test COMMAND open_failpoint_test)
+endif()
 add_test(NAME scc_protocol_test COMMAND scc_protocol_test)
 add_test(NAME kv_shared_protocol_test COMMAND kv_shared_protocol_test)
 add_test(NAME region_allocator_test COMMAND region_allocator_test)
