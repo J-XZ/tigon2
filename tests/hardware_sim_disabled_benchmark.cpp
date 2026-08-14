@@ -27,9 +27,16 @@
 // The benchmark needs the engine's mapped pool base to re-register its ranges
 // while the KV cases run (the component cases register the benchmark pool's
 // ranges); the pool handle is private, so access is relaxed for this TU only.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
 #define private public
 #include "kv/engine/kv_engine.h"
 #undef private
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #include <algorithm>
 #include <array>
