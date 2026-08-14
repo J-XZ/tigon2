@@ -145,6 +145,8 @@ chmod +x "$fakebin/ssh"; old_path="$PATH"; export PATH="$fakebin:$PATH" FAKE_SSH
 printf 'stale-node=0\nstale-node=1\nstale-node=2\nstale-node=3\n' >"$tmp/probe.node0"
 harness_probe_guest 4 10022 "$tmp/runtime/ssh/%C" "$tmp/probe" 'node={node}' >/dev/null; harness_probe_matches "$tmp/probe" 4 "$FAKE_SSH_PARTICIPANT" "$FAKE_SSH_CONFIG" none
 [[ "$(harness_probe_boot_ids "$tmp/probe")" == node0:*node1:*node2:*node3:* ]]
+printf 'runtime_dependency=missing participant=/guest/bin\nprobe_status=91 node=0\n' >"$tmp/probe-runtime-dependency"
+[[ "$(harness_probe_failure_reason "$tmp/probe-runtime-dependency")" == runtime-dependency ]]
 cp "$tmp/probe" "$tmp/probe-duplicate-node"; sed -i '2s/node=1/node=0/' "$tmp/probe-duplicate-node"
 if harness_probe_matches "$tmp/probe-duplicate-node" 4 "$FAKE_SSH_PARTICIPANT" "$FAKE_SSH_CONFIG" none; then exit 1; fi
 export FAKE_SSH_FAIL_PORT=10023; if harness_probe_guest 4 10022 "$tmp/runtime/ssh/fail-%C" "$tmp/probe-fail" 'node={node}'; then exit 1; fi; export PATH="$old_path"

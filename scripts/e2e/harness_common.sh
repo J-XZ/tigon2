@@ -463,6 +463,8 @@ def authoritative_first_node(root):
         paths.append((priority,str(path),path))
     patterns=(
         re.compile(r'first checker failure\s+node\s*([0-9]+)',re.IGNORECASE),
+        re.compile(r'checker round failed at node\s*([0-9]+)',re.IGNORECASE),
+        re.compile(r'node\s*([0-9]+) exited before followers',re.IGNORECASE),
         re.compile(r'\bFAIL_FAST\b.*?\bfirst_node=([0-9]+)',re.IGNORECASE),
         re.compile(r'\b(?:TIGONKV_FAIL_FAST|DSIDLE_FAIL_FAST)\b.*?\bfirst_vm=([0-9]+)',re.IGNORECASE),
         re.compile(r'\b(?:TIGONKV_DEPLOY_FAILED|DSIDLE_DEPLOY_FAILED)\b.*?\bnode=([0-9]+)',re.IGNORECASE),
@@ -734,7 +736,8 @@ harness_probe_matches() {
 import re, sys
 from pathlib import Path
 path, expected_nodes, participant_csv, expected_config, expected_tool = sys.argv[1:]
-lines = [line.strip() for line in Path(path).read_text(errors="replace").splitlines() if line.strip()]
+lines = [line.strip() for line in Path(path).read_text(errors="replace").splitlines()
+         if line.strip().startswith("node=")]
 expected_node_ids = set(range(int(expected_nodes)))
 if len(lines) != int(expected_nodes):
     print(f"PROBE_MISMATCH field=node_count expected={expected_nodes} observed={len(lines)}", file=sys.stderr)
@@ -778,6 +781,8 @@ import re, sys
 from pathlib import Path
 rows = []
 for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    if not line.strip().startswith("node="):
+        continue
     node = re.search(r"\bnode=(\d+)\b", line)
     boot = re.search(r"\bboot_id=([0-9a-f-]+)\b", line)
     if not node or not boot:
@@ -796,9 +801,9 @@ harness_probe_first_failed_node() {
 harness_probe_failure_reason() {
   local output=$1
   if [[ ! -f "$output" ]]; then printf 'ssh\n';
-  elif grep -q 'probe_status=' "$output"; then printf 'ssh\n';
   elif grep -q 'runtime_dependency=missing' "$output"; then printf 'runtime-dependency\n';
   elif grep -q 'latencycheck' "$output"; then printf 'latencycheck-tool\n';
+  elif grep -q 'probe_status=' "$output"; then printf 'ssh\n';
   else printf 'guest-participant-sha\n'; fi
 }
 
